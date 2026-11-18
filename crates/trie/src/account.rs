@@ -236,4 +236,35 @@ mod tests {
         let decoded = AccountState::decode(&encoded).unwrap();
         assert_eq!(decoded.balance, balance);
     }
+
+    /// rskj `AccountStateTest.testGetEncoded`: nonce 0 and a balance of 2^200
+    /// encode as the list `dc`, the nonce's `80`, and the balance's 26 bytes,
+    /// `9a`, `01` and 25 zeros.
+    #[test]
+    fn an_account_encodes_as_rskj_encodes_it() {
+        let balance = U256::from(1) << 200;
+        let expected = format!("dc809a01{}", "00".repeat(25));
+        let encoded = AccountState::new(U256::ZERO, balance).encode();
+        assert_eq!(alloy_primitives::hex::encode(&encoded), expected);
+        assert_eq!(
+            AccountState::decode(&encoded).unwrap(),
+            AccountState::new(U256::ZERO, balance)
+        );
+    }
+
+    /// rskj `AccountStateTest.encodeDecodeStateWith*InStateFlags`: the state
+    /// flags 0, 128 and 238 come back as they went, the last two taking a
+    /// length byte.
+    #[test]
+    fn state_flags_come_back_as_they_went() {
+        let balance = U256::from(1) << 200;
+        for state_flags in [0, 128, 238] {
+            let account = AccountState {
+                nonce: U256::ZERO,
+                balance,
+                state_flags,
+            };
+            assert_eq!(AccountState::decode(&account.encode()).unwrap(), account);
+        }
+    }
 }

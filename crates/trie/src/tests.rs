@@ -384,6 +384,95 @@ mod unit {
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // Children's size (from rskj TrieTreeSizeTest.java)
+    // ═══════════════════════════════════════════════════════════════
+
+    /// rskj `childrenSizeShortValue`: a node's children's size is the sum of
+    /// each child's message, its own children's size and its value kept apart.
+    /// The keys 0x00 and 0x01 part at their last bit: the left child's message
+    /// is its flags and the value 0x01, 2 bytes, and the right's its flags and
+    /// 32 bytes held in it, 33. The size is read back from the saved message.
+    #[test]
+    fn a_nodes_children_size_is_its_childrens_messages() {
+        let store = MemoryTrieStore::new();
+        let mut root = TrieNode::empty()
+            .put(&TrieKeySlice::from_key(&[0x00]), &[0x01], &store)
+            .put(&TrieKeySlice::from_key(&[0x01]), &[0u8; 32], &store);
+        assert_eq!(root.children_size, 35);
+        root.save(&store, true);
+        let message = store.get(root.compute_hash(&store).as_slice()).unwrap();
+        assert_eq!(TrieNode::from_message(&message, &store).children_size, 35);
+    }
+
+    /// rskj `childrenSizeLongValue`: a value of 33 bytes is kept apart from its
+    /// node, whose message holds its hash and its length in 3 bytes, 36 bytes
+    /// with the flags, and the value's 33 bytes count in the parent's
+    /// children's size besides.
+    #[test]
+    fn a_value_kept_apart_counts_in_the_parents_children_size() {
+        let store = MemoryTrieStore::new();
+        let mut root = TrieNode::empty()
+            .put(&TrieKeySlice::from_key(&[0x00]), &[0x01], &store)
+            .put(&TrieKeySlice::from_key(&[0x01]), &[0u8; 33], &store);
+        assert_eq!(root.children_size, 71);
+        root.save(&store, true);
+        let message = store.get(root.compute_hash(&store).as_slice()).unwrap();
+        assert_eq!(TrieNode::from_message(&message, &store).children_size, 71);
+    }
+
+    /// rskj `Trie.fromMessageRskip107` refuses a message with bytes after a
+    /// kept-apart value's hash and 3-byte length ("The message had more data
+    /// than expected"), alone or embedded in its parent's.
+    #[test]
+    fn a_message_with_bytes_after_a_long_values_length_is_refused() {
+        let store = MemoryTrieStore::new();
+        let leaf = TrieNode::new_leaf(TrieKeySlice::empty(), make_value(33));
+        let message = leaf.to_message(&store);
+        assert_eq!(message.len(), 36);
+        assert!(TrieNode::try_from_message(&message, &store).is_some());
+        let mut longer = message.clone();
+        longer.push(0);
+        assert!(TrieNode::try_from_message(&longer, &store).is_none());
+
+        // A left child embedded (flags 0b0000_1010), its length, its
+        // message, and the children's size, a VarInt of one byte.
+        let parent =
+            |child: &[u8]| [&[0b0000_1010, child.len() as u8][..], child, &[33 + 36]].concat();
+        assert!(TrieNode::try_from_message(&parent(&message), &store).is_some());
+        assert!(TrieNode::try_from_message(&parent(&longer), &store).is_none());
+    }
+
+    /// rskj embeds a child in its parent's message when the child has no
+    /// children and its own message is at most 44 bytes (`Trie.isEmbeddable`),
+    /// and refers to it by its hash otherwise. A node without children records
+    /// no children's size: 32 bytes of value under a shared path of 72 bits make
+    /// 44 bytes (the flags, 0xFF and the length 72, 9 bytes of path, the
+    /// value), and under one of 73 bits, 45.
+    #[test]
+    fn a_child_of_44_bytes_is_embedded_and_one_of_45_is_not() {
+        let store = MemoryTrieStore::new();
+        for (bits, embedded) in [(72, true), (73, false)] {
+            let leaf =
+                TrieNode::new_leaf(TrieKeySlice::new(vec![1; bits], 0, bits), make_value(32));
+            assert_eq!(leaf.message_length(&store), 44 + usize::from(!embedded));
+            assert_eq!(leaf.is_embeddable(&store), embedded);
+            let parent = TrieNode::from_parts(
+                TrieKeySlice::empty(),
+                None,
+                None,
+                crate::node::NodeRef::Node(Arc::new(leaf)),
+                crate::node::NodeRef::Empty,
+            );
+            let message = parent.to_message(&store);
+            assert_eq!(message[0] & 0b0000_0010 != 0, embedded, "{bits} bits");
+            assert_eq!(
+                message.len(),
+                if embedded { 1 + 1 + 44 + 1 } else { 1 + 32 + 1 }
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // Deletion hash equivalence (from rskj TrieDeleteTest.java)
     // ═══════════════════════════════════════════════════════════════
 

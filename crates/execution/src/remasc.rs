@@ -6,7 +6,7 @@
 /// - Journal-based sload/sstore and balance transfer helpers
 /// - `process_miners_fees`: core fee distribution algorithm
 use alloy_primitives::{Address, U256};
-use revm::context_interface::{Block as BlockTr, ContextTr, JournalTr};
+use revm::context_interface::JournalTr;
 use revm::precompile::PrecompileError;
 use rustock_storage::BlockStore;
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use std::sync::Arc;
 use alloy_primitives::B256;
 use rustock_core::Header;
 
+use crate::hardfork::RskHardforkConfig;
 use crate::precompiles::REMASC_ADDR;
 
 /// Maximum number of blocks after a block in which its uncle can be included.
@@ -44,10 +45,14 @@ pub struct RemascConfig {
     pub rsk_labs_address: Address,
     /// RSK Labs reward address (post-RSKIP218).
     pub rsk_labs_address_rskip218: Address,
-    /// Block height at which RSKIP218 activates (changes the labs payout address).
-    pub rskip218_activation_height: u64,
-    /// Block height at which RSKIP85 activates (minimum payable reward gates).
-    pub rskip85_activation_height: u64,
+    /// Where RSKIP218 is scheduled apart from its upgrade, as rskj's
+    /// `consensusRules` can schedule any rule: from this height, or never at
+    /// `u64::MAX`. `None`, every network's, reads it with iris300 from the
+    /// schedule ([`RskHardforkConfig::has_rskip218`]).
+    pub rskip218_activation_height: Option<u64>,
+    /// Where RSKIP85 is scheduled apart from orchid, likewise: `None` reads it
+    /// from the schedule ([`RskHardforkConfig::has_rskip85`]).
+    pub rskip85_activation_height: Option<u64>,
     /// RSKIP85: synthetic reward must exceed mgp * this (rskj Constants 200_000).
     pub minimum_payable_gas: u64,
     /// RSKIP85: per-federator share must exceed mgp * this (rskj Constants 50_000).
@@ -73,8 +78,8 @@ impl RemascConfig {
             rsk_labs_address_rskip218: "dcb12179ba4697350f66224c959bdd9c282818df"
                 .parse()
                 .unwrap(),
-            rskip218_activation_height: 3_614_800, // rskj: rskip218 = iris300
-            rskip85_activation_height: 729_000,     // rskj: rskip85 = orchid
+            rskip218_activation_height: None,
+            rskip85_activation_height: None,
             minimum_payable_gas: 200_000,
             federator_minimum_payable_gas: 50_000,
             genesis_federation_public_keys:
@@ -97,8 +102,8 @@ impl RemascConfig {
             rsk_labs_address_rskip218: "dabadabadabadabadabadabadabadabadaba0003"
                 .parse()
                 .unwrap(),
-            rskip218_activation_height: 2_060_500, // rskj: rskip218 = iris300
-            rskip85_activation_height: 0,           // rskj: rskip85 = orchid (testnet 0)
+            rskip218_activation_height: None,
+            rskip85_activation_height: None,
             minimum_payable_gas: 200_000,
             federator_minimum_payable_gas: 50_000,
             genesis_federation_public_keys:
@@ -121,8 +126,8 @@ impl RemascConfig {
             rsk_labs_address_rskip218: "dabadabadabadabadabadabadabadabadaba0001"
                 .parse()
                 .unwrap(),
-            rskip218_activation_height: 0,
-            rskip85_activation_height: 0,
+            rskip218_activation_height: None,
+            rskip85_activation_height: None,
             minimum_payable_gas: 200_000,
             federator_minimum_payable_gas: 50_000,
             genesis_federation_public_keys:
@@ -130,12 +135,26 @@ impl RemascConfig {
         }
     }
 
-    /// Returns the correct RSK Labs address for the given block height.
-    pub fn labs_address_at(&self, block_number: u64) -> Address {
-        if block_number >= self.rskip218_activation_height {
+    /// rskj `Remasc.getRskLabsAddress`: the Core Developers Fund's address,
+    /// the new one where RSKIP218 is on at the executing block `block_number`.
+    pub fn labs_address_at(&self, hardfork_cfg: &RskHardforkConfig, block_number: u64) -> Address {
+        let rskip218 = match self.rskip218_activation_height {
+            Some(height) => block_number >= height,
+            None => hardfork_cfg.has_rskip218(block_number),
+        };
+        if rskip218 {
             self.rsk_labs_address_rskip218
         } else {
             self.rsk_labs_address
+        }
+    }
+
+    /// rskj `Remasc.shouldRewardBeAboveMinimumPayableGas`: whether RSKIP85 is
+    /// on at the executing block `block_number`.
+    pub fn rskip85_active(&self, hardfork_cfg: &RskHardforkConfig, block_number: u64) -> bool {
+        match self.rskip85_activation_height {
+            Some(height) => block_number >= height,
+            None => hardfork_cfg.has_rskip85(block_number),
         }
     }
 }
@@ -184,6 +203,42 @@ pub fn remasc_load_bool<CTX: crate::RskContextTr>(ctx: &mut CTX, key: U256) -> b
     remasc_sload(ctx, key) != U256::ZERO
 }
 
+/// `getStateForDebugging()`'s selector. It is the one REMASC method that
+/// answers any caller, a contract's call or any transaction.
+pub const GET_STATE_FOR_DEBUGGING: [u8; 4] = [0x0d, 0x0c, 0xee, 0x93];
+
+/// rskj `RemascContract.getStateForDebugging`: the contract's state as
+/// `RemascState.getEncoded` writes it, ABI-encoded as the method's one
+/// `bytes` output (`Function.encodeOutputs`).
+pub fn state_for_debugging<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<u8> {
+    let reward = remasc_sload(ctx, remasc_storage_key(REWARD_BALANCE_KEY));
+    let burned = remasc_sload(ctx, remasc_storage_key(BURNED_BALANCE_KEY));
+    let broken = remasc_load_bool(ctx, remasc_storage_key(BROKEN_SELECTION_RULE_KEY));
+    crate::abi::encode_bytes(&encode_state(reward, burned, broken))
+}
+
+/// `RemascState.getEncoded`: an RLP list of the reward balance and the burned
+/// balance (`RLP.encodeCoin`, which alloy's encoding of a `U256` matches:
+/// `0x80` for zero, else the value's bytes as a string), an empty list where
+/// the siblings once were, and the broken-selection-rule flag as a bare byte,
+/// 0 or 1, which goes into the list without being encoded.
+fn encode_state(reward: U256, burned: U256, broken: bool) -> Vec<u8> {
+    use alloy_rlp::Encodable;
+    let mut items = Vec::new();
+    reward.encode(&mut items);
+    burned.encode(&mut items);
+    items.push(alloy_rlp::EMPTY_LIST_CODE);
+    items.push(u8::from(broken));
+    let mut state = Vec::with_capacity(items.len() + 2);
+    alloy_rlp::Header {
+        list: true,
+        payload_length: items.len(),
+    }
+    .encode(&mut state);
+    state.extend_from_slice(&items);
+    state
+}
+
 // ---------------------------------------------------------------------------
 // Balance transfer helper
 // ---------------------------------------------------------------------------
@@ -217,64 +272,148 @@ pub fn remasc_transfer<CTX: crate::RskContextTr>(ctx: &mut CTX, recipient: Addre
 #[derive(Debug, Clone)]
 pub struct Sibling {
     pub hash: B256,
-    pub coinbase: Address,
+    /// The uncle's coinbase: `None` for rskj's null address ([`Header::coinbase`]).
+    pub coinbase: Option<Address>,
     pub paid_fees: U256,
-    /// Coinbase of the block that included this uncle.
-    pub included_block_coinbase: Address,
+    /// Coinbase of the block that included this uncle, likewise.
+    pub included_block_coinbase: Option<Address>,
     /// Height of the block that included this uncle.
     pub included_height: u64,
     pub uncle_count: u64,
 }
 
-/// Collect siblings for the processing block from the canonical chain.
-///
-/// Walks blocks `candidate_number + 1` through `candidate_number + UNCLE_GENERATION_LIMIT`,
-/// checking each block's ommers for headers with `number == candidate_number`.
-fn collect_siblings(
-    block_store: &BlockStore,
-    candidate_number: u64,
-    current_number: u64,
-) -> Result<Vec<Sibling>, PrecompileError> {
-    let mut siblings = Vec::new();
-    let end = (candidate_number + UNCLE_GENERATION_LIMIT).min(current_number);
+/// What REMASC reads of the chain the executing block is on: the processing
+/// block, and after it the blocks whose uncles may be its siblings, each with
+/// its uncles, nearest first.
+struct Lineage {
+    processing: (B256, Header),
+    descendants: Vec<(Header, Vec<Header>)>,
+}
 
-    for height in (candidate_number + 1)..=end {
-        let hash = match block_store
-            .canonical_hash(height)
-            .map_err(|e| PrecompileError::other(format!("REMASC: {e}")))?
-        {
-            Some(h) => h,
-            None => continue,
-        };
+/// rskj `Remasc.processMinersFees` 128-148: from the executing block's
+/// parent, the block `maturity - 1 - uncleGenerationLimit` below it, found as
+/// `IndexedBlockStore.getBlockAtDepthStartingAt` finds it, then its parents,
+/// `uncleGenerationLimit` blocks in all, each with its uncles
+/// (`getSiblingsFromBlockByHash`); the parent of the last is the processing
+/// block. Every one of them is the executing block's own ancestor, so a block
+/// on a fork reads its fork, not the main chain's blocks at those heights.
+fn lineage(store: &BlockStore, parent: B256, maturity: u64) -> Result<Lineage, PrecompileError> {
+    // rskj's depth is a `long`: below 0, which no network's maturity gives,
+    // its walk starts at the parent itself, as at 0.
+    let depth = maturity.saturating_sub(1 + UNCLE_GENERATION_LIMIT);
+    let (mut hash, mut header) = block_at_depth(store, parent, depth)?;
+    let mut descendants = Vec::with_capacity(UNCLE_GENERATION_LIMIT as usize);
+    for _ in 0..UNCLE_GENERATION_LIMIT {
+        let uncles = uncles_of(store, hash, &header)?;
+        hash = header.parent_hash;
+        let parent = stored_header(store, hash)?;
+        descendants.push((std::mem::replace(&mut header, parent), uncles));
+    }
+    descendants.reverse();
+    Ok(Lineage {
+        processing: (hash, header),
+        descendants,
+    })
+}
 
-        let including_header = block_store
-            .header(hash)
-            .map_err(|e| PrecompileError::other(format!("REMASC: {e}")))?;
-        let including_header = match including_header {
-            Some(h) => h,
-            None => continue,
-        };
+/// rskj `IndexedBlockStore.getBlockAtDepthStartingAt` (134-156): the block
+/// `depth` below `start`, found up its parents until one is the main chain's
+/// at its height, whose index then names the rest.
+fn block_at_depth(
+    store: &BlockStore,
+    start: B256,
+    depth: u64,
+) -> Result<(B256, Header), PrecompileError> {
+    let first = stored_header(store, start)?;
+    if depth == 0 {
+        return Ok((start, first));
+    }
+    // rskj finds no block where `start` is numbered `depth` or lower, and
+    // REMASC then throws.
+    let target = first
+        .number
+        .checked_sub(depth)
+        .filter(|target| *target > 0)
+        .ok_or_else(|| missing(format!("ancestor {depth} below block #{}", first.number)))?;
+    let (mut hash, mut header) = (start, first);
+    for _ in 0..depth {
+        if store.canonical_hash(header.number).map_err(store_failed)? == Some(hash) {
+            let hash = store
+                .canonical_hash(target)
+                .map_err(store_failed)?
+                .ok_or_else(|| missing(format!("main-chain block #{target}")))?;
+            return Ok((hash, stored_header(store, hash)?));
+        }
+        hash = header.parent_hash;
+        header = stored_header(store, hash)?;
+    }
+    Ok((hash, header))
+}
 
-        let body = block_store
-            .body(hash)
-            .map_err(|e| PrecompileError::other(format!("REMASC: {e}")))?;
-        let (_, ommers) = body.unwrap_or_default();
+/// The header stored under `hash`.
+fn stored_header(store: &BlockStore, hash: B256) -> Result<Header, PrecompileError> {
+    store
+        .header(hash)
+        .map_err(store_failed)?
+        .ok_or_else(|| missing(format!("header {hash:?}")))
+}
 
-        for ommer in &ommers {
-            if ommer.number == candidate_number {
-                siblings.push(Sibling {
-                    hash: ommer.hash(),
-                    coinbase: ommer.beneficiary,
-                    paid_fees: ommer.paid_fees,
-                    included_block_coinbase: including_header.beneficiary,
-                    included_height: height,
-                    uncle_count: ommer.uncle_count,
-                });
+/// A block's uncles (`Block.getUncleList`): its body's, or the freezer's once
+/// the body of a main-chain block is pruned. A block with no uncles may be
+/// kept without its body.
+fn uncles_of(
+    store: &BlockStore,
+    hash: B256,
+    header: &Header,
+) -> Result<Vec<Header>, PrecompileError> {
+    if let Some(uncles) = store.uncles(hash).map_err(store_failed)? {
+        return Ok(uncles);
+    }
+    if header.uncle_count == 0 {
+        return Ok(Vec::new());
+    }
+    if store.canonical_hash(header.number).map_err(store_failed)? == Some(hash) {
+        if let Some(freezer) = store.freezer() {
+            if let Some(uncles) = freezer.uncles(header.number).map_err(store_failed)? {
+                return Ok(uncles);
             }
         }
     }
+    Err(missing(format!("uncles of block #{}", header.number)))
+}
 
-    Ok(siblings)
+/// The processing block's siblings, numbered `candidate`, among the
+/// descendants' uncles: rskj's `getSiblingsToReward`, one for each uncle of
+/// that number, in the order of the blocks and of their uncles, each paid as
+/// the block that included it says (`Sibling`).
+fn siblings_in(descendants: &[(Header, Vec<Header>)], candidate: u64) -> Vec<Sibling> {
+    descendants
+        .iter()
+        .flat_map(|(including, uncles)| {
+            uncles
+                .iter()
+                .filter(move |uncle| uncle.number == candidate)
+                .map(move |uncle| Sibling {
+                    hash: uncle.hash(),
+                    coinbase: uncle.coinbase(),
+                    paid_fees: uncle.paid_fees,
+                    included_block_coinbase: including.coinbase(),
+                    included_height: including.number,
+                    uncle_count: uncle.uncle_count,
+                })
+        })
+        .collect()
+}
+
+/// A store that fails to read leaves REMASC with no answer.
+fn store_failed(error: impl std::fmt::Display) -> PrecompileError {
+    PrecompileError::other(format!("REMASC: {error}"))
+}
+
+/// What the store lacks of the blocks REMASC reads, every one of which rskj
+/// holds for any block it runs.
+fn missing(what: String) -> PrecompileError {
+    PrecompileError::other(format!("REMASC: the block store has no {what}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -368,20 +507,29 @@ impl SiblingPayment {
 
 /// rskj `RemascFeesPayer.payMiningFees`: transfer plus a `mining_fee_topic`
 /// log (topics: [topic, payee-as-word], data: RLP([processingBlockHash, value])).
-/// Format groundtruthed by the mainnet #4010 REMASC receipt.
+/// Format groundtruthed by the mainnet #4010 REMASC receipt. `to` is `None`
+/// for rskj's null address, whose word is zero (`DataWord.valueOf` of no
+/// bytes).
 fn pay_mining_fees<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     processing_block_hash: alloy_primitives::B256,
-    to: Address,
+    to: Option<Address>,
     value: U256,
 ) {
     use alloy_rlp::Encodable;
     use revm::context_interface::JournalTr;
 
-    remasc_transfer(ctx, to, value);
-
     let mut topic_payee = [0u8; 32];
-    topic_payee[12..].copy_from_slice(to.as_slice());
+    match to {
+        Some(to) => {
+            remasc_transfer(ctx, to, value);
+            topic_payee[12..].copy_from_slice(to.as_slice());
+        }
+        None => pay_null_address(ctx, value),
+    }
+    // rskj `transferPayment` reports the payment as a CALL subtrace to the
+    // payee, whose word is zero for the null address.
+    crate::tracer::record_precompile_transfer(ctx, REMASC_ADDR, to.unwrap_or(Address::ZERO), value);
 
     let mut inner = Vec::with_capacity(40);
     processing_block_hash.as_slice().encode(&mut inner);
@@ -400,39 +548,83 @@ fn pay_mining_fees<CTX: crate::RskContextTr>(
     ));
 }
 
-/// Active federation members as RSK addresses: the Bridge-stored federation,
-/// or the genesis federation while none is stored. Members are ordered by
-/// compressed BTC public key (rskj Federation constructor), groundtruthed by
-/// the mainnet #4010 payout order.
+/// rskj's `addBalance(nullAddress, value)`, after REMASC's own. The null
+/// address has no bytes for revm to hold, so REMASC's balance goes down
+/// here and the null account's goes up in the trie at the block's end
+/// (`RskChainExt::null_account`), which creates it if it is new, even for
+/// nothing, as `addBalance` does.
+fn pay_null_address<CTX: crate::RskContextTr>(ctx: &mut CTX, value: U256) {
+    use revm::context_interface::journaled_state::account::JournaledAccountTr;
+    if !value.is_zero() {
+        // As `remasc_transfer`: a payment REMASC can't cover isn't made.
+        let paid = ctx
+            .journal_mut()
+            .load_account_mut(REMASC_ADDR)
+            .is_ok_and(|mut remasc| remasc.decr_balance(value));
+        if !paid {
+            return;
+        }
+    }
+    *ctx.chain_mut().null_account.get_or_insert(U256::ZERO) += value;
+}
+
+/// The active federation's members as REMASC pays them: the Bridge-stored
+/// federation, or the genesis federation while none is stored. Members are
+/// ordered by compressed BTC public key (rskj Federation constructor),
+/// groundtruthed by the mainnet #4010 payout order.
+///
+/// rskj's REMASC builds its `FederationSupportImpl` on the processing block,
+/// with the executing block's upgrades (`Remasc.payToFederation` 213-221): a
+/// committed federation takes over once its age, counted to the processing
+/// block, reaches the activation age the executing block's upgrades give
+/// (`FederationSupportImpl` 72-103, `FederationConstants
+/// .getFederationActivationAge`). From RSKIP415, also read at the executing
+/// block (`Remasc.activations = forBlock(executionBlock.getNumber())`), a
+/// federator is paid at the address of its RSK public key, and before it at
+/// its BTC key's (`RemascFederationProvider.getFederatorAddress`). A member
+/// whose key is the point at infinity is paid too, at that key's address
+/// (`federation::member_rsk_address`).
 fn federation_rsk_addresses<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
-    config: &RemascConfig,
     bridge_config: &crate::bridge::constants::BridgeConstants,
-    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    hardfork_cfg: &RskHardforkConfig,
     processing_block_number: u64,
     current_number: u64,
 ) -> Vec<Address> {
+    use crate::bridge::federation::{load_stored_federation, StoredFederation};
+    use crate::bridge::storage::{NEW_FEDERATION_KEY, OLD_FEDERATION_KEY};
     // The Bridge account may be cold outside revm's transact flow; journal
     // storage reads require the account to be loaded.
-    use revm::context_interface::JournalTr;
     let _ = ctx.journal_mut().load_account(crate::precompiles::BRIDGE_ADDR);
-    // RSKIP415 (arrowhead600): rskj's `RemascFederationProvider.getFederatorAddress`
-    // switches from `getRskAddressFromBtcKey` to `getRskAddressFromRskKey`, i.e. it
-    // derives the federator RSK address from the member's RSK public key instead of
-    // its BTC public key. The activation is gated on the EXECUTION block number
-    // (rskj `Remasc.activations = forBlock(executionBlock.getNumber())`), not the
-    // processing/matured block.
-    let stored = crate::bridge::peg::federation_keys_or_genesis(
-        ctx,
-        bridge_config,
-        hardfork_cfg,
-        processing_block_number,
-        hardfork_cfg.has_rskip415(current_number),
-    );
-    let _ = config;
-    stored
+    let want_rsk = hardfork_cfg.has_rskip415(current_number);
+    let keys = |federation: &StoredFederation| {
+        if want_rsk {
+            federation.rsk_keys()
+        } else {
+            federation.btc_keys()
+        }
+    };
+    let new = load_stored_federation(ctx, NEW_FEDERATION_KEY);
+    let old = load_stored_federation(ctx, OLD_FEDERATION_KEY);
+    let members = match (new, old) {
+        (None, _) => crate::bridge::peg::genesis_federation_keys(bridge_config),
+        (Some(new), None) => keys(&new),
+        (Some(new), Some(old)) => {
+            let age = crate::bridge::governance::federation_activation_age(
+                bridge_config,
+                hardfork_cfg,
+                current_number,
+            );
+            if processing_block_number >= new.creation_block.saturating_add(age) {
+                keys(&new)
+            } else {
+                keys(&old)
+            }
+        }
+    };
+    members
         .iter()
-        .filter_map(|k| crate::bridge::federation::rsk_address_from_public_key(k))
+        .filter_map(crate::bridge::federation::member_rsk_address)
         .collect()
 }
 
@@ -444,10 +636,10 @@ fn pay_to_federation<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &RemascConfig,
     bridge_config: &crate::bridge::constants::BridgeConstants,
-    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    hardfork_cfg: &RskHardforkConfig,
     processing_block_hash: alloy_primitives::B256,
     processing_block_number: u64,
-    current_number: u64,
+    executing: &Header,
     synthetic_reward: U256,
 ) -> U256 {
     let federation_reward = synthetic_reward / U256::from(config.federation_divisor);
@@ -461,11 +653,10 @@ fn pay_to_federation<CTX: crate::RskContextTr>(
     // genesis federation).
     let federators = federation_rsk_addresses(
         ctx,
-        config,
         bridge_config,
         hardfork_cfg,
         processing_block_number,
-        current_number,
+        executing.number,
     );
     if federators.is_empty() {
         remasc_sstore(ctx, fed_key, pay_total);
@@ -476,9 +667,12 @@ fn pay_to_federation<CTX: crate::RskContextTr>(
     let per_federator = pay_total / n;
     let remainder = pay_total % n;
 
-    if current_number >= config.rskip85_activation_height {
-        let min_payable = U256::from(ctx.block().basefee())
-            * U256::from(config.federator_minimum_payable_gas);
+    if config.rskip85_active(hardfork_cfg, executing.number) {
+        // The executing block's minimum gas price, whole, as rskj's `Coin`
+        // multiplies it: revm's base fee holds no more than 64 bits of it.
+        let min_payable = executing
+            .minimum_gas_price
+            .saturating_mul(U256::from(config.federator_minimum_payable_gas));
         if per_federator < min_payable {
             remasc_sstore(ctx, fed_key, pay_total);
             return federation_reward;
@@ -490,7 +684,7 @@ fn pay_to_federation<CTX: crate::RskContextTr>(
     let last = federators.len() - 1;
     for (k, federator) in federators.iter().enumerate() {
         let amount = if k == last { per_federator + remainder } else { per_federator };
-        pay_mining_fees(ctx, processing_block_hash, *federator, amount);
+        pay_mining_fees(ctx, processing_block_hash, Some(*federator), amount);
     }
     federation_reward
 }
@@ -498,15 +692,17 @@ fn pay_to_federation<CTX: crate::RskContextTr>(
 /// Implements rskj's `Remasc.processMinersFees()`.
 ///
 /// This runs when the REMASC precompile is called (last tx of each block).
-/// It distributes fees from the block that matured `config.maturity` blocks ago.
+/// It distributes fees from the block that matured `config.maturity` blocks
+/// ago on the chain of `executing`, the block it runs in.
 pub fn process_miners_fees<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &RemascConfig,
     bridge_config: &crate::bridge::constants::BridgeConstants,
-    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    hardfork_cfg: &RskHardforkConfig,
     block_store: Option<&Arc<BlockStore>>,
+    executing: &Header,
 ) -> Result<(), PrecompileError> {
-    let current_number = ctx.block().number().to::<u64>();
+    let current_number = executing.number;
 
     let candidate_block_number = match current_number.checked_sub(config.maturity) {
         Some(n) if n >= 1 => n,
@@ -516,16 +712,13 @@ pub fn process_miners_fees<CTX: crate::RskContextTr>(
     let block_store = block_store
         .ok_or_else(|| PrecompileError::other("REMASC: no block store configured"))?;
 
-    // Find the processing block (the block whose fees are being distributed)
-    let processing_hash = block_store
-        .canonical_hash(candidate_block_number)
-        .map_err(|e| PrecompileError::other(format!("REMASC: {e}")))?
-        .ok_or_else(|| PrecompileError::other("REMASC: processing block not found"))?;
-
-    let processing_header = block_store
-        .header(processing_hash)
-        .map_err(|e| PrecompileError::other(format!("REMASC: {e}")))?
-        .ok_or_else(|| PrecompileError::other("REMASC: processing header not found"))?;
+    // The processing block (the block whose fees are being distributed), and
+    // the blocks after it whose uncles may be its siblings: the executing
+    // block's own ancestors.
+    let Lineage {
+        processing: (processing_hash, processing_header),
+        descendants,
+    } = lineage(block_store, executing.parent_hash, config.maturity)?;
 
     // Accrue the processing block's fees into rewardBalance
     let reward_key = remasc_storage_key(REWARD_BALANCE_KEY);
@@ -538,8 +731,8 @@ pub fn process_miners_fees<CTX: crate::RskContextTr>(
         return Ok(());
     }
 
-    // Collect siblings from descendant blocks
-    let siblings = collect_siblings(block_store, candidate_block_number, current_number)?;
+    // The siblings the descendant blocks included as uncles
+    let siblings = siblings_in(&descendants, candidate_block_number);
 
     // Selection rule
     let broken_key = remasc_storage_key(BROKEN_SELECTION_RULE_KEY);
@@ -580,9 +773,12 @@ pub fn process_miners_fees<CTX: crate::RskContextTr>(
 
     // RSKIP85: skip distribution while the synthetic reward is below the
     // minimum payable amount (checked before debiting the reward balance).
-    if current_number >= config.rskip85_activation_height {
-        let min_payable =
-            U256::from(ctx.block().basefee()) * U256::from(config.minimum_payable_gas);
+    // The executing block's minimum gas price goes in whole, as rskj's `Coin`
+    // multiplies it: revm's base fee holds no more than 64 bits of it.
+    if config.rskip85_active(hardfork_cfg, current_number) {
+        let min_payable = executing
+            .minimum_gas_price
+            .saturating_mul(U256::from(config.minimum_payable_gas));
         if synthetic_reward < min_payable {
             return Ok(());
         }
@@ -594,8 +790,8 @@ pub fn process_miners_fees<CTX: crate::RskContextTr>(
 
     // Pay RSK Labs (use RSKIP218 address if active)
     let rsk_labs_pay = synthetic_reward / U256::from(config.rsk_labs_divisor);
-    let labs_addr = config.labs_address_at(current_number);
-    pay_mining_fees(ctx, processing_hash, labs_addr, rsk_labs_pay);
+    let labs_addr = config.labs_address_at(hardfork_cfg, current_number);
+    pay_mining_fees(ctx, processing_hash, Some(labs_addr), rsk_labs_pay);
     let mut remaining = synthetic_reward - rsk_labs_pay;
 
     // Pay the federation its cut (rskj Remasc.payToFederation)
@@ -607,7 +803,7 @@ pub fn process_miners_fees<CTX: crate::RskContextTr>(
             hardfork_cfg,
             processing_hash,
             candidate_block_number,
-            current_number,
+            executing,
             remaining,
         );
     remaining -= federation_reward;
@@ -621,7 +817,12 @@ pub fn process_miners_fees<CTX: crate::RskContextTr>(
             remaining -= punishment;
             add_to_burned(ctx, punishment);
         }
-        pay_mining_fees(ctx, processing_hash, processing_header.beneficiary, remaining);
+        pay_mining_fees(
+            ctx,
+            processing_hash,
+            processing_header.coinbase(),
+            remaining,
+        );
     }
 
     Ok(())
@@ -670,7 +871,12 @@ fn pay_with_siblings<CTX: crate::RskContextTr>(
     }
 
     // Pay main chain miner
-    pay_mining_fees(ctx, processing_hash, processing_header.beneficiary, calc.individual_miner_reward);
+    pay_mining_fees(
+        ctx,
+        processing_hash,
+        processing_header.coinbase(),
+        calc.individual_miner_reward,
+    );
 }
 
 /// Add amount to burnedBalance storage.
@@ -803,6 +1009,41 @@ mod tests {
         }
     }
 
+    /// `getStateForDebugging()` as `Function.encodeSignature` hashes it.
+    #[test]
+    fn get_state_for_debugging_selector() {
+        assert_eq!(
+            GET_STATE_FOR_DEBUGGING,
+            crate::abi::selector("getStateForDebugging()")
+        );
+    }
+
+    /// `RemascState.getEncoded`, worked by hand from rskj's `RLP`: a zero coin
+    /// is `0x80`, a coin below `0x80` is its own byte and one from `0x80` a
+    /// string, the flag goes in bare, and a payload of 56 bytes or more takes
+    /// the long list header.
+    #[test]
+    fn remasc_state_encodes_as_rskj_encodes_it() {
+        assert_eq!(
+            encode_state(U256::ZERO, U256::ZERO, false),
+            [0xc4, 0x80, 0x80, 0xc0, 0x00]
+        );
+        assert_eq!(
+            encode_state(U256::from(0x1234), U256::from(0x7f), true),
+            [0xc6, 0x82, 0x12, 0x34, 0x7f, 0xc0, 0x01]
+        );
+        assert_eq!(
+            encode_state(U256::from(0x80), U256::ZERO, false),
+            [0xc5, 0x81, 0x80, 0x80, 0xc0, 0x00]
+        );
+        let mut largest = vec![0xf8, 68, 0xa0];
+        largest.extend([0xff; 32]);
+        largest.push(0xa0);
+        largest.extend([0xff; 32]);
+        largest.extend([0xc0, 0x01]);
+        assert_eq!(encode_state(U256::MAX, U256::MAX, true), largest);
+    }
+
     // -----------------------------------------------------------------------
     // Stage 6c unit tests: SelectionRule + SiblingPaymentCalculator
     // -----------------------------------------------------------------------
@@ -833,6 +1074,7 @@ mod tests {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         }
     }
 
@@ -841,9 +1083,9 @@ mod tests {
         hash.0[0] = hash_byte;
         Sibling {
             hash,
-            coinbase: Address::repeat_byte(0x22),
+            coinbase: Some(Address::repeat_byte(0x22)),
             paid_fees: U256::from(paid_fees),
-            included_block_coinbase: Address::repeat_byte(0x33),
+            included_block_coinbase: Some(Address::repeat_byte(0x33)),
             included_height: 6,
             uncle_count,
         }
@@ -1042,3 +1284,6 @@ mod chain_selection_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod parity_tests;

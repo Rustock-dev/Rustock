@@ -46,6 +46,7 @@ use crate::{BlockStore, CF_NUMBERS, KEY_EXEC_HEAD, KEY_HEAD};
 use alloy_primitives::B256;
 use anyhow::{Context, Result};
 use rocksdb::WriteBatch;
+use rustock_core::selection_rule::should_we_add_this_block;
 use rustock_core::Header;
 
 /// A block, by height and hash.
@@ -247,11 +248,48 @@ impl Transition {
     }
 }
 
+/// A move of the executed head that a change of head made: execution taken
+/// off a block the new chain leaves out, or that stands above its new head,
+/// to a block of the new chain (see `stage_execution_after_reorg`).
+///
+/// Execution recording its own progress is not one. A batch does that on a
+/// thread of its own while the sync service stores headers, so the executed
+/// head read before and after a call can differ with no switch at all. The
+/// switch is what the store records here, from the executed head it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionSwitch {
+    /// The executed head the change of head found.
+    pub from: B256,
+    /// Where it put it.
+    pub to: B256,
+    /// The state root recorded with `to`.
+    pub state_root: B256,
+}
+
+/// How many switches are kept for the calls that made them to take up. A
+/// call makes a few at most: one for each block it weighs again.
+const SWITCHES_KEPT: usize = 1024;
+
+/// The switches changes of head made, numbered, the latest kept.
+#[derive(Debug, Default)]
+pub(crate) struct Switches {
+    /// The number the next switch gets.
+    next: u64,
+    /// The latest, oldest first.
+    kept: std::collections::VecDeque<(u64, ExecutionSwitch)>,
+}
+
 impl BlockStore {
     /// Read all three position keys together.
     ///
     /// `None` when the node has no head yet -- an empty database, before
     /// genesis. There is nothing to be incoherent about.
+    ///
+    /// With no executed head recorded -- a node that has executed nothing, as
+    /// one has until its snapshot sync finishes -- `executed` reads as the
+    /// head and `state_root` as zero. That keeps the relations between the
+    /// three keys checkable, but it is a stand-in, not a block whose state was
+    /// computed: code that moves execution reads [`BlockStore::exec_head`].
     pub fn cursor(&self) -> Result<Option<Cursor>> {
         let Some(head_hash) = self.head()? else {
             return Ok(None);
@@ -287,19 +325,36 @@ impl BlockStore {
     /// `put`, which is precisely the window stall 6 lived in -- except that it
     /// did not even need a crash to get there, because the two calls were made
     /// from different places.
+    ///
+    /// And one at a time. A batch records execution on a thread of its own
+    /// while the sync service moves the head, and each reads the executed head
+    /// it changes: a move of the head that read it just before the batch's
+    /// record landed would leave execution on a block the new chain leaves
+    /// out, and record the switch from the wrong block.
     pub fn apply(&self, transition: &Transition) -> Result<Cursor> {
+        let held = self.transitions.lock().unwrap_or_else(|e| e.into_inner());
+        self.apply_holding(&held, transition)
+    }
+
+    /// [`Self::apply`], for a caller that holds the lock on transitions
+    /// already: one that weighs a move against the executed head first.
+    pub(crate) fn apply_holding(
+        &self,
+        _held: &std::sync::MutexGuard<'_, ()>,
+        transition: &Transition,
+    ) -> Result<Cursor> {
         let cf_numbers = self.cf(CF_NUMBERS)?;
         let mut batch = WriteBatch::default();
         let before = self.cursor()?;
 
-        match transition {
+        let switch = match transition {
             Transition::Adopt { head } => {
                 for (number, hash) in &head.lineage {
                     batch.put_cf(cf_numbers, number.to_be_bytes(), hash.as_slice());
                 }
                 self.stage_drop_above(&mut batch, cf_numbers, head.number())?;
                 batch.put(KEY_HEAD, head.hash().as_slice());
-                self.stage_execution_after_reorg(&mut batch, before.as_ref(), head)?;
+                self.stage_execution_after_reorg(&mut batch, before.as_ref(), head)?
             }
             Transition::Retreat { to } => {
                 for (number, hash) in &to.lineage {
@@ -307,7 +362,7 @@ impl BlockStore {
                 }
                 self.stage_drop_above(&mut batch, cf_numbers, to.number())?;
                 batch.put(KEY_HEAD, to.hash().as_slice());
-                self.stage_execution_after_reorg(&mut batch, before.as_ref(), to)?;
+                self.stage_execution_after_reorg(&mut batch, before.as_ref(), to)?
             }
             Transition::Executed { at, state_root } => {
                 // `Validated` proves lineage, not canonicity: a fork block is
@@ -338,15 +393,59 @@ impl BlockStore {
                 buf.extend_from_slice(at.hash().as_slice());
                 buf.extend_from_slice(state_root.as_slice());
                 batch.put(KEY_EXEC_HEAD, &buf);
+                None
             }
-        }
+        };
 
         self.db
             .write(batch)
             .with_context(|| format!("applying transition: {}", transition.describe()))?;
+        if let Some(switch) = switch {
+            self.note_switch(switch);
+        }
 
         self.cursor()?
             .context("position is unreadable immediately after applying a transition")
+    }
+
+    /// A mark to take up switches of execution from:
+    /// [`Self::take_switches_since`] returns those made after it.
+    pub fn switch_mark(&self) -> u64 {
+        self.switches.lock().unwrap_or_else(|e| e.into_inner()).next
+    }
+
+    /// The switches of execution changes of head made since `mark`, as one:
+    /// from the executed head the first found to where the last put it.
+    /// `None` when there were none, though the executed head may have moved all
+    /// the same, by execution recording its progress, which is no switch. Each
+    /// is returned once.
+    pub fn take_switches_since(&self, mark: u64) -> Option<ExecutionSwitch> {
+        let mut switches = self.switches.lock().unwrap_or_else(|e| e.into_inner());
+        let mut taken: Option<ExecutionSwitch> = None;
+        switches.kept.retain(|&(number, switch)| {
+            if number < mark {
+                return true;
+            }
+            taken = Some(match taken {
+                Some(first) => ExecutionSwitch {
+                    from: first.from,
+                    ..switch
+                },
+                None => switch,
+            });
+            false
+        });
+        taken
+    }
+
+    fn note_switch(&self, switch: ExecutionSwitch) {
+        let mut switches = self.switches.lock().unwrap_or_else(|e| e.into_inner());
+        let number = switches.next;
+        switches.next += 1;
+        if switches.kept.len() == SWITCHES_KEPT {
+            switches.kept.pop_front();
+        }
+        switches.kept.push_back((number, switch));
     }
 
     /// Bring the executed head back with the chain when adopting or retreating
@@ -368,16 +467,42 @@ impl BlockStore {
     /// conservative: a block common to both branches. Re-executing a few
     /// blocks costs seconds; executing from the wrong branch costs a fork.
     ///
+    /// Unless this node has executed the new branch above the fork already,
+    /// as it does every block beside the chain on arrival, the way rskj
+    /// connects every block: then execution goes to the highest of those
+    /// blocks the lineage reaches without a gap, and a switch to a branch
+    /// already executed is a change of pointer, with nothing run again.
+    ///
+    /// It only ever goes to execution that happened. Moving the executed head
+    /// anywhere else records as computed a state that was not, and the node
+    /// cannot resume from it.
+    ///
     /// The state root comes from the target header, which post-RSKIP126 is the
     /// committed unitrie root -- the same source the reorg path has always
     /// used.
+    ///
+    /// Returns the switch it stages, when it moves execution.
     fn stage_execution_after_reorg(
         &self,
         batch: &mut WriteBatch,
         before: Option<&Cursor>,
         new_head: &Validated,
-    ) -> Result<()> {
-        let Some(before) = before else { return Ok(()) };
+    ) -> Result<Option<ExecutionSwitch>> {
+        let Some(before) = before else {
+            return Ok(None);
+        };
+        // Nothing executed is nothing to bring back. Without a recorded
+        // executed head, `cursor` reads execution as the head, and taken at
+        // its word that stand-in is above any retreat -- so the rollback below
+        // recorded the retreat's target as executed. Mainnet, 6 November 2026:
+        // a light node whose snapshot sync had given up retreated from
+        // #9,388,800 to #9,388,799 on the watchdog's first escalation and was
+        // left "executed" at #9,388,799, with no state under it. A restart
+        // could not clear that either, because snapshot sync starts only on a
+        // node that has executed nothing.
+        if self.exec_head()?.is_none() {
+            return Ok(None);
+        }
         let executed = before.executed;
 
         // What will the canonical block at the executed height be once this
@@ -392,7 +517,7 @@ impl BlockStore {
         let orphaned = canonical_at_exec != Some(executed.hash);
         let above_head = executed.number > new_head.number();
         if !orphaned && !above_head {
-            return Ok(());
+            return Ok(None);
         }
 
         // The fork point: just below the lowest height this transition
@@ -403,6 +528,15 @@ impl BlockStore {
             Some(n) => n.saturating_sub(1).min(new_head.number()),
             None => new_head.number(),
         };
+
+        // A target at or above the executed height means this transition
+        // rewrites nothing at or below it: the executed block was off the
+        // chain before it began. Moving execution to the canonical block up
+        // there would claim a state never computed. That repair belongs to the
+        // sync layer, which can see what state is held (I5).
+        if target_number >= executed.number {
+            return Ok(None);
+        }
 
         // Resolve the target on the chain as it will be after this batch.
         let target_hash = new_head
@@ -424,12 +558,111 @@ impl BlockStore {
                  at #{target_number} is not in the header store"
             );
         };
+        let (target_hash, target) =
+            match self.executed_climb(&new_head.lineage, target_number, new_head.number())? {
+                Some(climbed) => climbed,
+                None => (target_hash, target),
+            };
 
         let mut buf = Vec::with_capacity(64);
         buf.extend_from_slice(target_hash.as_slice());
         buf.extend_from_slice(target.state_root.as_slice());
         batch.put(KEY_EXEC_HEAD, &buf);
-        Ok(())
+        Ok(Some(ExecutionSwitch {
+            from: executed.hash,
+            to: target_hash,
+            state_root: target.state_root,
+        }))
+    }
+
+    /// The highest block of `lineage` above height `above`, and not above
+    /// `top`, that this node executed and still holds the state of: climbing
+    /// from `above + 1` and stopping at the first block it did not execute,
+    /// so that every block below the one returned was executed too.
+    fn executed_climb(
+        &self,
+        lineage: &[(u64, B256)],
+        above: u64,
+        top: u64,
+    ) -> Result<Option<(B256, Header)>> {
+        let mut climbed = None;
+        let mut next = above.saturating_add(1);
+        for &(number, hash) in lineage {
+            if number < next {
+                continue;
+            }
+            if number != next || number > top {
+                break;
+            }
+            let Some(header) = self.header(hash)? else {
+                break;
+            };
+            if !self.executed_here(hash, &header) {
+                break;
+            }
+            climbed = Some((hash, header));
+            next += 1;
+        }
+        Ok(climbed)
+    }
+
+    /// Whether adopting `new_head` has to wait until this node has executed
+    /// more of its branch: rskj's rule that a block becomes the best one only
+    /// once it has been connected, that is executed
+    /// (`BlockChainImpl.internalTryToConnect`).
+    ///
+    /// It waits when the move would leave the executed head off the chain --
+    /// the new branch rewrites the executed height, or ends below it -- and
+    /// the highest block of the new branch this node has executed, climbing
+    /// from the fork point without a gap, does not take the place of the
+    /// executed head by rskj's selection rule. A node that executes nothing
+    /// never waits: it has no executed head to strand, and nothing to execute
+    /// the branch with.
+    pub(crate) fn adoption_waits_for_execution(&self, new_head: &Validated) -> Result<bool> {
+        if !self.executes() {
+            return Ok(false);
+        }
+        let Some((exec_hash, _)) = self.exec_head()? else {
+            return Ok(false);
+        };
+        let Some(executed) = self.header(exec_hash)? else {
+            return Ok(false);
+        };
+        // Nothing rewritten at or below the executed height: the new head
+        // extends the chain execution is on.
+        let Some(&(lowest, _)) = new_head.lineage.first() else {
+            return Ok(false);
+        };
+        if lowest > executed.number {
+            return Ok(false);
+        }
+        // The lineage runs without a gap from `lowest` to the new head, so
+        // when it holds no entry at the executed height the new head is below
+        // it, and the executed block is dropped with everything above.
+        let stranded = new_head
+            .lineage
+            .iter()
+            .find(|(n, _)| *n == executed.number)
+            .is_none_or(|(_, hash)| *hash != exec_hash);
+        if !stranded {
+            return Ok(false);
+        }
+        let fork = lowest.saturating_sub(1);
+        let Some((tip, _)) = self.executed_climb(&new_head.lineage, fork, new_head.number())?
+        else {
+            return Ok(true);
+        };
+        let tip_td = self.total_difficulty(tip)?.unwrap_or_default();
+        let exec_td = self.total_difficulty(exec_hash)?.unwrap_or_default();
+        Ok(
+            match (
+                self.contender(tip, tip_td)?,
+                self.contender(exec_hash, exec_td)?,
+            ) {
+                (Some(tip), Some(current)) => !should_we_add_this_block(&tip, &current),
+                _ => true,
+            },
+        )
     }
 
     /// Stage deletion of every canonical entry above `top`.
@@ -513,6 +746,7 @@ pub fn verify_local_coherence(store: &BlockStore, cursor: &Cursor) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DeferredHead;
     use alloy_primitives::{Address, Bytes, U256};
     use tempfile::tempdir;
 
@@ -542,6 +776,7 @@ mod tests {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         }
     }
 
@@ -785,5 +1020,340 @@ mod tests {
             );
             assert_eq!(store.canonical_hash(c.validated_head.number + 1).unwrap(), None);
         }
+    }
+
+    // -- Execution that never happened ------------------------------------
+
+    /// A coherent chain 0..=len and no executed head: what a node holds before
+    /// it has executed anything, as a light node does until its snapshot sync
+    /// finishes.
+    fn chain_never_executed(len: u64) -> (BlockStore, tempfile::TempDir, Vec<Header>) {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let mut hs = Vec::new();
+        let mut parent = B256::ZERO;
+        for n in 0..=len {
+            let h = header(n, parent, 0);
+            store.update_head(&h, U256::from(n + 1)).unwrap();
+            parent = h.hash();
+            hs.push(h);
+        }
+        assert_eq!(
+            store.exec_head().unwrap(),
+            None,
+            "precondition: nothing executed"
+        );
+        (store, dir, hs)
+    }
+
+    /// A retreat on a node that has executed nothing leaves it having executed
+    /// nothing. It used to record the retreat's target as executed: on
+    /// mainnet, a block with no state under it, which even a restart could not
+    /// undo.
+    #[test]
+    fn retreating_a_node_that_executed_nothing_records_no_execution() {
+        let (store, _d, hs) = chain_never_executed(10);
+        let v = Validated::prove(&store, hs[9].hash()).unwrap();
+        let cursor = store.apply(&Transition::Retreat { to: v }).unwrap();
+
+        assert_eq!(
+            cursor.validated_head.number, 9,
+            "the retreat itself happens"
+        );
+        assert_eq!(
+            store.exec_head().unwrap(),
+            None,
+            "a retreat recorded as executed a block nothing executed"
+        );
+    }
+
+    /// The same for a reorg: adopting a fork records no execution, at the fork
+    /// point or anywhere else.
+    #[test]
+    fn adopting_a_fork_on_a_node_that_executed_nothing_records_no_execution() {
+        let (store, _d, hs) = chain_never_executed(10);
+        // A fork from #4: 5', 6', 7'.
+        let a = header(5, hs[4].hash(), 99);
+        let b = header(6, a.hash(), 99);
+        let c = header(7, b.hash(), 99);
+        for h in [&a, &b, &c] {
+            stash(&store, h);
+        }
+        let v = Validated::prove(&store, c.hash()).unwrap();
+        assert_eq!(
+            v.lineage()[0].0,
+            5,
+            "precondition: the fork rewrites from #5"
+        );
+
+        let cursor = store.apply(&Transition::Adopt { head: v }).unwrap();
+
+        assert_eq!(cursor.validated_head.hash, c.hash(), "the fork is adopted");
+        assert_eq!(
+            store.exec_head().unwrap(),
+            None,
+            "adopting a fork recorded execution the node never did"
+        );
+    }
+
+    /// Execution only comes down. When the executed block was off the chain
+    /// before a transition that rewrites only above it, moving execution to the
+    /// canonical block up there would claim a state never computed. It stays
+    /// where it is, for the sync layer's repair (I5), which can see what state
+    /// is held.
+    #[test]
+    fn execution_already_off_the_chain_is_not_moved_up() {
+        let (store, _d, hs) = chain(10);
+        // Executed at a sibling of #6, which is not canonical.
+        let sibling = header(6, hs[5].hash(), 99);
+        stash(&store, &sibling);
+        let root = B256::repeat_byte(0x66);
+        store.set_exec_head(sibling.hash(), root).unwrap();
+
+        // One block on top of the chain: the transition rewrites #11 alone.
+        let next = header(11, hs[10].hash(), 0);
+        stash(&store, &next);
+        let v = Validated::prove(&store, next.hash()).unwrap();
+        store.apply(&Transition::Adopt { head: v }).unwrap();
+
+        assert_eq!(
+            store.exec_head().unwrap(),
+            Some((sibling.hash(), root)),
+            "execution was moved off the block it ran at, to one it never ran"
+        );
+    }
+
+    // -- A heavier branch is adopted once it is executed ---------------------
+
+    /// The blocks this node executed, as the check the sync service installs
+    /// reads them from receipts and the trie store: here a set, starting with
+    /// `chain`.
+    fn executed_set(
+        store: &BlockStore,
+        chain: &[Header],
+    ) -> std::sync::Arc<std::sync::Mutex<std::collections::HashSet<B256>>> {
+        let set = std::sync::Arc::new(std::sync::Mutex::new(
+            chain
+                .iter()
+                .map(|h| h.hash())
+                .collect::<std::collections::HashSet<_>>(),
+        ));
+        let seen = set.clone();
+        store.set_executed_check(std::sync::Arc::new(move |hash, _| {
+            seen.lock().unwrap().contains(&hash)
+        }));
+        set
+    }
+
+    /// A branch off `hs[7]`, #8' to #12', with total difficulties 9 to 13: #10'
+    /// is level with the chain's #10 (11), and #11' outweighs it.
+    fn branch_from_seven(hs: &[Header]) -> Vec<(Header, U256)> {
+        let mut branch = Vec::new();
+        let mut parent = hs[7].hash();
+        for n in 8..=12u64 {
+            let h = header(n, parent, 99);
+            parent = h.hash();
+            branch.push((h, U256::from(n + 1)));
+        }
+        branch
+    }
+
+    /// Headers arriving as the sync manager stores them, weighed against the
+    /// head.
+    fn ingest(store: &BlockStore, entries: &[(Header, U256)]) {
+        let head = store.head().unwrap();
+        let td = head
+            .and_then(|h| store.total_difficulty(h).unwrap())
+            .unwrap_or_default();
+        let refs: Vec<(&Header, U256)> = entries.iter().map(|(h, td)| (h, *td)).collect();
+        store.store_headers_batch(&refs, head, td).unwrap();
+    }
+
+    /// rskj makes a block its best only once it has executed it, so a heavier
+    /// branch known by its headers alone leaves the node where it is. Taken on
+    /// its headers, it pulled execution back to the fork point, and with its
+    /// bodies withheld it would have held the node there.
+    #[test]
+    fn a_heavier_branch_waits_until_it_is_executed_past_the_executed_head() {
+        let (store, _d, hs) = chain(10);
+        let executed = executed_set(&store, &hs);
+        let branch = branch_from_seven(&hs);
+
+        ingest(&store, &branch[..4]);
+        assert_eq!(
+            store.head().unwrap(),
+            Some(hs[10].hash()),
+            "the head moved to a branch this node has not executed"
+        );
+        assert_eq!(store.canonical_hash(10).unwrap(), Some(hs[10].hash()));
+        assert_eq!(
+            store.exec_head().unwrap().map(|(h, _)| h),
+            Some(hs[10].hash()),
+            "execution was pulled back to the fork point"
+        );
+        assert_eq!(store.deferred_head(), Some(branch[3].0.hash()));
+
+        // Executed through #10': level with #10, and with no fees on either
+        // side a tie keeps the block held first.
+        executed
+            .lock()
+            .unwrap()
+            .extend(branch[..3].iter().map(|(h, _)| h.hash()));
+        assert_eq!(store.retry_deferred_head().unwrap(), DeferredHead::Waiting);
+        assert_eq!(store.head().unwrap(), Some(hs[10].hash()));
+
+        // #11' executed: it outweighs #10, so the branch is the chain now, with
+        // execution at its tip and nothing to run again.
+        executed.lock().unwrap().insert(branch[3].0.hash());
+        assert_eq!(store.retry_deferred_head().unwrap(), DeferredHead::Adopted);
+        assert_eq!(store.head().unwrap(), Some(branch[3].0.hash()));
+        assert_eq!(store.canonical_hash(10).unwrap(), Some(branch[2].0.hash()));
+        assert_eq!(
+            store.exec_head().unwrap(),
+            Some((branch[3].0.hash(), branch[3].0.state_root))
+        );
+        assert_eq!(store.deferred_head(), None);
+    }
+
+    /// A switch to a branch executed beside the chain as it arrived takes
+    /// execution to that branch's executed tip, not back to the fork point to
+    /// run its blocks a second time.
+    #[test]
+    fn a_switch_takes_execution_to_the_executed_tip_of_the_new_branch() {
+        let (store, _d, hs) = chain(10);
+        let executed = executed_set(&store, &hs);
+        let branch = branch_from_seven(&hs);
+        // #8' to #11' were executed as they arrived; #12' not yet.
+        executed
+            .lock()
+            .unwrap()
+            .extend(branch[..4].iter().map(|(h, _)| h.hash()));
+
+        ingest(&store, &branch);
+
+        assert_eq!(store.head().unwrap(), Some(branch[4].0.hash()));
+        assert_eq!(
+            store.exec_head().unwrap().map(|(h, _)| h),
+            Some(branch[3].0.hash()),
+            "execution went back to the fork point, to run again blocks it ran already"
+        );
+    }
+
+    /// A change of head that takes execution off its branch is recorded as a
+    /// switch, from the executed head it found; execution recording its own
+    /// progress is no switch. A batch records its progress on a thread of its
+    /// own while the sync service stores headers, and the service takes up
+    /// the switches and nothing else.
+    #[test]
+    fn only_a_change_of_head_that_moves_execution_is_a_switch() {
+        let (store, _d, hs) = chain(10);
+        let executed = executed_set(&store, &hs);
+        store.set_exec_head(hs[7].hash(), B256::ZERO).unwrap();
+
+        let mark = store.switch_mark();
+        for h in &hs[8..=9] {
+            let at = Validated::prove(&store, h.hash()).unwrap();
+            store
+                .apply(&Transition::Executed {
+                    at,
+                    state_root: B256::ZERO,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            store.take_switches_since(mark),
+            None,
+            "execution recording its progress was taken for a switch"
+        );
+
+        // A branch off #7, executed as it came, outweighs the chain.
+        let mark = store.switch_mark();
+        let branch = branch_from_seven(&hs);
+        executed
+            .lock()
+            .unwrap()
+            .extend(branch[..4].iter().map(|(h, _)| h.hash()));
+        ingest(&store, &branch);
+        assert_eq!(
+            store.take_switches_since(mark),
+            Some(ExecutionSwitch {
+                from: hs[9].hash(),
+                to: branch[3].0.hash(),
+                state_root: branch[3].0.state_root,
+            }),
+            "the switch is from the block execution had got to"
+        );
+        assert_eq!(
+            store.take_switches_since(mark),
+            None,
+            "a switch is taken up once"
+        );
+    }
+
+    /// A node with no check installed executes nothing it could run a branch
+    /// with, and adopts on headers as it always has.
+    #[test]
+    fn a_node_without_the_check_adopts_on_headers_as_before() {
+        let (store, _d, hs) = chain(10);
+        let branch = branch_from_seven(&hs);
+
+        ingest(&store, &branch[..4]);
+
+        assert_eq!(store.head().unwrap(), Some(branch[3].0.hash()));
+        assert_eq!(
+            store.exec_head().unwrap().map(|(h, _)| h),
+            Some(hs[7].hash())
+        );
+        assert_eq!(store.deferred_head(), None);
+    }
+
+    /// A branch that waits is forgotten once the chain the node is on
+    /// outgrows it.
+    #[test]
+    fn a_waiting_branch_the_chain_outgrows_is_forgotten() {
+        let (store, _d, hs) = chain(10);
+        let _executed = executed_set(&store, &hs);
+        let branch = branch_from_seven(&hs);
+        ingest(&store, &branch[..4]);
+        assert_eq!(store.deferred_head(), Some(branch[3].0.hash()));
+
+        // The chain grows to #12, total difficulty 13 against #11''s 12.
+        let mut ours = Vec::new();
+        let mut parent = hs[10].hash();
+        for n in 11..=12u64 {
+            let h = header(n, parent, 0);
+            parent = h.hash();
+            ours.push((h, U256::from(n + 1)));
+        }
+        ingest(&store, &ours);
+
+        assert_eq!(store.head().unwrap(), Some(ours[1].0.hash()));
+        assert_eq!(store.retry_deferred_head().unwrap(), DeferredHead::Dropped);
+        assert_eq!(store.deferred_head(), None);
+    }
+
+    /// A block whose total rose once its body showed its uncles, which its
+    /// header alone could not, takes the head when weighed again.
+    #[test]
+    fn a_block_weighed_again_takes_the_head_once_it_outweighs_it() {
+        let (store, _d, hs) = chain(10);
+        let executed = executed_set(&store, &hs);
+        // A sibling of #10, level with it on its header alone.
+        let sibling = header(10, hs[9].hash(), 99);
+        ingest(&store, &[(sibling.clone(), U256::from(11))]);
+        assert_eq!(store.head().unwrap(), Some(hs[10].hash()));
+
+        // Executed, and its uncle counted: 12 now.
+        store
+            .put_total_difficulty(sibling.hash(), U256::from(12))
+            .unwrap();
+        executed.lock().unwrap().insert(sibling.hash());
+
+        assert!(store.reconsider_head(sibling.hash()).unwrap());
+        assert_eq!(store.head().unwrap(), Some(sibling.hash()));
+        assert_eq!(
+            store.exec_head().unwrap().map(|(h, _)| h),
+            Some(sibling.hash())
+        );
     }
 }

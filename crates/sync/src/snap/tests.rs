@@ -48,6 +48,32 @@ impl Peer {
         Self { root, store, root_hash }
     }
 
+    /// The trie [`toy_state`] makes, with the value of each account `long`
+    /// names made that many bytes long instead: the length a contract's code
+    /// or a value of the Bridge's storage can reach.
+    fn with_long_values(n: usize, long: &[(usize, usize)]) -> Self {
+        let store = Arc::new(MemoryTrieStore::new());
+        let mut root = TrieNode::empty();
+        for i in 0..n {
+            let key = [(i >> 8) as u8, i as u8, (i * 7) as u8, (i * 13) as u8];
+            let value: Vec<u8> = match long.iter().find(|(at, _)| *at == i) {
+                Some(&(_, len)) => (0..len)
+                    .map(|b| (b as u8).wrapping_mul(31).wrapping_add(i as u8))
+                    .collect(),
+                None if i % 5 == 0 => (0..96u8).map(|b| b.wrapping_add(i as u8)).collect(),
+                None => vec![i as u8, (i >> 8) as u8, 7],
+            };
+            root = root.put(&TrieKeySlice::from_key(&key), &value, store.as_ref());
+        }
+        root.save(store.as_ref(), true);
+        let root_hash = root.compute_hash(store.as_ref());
+        Self {
+            root,
+            store,
+            root_hash,
+        }
+    }
+
     /// Serves a grid cell and puts it through RLP, so the test sees what a
     /// real client would. `budget` is the grid size, as a server's is.
     fn serve(&self, from: u64, budget: u64) -> SnapChunkResponse {
@@ -604,6 +630,7 @@ fn server_fixture(n: usize) -> (Arc<rustock_storage::BlockStore>, Peer, u64) {
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     };
     let hash = header.hash();
     store.put_header(&header).expect("put header");
@@ -1125,6 +1152,7 @@ fn put_checkpoint(store: &Arc<rustock_storage::BlockStore>, number: u64, root: B
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     };
     let hash = header.hash();
     store.put_header(&header).expect("put header");
@@ -1550,3 +1578,409 @@ fn a_missing_root_is_caught() {
     assert!(err.contains("root"), "unhelpful complaint: {err}");
 }
 
+/// An rskj server, serving as rskj does: whatever the request says, the nodes
+/// from the one holding `from` until `from + cell`, in rskj's format, through
+/// the wire. rskj's `cell` is `50 * 1024`, a constant on its side.
+fn rskj_serves(peer: &Peer, from: u64, cell: u64) -> SnapChunkResponse {
+    use rustock_trie::snapshot_legacy::{encode_blob, legacy_chunk};
+    let root: [u8; 32] = peer.root_hash.into();
+    let chunk = legacy_chunk(&root, from, from + cell, peer.store.as_ref()).expect("a chunk");
+    let response = SnapChunkResponse {
+        id: 1,
+        payload: ChunkPayload::Legacy(encode_blob(&chunk).into()),
+        block_number: 100,
+        from,
+        to: from + cell,
+        complete: false,
+        refusal: rustock_networking::protocol::snap::Refusal::None,
+    };
+    let encoded = response.encode_body();
+    SnapChunkResponse::decode_body(&mut encoded.as_slice()).expect("survives the wire")
+}
+
+/// The rebuilt chunk an rskj server's answer comes to.
+fn rebuilt(peer: &Peer, response: &SnapChunkResponse) -> super::client::RebuiltChunk {
+    use super::client::{chunk_from_payload, Arrived};
+    match chunk_from_payload(&response.payload, peer.root_hash) {
+        Ok(Arrived::Rebuilt(chunk)) => chunk,
+        other => panic!("an rskj chunk must rebuild: {other:?}"),
+    }
+}
+
+/// Downloads a state from rskj servers alone, as mainnet's are, with this
+/// node's own grid. Returns the client, its store, and how many requests it
+/// took.
+fn download_from_rskj(
+    peer: &Peer,
+    grid: u64,
+    cell: u64,
+) -> (StateDownload, Arc<MemoryTrieStore>, usize) {
+    let local = Arc::new(MemoryTrieStore::new());
+    let config = SnapConfig {
+        chunk_grid: grid,
+        ..config(4, grid)
+    };
+    let mut client = StateDownload::new(peer.root_hash, peer.total(), &config, local.clone());
+    // Several times what a download that moves needs, so that one that has
+    // stopped moving fails at once rather than after a hundred thousand
+    // rebuilds.
+    let enough = 4 * (peer.total() / cell + 1) as usize + 64;
+    let mut asked = 0;
+    while !client.is_complete() {
+        asked += 1;
+        assert!(
+            asked < enough,
+            "{asked} requests and not done: the download has stopped moving"
+        );
+        let request = client.next_request().expect("work left and none in flight");
+        let chunk = rebuilt(peer, &rskj_serves(peer, request.from, cell));
+        client
+            .accept_rebuilt(request.from, &chunk)
+            .expect("an honest rskj chunk");
+    }
+    (client, local, asked)
+}
+
+/// Every node of the peer's trie, and every long value, is in `local`.
+fn holds_everything(peer: &Peer, local: &MemoryTrieStore) {
+    use rustock_trie::snapshot::chunk_from;
+    for node in chunk_from(&peer.root, 0, u64::MAX, peer.store.as_ref()) {
+        assert!(
+            local.get(keccak256(&node.message).as_slice()).is_some(),
+            "the node at offset {} was never fetched",
+            node.offset
+        );
+        for value in &node.long_values {
+            assert!(
+                local.get(keccak256(value).as_slice()).is_some(),
+                "a long value was never fetched"
+            );
+        }
+    }
+}
+
+/// **An rskj server fills every cell of a wider grid.**
+///
+/// rskj serves `from` to `from + 50 * 1024` whatever is asked, and this client
+/// used to mark the whole 100,000-byte cell it asked for as done. On mainnet
+/// that left the last 48,800 bytes of every cell unfetched -- 45.7% of the
+/// state, which nothing noticed until the check after an hour's download,
+/// five attempts running. The cursor now moves as far as the chunk reached,
+/// and the next request picks up exactly there.
+#[test]
+fn an_rskj_server_fills_every_cell_of_a_wider_grid() {
+    use crate::snap::RSKJ_CHUNK_GRID;
+
+    let peer = Peer::new(12_000);
+    let total = peer.total();
+    assert!(
+        total > 6 * 100_000,
+        "the trie must span several cells, not {total} bytes"
+    );
+
+    let (client, local, asked) = download_from_rskj(&peer, 100_000, RSKJ_CHUNK_GRID);
+    client
+        .verify_stored()
+        .expect("the downloaded state is whole");
+    holds_everything(&peer, &local);
+
+    // And at one request per rskj cell, give or take one per slice: an
+    // answer that stops mid-cell is followed by a request for exactly where
+    // it stopped, not by the same cell again.
+    let cells = total.div_ceil(RSKJ_CHUNK_GRID) as usize;
+    assert!(
+        asked <= cells + cells / 10 + 2 * 4,
+        "{asked} requests for {cells} rskj cells"
+    );
+}
+
+/// **A node longer than rskj's cell is fetched.**
+///
+/// rskj keeps a node among a chunk's own only if it ends before `from + 50 *
+/// 1024`, so a node longer than that -- a contract's code, or a long value of
+/// the Bridge's storage -- is never one of them. It is the node the walk stops
+/// at, which rskj sends whole all the same, on top of the stack it hands back
+/// after the chunk's own. Asked at the cursor before it, every answer was the
+/// one node that ends there, taken and stored again with the cursor where it
+/// was: testnet's download stood at 94% for hours, writing all the while. The
+/// node the walk stopped at now counts as fetched when it follows the chunk's
+/// own, and when the chunk carried nothing of its own, the node it stopped at
+/// is the one holding the offset asked.
+#[test]
+fn a_node_longer_than_an_rskj_cell_is_fetched() {
+    use crate::snap::RSKJ_CHUNK_GRID;
+    use rustock_trie::snapshot::chunk_from;
+
+    let long = [
+        (2_000, 60_000),
+        (6_000, 150_000),
+        (6_001, 52_000),
+        (9_000, 400_000),
+    ];
+    let peer = Peer::with_long_values(12_000, &long);
+    let stream = chunk_from(&peer.root, 0, u64::MAX, peer.store.as_ref());
+    let longer: Vec<_> = stream.iter().filter(|n| n.span > RSKJ_CHUNK_GRID).collect();
+    // Two of them side by side: a leaf that holds a long value names it by
+    // hash and length, small enough to embed, so both sit in one node's entry.
+    assert_eq!(
+        longer.len(),
+        3,
+        "four long values make three nodes longer than rskj's cell"
+    );
+
+    // What rskj sends: asked where a long node begins, only the node that ends
+    // there; asked inside one, a cell or more from its end, nothing of its own.
+    for node in &longer {
+        let at_start = rebuilt(&peer, &rskj_serves(&peer, node.offset, RSKJ_CHUNK_GRID));
+        assert_eq!(
+            at_start.span.map(|(_, end)| end),
+            Some(node.offset),
+            "asked at {}",
+            node.offset
+        );
+        assert_eq!(
+            at_start.stopped_at,
+            Some((node.offset, node.end())),
+            "stopped at, asked at {}",
+            node.offset
+        );
+        let inside = node.offset + node.span - RSKJ_CHUNK_GRID;
+        let within = rebuilt(&peer, &rskj_serves(&peer, inside, RSKJ_CHUNK_GRID));
+        assert_eq!(
+            within.span, None,
+            "asked at {inside}, inside the node at {}",
+            node.offset
+        );
+        assert_eq!(
+            within.stopped_at,
+            Some((node.offset, node.end())),
+            "stopped at, asked at {inside}"
+        );
+    }
+
+    // From the start, each long node is met at the cursor just before it.
+    let (client, local, _) = download_from_rskj(&peer, 100_000, RSKJ_CHUNK_GRID);
+    client
+        .verify_stored()
+        .expect("the downloaded state is whole");
+    holds_everything(&peer, &local);
+
+    // And a slice that begins inside the longest node asks for an offset the
+    // node holds, which rskj answers with nothing of its own.
+    let node = longer.iter().max_by_key(|n| n.span).expect("a long node");
+    let inside = node.offset + node.span / 2;
+    let local = Arc::new(MemoryTrieStore::new());
+    let cfg = SnapConfig {
+        chunk_grid: 1,
+        ..config(2, 100_000)
+    };
+    let mut client = StateDownload::new(peer.root_hash, 2 * inside, &cfg, local.clone());
+    let mut offsets = Vec::new();
+    while !client.is_complete() {
+        let enough = 4 * (peer.total() / RSKJ_CHUNK_GRID) as usize + 64;
+        assert!(
+            offsets.len() < enough,
+            "{} requests and not done: stopped moving",
+            offsets.len()
+        );
+        let request = client.next_request().expect("work left and none in flight");
+        offsets.push(request.from);
+        let chunk = rebuilt(&peer, &rskj_serves(&peer, request.from, RSKJ_CHUNK_GRID));
+        client
+            .accept_rebuilt(request.from, &chunk)
+            .expect("an honest rskj chunk");
+    }
+    assert!(
+        offsets.contains(&inside),
+        "no slice began inside the node at {}",
+        node.offset
+    );
+    client
+        .verify_stored()
+        .expect("the downloaded state is whole");
+    holds_everything(&peer, &local);
+}
+
+/// **A short answer is not taken for the cell.** A server serving less than
+/// anything this client expects still leaves no hole: each answer advances
+/// the download by what it carried.
+#[test]
+fn a_short_rskj_chunk_is_not_taken_for_the_cell() {
+    let peer = Peer::new(3_000);
+    let (client, local, _) = download_from_rskj(&peer, 100_000, 7_000);
+    client
+        .verify_stored()
+        .expect("the downloaded state is whole");
+    holds_everything(&peer, &local);
+}
+
+/// **An rskj chunk that begins after the offset asked for is refused**, and
+/// leaves the store and the range as they were. Its nodes are genuine -- it
+/// rebuilds to the root -- but it is not an answer to the question, and
+/// taking it would leave a gap behind the cursor.
+#[test]
+fn an_rskj_chunk_that_begins_after_the_offset_asked_is_refused() {
+    use crate::snap::RSKJ_CHUNK_GRID;
+
+    let peer = Peer::new(3_000);
+    assert!(
+        peer.total() > 4 * RSKJ_CHUNK_GRID,
+        "the trie must span several rskj cells"
+    );
+    let local = Arc::new(MemoryTrieStore::new());
+    let mut client = StateDownload::new(
+        peer.root_hash,
+        peer.total(),
+        &config(1, 100_000),
+        local.clone(),
+    );
+
+    let request = client.next_request().expect("a request");
+    let elsewhere = rebuilt(
+        &peer,
+        &rskj_serves(&peer, request.from + 2 * RSKJ_CHUNK_GRID, RSKJ_CHUNK_GRID),
+    );
+    match client.accept_rebuilt(request.from, &elsewhere) {
+        Err(ChunkError::Misplaced { asked, starts }) => {
+            assert_eq!(asked, request.from);
+            assert!(starts > request.from);
+        }
+        other => panic!("a chunk from elsewhere was taken: {other:?}"),
+    }
+    assert_eq!(local.len(), 0, "a refused chunk wrote to the store");
+    assert_eq!(client.progress().0, 0, "a refused chunk moved the cursor");
+    assert_eq!(
+        client.next_request().map(|r| r.from),
+        Some(request.from),
+        "the range was not asked again"
+    );
+}
+
+/// **After an rskj chunk the next request names the offset just past the
+/// cursor; refused, it goes back to the grid.** An rskj server answers any
+/// offset and a rustock server only its grid's, and the next request may go
+/// to either.
+#[test]
+fn a_refused_exact_offset_is_asked_on_the_grid_next() {
+    use crate::snap::RSKJ_CHUNK_GRID;
+
+    let peer = Peer::new(3_000);
+    let local = Arc::new(MemoryTrieStore::new());
+    let mut client = StateDownload::new(peer.root_hash, peer.total(), &config(1, 100_000), local);
+
+    let first = client.next_request().expect("a request");
+    assert_eq!(first.from, 0);
+    let chunk = rebuilt(&peer, &rskj_serves(&peer, first.from, RSKJ_CHUNK_GRID));
+    client
+        .accept_rebuilt(first.from, &chunk)
+        .expect("an honest chunk");
+    let (cursor, _) = client.progress();
+    assert!(
+        cursor > 0 && cursor < 100_000,
+        "an rskj chunk stops mid-cell, at {cursor}"
+    );
+
+    let exact = client.next_request().expect("more to fetch");
+    assert_eq!(
+        exact.from,
+        cursor + 1,
+        "the next request does not ask just past where the chunk stopped"
+    );
+
+    client.realign(exact.from);
+    let aligned = client.next_request().expect("more to fetch");
+    assert_eq!(
+        aligned.from, 0,
+        "a refused offset was asked again instead of the cell"
+    );
+}
+
+/// **An rskj chunk counts the node its walk stopped at**, which rskj sends
+/// whole after the chunk's own nodes: the download moves to where that node
+/// ends, and does not ask for it again.
+#[test]
+fn an_rskj_chunk_counts_the_node_its_walk_stopped_at() {
+    use crate::snap::RSKJ_CHUNK_GRID;
+
+    let peer = Peer::new(3_000);
+    let local = Arc::new(MemoryTrieStore::new());
+    let mut client = StateDownload::new(peer.root_hash, peer.total(), &config(1, 100_000), local);
+
+    let first = client.next_request().expect("a request");
+    let chunk = rebuilt(&peer, &rskj_serves(&peer, first.from, RSKJ_CHUNK_GRID));
+    let (Some((_, own_end)), Some((begins, ends))) = (chunk.span, chunk.stopped_at) else {
+        panic!(
+            "not the chunk this test is about: {:?} {:?}",
+            chunk.span, chunk.stopped_at
+        );
+    };
+    assert_eq!(
+        begins, own_end,
+        "the walk stopped somewhere other than after the chunk's own"
+    );
+    client
+        .accept_rebuilt(first.from, &chunk)
+        .expect("an honest chunk");
+    assert_eq!(
+        client.progress().0,
+        ends,
+        "the node the walk stopped at was not counted"
+    );
+    assert_eq!(client.next_request().map(|r| r.from), Some(ends + 1));
+}
+
+/// **An answer goes to the slice that asked for it**, when two slices ask
+/// inside one cell: one for the cell, the other just past where its last
+/// chunk stopped. The cell's offset used to match either, and the slice asking
+/// exactly took the other's answer; the other waited on an answer already
+/// spent, and the first's own came back unsolicited.
+#[test]
+fn an_answer_goes_to_the_slice_that_asked_for_it() {
+    let peer = Peer::new(1_000);
+    let total = peer.total();
+    let local = Arc::new(MemoryTrieStore::new());
+    let mut client = StateDownload::new(peer.root_hash, total, &config(2, 100_000), local);
+
+    let (first, second) = (
+        client.next_request().expect("a request"),
+        client.next_request().expect("another"),
+    );
+    assert_eq!(
+        (first.from, second.from),
+        (0, 0),
+        "both slices begin in the first cell, of {total}"
+    );
+    let chunk = rebuilt(&peer, &rskj_serves(&peer, 0, 2_000));
+    client
+        .accept_rebuilt(first.from, &chunk)
+        .expect("the first slice's answer");
+    let (reached, _) = client.progress();
+    assert!(
+        reached > 0 && reached < total / 2,
+        "the first chunk reached {reached}, into the second slice"
+    );
+    let exact = client.next_request().expect("the first slice asks again");
+    assert_eq!(exact.from, reached + 1);
+
+    // The second slice's answer, for the cell it asked; then the first's own.
+    let taken = client
+        .accept_rebuilt(second.from, &chunk)
+        .expect("the second slice's answer");
+    assert_eq!(
+        taken.advanced, 0,
+        "the cell's first chunk ends before the second slice begins"
+    );
+    let next = rebuilt(&peer, &rskj_serves(&peer, exact.from, 2_000));
+    let taken = client
+        .accept_rebuilt(exact.from, &next)
+        .expect("the first slice's answer was taken by another");
+    assert!(taken.advanced > 0);
+    assert_eq!(client.progress().0, reached + taken.advanced);
+
+    // Both slices are free again: each asks just past its own cursor.
+    let asks = [client.next_request(), client.next_request()].map(|r| r.map(|r| r.from));
+    assert_eq!(
+        asks,
+        [Some(reached + taken.advanced + 1), Some(total / 2 + 1)]
+    );
+}

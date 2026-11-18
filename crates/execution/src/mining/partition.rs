@@ -648,6 +648,26 @@ mod tests {
         assert_eq!(h.edges(), vec![1], "the sequential sublist is not an edge");
     }
 
+    /// rskj `addRemascTransaction` tests no gas: a sequential sublist
+    /// already full still takes REMASC, and counts the gas it used past
+    /// its limit.
+    #[test]
+    fn the_remasc_transaction_goes_in_a_full_sequential_sublist() {
+        let mut h = handler();
+        let (_, sequential_limit) = sublist_gas_limits(BLOCK_GAS_LIMIT, 2, MIN_SEQUENTIAL);
+        let filling = TxFootprint {
+            sender: sender(1),
+            gas_limit: sequential_limit,
+            gas_used: sequential_limit,
+            reads: vec![],
+            writes: vec![],
+        };
+        assert_eq!(h.add_to_sequential(0, &filling), Some(SEQUENTIAL));
+        assert_eq!(h.add_remasc(1, 21_000), SEQUENTIAL);
+        assert_eq!(h.transactions_in_order(), vec![0, 1]);
+        assert_eq!(h.gas_used_in_sequential(), sequential_limit + 21_000);
+    }
+
     /// A Bridge call goes to the sequential sublist and its keys are still
     /// recorded, so later transactions are placed knowing about it.
     #[test]

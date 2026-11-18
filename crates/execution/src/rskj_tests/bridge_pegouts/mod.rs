@@ -1,0 +1,22 @@
+//! The Bridge's storage, peg-outs, signatures and events.
+
+mod bitcoin_utils_legacy_test;
+mod bridge_event_logger_impl_test;
+mod bridge_event_logger_legacy_impl_test;
+mod bridge_storage_provider_test;
+mod bridge_support_add_signature_test;
+mod bridge_support_get_estimated_fees_test;
+mod bridge_support_pegout_transaction_created_event_test;
+mod bridge_support_process_funds_migration_test;
+mod bridge_support_register_btc_transaction_test;
+mod bridge_support_release_btc_test;
+mod bridge_support_sig_hash_test;
+mod peg_utils_all_utxos_to_fed_are_above_minimum_pegin_value_test;
+mod peg_utils_get_transaction_type_test;
+mod peg_utils_legacy_get_transaction_type_test;
+mod pegouts_waiting_for_confirmations_test;
+mod poc_sighash_test;
+mod point_at_infinity_signer_test;
+mod release_transaction_builder_test;
+mod support;
+mod what_a_call_writes_back_test;

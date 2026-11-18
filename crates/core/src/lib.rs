@@ -7,6 +7,16 @@ pub mod validation;
 pub mod config;
 pub mod rlp_compat;
 pub mod rskj_genesis;
+pub mod rskj_rlp;
+pub mod partial_merkle_tree;
+pub mod btc_block;
+pub mod selection_rule;
+
+#[cfg(test)]
+mod mutate;
+
+#[cfg(test)]
+mod rskj_tests;
 
 pub use types::block::Block;
 pub use types::header::Header;

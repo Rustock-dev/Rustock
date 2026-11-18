@@ -108,6 +108,13 @@ pub struct ProgramTrace {
     /// `invoke.getGas()`, which is the transaction gas limit less the
     /// intrinsic cost, and what the top-level trace reports as `action.gas`.
     pub root_gas: u64,
+    /// Whether a program ran for the transaction itself -- rskj's
+    /// `program != null`. Where none did (a plain transfer, a call straight to
+    /// a precompile, a creation with no init code), rskj's trace is a bare
+    /// `SummarizedProgramTrace`, which `TransactionExecutor.extractTrace`
+    /// gives no gas, no error and no revert, whatever became of the
+    /// transaction.
+    pub ran_program: bool,
     /// The transaction's call tree: rskj's `SummarizedProgramTrace.subtraces`.
     ///
     /// The transaction's own frame is **not** here. rskj renders the top-level
@@ -193,6 +200,61 @@ pub struct Subtrace {
     /// matches exactly.
     pub reverted: bool,
     pub subtraces: Vec<Subtrace>,
+}
+
+/// Notes a value transfer that rskj reports as a CALL subtrace of a call to
+/// a precompile: `BridgeSupport.transferTo` and
+/// `RemascFeesPayer.transferPayment` add one for every transfer they make, a
+/// zero one included.
+pub fn record_precompile_transfer<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    from: Address,
+    to: Address,
+    value: U256,
+) {
+    ctx.chain_mut().precompile_transfers.push((from, to, value));
+}
+
+/// The subtraces rskj hangs under a transaction sent straight to a
+/// precompile, if `success` and `to` is one that transfers: one CALL per
+/// transfer it made, from the precompile to the payee, with gas 0 and an empty
+/// result (`TransferInvoke(from, to, 0L, value)`,
+/// `ProgramSubtrace.newCallSubtrace`). `TransactionExecutor.call` takes
+/// `precompiledContract.getSubtraces()` once `execute` returns and
+/// `extractTrace` hangs them under the transaction's trace; a precompile a
+/// contract calls adds nothing (`Program.callToPrecompiledAddress` reads no
+/// subtraces), so its transfers are dropped.
+pub fn precompile_subtraces(
+    to: Option<Address>,
+    success: bool,
+    transfers: Vec<(Address, Address, U256)>,
+) -> Option<Vec<Subtrace>> {
+    let to = to?;
+    if !success || (to != crate::BRIDGE_ADDR && to != crate::REMASC_ADDR) {
+        return None;
+    }
+    Some(
+        transfers
+            .into_iter()
+            .map(|(from, to, value)| Subtrace {
+                kind: SubtraceKind::Call,
+                call_kind: Some(CallKind::Call),
+                is_create2: false,
+                caller: from,
+                owner: to,
+                code_address: None,
+                gas: 0,
+                gas_used: 0,
+                value,
+                input: Vec::new(),
+                output: Vec::new(),
+                created_address: None,
+                error: None,
+                reverted: false,
+                subtraces: Vec::new(),
+            })
+            .collect(),
+    )
 }
 
 /// A frame the tracer has entered and not yet left.
@@ -325,6 +387,7 @@ impl RskTracer {
             // reporting the real figure here would disagree with every rskj
             // node.
             root_gas: if self.root_has_program { self.root_gas } else { 0 },
+            ran_program: self.root_has_program,
             ..Default::default()
         };
         self.pending_storage = None;
@@ -435,10 +498,13 @@ where
     INTR: InterpreterTypes,
 {
     fn initialize_interp(&mut self, _interp: &mut Interpreter<INTR>, _context: &mut CTX) {
-        // Fires exactly when revm builds an interpreter for a frame, which is
-        // rskj's `program != null`. See `take_trace` for why that matters.
-        if self.open_frames.len() == 1 {
-            self.root_has_program = true;
+        // Fires when revm builds an interpreter for a frame, which is rskj's
+        // `program != null` but for one case: revm builds one for a creation
+        // with no init code as well, where rskj's `create()` builds no
+        // `Program` (`isEmpty(tx.getData())`). See `take_trace` for why that
+        // matters.
+        if let [root] = self.open_frames.as_slice() {
+            self.root_has_program = root.kind != SubtraceKind::Create || !root.input.is_empty();
         }
     }
 

@@ -51,7 +51,7 @@
 
 use alloy_primitives::U256;
 use rustock_core::{Header, Transaction};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 /// Transactions sampled for the price percentile. rskj `TX_WINDOW_SIZE`.
 const TX_WINDOW_SIZE: usize = 512;
@@ -130,7 +130,7 @@ impl GasPriceTracker {
     /// fullness enters the block window, and its transactions enter the price
     /// window.
     pub fn on_block(&self, header: &Header, transactions: &[Transaction]) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         inner.default_price = header.minimum_gas_price;
 
         // rskj `trackBlockCompleteness`: gasUsed / gasLimit.
@@ -143,8 +143,8 @@ impl GasPriceTracker {
         inner.block_window[at] = Some(completeness);
         inner.block_idx += 1;
 
-        for tx in transactions {
-            if rustock_execution::BlockProcessor::is_remasc_tx(tx) {
+        for (index, tx) in transactions.iter().enumerate() {
+            if tx.is_remasc(index, transactions.len()) {
                 continue;
             }
             if inner.tx_idx == -1 {
@@ -161,24 +161,24 @@ impl GasPriceTracker {
     /// rskj `onBestBlock`: only the head's minimum gas price is kept, and only
     /// as the floor applied in `gas_price`.
     pub fn on_best_block(&self, header: &Header) {
-        self.inner.lock().unwrap().best_block_price = Some(header.minimum_gas_price);
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .best_block_price = Some(header.minimum_gas_price);
     }
 
     /// rskj `getGasPrice`: the windowed percentile, floored at the best
     /// block's minimum times 1.1; the last seen block minimum until the window
     /// has 512 transactions in it.
     pub fn gas_price(&self) -> U256 {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
 
         let Some(percentile) = inner.percentile() else {
             return inner.default_price;
         };
         match inner.best_block_price {
             None => percentile,
-            Some(best) => {
-                let floor = best * U256::from(MULTIPLIER_NUM) / U256::from(MULTIPLIER_DEN);
-                percentile.max(floor)
-            }
+            Some(best) => percentile.max(times_multiplier(best)),
         }
     }
 
@@ -188,7 +188,7 @@ impl GasPriceTracker {
     /// The fullness test is what gates the rate limiter's low-gas-price
     /// factor. False is a normal answer on a chain with spare capacity.
     pub fn is_fee_market_working(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         // rskj checks the LAST slot, which is only written once 50 blocks have
         // gone by -- a full ring, not merely a non-empty one.
         if inner.block_window[BLOCK_WINDOW_SIZE - 1].is_none() {
@@ -231,9 +231,11 @@ impl GasPriceTracker {
                 .flatten()
                 .map(|(txs, _)| txs)
                 .unwrap_or_default();
+            let count = transactions.len();
             tx_count += transactions
                 .iter()
-                .filter(|t| !rustock_execution::BlockProcessor::is_remasc_tx(t))
+                .enumerate()
+                .filter(|(index, t)| !t.is_remasc(*index, count))
                 .count();
             let parent = header.parent_hash;
             let at_genesis = header.number == 0;
@@ -275,7 +277,13 @@ impl GasPriceTracker {
     /// How many of the 512 transaction slots are filled. For diagnostics and
     /// tests; rskj has no equivalent.
     pub fn sampled_transactions(&self) -> usize {
-        self.inner.lock().unwrap().tx_window.iter().filter(|s| s.is_some()).count()
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .tx_window
+            .iter()
+            .filter(|s| s.is_some())
+            .count()
     }
 }
 
@@ -292,6 +300,17 @@ impl Inner {
         }
         self.last_val
     }
+}
+
+/// `value` times 1.1, truncated, as rskj's `BigDecimal` product is: exact
+/// while the answer fits in 256 bits, which multiplying by 11 first is not
+/// from 2^256 / 11 up. Past it, `U256::MAX`: no account can pay that for
+/// 21,000 gas, so the fee market, which needs full blocks, never works there.
+fn times_multiplier(value: U256) -> U256 {
+    let (num, den) = (U256::from(MULTIPLIER_NUM), U256::from(MULTIPLIER_DEN));
+    (value / den)
+        .saturating_mul(num)
+        .saturating_add(value % den * num / den)
 }
 
 #[cfg(test)]
@@ -325,6 +344,7 @@ mod tests {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         }
     }
 
@@ -405,6 +425,16 @@ mod tests {
         // A floor below it does not.
         tracker.on_best_block(&header(3, 0, 6_800_000, 10));
         assert_eq!(tracker.gas_price(), U256::from(129));
+
+        // Exact near the top of 256 bits, where 11 times the minimum is not.
+        let mut best = header(4, 0, 6_800_000, 0);
+        best.minimum_gas_price = U256::from(1) << 253;
+        tracker.on_best_block(&best);
+        let expected: U256 =
+            "15921412270130976870741010438694587329824622891525577555425417801088055325491"
+                .parse()
+                .unwrap();
+        assert_eq!(tracker.gas_price(), expected, "2^253 * 1.1");
     }
 
     /// REMASC carries no gas price; counting it would drag the percentile to

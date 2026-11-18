@@ -106,6 +106,11 @@ pub struct RpcState {
     /// no network round trip and no verification.
     pub proof_fetcher: Option<Arc<dyn ProofFetcher>>,
     pub hardfork_cfg: Option<RskHardforkConfig>,
+    /// The Bridge's constants where they aren't the chain's own: a chain from
+    /// an rskj genesis file runs on rskj's regtest ones, as the node's block
+    /// processor does (`BlockProcessor::with_bridge_constants`). A call, an
+    /// estimate and a trace run on the same.
+    pub bridge_constants: Option<rustock_execution::bridge::constants::BridgeConstants>,
     pub filter_store: Arc<logs::FilterStore>,
     pub tx_pool: Option<Arc<dyn TxPoolReader>>,
     /// Live depth of the inbound wire-message queue, for
@@ -174,6 +179,29 @@ pub struct RpcState {
     /// without an event source, and keeps the WebSocket transport testable
     /// without one.
     pub events: Option<crate::subscribe::EventSender>,
+}
+
+impl RpcState {
+    /// The executor a call or an estimate runs on, under `config`.
+    pub(crate) fn executor(&self, config: RskHardforkConfig) -> rustock_execution::RskExecutor {
+        let executor = rustock_execution::RskExecutor::new(config, self.store.clone());
+        match &self.bridge_constants {
+            Some(constants) => executor.with_bridge_constants(constants.clone()),
+            None => executor,
+        }
+    }
+
+    /// The processor a trace runs a block again on, under `config`.
+    pub(crate) fn block_processor(
+        &self,
+        config: RskHardforkConfig,
+    ) -> rustock_execution::BlockProcessor {
+        let processor = rustock_execution::BlockProcessor::new(config, self.store.clone());
+        match &self.bridge_constants {
+            Some(constants) => processor.with_bridge_constants(constants.clone()),
+            None => processor,
+        }
+    }
 }
 
 /// Starts the JSON-RPC HTTP server on the given host and port.
@@ -347,13 +375,53 @@ async fn dispatch_heavy(state: &RpcState, req: JsonRpcRequest) -> JsonRpcRespons
     }
 }
 
+/// One request, answered whatever happens inside it.
+///
+/// rskj's `RskErrorResolver` answers an exception it has no specific answer
+/// for with -32603 "Internal server error", logs it, and goes on serving. A
+/// panic here is the same failure, so it gets the same answer. Uncaught, it
+/// would unwind the connection's task instead, and the client, with every
+/// other request in its batch, would get a dropped connection, not a reply.
 async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
+    let id = req.id.clone().unwrap_or(Value::Null);
+    let method = req.method.clone();
+    answered(id, &method, route(state, req)).await
+}
+
+/// `answer`'s response, or rskj's internal error if it panics.
+async fn answered(
+    id: Value,
+    method: &str,
+    answer: impl std::future::Future<Output = JsonRpcResponse>,
+) -> JsonRpcResponse {
+    match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(answer)).await {
+        Ok(response) => response,
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("no message");
+            tracing::error!("JSON-RPC method {method} panicked: {message}");
+            JsonRpcResponse::error(id, INTERNAL_ERROR, "Internal server error")
+        }
+    }
+}
+
+async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
+    let id = req.id.clone().unwrap_or(Value::Null);
+    let params = &req.params;
+
+    // jsonrpc4j counts a call's parameters before the method runs.
+    if let Some(refused) = crate::stubs::wrong_arity(&id, &req.method, params) {
+        return refused;
+    }
+
+    // The methods that run EVM code go off the runtime, once the arity
+    // check above has refused a call as jsonrpc4j would.
     if is_heavy(&req.method) {
         return dispatch_heavy(state, req).await;
     }
-
-    let id = req.id.unwrap_or(Value::Null);
-    let params = &req.params;
 
     match req.method.as_str() {
         // -- web3 --
@@ -468,7 +536,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         | "rsk_flush" | "rsk_shutdown"
             if !state.admin_enabled =>
         {
-            JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Method not found")
+            crate::stubs::method_not_found(id)
         }
         "rsk_collectTrie" => admin::rsk_collect_trie(
             id,
@@ -486,6 +554,10 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         ),
         "rsk_storageStatus" => admin::rsk_storage_status(id, &state.store, &state.epoch_store),
         "rsk_getStorageBytesAt" => rsk::rsk_get_storage_bytes_at(id, params, state),
+        "rsk_getStorageNodes" => proof::rsk_get_storage_nodes(id, params, state),
+        "rsk_getStateNodes" => proof::rsk_get_state_nodes(id, params, state),
+        "rsk_getBlockNumberByHash" => rsk::rsk_get_block_number_by_hash(id, params, &state.store),
+        "rsk_getRawBlocks" => rsk::rsk_get_raw_blocks(id, params, &state.store),
         "rsk_getRawTransactionReceiptByHash" => {
             rsk::rsk_get_raw_transaction_receipt_by_hash(id, params, &state.store)
         }
@@ -495,7 +567,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "rsk_getRawBlockHeaderByHash" => rsk::rsk_get_raw_block_header_by_hash(id, params, &state.store),
         "rsk_getRawBlockHeaderByNumber" => rsk::rsk_get_raw_block_header_by_number(id, params, &state.store),
 
-        "eth_sendRawTransaction" => eth::eth_send_raw_transaction(id, params, &state.tx_submitter).await,
+        "eth_sendRawTransaction" => eth::eth_send_raw_transaction(id, params, state).await,
 
         // -- state queries --
         "eth_getBalance" => state::eth_get_balance(id, params, state),
@@ -522,17 +594,26 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_getFilterLogs" => logs::eth_get_filter_logs(id, params, state),
         "eth_uninstallFilter" => logs::eth_uninstall_filter(id, params, state),
 
-        // Answered out of the operator-supplied wallet, and refused with
-        // METHOD_NOT_FOUND when there is none -- which is what they did
-        // before a wallet was possible.
+        // Answered out of the operator-supplied wallet. Without one they're
+        // refused as rskj refuses them with its wallet off (`sign.rs`).
         "eth_sendTransaction" => sign::eth_send_transaction(id, params, state).await,
         "eth_sign" => sign::eth_sign(id, params, state),
         "eth_signTransaction" => sign::eth_sign_transaction(id, params, state),
 
-        // -- unsupported methods --
-        "eth_getCompilers" | "eth_compileSolidity" => {
-            execution_not_available(id, &req.method)
+        // -- what rskj's Web3Impl answers with a fixed value or as unsupported --
+        "eth_getCompilers" => crate::stubs::eth_get_compilers(id),
+        "eth_compileLLL"
+        | "eth_compileSerpent"
+        | "eth_compileSolidity"
+        | "eth_submitWork"
+        | "eth_submitHashrate" => crate::stubs::not_available(id, &req.method),
+        // No-ops in Web3Impl, but `db` isn't one of the modules rskj's
+        // reference.conf turns on, so JsonRpcMethodFilter refuses them first,
+        // in the same words.
+        "db_putString" | "db_getString" | "db_putHex" | "db_getHex" => {
+            crate::stubs::not_available(id, &req.method)
         }
+        m if m.starts_with("personal_") => crate::stubs::personal(id, m, params),
 
         "debug_wireProtocolQueueSize" => debug::debug_wire_protocol_queue_size(id, state),
         "debug_traceTransaction" => debug::debug_trace_transaction(id, params, state),
@@ -557,16 +638,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "txpool_inspect" => txpool::txpool_inspect(id, state),
         "txpool_status" => txpool::txpool_status(id, state),
 
-        m if m.starts_with("debug_")
-            || m.starts_with("trace_")
-            || m.starts_with("personal_")
-            || m.starts_with("evm_")
-            || m.starts_with("txpool_")
-            || m.starts_with("db_") => {
-            execution_not_available(id, m)
-        }
-
-        _ => JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Method not found"),
+        _ => crate::stubs::method_not_found(id),
     }
 }
 
@@ -597,6 +669,36 @@ pub async fn dispatch_rpc(state: &RpcState, req: JsonRpcRequest) -> JsonRpcRespo
 #[cfg(test)]
 pub(crate) async fn dispatch_for_test(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
     dispatch(state, req).await
+}
+
+#[cfg(test)]
+mod panic_boundary_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_method_that_panics_is_answered_as_rskj_answers_an_exception() {
+        let response = answered(json!(7), "eth_example", async { panic!("a bug") }).await;
+        let error = response.error.expect("an error, not a dropped connection");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(error.message, "Internal server error");
+        assert_eq!(response.id, json!(7));
+        assert!(response.result.is_none());
+
+        // A panic carrying a formatted message is caught the same way.
+        let response = answered(Value::Null, "eth_example", async { panic!("{} bugs", 2) }).await;
+        assert_eq!(response.error.expect("an error").code, INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn an_answer_passes_the_boundary_untouched() {
+        let response = answered(json!("a"), "eth_example", async {
+            JsonRpcResponse::success(json!("a"), json!("0x1"))
+        })
+        .await;
+        assert!(response.error.is_none());
+        assert_eq!(response.result, Some(json!("0x1")));
+        assert_eq!(response.id, json!("a"));
+    }
 }
 
 #[cfg(test)]

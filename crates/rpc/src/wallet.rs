@@ -10,7 +10,8 @@
 //! That reasoning still holds, and this does not weaken it: **a wallet
 //! exists only when the operator supplies one.** Without
 //! `--wallet-file`, `RpcState::wallet` is `None`, `eth_accounts` is empty
-//! and the three signing methods answer exactly as before. The keys are
+//! and the three signing methods are refused, as rskj refuses them with its
+//! wallet off. The keys are
 //! the ones in the file and nothing else; nothing here can reach the node
 //! identity key or a miner key.
 //!
@@ -149,6 +150,20 @@ impl Wallet {
         out[..64].copy_from_slice(&sig);
         out[64] = 27 + i32::from(recid) as u8;
         Some(out)
+    }
+
+    /// A signature over `digest` by the key for `address`: its recovery id,
+    /// then r and s. `None` when this wallet does not hold the key.
+    ///
+    /// For the hash a transaction is signed by. A message goes through
+    /// [`Wallet::sign_message`], which hashes it under its prefix first.
+    pub fn sign_digest(&self, address: &Address, digest: B256) -> Option<(u8, [u8; 64])> {
+        let secret = self.keys.get(address)?;
+        let (recid, sig) = self
+            .secp
+            .sign_ecdsa_recoverable(Message::from_digest(digest.0), secret)
+            .serialize_compact();
+        Some((i32::from(recid) as u8, sig))
     }
 
     /// Sign a transaction in place, EIP-155 style.

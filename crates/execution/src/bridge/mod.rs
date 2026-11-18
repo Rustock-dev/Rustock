@@ -14,19 +14,23 @@ pub mod btc_block_cache;
 #[cfg(test)]
 mod btc_block_cache_readpath_tests;
 pub mod btc_chain;
+pub mod btc_rules;
 pub mod btc_store;
 pub mod constants;
+mod der_signature;
 pub mod events;
 pub mod federation;
 pub mod getters;
 pub mod legacy_events;
 pub mod governance;
 pub mod peg;
+pub mod peg_legacy;
 pub mod pegin_instructions;
 pub mod pmt;
 pub mod release_tx;
 /// rskj-compatible peg-in sender detection, isolated so it can be removed.
 pub mod rskj_sender_compat;
+pub mod script_spend;
 pub mod serialization;
 pub mod storage;
 pub mod tx;
@@ -68,154 +72,22 @@ pub(crate) fn compute_selector(sig: &str) -> [u8; 4] {
 // mainnet #6,223,797 tx[3] forwards `receiveHeaders(bytes[])` with a `bytes[]`
 // offset of 0xa0 into a 60-byte argument payload, so rskj's decode throws.
 //
-// `abi_args_decode_ok` mirrors the bound checks rskj's `SolidityType` decoders
-// perform (`Utils.safeCopyOfRange`/`validateArrayAllegedSize` throw when
-// `data.length < offset + size`; `IntType.decodeInt` special-cases an empty
-// payload as 0; offsets/lengths are read via `BigInteger.intValue()`).
+// The decoding is `crate::abi::Args`, which every method handler reads its
+// arguments through as well: a payload that passes here is read by each
+// handler as rskj's `Object[] args` holds it.
 
-#[derive(Clone)]
-enum AbiArgType {
-    /// 32-byte head word read with `IntType.decodeInt` (empty payload → 0):
-    /// int/uint/address/bool.
-    Word,
-    /// 32-byte head word read with `safeCopyOfRange` (no empty special case):
-    /// bytesN.
-    FixedBytes,
-    /// Dynamic `bytes`/`string`.
-    Bytes,
-    /// Dynamic `T[]`.
-    Array(Box<AbiArgType>),
-}
-
-impl AbiArgType {
-    fn is_dynamic(&self) -> bool {
-        matches!(self, AbiArgType::Bytes | AbiArgType::Array(_))
-    }
-}
-
-/// Parse a single Solidity type name (as it appears in a bridge signature).
-fn parse_abi_type(t: &str) -> AbiArgType {
-    let t = t.trim();
-    if let Some(elem) = t.strip_suffix("[]") {
-        return AbiArgType::Array(Box::new(parse_abi_type(elem)));
-    }
-    match t {
-        "bytes" | "string" => AbiArgType::Bytes,
-        _ if t.starts_with("bytes") => AbiArgType::FixedBytes, // bytes1..bytes32
-        _ => AbiArgType::Word, // int*, uint*, address, bool
-    }
-}
-
-/// Extract the argument types from a method signature like `name(a,b,c)`.
-fn parse_signature_args(signature: &str) -> Vec<AbiArgType> {
-    let inner = signature
-        .split_once('(')
-        .and_then(|(_, rest)| rest.strip_suffix(')'))
-        .unwrap_or("");
-    if inner.is_empty() {
-        return Vec::new();
-    }
-    inner.split(',').map(parse_abi_type).collect()
-}
-
-/// rskj `IntType.decodeInt(encoded, offset).intValue()`: an empty payload
-/// decodes to 0 without bounds-checking; otherwise the 32-byte word must fit
-/// (`safeCopyOfRange`) and the result is its low-32-bit signed `intValue()`.
-fn abi_decode_int(args: &[u8], off: usize) -> Option<i64> {
-    if args.is_empty() {
-        return Some(0);
-    }
-    let end = off.checked_add(32)?;
-    if end > args.len() {
-        return None;
-    }
-    let low = u32::from_be_bytes([args[off + 28], args[off + 29], args[off + 30], args[off + 31]]);
-    Some(low as i32 as i64)
-}
-
-/// Validate that `value` (an `int`-decoded offset/length) is usable as a
-/// non-negative index. rskj throws (`Math.addExact`, array bounds) on negatives.
-fn abi_index(value: i64) -> Option<usize> {
-    if value < 0 {
-        None
-    } else {
-        Some(value as usize)
-    }
-}
-
-/// Mirror `SolidityType.decode(encoded, offset)` for one value, returning
-/// `None` exactly where rskj would throw.
-fn abi_decode_value_ok(args: &[u8], off: usize, ty: &AbiArgType) -> Option<()> {
-    match ty {
-        // IntType.decode -> decodeInt (empty payload tolerated).
-        AbiArgType::Word => abi_decode_int(args, off).map(|_| ()),
-        // Bytes32Type.decode -> safeCopyOfRange(encoded, off, 32) (strict).
-        AbiArgType::FixedBytes => {
-            let end = off.checked_add(32)?;
-            (end <= args.len()).then_some(())
-        }
-        // BytesType.decode: len = decodeInt(off); safeCopyOfRange(off+32, len).
-        AbiArgType::Bytes => {
-            let len = abi_index(abi_decode_int(args, off)?)?;
-            let data_off = off.checked_add(32)?;
-            (data_off.checked_add(len)? <= args.len()).then_some(())
-        }
-        // DynamicArrayType.decode.
-        AbiArgType::Array(elem) => {
-            if args.is_empty() {
-                return Some(()); // empty payload → empty array (no throw)
-            }
-            let len = abi_index(abi_decode_int(args, off)?)?;
-            let base = off.checked_add(32)?;
-            // validateArrayAllegedSize(encoded, base, len) — lower bound.
-            if base.checked_add(len)? > args.len() {
-                return None;
-            }
-            let mut elem_off = base;
-            for _ in 0..len {
-                if elem.is_dynamic() {
-                    let dyn_off = abi_index(abi_decode_int(args, elem_off)?)?;
-                    abi_decode_value_ok(args, base.checked_add(dyn_off)?, elem)?;
-                } else {
-                    abi_decode_value_ok(args, elem_off, elem)?;
-                }
-                elem_off = elem_off.checked_add(32)?; // every element head slot is 32 bytes
-            }
-            Some(())
-        }
-    }
-}
-
-/// rskj `CallTransaction.Function.decode(encoded, inputs)` (CallTransaction.java
-/// :409): walk the head, following each dynamic argument's offset, and confirm
-/// every value decodes without an out-of-bounds access. `args` is the calldata
-/// AFTER the 4-byte selector. Returns false where rskj's decode would throw
-/// (→ `parseData` null → flat 23_000 parse-failure cost).
+/// rskj `CallTransaction.Function.decode(encoded, inputs)`: whether every
+/// argument decodes. `args` is the calldata AFTER the 4-byte selector.
+/// Returns false where rskj's decode would throw (→ `parseData` null → flat
+/// 23_000 parse-failure cost).
 fn abi_args_decode_ok(args: &[u8], signature: &str) -> bool {
-    let types = parse_signature_args(signature);
-    let mut off = 0usize;
-    for ty in &types {
-        let ok = if ty.is_dynamic() {
-            match abi_decode_int(args, off).and_then(abi_index) {
-                Some(dyn_off) => abi_decode_value_ok(args, dyn_off, ty).is_some(),
-                None => false,
-            }
-        } else {
-            abi_decode_value_ok(args, off, ty).is_some()
-        };
-        if !ok {
-            return false;
-        }
-        match off.checked_add(32) {
-            Some(n) => off = n,
-            None => return false,
-        }
-    }
-    true
+    crate::abi::Args::new(args)
+        .decode(signature)
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
-// BridgeMethod — all 69 methods (32 tx-callable + 37 local-only)
+// BridgeMethod — all 83 methods (45 tx-callable, 37 local-only, 1 that turns)
 // ---------------------------------------------------------------------------
 
 /// Permission model for a Bridge method.
@@ -249,6 +121,10 @@ pub enum BridgeMethodEnabled {
     Since(crate::hardfork::RskNetworkUpgrade),
     /// Enabled only BEFORE the given network upgrade (legacy methods).
     Until(crate::hardfork::RskNetworkUpgrade),
+    /// Enabled where the rule's own predicate says so. For a rule whose
+    /// upgrade a network skips, which `Since` would read as implied by any
+    /// later upgrade there (see `RskHardforkConfig::has_rskip144`).
+    Rule(fn(&RskHardforkConfig, u64) -> bool),
 }
 
 impl BridgeMethodEnabled {
@@ -257,6 +133,7 @@ impl BridgeMethodEnabled {
             Self::Always => true,
             Self::Since(u) => hardfork_cfg.active_upgrade(block_number) >= *u,
             Self::Until(u) => hardfork_cfg.active_upgrade(block_number) < *u,
+            Self::Rule(active) => active(hardfork_cfg, block_number),
         }
     }
 }
@@ -269,14 +146,19 @@ fn method_enabled(name: &str) -> BridgeMethodEnabled {
     use crate::hardfork::RskNetworkUpgrade::*;
     use BridgeMethodEnabled::*;
     match name {
-        // RSKIP502 (reed810): the union bridge.
+        // RSKIP502 (reed810): the union bridge. By reed810's schedule, which
+        // mainnet never sets: `Since(Reed810)` read its vetiver900 as
+        // implying it.
         "setUnionBridgeContractAddressForTestnet"
         | "getUnionBridgeContractAddress"
         | "getUnionBridgeLockingCap"
         | "increaseUnionBridgeLockingCap"
         | "requestUnionBridgeRbtc"
         | "releaseUnionBridgeRbtc"
-        | "setUnionBridgeTransferPermissions" => Since(Reed810),
+        | "setUnionBridgeTransferPermissions" => Rule(RskHardforkConfig::has_rskip502),
+        // RSKIP529 (reed810): the union bridge's super and base events.
+        "getSuperEvent" | "setSuperEvent" | "clearSuperEvent" | "getBaseEvent" | "setBaseEvent"
+        | "clearBaseEvent" => Rule(RskHardforkConfig::has_rskip529),
         // !RSKIP87 / !RSKIP89
         "addLockWhitelistAddress" | "getBtcBlockchainBlockLocator" => Until(Orchid),
         // RSKIP87 / RSKIP89
@@ -386,6 +268,12 @@ fn method_allows_static_call(name: &str) -> bool {
             | "getQueuedPegoutsCount"
             | "getEstimatedFeesForNextPegOutEvent"
             | "getEstimatedFeesForPegOutAmount"
+            // RSKIP502: the union bridge's two getters.
+            | "getUnionBridgeContractAddress"
+            | "getUnionBridgeLockingCap"
+            // RSKIP529: the two event getters.
+            | "getSuperEvent"
+            | "getBaseEvent"
     )
 }
 
@@ -475,6 +363,13 @@ fn build_method_table() -> Vec<BridgeMethodInfo> {
         ("requestUnionBridgeRbtc",      "requestUnionBridgeRbtc(uint256)",                            Fixed(8000),  TransactionCallable),
         ("releaseUnionBridgeRbtc",      "releaseUnionBridgeRbtc()",                                   Fixed(8000),  TransactionCallable),
         ("setUnionBridgeTransferPermissions","setUnionBridgeTransferPermissions(bool,bool)",          Fixed(8000),  TransactionCallable),
+        // -- RSKIP529 union bridge events (reed810) --
+        ("getSuperEvent",               "getSuperEvent()",                                            Fixed(3000),  TransactionCallable),
+        ("setSuperEvent",               "setSuperEvent(bytes)",                                       Fixed(8000),  TransactionCallable),
+        ("clearSuperEvent",             "clearSuperEvent()",                                          Fixed(8000),  TransactionCallable),
+        ("getBaseEvent",                "getBaseEvent()",                                             Fixed(3000),  TransactionCallable),
+        ("setBaseEvent",                "setBaseEvent(bytes)",                                        Fixed(8000),  TransactionCallable),
+        ("clearBaseEvent",              "clearBaseEvent()",                                           Fixed(8000),  TransactionCallable),
         // -- Dynamic permission --
         ("getBtcBlockchainBestChainHeight","getBtcBlockchainBestChainHeight()",                       Fixed(19000), DynamicRskip220),
         // -- Local-only getters (needed for completeness; not consensus-critical) --
@@ -543,6 +438,12 @@ static BRIDGE_SELECTOR_MAP: LazyLock<HashMap<[u8; 4], usize>> = LazyLock::new(||
         .collect()
 });
 
+/// Every Bridge method's selector, enabled or not, for tests that call each.
+#[cfg(test)]
+pub(crate) fn every_selector() -> Vec<[u8; 4]> {
+    BRIDGE_METHODS.iter().map(|m| m.selector).collect()
+}
+
 /// Look up a Bridge method by its 4-byte ABI selector.
 pub fn find_bridge_method(selector: &[u8; 4]) -> Option<&'static BridgeMethodInfo> {
     BRIDGE_SELECTOR_MAP.get(selector).map(|&i| &BRIDGE_METHODS[i])
@@ -557,8 +458,9 @@ pub fn find_bridge_method(selector: &[u8; 4]) -> Option<&'static BridgeMethodInf
 /// `getGasForData` and, when `Bridge.execute` throws (parse failure OR a
 /// method `VMException`/`RuntimeException`), only spends `requiredGas +
 /// basicTxCost` while still flagging the summary as failed: the receipt is
-/// SUCCESS with that spent gas, no logs, no endowment, but the sender is
-/// charged the FULL gas limit. The marker carries `requiredGas` so the
+/// SUCCESS with that spent gas, no endowment, and of the logs those the
+/// method wrote before it threw; but the sender is charged the FULL gas
+/// limit. The marker carries `requiredGas` so the
 /// precompile frame can record exactly that cost (the basic tx cost is
 /// charged separately by revm's intrinsic accounting).
 pub const INVISIBLE_EXCEPTION_MARKER: &str = "rskj invisible exception:";
@@ -600,6 +502,26 @@ pub fn is_invisible_exception(e: &PrecompileError) -> bool {
 /// Internal (depth>1) Bridge method throw: returns the spent `requiredGas`.
 pub fn internal_throw_gas(e: &PrecompileError) -> Option<u64> {
     marker_gas(e, INTERNAL_BRIDGE_THROW_MARKER)
+}
+
+/// Build the internal (depth>1) throw error carrying its `requiredGas`.
+/// REMASC throws through it too, with its `getGasForData` of 0.
+pub fn internal_throw_marker_with_gas(gas: u64) -> PrecompileError {
+    marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas)
+}
+
+/// Marker for a contract's call to the Bridge that ends the contract itself,
+/// in every era: an exception `Program.callToPrecompiledAddress` lets out of
+/// the VM, which `VM.steps` turns into the failure of the program that made
+/// the call, all its gas spent. `Bridge.getGasForData` throws one for any
+/// call from a contract before RSKIP88, and before RSKIP150
+/// `Program.memorySave` throws one on the null a method with nothing to
+/// return answers.
+pub const CALLER_ABORT_MARKER: &str = "rskj bridge call ends its caller";
+
+/// Whether a Bridge error is [`CALLER_ABORT_MARKER`].
+pub fn ends_its_caller(e: &PrecompileError) -> bool {
+    matches!(e, PrecompileError::Other(msg) if msg == CALLER_ABORT_MARKER)
 }
 
 /// Marker prefix for the rskj `Program.callToPrecompiledAddress` insufficient-
@@ -662,30 +584,34 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
     call_kind: BridgeCallKind,
     call_value: U256,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // Empty input → releaseBtc (legacy behavior matching rskj)
-    if input.is_empty() {
-        let gas_cost = 23_000u64;
-        if gas_limit < gas_cost {
-            return Err(insufficient_gas_marker(ctx, gas_limit));
-        }
-        return execute_method(ctx, "releaseBtc", &[], gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx, caller, call_depth, call_value);
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    // rskj `BridgeUtils.isContractTx`: the Bridge was given an internal
+    // transaction, a contract's call.
+    let from_contract = call_depth > 1;
+
+    // rskj `Bridge.getGasForData` (Bridge.java:297): before RSKIP88 a call
+    // from a contract throws a NullPointerException before anything is charged
+    // or run. `Program.callToPrecompiledAddress` asks for the gas outside
+    // every try, so the exception leaves the VM whatever the era.
+    if from_contract && !hardfork_cfg.has_rskip88(block_number) {
+        return Err(PrecompileError::other(CALLER_ABORT_MARKER));
     }
 
-    // rskj Bridge.parseData: 1-3 byte data, an unknown selector, or a method
-    // not enabled at this block is a parse failure. Before RSKIP88 (orchid)
-    // execute() returns null — the tx SUCCEEDS, charged the flat releaseBtc
-    // cost without executing anything (mainnet #648,914 sent ASCII text as
-    // calldata). Afterwards it throws BridgeIllegalArgumentException.
-    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let parsed = if input.len() < 4 {
-        None
-    } else {
-        find_bridge_method(&[input[0], input[1], input[2], input[3]])
-            .filter(|m| m.enabled.is_enabled(hardfork_cfg, block_number))
+    // rskj Bridge.parseData: no data at all is releaseBtc with no arguments.
+    // 1-3 byte data, an unknown selector, or a method not enabled at this
+    // block is a parse failure. Before RSKIP88 (orchid) execute() returns
+    // null — the tx SUCCEEDS, charged the flat releaseBtc cost without
+    // executing anything (mainnet #648,914 sent ASCII text as calldata).
+    // Afterwards it throws BridgeIllegalArgumentException.
+    let parsed = match input.len() {
+        0 => find_bridge_method(&compute_selector("releaseBtc()")),
+        1..=3 => None,
+        _ => find_bridge_method(&[input[0], input[1], input[2], input[3]])
             // rskj `parseData` ABI-decodes the arguments; a malformed payload
             // (e.g. an out-of-bounds dynamic offset) is a parse failure too.
-            .filter(|m| abi_args_decode_ok(&input[4..], m.signature))
-    };
+            .filter(|m| abi_args_decode_ok(&input[4..], m.signature)),
+    }
+    .filter(|m| m.enabled.is_enabled(hardfork_cfg, block_number));
     let Some(method) = parsed else {
         // Which selector, and from where. A Bridge method that exists in rskj
         // and not here fails exactly like a malformed call, and the two are
@@ -732,7 +658,7 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
         return Err(marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas_cost));
     };
 
-    let args = &input[4..];
+    let args = input.get(4..).unwrap_or_default();
     let gas_cost = bridge_call_gas_cost(ctx, input, config, hardfork_cfg)?;
 
     if gas_limit < gas_cost {
@@ -742,15 +668,17 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
     // rskj `Bridge.validateCall` (Bridge.java:426) runs two gates after the gas
     // is charged, both throwing `BridgeIllegalArgumentException` → `VMException`
     // (consume `requiredGas`, CALL returns empty). The first is
-    // `validateLocalCall` (Bridge.java:431): post-RSKIP88, a LOCAL-ONLY method
+    // `validateLocalCall` (Bridge.java:431): from RSKIP88, a LOCAL-ONLY method
     // reached by a non-local call throws. Only `eth_call` is a local call, so
     // every on-chain CALL/transaction during block execution is non-local — a
     // local-only getter invoked on-chain always throws here and returns empty
     // (mainnet #6,223,900: a relay plain-CALLs `getFederationAddress`, which
-    // rskj empties so the relay's RETURNDATASIZE check sees 0).
+    // rskj empties so the relay's RETURNDATASIZE check sees 0). Before RSKIP88
+    // rskj does not ask, and a transaction's own call runs such a method.
     // `!isLocalCall()` in rskj's condition: a local call (eth_call,
     // estimateGas) reaches these getters, on-chain execution never does.
-    if !tx_ctx.local_call
+    if hardfork_cfg.has_rskip88(block_number)
+        && !tx_ctx.local_call
         && method_only_allows_local_calls(method.permission, hardfork_cfg, block_number)
     {
         use revm::context_interface::JournalTr;
@@ -760,18 +688,20 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
         return Err(marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas_cost));
     }
 
-    // rskj `Bridge.validateCallMessageType` (Bridge.java:446): after the gas is
-    // charged, a method reached via a call type it does not accept throws. The
-    // default is CALL-only; the read getters also accept STATICCALL; no method
-    // accepts DELEGATECALL/CALLCODE. The throw consumes `requiredGas` and the
-    // CALL returns zero (mainnet #6,223,797-adjacent #6,223,812: a relay
-    // DELEGATECALLs receiveHeader, which rskj rejects so RETURNDATASIZE is 0).
+    // rskj `Bridge.validateCallMessageType` (Bridge.java:446): from RSKIP417,
+    // after the gas is charged, a method reached via a call type it does not
+    // accept throws. The default is CALL-only; the read getters also accept
+    // STATICCALL; no method accepts DELEGATECALL/CALLCODE. The throw consumes
+    // `requiredGas` and the CALL returns zero (mainnet #6,223,797-adjacent
+    // #6,223,812: a relay DELEGATECALLs receiveHeader, which rskj rejects so
+    // RETURNDATASIZE is 0). Before RSKIP417 rskj does not ask, and every kind
+    // of call runs the method.
     let accepts_call = match call_kind {
         BridgeCallKind::Call => true,
         BridgeCallKind::StaticCall => method_allows_static_call(method.name),
         BridgeCallKind::DelegateOrCallCode => false,
     };
-    if !accepts_call {
+    if hardfork_cfg.has_rskip417(block_number) && !accepts_call {
         use revm::context_interface::JournalTr;
         if ctx.journal().depth() == 1 {
             return Err(marker_with_gas(INVISIBLE_EXCEPTION_MARKER, gas_cost));
@@ -779,7 +709,17 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
         return Err(marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas_cost));
     }
 
+    // What this call reads of the federation stored as the new one is what
+    // rskj's `save()` writes back, not what was read before it.
+    ctx.chain_mut().new_federation_read = false;
     let result = execute_method(ctx, method.name, args, gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx, caller, call_depth, call_value);
+    // rskj `Bridge.execute` ends a method that returns with `teardown`, whose
+    // `FederationStorageProviderImpl.saveNewFederation` writes back the new
+    // federation the method read, from RSKIP123 with all three keys of each
+    // member and its format version, however the cell held it.
+    if matches!(&result, Ok(output) if !output.reverted) && ctx.chain().new_federation_read {
+        federation::save_new_federation_multikey(ctx, hardfork_cfg, block_number);
+    }
     // rskj `Bridge.execute` wraps any method `RuntimeException` in a
     // `VMException`, which `TransactionExecutor.call` / `Program` then handle
     // by spending only `requiredGas` (the `getGasForData` cost) — NOT all the
@@ -787,6 +727,28 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
     // depth-aware markers so the precompile frame records exactly `gas_cost`.
     // (OOG and Fatal keep their original semantics.)
     match result {
+        // rskj `Bridge.calculateVoidReturnValue`: before RSKIP417 a method with
+        // nothing to return answers null. To a transaction's own call that is
+        // no output. A contract's call hands the null to the VM.
+        Ok(output)
+            if from_contract
+                && output.bytes.is_empty()
+                && !output.reverted
+                && !hardfork_cfg.has_rskip417(block_number) =>
+        {
+            if hardfork_cfg.has_rskip197(block_number) {
+                // `Program.executePrecompiledAndHandleError` passes it to
+                // `Memory.write`, which reads its length inside the try: the
+                // call fails for its `requiredGas`, its track rolled back.
+                Err(marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas_cost))
+            } else if hardfork_cfg.has_rskip150(block_number) {
+                // `Program.saveOutAfterExecution` skips a null.
+                Ok(output)
+            } else {
+                // `Program.memorySave` reads its length, outside any try.
+                Err(PrecompileError::other(CALLER_ABORT_MARKER))
+            }
+        }
         Err(e) if !e.is_oog() && !matches!(e, PrecompileError::Fatal(_)) => {
             use revm::context_interface::JournalTr;
             if ctx.journal().depth() == 1 {
@@ -820,6 +782,9 @@ pub fn bridge_call_gas_cost<CTX: crate::RskContextTr>(
     let selector = [input[0], input[1], input[2], input[3]];
     let Some(method) = find_bridge_method(&selector)
         .filter(|m| m.enabled.is_enabled(hardfork_cfg, block_number))
+        // getGasForData parses the call as execute() does, so arguments that
+        // do not decode cost the flat releaseBtc amount here too.
+        .filter(|m| abi_args_decode_ok(&input[4..], m.signature))
     else {
         return Ok(23_000);
     };
@@ -829,7 +794,7 @@ pub fn bridge_call_gas_cost<CTX: crate::RskContextTr>(
     let function_cost = match method.gas_cost {
         BridgeGasCost::Fixed(c) => c,
         BridgeGasCost::InputDependent => receive_headers_cost(args, hardfork_cfg, block_number),
-        BridgeGasCost::Dynamic => btc_tx_confirmations_cost(ctx, args, config),
+        BridgeGasCost::Dynamic => btc_tx_confirmations_cost(ctx, args, config, hardfork_cfg),
     };
     // rskj Bridge.getGasForData: totalCost = functionCost + data.length * 2
     Ok(function_cost.saturating_add(2 * input.len() as u64))
@@ -845,7 +810,10 @@ fn receive_headers_cost(args: &[u8], hardfork_cfg: &RskHardforkConfig, block_num
     let base: u64 = if rskip132 { 25_000 } else { 66_000 };
     let per_additional_header: u64 = if rskip132 { 3_500 } else { 1_650 };
 
-    match abi_array_len(args, 0) {
+    match crate::abi::Args::new(args)
+        .bytes_array(0)
+        .map(|headers| headers.len() as u64)
+    {
         Some(n) if n > 0 => base.saturating_add((n - 1).saturating_mul(per_additional_header)),
         _ => base,
     }
@@ -853,24 +821,37 @@ fn receive_headers_cost(args: &[u8], hardfork_cfg: &RskHardforkConfig, block_num
 
 /// rskj `BridgeSupport.getBtcTransactionConfirmationsGetCost`:
 /// 27_000 base + blockDepth * 315 + merkleBranchHashes * 144, falling back to
-/// the base cost when the block is unknown or too deep.
+/// the base cost when the block is unknown or too deep. It finds the block
+/// as the call does (`getBlockKeepingTestnetConsensus`).
 fn btc_tx_confirmations_cost<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
 ) -> u64 {
     const BASIC_COST: u64 = 27_000;
     const STEP_COST: u64 = 315;
     const DOUBLE_HASH_COST: u64 = 144;
 
     // args: bytes32 btcTxHash, bytes32 btcBlockHash, uint256 path, bytes32[] hashes
-    let (block_hash, branch_hashes) = match (args.get(32..64), abi_array_len(args, 96)) {
-        (Some(h), Some(n)) => (alloy_primitives::B256::from_slice(h), n),
+    let args = crate::abi::Args::new(args);
+    let (block_hash, branch_hashes) = match (args.bytes32(1), args.bytes32_array(3)) {
+        (Some(h), Some(hashes)) => (alloy_primitives::B256::from(h), hashes.len() as u64),
         _ => return BASIC_COST,
     };
 
+    // rskj seeds a store nothing has seeded yet before it looks the block up
+    // (`ensureBtcBlockStore`), so on an empty store the genesis block and
+    // the checkpoint are found. A transaction's own call keeps the seeding
+    // though it then runs out of gas, since rskj's `TransactionExecutor.go`
+    // commits what the store wrote (`btc_store::store_raw_bytes`); a
+    // contract's call that runs out of gas drops it. A store that can't be
+    // seeded is priced as it stands; the call then throws as it seeds.
+    let _ = crate::bridge::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg);
     let block_hash = crate::bridge::btc_chain::b256_to_bitcoin_hash(&block_hash);
-    let Some(block) = crate::bridge::btc_store::get_stored_block(ctx, &block_hash) else {
+    let Some(block) =
+        crate::bridge::btc_store::get_block_keeping_testnet_consensus(ctx, config, &block_hash)
+    else {
         return BASIC_COST;
     };
     let Some(head) = crate::bridge::btc_store::load_chain_head(ctx) else {
@@ -883,14 +864,6 @@ fn btc_tx_confirmations_cost<CTX: crate::RskContextTr>(
     }
 
     BASIC_COST + depth * STEP_COST + branch_hashes * DOUBLE_HASH_COST
-}
-
-/// Length of an ABI dynamic array whose offset word sits at `slot` in `args`.
-fn abi_array_len(args: &[u8], slot: usize) -> Option<u64> {
-    let offset = U256::from_be_slice(args.get(slot..slot + 32)?).try_into().ok()?;
-    let offset: usize = offset;
-    let len = args.get(offset..offset + 32)?;
-    Some(U256::from_be_slice(len).to::<u64>())
 }
 
 /// Dispatch to individual method handlers.
@@ -909,45 +882,82 @@ fn execute_method<CTX: crate::RskContextTr>(
     call_value: U256,
 ) -> Result<PrecompileOutput, PrecompileError> {
 
-    // rskj `Bridge.activeAndRetiringFederationOnly` authorization. The executor
-    // for `updateCollections` (always) and `receiveHeaders` (when not public,
-    // i.e. post-RSKIP200) throws a `VMException` when the call's sender is not a
-    // member of the active or retiring federation. Bridge.execute wraps that in
-    // a VMException which `executePrecompiledAndHandleError` turns into a
-    // rollback + stackPushZero (the call returns 0 / empty data) while still
-    // charging the full `requiredGas`. A relay contract forwarding the call is
-    // checked by its own address, so a non-federation caller is rejected with no
-    // state change and no event (mainnet #6,223,774 tx[1]: updateCollections via
-    // relay 0x82494fb1 must NOT emit the update_collections log).
-    let federation_only = match method_name {
-        "updateCollections" => true,
+    // rskj wraps four methods' executors in a check of the caller against the
+    // federations (BridgeMethods.java). `activeAndRetiringFederationOnly`
+    // guards `updateCollections` always, `receiveHeaders` when it isn't public
+    // and `registerBtcTransaction` until RSKIP199 makes it public.
+    // `activeRetiringAndProposedFederationOnly` guards `addSignature` at every
+    // height. Each throws a plain `VMException` for anyone else, which nothing
+    // answers with null before RSKIP88: `executePrecompiledAndHandleError`
+    // turns it into a rollback + stackPushZero (the call returns 0 / empty
+    // data) while still charging the full `requiredGas`. A relay contract
+    // forwarding the call is checked by its own address, so a non-federation
+    // caller is rejected with no state change and no event (mainnet #6,223,774
+    // tx[1]: updateCollections via relay 0x82494fb1 must NOT emit the
+    // update_collections log).
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let (federation_only, proposed_too) = match method_name {
+        "updateCollections" => (true, false),
         // receiveHeadersIsPublic() = RSKIP124 && !RSKIP200; restricted otherwise.
         #[allow(clippy::nonminimal_bool)] // mirrors the rskj formula above
-        "receiveHeaders" => {
-            let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-            !(hardfork_cfg.has_rskip124(block_number) && !hardfork_cfg.has_rskip200(block_number))
-        }
-        _ => false,
+        "receiveHeaders" => (
+            !(hardfork_cfg.has_rskip124(block_number) && !hardfork_cfg.has_rskip200(block_number)),
+            false,
+        ),
+        // registerBtcTransactionIsPublic() = RSKIP199.
+        "registerBtcTransaction" => (!hardfork_cfg.has_rskip199(block_number), false),
+        "addSignature" => (true, true),
+        _ => (false, false),
     };
     if federation_only {
-        let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-        if !peg::is_sender_active_or_retiring_fed_member(ctx, config, hardfork_cfg, block_number, caller) {
-            // BridgeIllegalArgumentException-equivalent: a non-OOG throw the
-            // execute_bridge wrapper maps to the depth-aware bridge-throw marker
-            // (rollback + only requiredGas spent).
+        let member = peg::is_sender_active_or_retiring_fed_member(
+            ctx,
+            config,
+            hardfork_cfg,
+            block_number,
+            caller,
+        ) || (proposed_too
+            && peg::is_sender_proposed_fed_member(ctx, hardfork_cfg, block_number, caller));
+        if !member {
+            // A non-OOG throw the execute_bridge wrapper maps to the
+            // depth-aware bridge-throw marker (rollback + only requiredGas
+            // spent).
             return Err(PrecompileError::other("Bridge: sender is not a federation member"));
         }
     }
 
+    // rskj hands the Bridge the transaction that called it. For a contract's
+    // call that is an internal transaction whose sender is the contract
+    // (`Program.callToPrecompiledAddress`), not the account that signed the
+    // transaction the block holds.
+    let as_called = BridgeTxContext {
+        rsk_sender: caller,
+        ..tx_ctx.clone()
+    };
+
     match method_name {
         // Phase 2: BTC header chain
-        "receiveHeader" => btc_chain::receive_header(ctx, args, gas_cost, config, use_v2, hardfork_cfg),
-        "receiveHeaders" => btc_chain::receive_headers(ctx, args, gas_cost, config, use_v2, hardfork_cfg),
-        "getBtcBlockchainBestChainHeight" => btc_chain::get_best_chain_height(ctx, gas_cost),
-        "getBtcBlockchainBestBlockHeader" => btc_chain::get_best_block_header(ctx, gas_cost),
-        "getBtcBlockchainBlockHeaderByHash" => btc_chain::get_block_header_by_hash(ctx, args, gas_cost),
-        "getBtcBlockchainBlockHeaderByHeight" => btc_chain::get_block_header_by_height(ctx, args, gas_cost),
-        "getBtcBlockchainParentBlockHeaderByHash" => btc_chain::get_parent_block_header_by_hash(ctx, args, gas_cost),
+        "receiveHeader" => {
+            btc_chain::receive_header(ctx, args, gas_cost, config, use_v2, hardfork_cfg)
+        }
+        "receiveHeaders" => {
+            btc_chain::receive_headers(ctx, args, gas_cost, config, use_v2, hardfork_cfg)
+        }
+        "getBtcBlockchainBestChainHeight" => {
+            btc_chain::get_best_chain_height(ctx, gas_cost, config, hardfork_cfg)
+        }
+        "getBtcBlockchainBestBlockHeader" => {
+            btc_chain::get_best_block_header(ctx, gas_cost, config, hardfork_cfg)
+        }
+        "getBtcBlockchainBlockHeaderByHash" => {
+            btc_chain::get_block_header_by_hash(ctx, args, gas_cost, config, hardfork_cfg)
+        }
+        "getBtcBlockchainBlockHeaderByHeight" => {
+            btc_chain::get_block_header_by_height(ctx, args, gas_cost, config, hardfork_cfg)
+        }
+        "getBtcBlockchainParentBlockHeaderByHash" => {
+            btc_chain::get_parent_block_header_by_hash(ctx, args, gas_cost, config, hardfork_cfg)
+        }
 
         // RSKIP502: the union bridge, authorized against the *immediate*
         // caller.
@@ -977,9 +987,37 @@ fn execute_method<CTX: crate::RskContextTr>(
         "setUnionBridgeTransferPermissions" => {
             union::set_transfer_permissions(ctx, args, gas_cost, hardfork_cfg, caller)
         }
+        // RSKIP529: the super and base events, written only by the union
+        // bridge contract, against the same immediate caller.
+        "getSuperEvent" => union::get_event(ctx, union::SUPER_EVENT_KEY, gas_cost),
+        "setSuperEvent" => union::set_event(
+            ctx,
+            union::SUPER_EVENT_KEY,
+            args,
+            gas_cost,
+            hardfork_cfg,
+            caller,
+        ),
+        "clearSuperEvent" => {
+            union::clear_event(ctx, union::SUPER_EVENT_KEY, gas_cost, hardfork_cfg, caller)
+        }
+        "getBaseEvent" => union::get_event(ctx, union::BASE_EVENT_KEY, gas_cost),
+        "setBaseEvent" => union::set_event(
+            ctx,
+            union::BASE_EVENT_KEY,
+            args,
+            gas_cost,
+            hardfork_cfg,
+            caller,
+        ),
+        "clearBaseEvent" => {
+            union::clear_event(ctx, union::BASE_EVENT_KEY, gas_cost, hardfork_cfg, caller)
+        }
 
         // Phase 3: BTC transaction verification
-        "registerBtcCoinbaseTransaction" => tx::register_btc_coinbase_transaction(ctx, args, gas_cost),
+        "registerBtcCoinbaseTransaction" => {
+            tx::register_btc_coinbase_transaction(ctx, args, gas_cost, config, hardfork_cfg)
+        }
         "hasBtcBlockCoinbaseTransactionInformation" => tx::has_btc_block_coinbase_info(ctx, args, gas_cost),
         "getBtcTransactionConfirmations" => {
             tx::get_btc_transaction_confirmations(ctx, args, gas_cost, config, use_v2, hardfork_cfg)
@@ -994,23 +1032,30 @@ fn execute_method<CTX: crate::RskContextTr>(
         "updateCollections" => peg::update_collections(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
         "addSignature" => peg::add_signature(ctx, args, gas_cost, config, hardfork_cfg),
 
-        // Phase 6: Governance
-        "createFederation" => governance::create_federation(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
-        "commitFederation" => governance::commit_federation(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
-        "rollbackFederation" => governance::rollback_federation(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
-        "addFederatorPublicKey" => governance::add_federator_public_key(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
-        "addFederatorPublicKeyMultikey" => governance::add_federator_public_key_multikey(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
-        "voteFeePerKbChange" => governance::vote_fee_per_kb_change(ctx, args, gas_cost, config, tx_ctx),
-        "increaseLockingCap" => governance::increase_locking_cap(ctx, args, gas_cost, config, tx_ctx),
-        "addLockWhitelistAddress" => governance::add_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
-        "addOneOffLockWhitelistAddress" => governance::add_one_off_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
-        "addUnlimitedLockWhitelistAddress" => governance::add_unlimited_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
-        "removeLockWhitelistAddress" => governance::remove_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
-        "setLockWhitelistDisableBlockDelay" => governance::set_lock_whitelist_disable_block_delay(ctx, args, gas_cost, config, tx_ctx),
+        // Phase 6: Governance, each method of which asks an authorizer about
+        // the transaction it was called by: `as_called`.
+        "createFederation" => governance::create_federation(ctx, gas_cost, config, hardfork_cfg, &as_called),
+        "commitFederation" => governance::commit_federation(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
+        "rollbackFederation" => governance::rollback_federation(ctx, gas_cost, config, hardfork_cfg, &as_called),
+        "addFederatorPublicKey" => governance::add_federator_public_key(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
+        "addFederatorPublicKeyMultikey" => governance::add_federator_public_key_multikey(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
+        "voteFeePerKbChange" => governance::vote_fee_per_kb_change(ctx, args, gas_cost, config, &as_called),
+        "increaseLockingCap" => governance::increase_locking_cap(ctx, args, gas_cost, config, &as_called),
+        "addLockWhitelistAddress" => governance::add_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
+        "addOneOffLockWhitelistAddress" => governance::add_one_off_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
+        "addUnlimitedLockWhitelistAddress" => governance::add_unlimited_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
+        "removeLockWhitelistAddress" => governance::remove_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
+        "setLockWhitelistDisableBlockDelay" => {
+            governance::set_lock_whitelist_disable_block_delay(ctx, args, gas_cost, config, hardfork_cfg, &as_called)
+        }
 
         // Transaction-callable read-only
-        "getActivePowpegRedeemScript" => governance::get_active_powpeg_redeem_script(ctx, gas_cost),
-        "getActiveFederationCreationBlockHeight" => governance::get_active_federation_creation_block_height(ctx, gas_cost),
+        "getActivePowpegRedeemScript" => {
+            governance::get_active_powpeg_redeem_script(ctx, gas_cost, config, hardfork_cfg)
+        }
+        "getActiveFederationCreationBlockHeight" => {
+            governance::get_active_federation_creation_block_height(ctx, gas_cost, config, hardfork_cfg)
+        }
         "getNextPegoutCreationBlockNumber" => peg::get_next_pegout_creation_block_number(ctx, gas_cost),
         "getQueuedPegoutsCount" => peg::get_queued_pegouts_count(ctx, gas_cost),
         "getEstimatedFeesForNextPegOutEvent" => {
@@ -1040,14 +1085,18 @@ fn execute_method<CTX: crate::RskContextTr>(
         "getPendingFederationHash" => getters::get_pending_federation_hash(ctx, gas_cost),
         "getPendingFederatorPublicKey" => getters::get_pending_federator_public_key(ctx, args, gas_cost),
         "getPendingFederatorPublicKeyOfType" => getters::get_pending_federator_public_key_of_type(ctx, args, gas_cost),
-        "getProposedFederationAddress" => getters::get_proposed_federation_address(ctx, gas_cost, config),
+        "getProposedFederationAddress" => {
+            getters::get_proposed_federation_address(ctx, gas_cost, config, hardfork_cfg)
+        }
         "getProposedFederationSize" => getters::get_proposed_federation_size(ctx, gas_cost),
         "getProposedFederationCreationTime" => getters::get_proposed_federation_creation_time(ctx, gas_cost),
         "getProposedFederationCreationBlockNumber" => getters::get_proposed_federation_creation_block_number(ctx, gas_cost),
         "getProposedFederatorPublicKeyOfType" => getters::get_proposed_federator_public_key_of_type(ctx, args, gas_cost),
-        "getLockWhitelistSize" => getters::get_lock_whitelist_size(ctx, gas_cost),
-        "getLockWhitelistAddress" => getters::get_lock_whitelist_address(ctx, args, gas_cost, config),
-        "getLockWhitelistEntryByAddress" => getters::get_lock_whitelist_entry_by_address(ctx, args, gas_cost, config),
+        "getLockWhitelistSize" => getters::get_lock_whitelist_size(ctx, gas_cost, hardfork_cfg),
+        "getLockWhitelistAddress" => getters::get_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg),
+        "getLockWhitelistEntryByAddress" => {
+            getters::get_lock_whitelist_entry_by_address(ctx, args, gas_cost, config, hardfork_cfg)
+        }
         "getBtcTxHashProcessedHeight" => getters::get_btc_tx_hash_processed_height(ctx, args, gas_cost),
         "isBtcTxHashAlreadyProcessed" => getters::is_btc_tx_hash_already_processed(ctx, args, gas_cost),
         "getBtcBlockchainInitialBlockHeight" => btc_chain::get_initial_block_height(gas_cost, config),
@@ -1056,7 +1105,7 @@ fn execute_method<CTX: crate::RskContextTr>(
         "getBtcBlockchainBlockLocator" => btc_chain::get_block_locator(ctx, gas_cost, config, hardfork_cfg),
         "getStateForBtcReleaseClient" => getters::get_state_for_btc_release_client(ctx, gas_cost),
         "getStateForSvpClient" => getters::get_state_for_svp_client(ctx, gas_cost),
-        "getStateForDebugging" => getters::get_state_for_debugging(ctx, gas_cost, hardfork_cfg),
+        "getStateForDebugging" => getters::get_state_for_debugging(ctx, gas_cost, config, hardfork_cfg),
 
         // Every method in `bridge_method_table` must appear above. A name that
         // reaches here is a table entry with no implementation, which is a bug
@@ -1093,6 +1142,21 @@ fn unimplemented_method(method: &str) -> Result<PrecompileOutput, PrecompileErro
 mod tests {
     use super::*;
 
+    /// The decoder reads every type the method table's signatures use, so no
+    /// method is turned away for its types alone.
+    #[test]
+    fn the_decoder_reads_every_signature_in_the_method_table() {
+        for method in BRIDGE_METHODS.iter() {
+            assert!(
+                crate::abi::Args::new(&[])
+                    .decode(method.signature)
+                    .is_some(),
+                "{}",
+                method.signature
+            );
+        }
+    }
+
     /// Every method in the table must have a dispatch arm, or be one of the
     /// four that are deliberately unimplemented.
     ///
@@ -1109,15 +1173,18 @@ mod tests {
     /// the failure it exists to catch.
     #[test]
     fn bridge_method_table_is_fully_dispatched() {
-        const SOURCE: &str = include_str!("mod.rs");
-        let start = SOURCE
+        // Read as LF whatever the checkout wrote: on a Windows checkout with
+        // CRLF endings the search below found nothing, and the test failed
+        // on a source that was fine.
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
+        let start = source
             .find("    match method_name {\n        // Phase 2: BTC header chain")
             .expect("dispatch match not found -- did its shape change?");
-        let end = SOURCE[start..]
+        let end = source[start..]
             .find("        _ => unimplemented_method(method_name),")
             .expect("dispatch default arm not found")
             + start;
-        let dispatch = &SOURCE[start..end];
+        let dispatch = &source[start..end];
 
         /// Every method in the table is implemented as of issue #97. The list
         /// stays as the place to name one that is not, so that "unimplemented"
@@ -1146,15 +1213,17 @@ mod tests {
     }
 
     #[test]
-    fn method_table_has_77_entries() {
+    fn method_table_has_83_entries() {
         // 69 pre-vetiver methods + getEstimatedFeesForPegOutAmount (RSKIP540)
-        // + the seven union bridge methods (RSKIP502, reed810).
-        assert_eq!(BRIDGE_METHODS.len(), 77);
+        // + the seven union bridge methods (RSKIP502, reed810) + its six
+        // event methods (RSKIP529, reed810): BridgeMethods of rskj's release
+        // VETIVER-9.0.4, whole.
+        assert_eq!(BRIDGE_METHODS.len(), 83);
     }
 
     #[test]
-    fn selector_map_has_77_entries() {
-        assert_eq!(BRIDGE_SELECTOR_MAP.len(), 77);
+    fn selector_map_has_83_entries() {
+        assert_eq!(BRIDGE_SELECTOR_MAP.len(), 83);
     }
 
     #[test]
@@ -1259,6 +1328,26 @@ mod tests {
         assert!(method_allows_static_call("getFederationAddress"));
         assert!(method_allows_static_call("getBtcTransactionConfirmations"));
         assert!(method_allows_static_call("isBtcTxHashAlreadyProcessed"));
+        // The union bridge's getters are rskj's ALLOW_STATIC_CALL too, and
+        // its four mutators are not.
+        assert!(method_allows_static_call("getUnionBridgeContractAddress"));
+        assert!(method_allows_static_call("getUnionBridgeLockingCap"));
+        assert!(!method_allows_static_call("increaseUnionBridgeLockingCap"));
+        assert!(!method_allows_static_call("requestUnionBridgeRbtc"));
+        // RSKIP529: the event getters may be static-called, setting and
+        // clearing may not.
+        assert!(method_allows_static_call("getSuperEvent"));
+        assert!(method_allows_static_call("getBaseEvent"));
+        assert!(!method_allows_static_call("setSuperEvent"));
+        assert!(!method_allows_static_call("clearBaseEvent"));
+
+        // rskj's BridgeMethods marks 54 methods ALLOW_STATIC_CALL (counted
+        // from its enum, VETIVER-9.0.4), and this table names every one.
+        let static_callable = BRIDGE_METHODS
+            .iter()
+            .filter(|m| method_allows_static_call(m.name))
+            .count();
+        assert_eq!(static_callable, 54);
     }
 
     /// rskj `validateLocalCall`: a local-only getter reached by an on-chain call
@@ -1289,6 +1378,48 @@ mod tests {
         assert!(!method_only_allows_local_calls(dynm.permission, &cfg, post_iris));
     }
 
+    /// The union bridge's selectors follow reed810's schedule, which mainnet
+    /// never sets. Its vetiver900 outranks reed810, so the upgrade-order gate
+    /// these had made them methods on mainnet from #8,804,200, where rskj's
+    /// `parseData` finds no method: a call to one would have forked the node.
+    #[test]
+    fn the_union_bridge_is_never_a_method_on_mainnet() {
+        use crate::hardfork::RskHardforkConfig;
+        let mainnet = RskHardforkConfig::mainnet();
+        let testnet = RskHardforkConfig::testnet();
+        for signature in [
+            "setUnionBridgeContractAddressForTestnet(address)",
+            "getUnionBridgeContractAddress()",
+            "getUnionBridgeLockingCap()",
+            "increaseUnionBridgeLockingCap(uint256)",
+            "requestUnionBridgeRbtc(uint256)",
+            "releaseUnionBridgeRbtc()",
+            "setUnionBridgeTransferPermissions(bool,bool)",
+            "getSuperEvent()",
+            "setSuperEvent(bytes)",
+            "clearSuperEvent()",
+            "getBaseEvent()",
+            "setBaseEvent(bytes)",
+            "clearBaseEvent()",
+        ] {
+            let m = find_bridge_method(&compute_selector(signature)).unwrap();
+            for n in [8_804_199, 8_804_200, 9_500_000, u64::MAX] {
+                assert!(
+                    !m.enabled.is_enabled(&mainnet, n),
+                    "{signature} on mainnet at #{n}"
+                );
+            }
+            assert!(
+                !m.enabled.is_enabled(&testnet, 7_139_599),
+                "{signature} before reed810"
+            );
+            assert!(
+                m.enabled.is_enabled(&testnet, 7_139_600),
+                "{signature} at testnet's reed810"
+            );
+        }
+    }
+
     /// A well-formed `receiveHeaders(bytes[])` with one empty header element
     /// must decode successfully (no false parse failure).
     #[test]
@@ -1311,9 +1442,10 @@ mod tests {
             .filter(|m| m.permission == BridgePermission::TransactionCallable)
             .count();
         assert_eq!(
-            count, 39,
+            count, 45,
             "31 pre-vetiver methods with fixedPermission(false), \
-             getEstimatedFeesForPegOutAmount, and the seven union bridge methods"
+             getEstimatedFeesForPegOutAmount, the seven union bridge methods \
+             and its six event methods"
         );
     }
 
@@ -1343,22 +1475,327 @@ mod tests {
         assert_eq!(m.name, "releaseBtc");
     }
 
+    fn mainnet_at(
+        block_number: u64,
+    ) -> revm::Context<
+        revm::context::BlockEnv,
+        revm::context::TxEnv,
+        revm::context::CfgEnv,
+        revm::database::EmptyDB,
+        revm::Journal<revm::database::EmptyDB>,
+        crate::raw_storage::RskChainExt,
+    > {
+        use revm::MainContext;
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        ctx.block.number = U256::from(block_number);
+        ctx
+    }
+
+    /// Whether `method`, called by `caller` with no arguments, is turned down
+    /// as rskj's federation-only executors turn down a caller who is in none
+    /// of the federations they name.
+    fn turned_down_as_a_stranger<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        method: &str,
+        caller: alloy_primitives::Address,
+    ) -> bool {
+        let (config, cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+        let tx_ctx = BridgeTxContext {
+            rsk_sender: caller,
+            ..Default::default()
+        };
+        let result = execute_method(
+            ctx,
+            method,
+            &[],
+            0,
+            &config,
+            None,
+            cfg.has_stored_block_v2(block_number),
+            &cfg,
+            &tx_ctx,
+            caller,
+            0,
+            U256::ZERO,
+        );
+        result.is_err_and(|e| format!("{e:?}").contains("not a federation member"))
+    }
+
+    /// rskj gives four methods an executor that throws a `VMException` for a
+    /// caller outside the federations (BridgeMethods.java): `addSignature` at
+    /// every height, `registerBtcTransaction` until RSKIP199 makes it public,
+    /// `receiveHeaders` while it isn't public, and `updateCollections`.
+    #[test]
+    fn the_federations_methods_turn_a_stranger_down() {
+        let config = BridgeConstants::mainnet();
+        // With no federation stored yet the genesis federation is the active one.
+        let member =
+            federation::rsk_address_from_public_key(&peg::genesis_federation_keys(&config)[0])
+                .unwrap();
+        let stranger = alloy_primitives::Address::repeat_byte(0x99);
+
+        for block_number in [1, 3_000_000, 8_000_000] {
+            let mut ctx = mainnet_at(block_number);
+            assert!(turned_down_as_a_stranger(
+                &mut ctx,
+                "addSignature",
+                stranger
+            ));
+            assert!(!turned_down_as_a_stranger(&mut ctx, "addSignature", member));
+            assert!(turned_down_as_a_stranger(
+                &mut ctx,
+                "updateCollections",
+                stranger
+            ));
+        }
+
+        // RSKIP199 is iris300's, at 3,614,800.
+        let mut before = mainnet_at(3_614_799);
+        assert!(turned_down_as_a_stranger(
+            &mut before,
+            "registerBtcTransaction",
+            stranger
+        ));
+        assert!(!turned_down_as_a_stranger(
+            &mut before,
+            "registerBtcTransaction",
+            member
+        ));
+        let mut from = mainnet_at(3_614_800);
+        assert!(!turned_down_as_a_stranger(
+            &mut from,
+            "registerBtcTransaction",
+            stranger
+        ));
+    }
+
+    /// `activeRetiringAndProposedFederationOnly` also admits a member of the
+    /// proposed federation, which exists from RSKIP419 (lovell700, 7,338,024).
+    /// `activeAndRetiringFederationOnly` doesn't.
+    #[test]
+    fn add_signature_admits_a_member_of_the_proposed_federation() {
+        let key = |hex: &str| -> [u8; 33] {
+            alloy_primitives::hex::decode(hex)
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        // The curve's generator and its double.
+        let g = key("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+        let two_g = key("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5");
+        let proposed = federation::StoredMember {
+            btc: g,
+            rsk: two_g,
+            mst: g,
+        };
+        let caller = federation::rsk_address_from_public_key(&two_g).unwrap();
+
+        for (block_number, admitted) in [(7_338_023, false), (7_338_024, true)] {
+            let mut ctx = mainnet_at(block_number);
+            let stored = federation::serialize_federation_multikey(
+                std::slice::from_ref(&proposed),
+                1_700_000_000_000,
+                7_000_000,
+            );
+            storage::bridge_store_bytes_named(&mut ctx, storage::PROPOSED_FEDERATION_KEY, &stored);
+            assert_eq!(
+                !turned_down_as_a_stranger(&mut ctx, "addSignature", caller),
+                admitted,
+                "at {block_number}"
+            );
+            assert!(turned_down_as_a_stranger(
+                &mut ctx,
+                "updateCollections",
+                caller
+            ));
+        }
+    }
+
+    /// rskj hands the Bridge the transaction that called it: for a contract's
+    /// call, an internal one whose sender is the contract
+    /// (`Program.callToPrecompiledAddress`). The governance methods ask their
+    /// authorizers about that sender, so an authorizer's key is not authorized
+    /// from behind a contract that forwards its call.
+    #[test]
+    fn governance_authorizes_the_caller_not_the_transactions_sender() {
+        use crate::abi::encode::{self, Arg};
+        let (config, cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        let address_of = |key: &str| {
+            let key = alloy_primitives::hex::decode(key).unwrap();
+            federation::rsk_address_from_public_key(&key).unwrap()
+        };
+        let forwarder = alloy_primitives::Address::repeat_byte(0x77);
+        let code = |method: &str, args: &[u8], origin, caller| {
+            let mut ctx = mainnet_at(1);
+            let tx_ctx = BridgeTxContext {
+                rsk_sender: origin,
+                ..Default::default()
+            };
+            let out = execute_method(
+                &mut ctx,
+                method,
+                args,
+                0,
+                &config,
+                None,
+                false,
+                &cfg,
+                &tx_ctx,
+                caller,
+                0,
+                U256::ZERO,
+            )
+            .unwrap();
+            i64::from_be_bytes(out.bytes[24..32].try_into().unwrap())
+        };
+
+        let authorizer = address_of(config.federation_change_authorizer_keys[0]);
+        assert_eq!(code("createFederation", &[], authorizer, authorizer), 1);
+        assert_eq!(code("createFederation", &[], authorizer, forwarder), -10);
+        assert_eq!(code("createFederation", &[], forwarder, authorizer), 1);
+
+        let fee_authorizer = address_of(config.fee_per_kb_authorizer_keys[0]);
+        let fee = encode::args(&[Arg::Word(encode::int(1_000))]);
+        assert_eq!(
+            code("voteFeePerKbChange", &fee, fee_authorizer, fee_authorizer),
+            1
+        );
+        assert_eq!(
+            code("voteFeePerKbChange", &fee, fee_authorizer, forwarder),
+            -10
+        );
+    }
+
     /// rskj Bridge.receiveHeadersGetCost groundtruth: 22_000 pre-RSKIP124;
     /// post-RSKIP132 (mainnet wasabi100) 25_000 + (n-1) * 3_500.
     #[test]
     fn receive_headers_cost_matches_rskj() {
         let cfg = crate::hardfork::RskHardforkConfig::mainnet();
 
-        // ABI bytes[] with 3 entries: offset word + length word (entries not needed)
-        let mut args = vec![0u8; 64];
-        args[31] = 0x20; // offset 32
-        args[63] = 3;    // length 3
+        // Three headers. rskj counts the decoded array, so a count the
+        // entries do not back is not three headers but a parse failure.
+        use crate::abi::encode::{self, Arg};
+        let header: &[u8] = &[0u8; 80];
+        let args = encode::args(&[Arg::BytesArray(&[header, header, header])]);
 
         // Pre-wasabi100: flat 22_000 regardless of header count.
         assert_eq!(receive_headers_cost(&args, &cfg, 1_590_999), 22_000);
         // Post-wasabi100 (rskip124+132 both active on mainnet): 25_000 + 2*3_500.
         assert_eq!(receive_headers_cost(&args, &cfg, 1_591_000), 32_000);
-        // Unparseable args fall back to the base cost.
+        // No headers, which is what an empty payload decodes to, is the base
+        // cost, and so is a payload that does not decode.
         assert_eq!(receive_headers_cost(&[], &cfg, 1_591_000), 25_000);
+        assert_eq!(receive_headers_cost(&args[..64], &cfg, 1_591_000), 25_000);
+    }
+
+    /// rskj's `getBtcTransactionConfirmationsGetCost` seeds the BTC store
+    /// before it looks the block up (`ensureBtcBlockStore`), so on an empty
+    /// regtest store the genesis block is found at depth 0, and the branch is
+    /// charged for. Unseeded, it wasn't found: the base cost alone.
+    #[test]
+    fn the_confirmations_cost_seeds_an_empty_store_first() {
+        use crate::abi::encode::{self, Arg};
+        use revm::MainContext;
+        let (config, cfg) = (BridgeConstants::regtest(), RskHardforkConfig::regtest());
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        let block_hash = btc_chain::bitcoin_hash_to_b256(&genesis.block_hash());
+        let args = encode::args(&[
+            Arg::Word([0x11; 32]),
+            Arg::Word(block_hash.0),
+            Arg::Word(encode::int(0)),
+            Arg::Words(&[[0x22; 32], [0x33; 32]]),
+        ]);
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        assert_eq!(
+            btc_tx_confirmations_cost(&mut ctx, &args, &config, &cfg),
+            27_000 + 2 * 144
+        );
+    }
+
+    /// rskj `BuildBlockThatKeepsTestnetConsensusTests`: at testnet's block
+    /// #5,148,285, `getBtcTransactionConfirmations` and its cost find Bitcoin
+    /// block `00000000e8e7...f379`, which the store doesn't hold, as rskj's
+    /// hard-coded block at 2,817,125. Under a head at 2,817,200 the cost
+    /// charges its depth. On a fresh store, whose head is below it, the call
+    /// can't look up the main chain at its height and answers -3. At any other
+    /// block, or on mainnet, the block isn't found.
+    #[test]
+    fn the_confirmations_keep_testnet_consensus_at_5_148_285() {
+        use crate::abi::encode::{self, Arg};
+        use revm::MainContext;
+        let hard_coded: bitcoin::BlockHash =
+            "00000000e8e7b540df01a7067e020fd7e2026bf86289def2283a35120c1af379"
+                .parse()
+                .unwrap();
+        let args = encode::args(&[
+            Arg::Word([0x11; 32]),
+            Arg::Word(btc_chain::bitcoin_hash_to_b256(&hard_coded).0),
+            Arg::Word(encode::int(0)),
+            Arg::Words(&[]),
+        ]);
+        let (testnet, mainnet) = (BridgeConstants::testnet(), BridgeConstants::mainnet());
+        let cfg = RskHardforkConfig::testnet();
+        let ctx_at = |number: u64| {
+            let mut ctx =
+                revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+            ctx.block.number = alloy_primitives::U256::from(number);
+            ctx
+        };
+
+        // rskj's header is the block it names.
+        let block = btc_store::get_block_keeping_testnet_consensus(
+            &mut ctx_at(5_148_285),
+            &testnet,
+            &hard_coded,
+        )
+        .expect("the hard-coded block");
+        assert_eq!((block.block_hash(), block.height), (hard_coded, 2_817_125));
+        for (number, config) in [
+            (5_148_284, &testnet),
+            (5_148_286, &testnet),
+            (5_148_285, &mainnet),
+        ] {
+            let mut ctx = ctx_at(number);
+            assert!(
+                btc_store::get_block_keeping_testnet_consensus(&mut ctx, config, &hard_coded)
+                    .is_none()
+            );
+        }
+
+        // The cost, under rskj's test's head: Bitcoin testnet's block 2,817,200.
+        let head = btc_store::StoredBlock::new(
+            bitcoin::consensus::deserialize(
+                &alloy_primitives::hex::decode("0000642d6b8df2c8ae4a20e20a10ae3b34e485701b8ae7e80ede0828040000000000000063a17c3e5063da2f8f952e496beee729932d35f62c0765baaf12f32931f01c9b49354f66ecd410190f25f402").unwrap(),
+            )
+            .unwrap(),
+            2_817_200,
+            alloy_primitives::U256::from(1),
+        );
+        let cost_at = |number: u64| {
+            let mut ctx = ctx_at(number);
+            btc_store::store_chain_head(&mut ctx, &head, cfg.has_stored_block_v2(number));
+            btc_tx_confirmations_cost(&mut ctx, &args, &testnet, &cfg)
+        };
+        assert_eq!(cost_at(5_148_285), 27_000 + (2_817_200 - 2_817_125) * 315);
+        assert_eq!(cost_at(5_148_286), 27_000);
+
+        // The call, on a fresh store.
+        let answer_at = |number: u64| {
+            let out = tx::get_btc_transaction_confirmations(
+                &mut ctx_at(number),
+                &args,
+                0,
+                &testnet,
+                cfg.has_stored_block_v2(number),
+                &cfg,
+            )
+            .unwrap();
+            i64::from_be_bytes(out.bytes[24..32].try_into().unwrap())
+        };
+        assert_eq!(answer_at(5_148_285), -3);
+        assert_eq!(answer_at(5_148_286), -1);
     }
 }

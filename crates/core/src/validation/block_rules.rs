@@ -10,6 +10,7 @@ use super::{BlockValidator, HeaderValidator, ParentHeaderValidator, ValidationEr
 use crate::types::block::Block;
 use crate::types::header::Header;
 use alloy_primitives::U256;
+use num_bigint::BigUint;
 
 /// The REMASC contract address (`…01000008`), which the synthetic last
 /// transaction of every RSK block is sent to. Mirrors
@@ -19,33 +20,32 @@ pub(crate) const REMASC_ADDR: [u8; 20] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x00, 0x08,
 ];
 
-/// rskj `RemascTransaction`: `to == REMASC_ADDR`, zero signature, zero gas
-/// limit. Same predicate `BlockProcessor::is_remasc_tx` uses to skip sender
-/// recovery.
-fn is_remasc_tx(tx: &crate::types::transaction::Transaction) -> bool {
-    tx.v == 0
-        && tx.r.is_zero()
-        && tx.s.is_zero()
-        && tx.gas_limit.is_zero()
-        && tx.to.len() == 20
-        && tx.to.as_ref() == REMASC_ADDR
+/// Whether `block`'s transaction at `index` is its REMASC transaction, which
+/// rskj makes a `RemascTransaction` (`Transaction.isRemascTransaction`): only
+/// the last can be.
+fn is_remasc(block: &Block, index: usize) -> bool {
+    block.transactions[index].is_remasc(index, block.transactions.len())
 }
 
 /// rskj `TxsMinGasPriceRule`: every non-REMASC transaction must pay at least
 /// the block's `minimumGasPrice`. Unconditional — no activation gate.
+///
+/// A minimum past 256 bits is `U256::MAX` here. No transaction's price
+/// reaches either, since a block's transactions pay under 2^255
+/// (`Transaction::from_rskj`), so the rule decides as rskj's does.
 pub struct TxsMinGasPriceRule;
 
 impl BlockValidator for TxsMinGasPriceRule {
     fn validate_block(&self, block: &Block) -> Result<(), ValidationError> {
         let min = block.header.minimum_gas_price;
-        for tx in &block.transactions {
-            if is_remasc_tx(tx) {
+        for (index, tx) in block.transactions.iter().enumerate() {
+            if is_remasc(block, index) {
                 continue;
             }
             if tx.gas_price < min {
                 return Err(ValidationError::TxGasPriceBelowMinimum {
                     tx_gas_price: tx.gas_price,
-                    block_minimum: min,
+                    block_minimum: block.header.minimum_gas_price_value(),
                 });
             }
         }
@@ -80,8 +80,8 @@ impl BlockValidator for BlockTxsMaxGasPriceRule {
             return Ok(());
         }
         let cap = min.saturating_mul(U256::from(Self::FOR_BLOCK_MULTIPLIER));
-        for tx in &block.transactions {
-            if is_remasc_tx(tx) {
+        for (index, tx) in block.transactions.iter().enumerate() {
+            if is_remasc(block, index) {
                 continue;
             }
             if tx.gas_price > cap {
@@ -101,8 +101,8 @@ pub struct RemascValidationRule;
 
 impl BlockValidator for RemascValidationRule {
     fn validate_block(&self, block: &Block) -> Result<(), ValidationError> {
-        match block.transactions.last() {
-            Some(tx) if is_remasc_tx(tx) => Ok(()),
+        match block.transactions.len().checked_sub(1) {
+            Some(last) if is_remasc(block, last) => Ok(()),
             _ => Err(ValidationError::RemascTxMissing),
         }
     }
@@ -143,20 +143,26 @@ impl HeaderValidator for ExtraDataRule {
 ///   upper = center + delta
 ///   lower = max(0, center - delta)
 /// ```
-/// and the header's value must lie in `[lower, upper]` inclusive.
+/// and the header's value must lie in `[lower, upper]` inclusive. rskj
+/// computes it in `Coin`, a `BigInteger`, and nothing bounds the price from
+/// above, so both are read whole, of any size.
 pub struct PrevMinGasPriceRule;
 
 impl PrevMinGasPriceRule {
     /// The inclusive `[lower, upper]` band a child's minimum gas price may
     /// occupy, given the parent's.
-    pub fn range(parent_min_gas_price: U256) -> (U256, U256) {
+    pub fn range(parent_min_gas_price: &BigUint) -> (BigUint, BigUint) {
         let center = parent_min_gas_price;
-        let mut delta = center / U256::from(100u64);
-        if delta.is_zero() {
-            delta = U256::from(1u64);
+        let mut delta = center / 100u32;
+        if delta == BigUint::ZERO {
+            delta = BigUint::from(1u32);
         }
-        let upper = center.saturating_add(delta);
-        let lower = center.saturating_sub(delta);
+        let upper = center + &delta;
+        let lower = if *center >= delta {
+            center - &delta
+        } else {
+            BigUint::ZERO
+        };
         (lower, upper)
     }
 }
@@ -166,8 +172,8 @@ impl ParentHeaderValidator for PrevMinGasPriceRule {
         if header.number == 0 {
             return Ok(());
         }
-        let (lower, upper) = Self::range(parent.minimum_gas_price);
-        let got = header.minimum_gas_price;
+        let (lower, upper) = Self::range(&parent.minimum_gas_price_value());
+        let got = header.minimum_gas_price_value();
         if got < lower || got > upper {
             return Err(ValidationError::MinGasPriceOutOfRange { lower, upper, got });
         }
@@ -207,22 +213,12 @@ mod tests {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         }
     }
 
     fn remasc_tx() -> Transaction {
-        Transaction {
-            nonce: 0,
-            gas_price: U256::ZERO,
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(&REMASC_ADDR),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
-        }
+        Transaction::remasc(9_000_000)
     }
 
     fn user_tx(gas_price: u64) -> Transaction {
@@ -258,9 +254,15 @@ mod tests {
             Err(ValidationError::TxGasPriceBelowMinimum { .. })
         ));
 
-        // The REMASC transaction pays nothing and is exempt.
+        // The REMASC transaction pays nothing and is exempt; one of its shape
+        // before the last is no REMASC transaction, and is not.
         let only_remasc = block_at(9_000_000, 100, vec![remasc_tx()]);
         assert!(TxsMinGasPriceRule.validate_block(&only_remasc).is_ok());
+        let early = block_at(9_000_000, 100, vec![remasc_tx(), user_tx(100), remasc_tx()]);
+        assert!(matches!(
+            TxsMinGasPriceRule.validate_block(&early),
+            Err(ValidationError::TxGasPriceBelowMinimum { .. })
+        ));
     }
 
     /// rskj `BlockTxsMaxGasPriceRule` + `TxGasPriceCap.FOR_BLOCK` (RSKIP252).
@@ -278,13 +280,47 @@ mod tests {
             Err(ValidationError::TxGasPriceAboveCap { .. })
         ));
 
-        // One block before fingerroot500 the rule does not apply.
+        // One block before fingerroot500 the rule does not apply, and from
+        // its first block it does.
         let pre = block_at(5_467_999, 100, vec![user_tx(10_001), remasc_tx()]);
         assert!(rule.validate_block(&pre).is_ok());
+        let first = block_at(5_468_000, 100, vec![user_tx(10_001), remasc_tx()]);
+        assert!(matches!(
+            rule.validate_block(&first),
+            Err(ValidationError::TxGasPriceAboveCap { .. })
+        ));
 
         // `isSurpassed` short-circuits when the block's minimum is zero.
         let zero_min = block_at(9_000_000, 0, vec![user_tx(u64::MAX), remasc_tx()]);
         assert!(rule.validate_block(&zero_min).is_ok());
+    }
+
+    /// The body rules a chain runs hold it to RSKIP252 from its own
+    /// fingerroot500 (`reference.conf`): mainnet's #5,468,000 and testnet's
+    /// #4,015,800, and not a block sooner.
+    #[test]
+    fn the_default_body_rules_cap_prices_from_each_chains_fingerroot500() {
+        use crate::config::ChainConfig;
+        use crate::validation::BlockVerifier;
+        let over = |number| block_at(number, 100, vec![user_tx(10_001), remasc_tx()]);
+        for (config, first) in [
+            (ChainConfig::mainnet(), 5_468_000),
+            (ChainConfig::testnet(), 4_015_800),
+        ] {
+            let verifier = BlockVerifier::default_rsk(&config);
+            assert!(
+                verifier.verify(&over(first - 1)).is_ok(),
+                "no cap at #{}",
+                first - 1
+            );
+            assert!(
+                matches!(
+                    verifier.verify(&over(first)),
+                    Err(ValidationError::TxGasPriceAboveCap { .. })
+                ),
+                "the cap from #{first}"
+            );
+        }
     }
 
     /// rskj `RemascValidationRule`.
@@ -328,15 +364,15 @@ mod tests {
     #[test]
     fn prev_min_gas_price_allows_one_percent_either_way() {
         // center 1000 -> delta 10 -> [990, 1010] inclusive.
-        let (lower, upper) = PrevMinGasPriceRule::range(U256::from(1000u64));
-        assert_eq!(lower, U256::from(990u64));
-        assert_eq!(upper, U256::from(1010u64));
+        let (lower, upper) = PrevMinGasPriceRule::range(&BigUint::from(1000u32));
+        assert_eq!(lower, BigUint::from(990u32));
+        assert_eq!(upper, BigUint::from(1010u32));
 
         // A zero parent still gets delta 1, so it can rise to 1 (and the lower
         // bound is clamped at zero rather than going negative).
-        let (lower, upper) = PrevMinGasPriceRule::range(U256::ZERO);
-        assert_eq!(lower, U256::ZERO);
-        assert_eq!(upper, U256::from(1u64));
+        let (lower, upper) = PrevMinGasPriceRule::range(&BigUint::ZERO);
+        assert_eq!(lower, BigUint::ZERO);
+        assert_eq!(upper, BigUint::from(1u32));
 
         let mut parent = bare_header(8_999_999);
         parent.minimum_gas_price = U256::from(1000u64);
@@ -358,6 +394,68 @@ mod tests {
             check(1011),
             Err(ValidationError::MinGasPriceOutOfRange { .. })
         ));
+    }
+
+    /// rskj computes the range in `BigInteger`, so it holds past 256 bits,
+    /// where the typed field holds `U256::MAX`: 1% either way, exactly.
+    #[test]
+    fn prev_min_gas_price_is_exact_past_256_bits() {
+        let two = BigUint::from(2u8);
+        let at = |number: u64, price: &BigUint| {
+            let mut header = bare_header(number);
+            header.set_minimum_gas_price(price);
+            header
+        };
+        let check = |parent: &BigUint, price: &BigUint| {
+            PrevMinGasPriceRule.validate_with_parent(&at(9_000_000, price), &at(8_999_999, parent))
+        };
+        // 1% of 100 * 2^294 + 12,345 is 2^294 + 123.
+        let parent = two.pow(294) * 100u32 + 12_345u32;
+        let lower = two.pow(294) * 99u32 + 12_222u32;
+        let upper = two.pow(294) * 101u32 + 12_468u32;
+        assert_eq!(
+            PrevMinGasPriceRule::range(&parent),
+            (lower.clone(), upper.clone())
+        );
+        for price in [&lower, &parent, &upper] {
+            assert_eq!(check(&parent, price), Ok(()));
+        }
+        assert_eq!(
+            check(&parent, &(&lower - 1u8)),
+            Err(ValidationError::MinGasPriceOutOfRange {
+                lower: lower.clone(),
+                upper: upper.clone(),
+                got: &lower - 1u8,
+            })
+        );
+        assert!(check(&parent, &(&upper + 1u8)).is_err());
+        // A parent under 2^256 that 100 divides: its child may rise past
+        // 2^256 by exactly 1%, and no further.
+        let parent = two.pow(256) - 36u8;
+        let upper = &parent / 100u32 * 101u32;
+        assert!(upper > two.pow(256));
+        assert_eq!(check(&parent, &upper), Ok(()));
+        assert!(check(&parent, &(&upper + 1u8)).is_err());
+    }
+
+    /// A minimum past 256 bits refuses every transaction but REMASC, as rskj's
+    /// does, and the refusal names the minimum whole.
+    #[test]
+    fn a_minimum_gas_price_past_256_bits_refuses_all_but_remasc() {
+        let minimum = BigUint::from(2u8).pow(300);
+        let mut block = block_at(9_000_000, 0, vec![remasc_tx()]);
+        block.header.set_minimum_gas_price(&minimum);
+        assert_eq!(TxsMinGasPriceRule.validate_block(&block), Ok(()));
+        let mut highest = user_tx(0);
+        highest.gas_price = (U256::from(1) << 255) - U256::from(1);
+        block.transactions.insert(0, highest.clone());
+        assert_eq!(
+            TxsMinGasPriceRule.validate_block(&block),
+            Err(ValidationError::TxGasPriceBelowMinimum {
+                tx_gas_price: highest.gas_price,
+                block_minimum: minimum,
+            })
+        );
     }
 }
 
@@ -381,10 +479,14 @@ pub const TX_EXECUTION_THREADS: usize = 2;
 
 /// Validates the sublist edges against the block's transaction count.
 ///
-/// `edges` is `None` for a version-0 header, and `Some(&[])` means "all
-/// transactions in the sequential sublist" — both are valid and both return
-/// `Ok`. The distinction is preserved because the two encode differently and
-/// therefore hash differently.
+/// `Some(&[])` means "all transactions in the sequential sublist", and is
+/// valid. `edges` is `None` for a header that has none: one from before the
+/// rule, or one whose extension came beside the block's body without them
+/// (rskj `BlockHeaderExtensionV1.fromEncoded`, `BlockHeaderExtensionV2`
+/// alike). rskj's rule reads `edges.length` with no null check, so where it
+/// is active a header without edges makes it throw, and the block is not
+/// imported. The distinction from empty is preserved because the two encode
+/// differently and therefore hash differently.
 pub fn validate_tx_execution_sublists_edges(
     edges: Option<&[i16]>,
     transaction_count: usize,
@@ -393,7 +495,11 @@ pub fn validate_tx_execution_sublists_edges(
     if !active {
         return Ok(());
     }
-    let Some(edges) = edges else { return Ok(()) };
+    let Some(edges) = edges else {
+        return Err(ValidationError::InvalidSublistEdges {
+            reason: "the header has no execution list edges".to_string(),
+        });
+    };
     if edges.is_empty() {
         return Ok(());
     }
@@ -472,12 +578,19 @@ mod sublist_edges_tests {
         assert!(check(Some(&[])).is_ok());
     }
 
-    /// A version-0 header has no edges at all. Distinct from empty, and also
-    /// valid -- the two encode and hash differently, so the distinction is
-    /// carried rather than flattened.
+    /// Not in rskj's suite. A header has no edges at all where its extension
+    /// came without them (`BlockHeaderExtensionV1.fromEncoded` gives null for
+    /// an extension of one element, `V2` for one of two). rskj's rule reads
+    /// `edges.length` with no null check, so it throws and the block is not
+    /// imported. Distinct from empty, which is every transaction in the
+    /// sequential sublist and valid.
     #[test]
-    fn absent_edges_are_valid_and_distinct_from_empty() {
-        assert!(check(None).is_ok());
+    fn absent_edges_are_refused_and_distinct_from_empty() {
+        assert!(matches!(
+            check(None),
+            Err(ValidationError::InvalidSublistEdges { .. })
+        ));
+        assert!(check(Some(&[])).is_ok());
     }
 
     /// rskj `blockWithTooManyEdges`. The bound is rskj's

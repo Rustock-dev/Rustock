@@ -27,7 +27,7 @@
 //! Serialization matches rskj `BridgeSerializationUtils.serializeOneOffLockWhitelist`:
 //!   RLP_list [ hash160_0, bigint(maxVal_0), ..., bigint(disableBlockHeight) ]
 
-use alloy_primitives::{Bytes, U256};
+use alloy_primitives::U256;
 use revm::context_interface::ContextTr;
 use revm::precompile::{PrecompileError, PrecompileOutput};
 
@@ -39,53 +39,49 @@ use super::storage::*;
 // BTC address ABI decoding helpers
 // ---------------------------------------------------------------------------
 
-/// ABI-decode a `string` argument at the given parameter slot.
-/// Returns the decoded UTF-8 string or an error.
+/// The `string` argument at parameter slot `slot`, read as rskj's decoder
+/// reads it: UTF-8 with bad sequences replaced, never refused for its
+/// content. A payload that reaches a method has already decoded, so this
+/// only fails for a caller that skipped the Bridge's argument check.
 fn abi_decode_string_arg(args: &[u8], slot: usize) -> Result<String, PrecompileError> {
-    if args.len() < (slot + 1) * 32 {
-        return Err(PrecompileError::other("governance: args too short for string param"));
-    }
-    let offset = U256::from_be_slice(&args[slot * 32..(slot + 1) * 32]).to::<usize>();
-    if offset + 32 > args.len() {
-        return Err(PrecompileError::other("governance: string offset out of bounds"));
-    }
-    let len = U256::from_be_slice(&args[offset..offset + 32]).to::<usize>();
-    let data_start = offset + 32;
-    if data_start + len > args.len() {
-        return Err(PrecompileError::other("governance: string data out of bounds"));
-    }
-    String::from_utf8(args[data_start..data_start + len].to_vec())
-        .map_err(|_| PrecompileError::other("governance: invalid UTF-8 in string"))
+    crate::abi::Args::new(args)
+        .string(slot)
+        .ok_or_else(|| PrecompileError::other("governance: malformed string argument"))
 }
 
-/// Decode a BTC address string (Base58Check) to its 20-byte hash160.
+/// Decode a BTC address string (Base58Check) to its 20-byte hash160, as
+/// rskj's `Address.fromBase58(networkParameters, s)`: this network's P2PKH
+/// or P2SH version byte, and nothing else.
+fn btc_address_to_hash160(
+    addr_str: &str,
+    config: &super::constants::BridgeConstants,
+) -> Result<[u8; 20], PrecompileError> {
+    super::getters::parse_network_address_hash160(addr_str, config)
+        .ok_or_else(|| PrecompileError::other("governance: not a BTC address of this network"))
+}
+
+/// The satoshis a one-off whitelist entry stores for `maxTransferValue`.
 ///
-/// Matches rskj's `BridgeUtils.parseBtcAddressFromHex` / Address.fromBase58:
-/// Base58Check decode → version byte + 20-byte hash160 + 4-byte checksum.
-fn btc_address_to_hash160(addr_str: &str) -> Result<[u8; 20], PrecompileError> {
-    let decoded = bitcoin::base58::decode_check(addr_str)
-        .map_err(|_| PrecompileError::other("governance: invalid BTC address (bad Base58Check)"))?;
-    if decoded.len() != 21 {
-        return Err(PrecompileError::other("governance: BTC address decoded to wrong length"));
+/// rskj takes `Coin.valueOf(maxTransferValue.longValueExact())`, which
+/// throws for a value no long holds and keeps a negative one, and stores it
+/// with `RLP.encodeBigInteger`, whose `asUnsignedByteArray` writes a negative
+/// number's shortest two's-complement bytes. What the entry reads back as,
+/// in rskj and here, is those bytes taken unsigned: -5 becomes 251.
+fn one_off_max_transfer_value(max: &crate::abi::Int) -> Option<u64> {
+    let value = max.long_value_exact()?;
+    if value >= 0 {
+        return Some(value as u64);
     }
-    let mut hash160 = [0u8; 20];
-    hash160.copy_from_slice(&decoded[1..21]);
-    Ok(hash160)
-}
-
-/// ABI-decode an `int256` argument at the given parameter slot as a u64.
-fn abi_decode_int256_as_u64(args: &[u8], slot: usize) -> Option<u64> {
-    if args.len() < (slot + 1) * 32 {
-        return None;
+    let bytes = value.to_be_bytes();
+    let mut start = 0;
+    while start < 7 && bytes[start] == 0xFF && bytes[start + 1] & 0x80 != 0 {
+        start += 1;
     }
-    let word = &args[slot * 32..(slot + 1) * 32];
-    // Only accept non-negative values that fit in u64 (leading bytes must be 0x00)
-    if word[..24].iter().any(|&b| b != 0) {
-        return None;
-    }
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&word[24..32]);
-    Some(u64::from_be_bytes(buf))
+    Some(
+        bytes[start..]
+            .iter()
+            .fold(0u64, |n, b| n << 8 | u64::from(*b)),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +126,7 @@ pub fn create_federation<CTX: crate::RskContextTr>(
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let code = vote_federation_change(ctx, "create", vec![], config, hardfork_cfg, tx_ctx);
+    let code = vote_federation_change(ctx, "create", vec![], config, hardfork_cfg, tx_ctx)?;
     Ok(encode_int_result(gas_cost, code))
 }
 
@@ -146,7 +142,7 @@ pub fn add_federator_public_key<CTX: crate::RskContextTr>(
     let Ok(pubkey) = decode_bytes_arg(args) else {
         return Ok(encode_int_result(gas_cost, -10));
     };
-    let code = vote_federation_change(ctx, "add", vec![pubkey], config, hardfork_cfg, tx_ctx);
+    let code = vote_federation_change(ctx, "add", vec![pubkey], config, hardfork_cfg, tx_ctx)?;
     Ok(encode_int_result(gas_cost, code))
 }
 
@@ -177,7 +173,7 @@ pub fn add_federator_public_key_multikey<CTX: crate::RskContextTr>(
         config,
         hardfork_cfg,
         tx_ctx,
-    );
+    )?;
     Ok(encode_int_result(gas_cost, code))
 }
 
@@ -193,7 +189,7 @@ pub fn commit_federation<CTX: crate::RskContextTr>(
     let Ok(hash) = decode_bytes_arg(args) else {
         return Ok(encode_int_result(gas_cost, -10));
     };
-    let code = vote_federation_change(ctx, "commit", vec![hash], config, hardfork_cfg, tx_ctx);
+    let code = vote_federation_change(ctx, "commit", vec![hash], config, hardfork_cfg, tx_ctx)?;
     Ok(encode_int_result(gas_cost, code))
 }
 
@@ -205,10 +201,13 @@ pub fn rollback_federation<CTX: crate::RskContextTr>(
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let code = vote_federation_change(ctx, "rollback", vec![], config, hardfork_cfg, tx_ctx);
+    let code = vote_federation_change(ctx, "rollback", vec![], config, hardfork_cfg, tx_ctx)?;
     Ok(encode_int_result(gas_cost, code))
 }
 
+/// rskj `FederationSupportImpl.voteFederationChange`. `Err` is an exception
+/// the change's function throws that isn't a `BridgeIllegalArgumentException`,
+/// the one kind the vote catches: the call fails.
 fn vote_federation_change<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     function: &str,
@@ -216,28 +215,30 @@ fn vote_federation_change<CTX: crate::RskContextTr>(
     config: &super::constants::BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     tx_ctx: &crate::precompiles::BridgeTxContext,
-) -> i64 {
+) -> Result<i64, PrecompileError> {
     let authorizers = federation_change_authorizers(config);
     if !authorizers.contains(&tx_ctx.rsk_sender) {
-        return -10; // UNAUTHORIZED_CALLER
+        return Ok(-10); // UNAUTHORIZED_CALLER
     }
 
     // Dry-run first; only register the vote when the call would succeed.
-    let dry = execute_federation_change(ctx, function, &args, true, config, hardfork_cfg);
+    let dry = execute_federation_change(ctx, function, &args, true, config, hardfork_cfg)
+        .map_err(PrecompileError::other)?;
     if dry != 1 {
-        return dry;
+        return Ok(dry);
     }
 
     let spec = super::vote::AbiCallSpec::new(function, args.clone());
     let mut election = super::vote::Election::load(ctx, FEDERATION_ELECTION_KEY);
     if !election.vote(&spec, tx_ctx.rsk_sender) {
-        return -10; // GENERIC_ERROR (duplicate vote)
+        return Ok(-10); // GENERIC_ERROR (duplicate vote)
     }
 
     let required = authorizers.len() / 2 + 1;
     let mut code = 1i64;
     if let Some(winner) = election.winner(required) {
-        code = execute_federation_change(ctx, function, &args, false, config, hardfork_cfg);
+        code = execute_federation_change(ctx, function, &args, false, config, hardfork_cfg)
+            .map_err(PrecompileError::other)?;
         // create/commit/rollback clear the whole election inside the action;
         // clearWinners then removes the winning entry.
         if matches!(function, "create" | "commit" | "rollback") && code == 1 {
@@ -247,11 +248,91 @@ fn vote_federation_change<CTX: crate::RskContextTr>(
         }
     }
     election.store(ctx, FEDERATION_ELECTION_KEY);
-    code
+    Ok(code)
 }
 
-/// rskj FederationSupportImpl.executeVoteFederationChangeFunction.
+/// rskj FederationSupportImpl.executeVoteFederationChangeFunction. `Err` is
+/// what it throws that `voteFederationChange` doesn't catch.
 fn execute_federation_change<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    function: &str,
+    args: &[Vec<u8>],
+    dry_run: bool,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) -> Result<i64, &'static str> {
+    // COMMIT wraps its argument in a `Keccak256` before it looks at anything,
+    // and one of other than 32 bytes is an `IllegalArgumentException`.
+    if function == "commit" && args[0].len() != 32 {
+        return Err("commitFederation: the pending federation's hash isn't 32 bytes");
+    }
+    // The dry run answers before any federation is built. The commit itself
+    // builds it, in every era, and the build throws for one Bitcoin could
+    // not spend from.
+    if function == "commit"
+        && !dry_run
+        && federation_change_code(ctx, function, args, true, config, hardfork_cfg) == 1
+    {
+        let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+        let pending = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
+        let members = deserialize_pending_federation(&pending);
+        if let Some(why) = unbuildable_federation(&members, config, hardfork_cfg, block_number) {
+            return Err(why);
+        }
+    }
+    Ok(federation_change_code(
+        ctx,
+        function,
+        args,
+        dry_run,
+        config,
+        hardfork_cfg,
+    ))
+}
+
+/// rskj `ScriptValidations.MAX_P2SH_REDEEM_SCRIPT_SIZE`: what a scriptSig
+/// element holds (bitcoinj `Script.MAX_SCRIPT_ELEMENT_SIZE`, 520 bytes) less
+/// the 34 bytes a flyover prefix adds to a redeem script.
+const MAX_P2SH_REDEEM_SCRIPT_SIZE: usize = 520 - 34;
+
+/// rskj `ScriptValidations.MAX_P2WSH_REDEEM_SCRIPT_SIZE`: a standard P2WSH
+/// script (`Script.MAX_STANDARD_P2WSH_SCRIPT_SIZE`, 3600 bytes) less the same.
+const MAX_P2WSH_REDEEM_SCRIPT_SIZE: usize = 3600 - 34;
+
+/// Why rskj can't build the federation these pending members make at
+/// `block_number`, where it can't. bitcoinj's
+/// `ScriptBuilder.createMultiSigOutputScript`, which every format's redeem
+/// script goes through, takes no more than 20 keys, "the max OP_CHECKMULTISIG
+/// allows". An `ErpFederation` checks its redeem script's size as it is made
+/// (`validateRedeemScript`): against what a scriptSig holds, or for a
+/// P2SH-P2WSH federation against what a witness script may be.
+fn unbuildable_federation(
+    members: &[StoredMember],
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    block_number: u64,
+) -> Option<&'static str> {
+    if members.len() > 20 {
+        return Some("commitFederation: a federation of more than 20 keys");
+    }
+    let limit = match federation_format_version(hardfork_cfg, block_number) {
+        1000 => return None,
+        4000 => MAX_P2WSH_REDEEM_SCRIPT_SIZE,
+        _ => MAX_P2SH_REDEEM_SCRIPT_SIZE,
+    };
+    let mut keys: Vec<[u8; 33]> = members.iter().map(|m| m.btc).collect();
+    keys.sort();
+    let redeem = super::peg::build_committed_federation_redeem_script(
+        &keys,
+        config,
+        hardfork_cfg,
+        block_number,
+    );
+    (redeem.len() > limit).then_some("commitFederation: the redeem script is too long")
+}
+
+/// The code the change's function answers.
+fn federation_change_code<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     function: &str,
     args: &[Vec<u8>],
@@ -261,16 +342,30 @@ fn execute_federation_change<CTX: crate::RskContextTr>(
 ) -> i64 {
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let multikey = hardfork_cfg.has_rskip123(block_number);
-    // FederationMember stores all keys COMPRESSED, however they were passed.
+    // FederationMember stores all keys COMPRESSED, however they were passed:
+    // compressed, uncompressed or hybrid, which Bouncy Castle's `decodePoint`
+    // reads alike. It reads the one byte 00 too, as the point at infinity,
+    // and a member keeps that key, whose encoding stays the one byte
+    // (`federation::INFINITY_KEY`).
     let parse_key = |bytes: &[u8]| -> Option<[u8; 33]> {
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
-        let parsed = k256::PublicKey::from_sec1_bytes(bytes).ok()?;
-        parsed.to_encoded_point(true).as_bytes().try_into().ok()
+        if bytes == [0x00] {
+            return Some(super::federation::INFINITY_KEY);
+        }
+        let parsed = bitcoin::secp256k1::PublicKey::from_slice(bytes).ok()?;
+        Some(parsed.serialize())
     };
     match function {
         "create" => {
             if !bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY).is_empty() {
                 return -1; // PENDING_FEDERATION_ALREADY_EXISTS
+            }
+            // From RSKIP419 a committed federation waits as the proposed one
+            // through its spendability validation, and none is created while
+            // it does (`getProposedFederation` answers none before RSKIP419).
+            if hardfork_cfg.has_rskip419(block_number)
+                && !bridge_load_bytes_named(ctx, PROPOSED_FEDERATION_KEY).is_empty()
+            {
+                return -4; // PROPOSED_FEDERATION_ALREADY_EXISTS
             }
             let new_fed = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
             let old_fed = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY);
@@ -291,11 +386,11 @@ fn execute_federation_change<CTX: crate::RskContextTr>(
             if function == "add" && multikey {
                 return -10; // "add" disabled post-RSKIP123
             }
-            let pending_data = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
-            if pending_data.is_empty() {
-                return -1; // FEDERATION_NON_EXISTENT
-            }
-            // BtcECKey/ECKey.fromPublicOnly failure -> BridgeIllegalArgumentException -> -10
+            // executeVoteFederationChangeFunction reads the keys before
+            // addFederatorPublicKeyMultikey looks for the pending federation:
+            // a key BtcECKey or ECKey.fromPublicOnly can't decode throws a
+            // BridgeIllegalArgumentException, which the vote answers -10 for,
+            // pending federation or not.
             let member = if function == "add" {
                 let Some(btc) = parse_key(&args[0]) else { return -10 };
                 StoredMember::from_btc(btc)
@@ -309,6 +404,10 @@ fn execute_federation_change<CTX: crate::RskContextTr>(
                 };
                 StoredMember { btc, rsk, mst }
             };
+            let pending_data = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
+            if pending_data.is_empty() {
+                return -1; // FEDERATION_NON_EXISTENT
+            }
             let mut members = deserialize_pending_federation(&pending_data);
             if members
                 .iter()
@@ -380,15 +479,21 @@ pub(crate) fn federation_format_version(
     }
 }
 
+/// rskj `FederationConstants.getFederationActivationAge`: the legacy age
+/// before RSKIP383 and the age after it, with testnet's own step between
+/// RSKIP383 and RSKIP419 (`FederationTestNetConstants` overrides it to answer
+/// `preLovellActivationAge` there).
 pub(crate) fn federation_activation_age(
     config: &super::constants::BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     block_number: u64,
 ) -> u64 {
-    if hardfork_cfg.has_rskip383(block_number) {
-        config.federation_activation_age
-    } else {
-        config.federation_activation_age_legacy
+    if !hardfork_cfg.has_rskip383(block_number) {
+        return config.federation_activation_age_legacy;
+    }
+    match config.federation_activation_age_pre_lovell {
+        Some(age) if !hardfork_cfg.has_rskip419(block_number) => age,
+        _ => config.federation_activation_age,
     }
 }
 
@@ -477,7 +582,13 @@ pub(crate) fn commit_proposed_federation<CTX: crate::RskContextTr>(
         ),
     };
     let old_keys: Vec<[u8; 33]> = old_members.iter().map(|m| m.btc).collect();
-    let old_format = federation_format_version(hardfork_cfg, old_block);
+    // A stored federation keeps the format its creation block gave it; the
+    // genesis federation, the one its constants name
+    // (`FederationSupportImpl.getGenesisFederation`).
+    let old_format = match &active {
+        Some(_) => federation_format_version(hardfork_cfg, old_block),
+        None => config.genesis_federation_format,
+    };
 
     // moveUTXOsFromNewToOldFederation.
     let active_utxos = load_federation_utxos(ctx, hardfork_cfg, block_number);
@@ -509,8 +620,15 @@ pub(crate) fn commit_proposed_federation<CTX: crate::RskContextTr>(
     // RSKIP186: saveLastRetiredFederationScript (the retiring = old fed) +
     // setNextFederationCreationBlockHeight(proposed fed's creation block).
     if hardfork_cfg.has_rskip186(block_number) {
-        let old_redeem = super::peg::build_committed_federation_redeem_script(
-            &old_keys, config, hardfork_cfg, old_block,
+        // Its format is the one its creation gave it, but rskj rebuilds a
+        // stored federation with this block's activations, which pick the
+        // non-standard ERP builder.
+        let old_redeem = super::peg::federation_redeem_for_format_pub(
+            &old_keys,
+            old_format,
+            config,
+            hardfork_cfg,
+            block_number,
         );
         let old_hash160 = super::peg::redeem_script_hash160_pub(&old_redeem);
         // RSKIP377: getDefaultP2SHScript() = getOutputScript(getDefaultRedeemScript())
@@ -590,16 +708,27 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
     // 1000 standard multisig, 2000 non-standard ERP, 3000 P2SH-ERP, 4000
     // P2SH-P2WSH-ERP. The old fed's type is fixed by its creation block; the
     // built fed's by this block.
-    let old_format = federation_format_version(hardfork_cfg, old_block);
+    // The genesis federation's type is the one its constants name
+    // (`FederationSupportImpl.getGenesisFederation`).
+    let old_format = match &active {
+        Some(_) => federation_format_version(hardfork_cfg, old_block),
+        None => config.genesis_federation_format,
+    };
     let new_format = federation_format_version(hardfork_cfg, block_number);
 
     // Redeem scripts / hash160s: needed for the commit_federation event in BOTH
     // paths, and for the retiring fed's lastRetiredFederationP2SHScript in the
     // legacy handover. The retiring fed's redeem is rebuilt as the type it was
-    // CREATED with (keyed on its creation block); the built fed's by THIS
-    // block's activations (rskj PendingFederation.buildFederation).
-    let old_redeem = super::peg::build_committed_federation_redeem_script(
-        &old_keys, config, hardfork_cfg, old_block,
+    // CREATED with (its format, keyed on its creation block), but with THIS
+    // block's activations, as rskj reads a stored federation: they pick the
+    // non-standard ERP builder. The built fed's is by THIS block's
+    // activations too (rskj PendingFederation.buildFederation).
+    let old_redeem = super::peg::federation_redeem_for_format_pub(
+        &old_keys,
+        old_format,
+        config,
+        hardfork_cfg,
+        block_number,
     );
     let new_redeem = super::peg::build_committed_federation_redeem_script(
         &new_keys, config, hardfork_cfg, block_number,
@@ -785,9 +914,15 @@ pub fn vote_fee_per_kb_change<CTX: crate::RskContextTr>(
     config: &super::constants::BridgeConstants,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("voteFeePerKbChange: args too short"));
-    }
+    // rskj `Bridge.voteFeePerKbChange` takes `Coin.valueOf(longValueExact())`
+    // before anything else, and a value no long holds is GENERIC_ERROR: -10,
+    // the same code an unauthorized caller gets.
+    let Some(fee) = crate::abi::Args::new(args)
+        .int(0)
+        .and_then(|fee| fee.long_value_exact())
+    else {
+        return Ok(encode_int_result(gas_cost, -10));
+    };
 
     let authorizers: Vec<alloy_primitives::Address> = config
         .fee_per_kb_authorizer_keys
@@ -803,18 +938,17 @@ pub fn vote_fee_per_kb_change<CTX: crate::RskContextTr>(
         return Ok(encode_int_result(gas_cost, -10));
     }
 
-    // Negative (int256 sign bit) or zero is not a positive coin.
-    if args[0] & 0x80 != 0 {
+    // FeePerKbSupportImpl: `!feePerKb.isPositive()` is NEGATIVE_FEE_VOTED (-1),
+    // and a fee above the maximum EXCESSIVE_FEE_VOTED (-2).
+    let Ok(fee_satoshis) = u64::try_from(fee) else {
+        return Ok(encode_int_result(gas_cost, -1));
+    };
+    if fee_satoshis == 0 {
         return Ok(encode_int_result(gas_cost, -1));
     }
-    let fee_value = U256::from_be_slice(&args[..32]);
-    if fee_value.is_zero() {
-        return Ok(encode_int_result(gas_cost, -1));
-    }
-    if fee_value > U256::from(config.max_fee_per_kb) {
+    if fee_satoshis > config.max_fee_per_kb {
         return Ok(encode_int_result(gas_cost, -2));
     }
-    let fee_satoshis = fee_value.to::<u64>();
 
     // MAJORITY of the authorizer set must vote the same value. Entries are
     // keyed by the RLP-ENCODED coin (serializeCoin) bytes, like rskj's
@@ -939,9 +1073,10 @@ fn load_fee_per_kb_election<CTX: crate::RskContextTr>(
 /// a non-positive or over-long value throws BridgeIllegalArgumentException;
 /// the sender must match an increase-locking-cap authorizer key (minimum
 /// ONE); the new cap may not be below the current one (equal is allowed)
-/// nor above current × lockingCapIncrementsMultiplier. Reading the current
-/// cap lazily initializes it (getLockingCap), so a failed bound check still
-/// persists the initial value — but a failed authorizer check does not.
+/// nor above current × lockingCapIncrementsMultiplier, a product that fails
+/// the call where it passes a Java long. Reading the current cap lazily
+/// initializes it (getLockingCap), so a failed bound check still persists
+/// the initial value — but a failed authorizer check does not.
 pub fn increase_locking_cap<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
@@ -949,17 +1084,15 @@ pub fn increase_locking_cap<CTX: crate::RskContextTr>(
     config: &super::constants::BridgeConstants,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("increaseLockingCap: args too short"));
-    }
-
     // int256 satoshis; rskj getCoinFromBigInteger (longValueExact) and the
-    // <= 0 check both end in BridgeIllegalArgumentException.
-    let raw = U256::from_be_slice(&args[..32]);
-    if raw.is_zero() || raw > U256::from(i64::MAX as u64) {
-        return Err(PrecompileError::other("increaseLockingCap: invalid value"));
-    }
-    let new_cap = raw.to::<u64>();
+    // <= 0 check both end in BridgeIllegalArgumentException, before the
+    // authorizer is looked at.
+    let new_cap = crate::abi::Args::new(args)
+        .int(0)
+        .and_then(|cap| cap.long_value_exact())
+        .and_then(|cap| u64::try_from(cap).ok())
+        .filter(|cap| *cap > 0)
+        .ok_or_else(|| PrecompileError::other("increaseLockingCap: invalid value"))?;
 
     let authorized = config.increase_locking_cap_authorizer_keys.iter().any(|hex| {
         alloy_primitives::hex::decode(hex)
@@ -973,9 +1106,21 @@ pub fn increase_locking_cap<CTX: crate::RskContextTr>(
     }
 
     let current_cap = super::peg::get_or_init_locking_cap(ctx, config);
-    if new_cap < current_cap
-        || new_cap > current_cap.saturating_mul(config.locking_cap_increments_multiplier)
-    {
+    if new_cap < current_cap {
+        return Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()));
+    }
+    // The most the cap may grow to, as bitcoinj's `Coin.multiply` takes it:
+    // Guava's `LongMath.checkedMultiply`, which throws past a Java long, and
+    // `Bridge.execute` makes the throw a VMException that fails the call.
+    let most = i64::try_from(current_cap)
+        .ok()
+        .zip(i64::try_from(config.locking_cap_increments_multiplier).ok())
+        .and_then(|(cap, multiplier)| cap.checked_mul(multiplier))
+        .and_then(|most| u64::try_from(most).ok())
+        .ok_or_else(|| {
+            PrecompileError::other("increaseLockingCap: the cap times its multiplier passes a long")
+        })?;
+    if new_cap > most {
         return Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()));
     }
 
@@ -1004,9 +1149,10 @@ pub fn add_lock_whitelist_address<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    add_one_off_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx)
+    add_one_off_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx)
 }
 
 /// rskj AddressBasedAuthorizer (minimum ONE): the tx sender must be the RSK
@@ -1037,6 +1183,7 @@ pub fn add_one_off_lock_whitelist_address<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let addr_str = match abi_decode_string_arg(args, 0) {
@@ -1044,33 +1191,38 @@ pub fn add_one_off_lock_whitelist_address<CTX: crate::RskContextTr>(
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
 
-    let hash160 = match btc_address_to_hash160(&addr_str) {
+    // WhitelistSupportImpl.addOneOffLockWhitelistAddress parses the address
+    // (INVALID_ADDRESS_FORMAT, -2), then the value, whose `longValueExact`
+    // throws, and only then asks whether the caller may change the list.
+    let hash160 = match btc_address_to_hash160(&addr_str, config) {
         Ok(h) => h,
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
 
-    let max_val = match abi_decode_int256_as_u64(args, 1) {
-        Some(v) => v,
-        None => return Ok(encode_int_result(gas_cost, -2)),
-    };
+    let max_val = crate::abi::Args::new(args)
+        .int(1)
+        .as_ref()
+        .and_then(one_off_max_transfer_value)
+        .ok_or_else(|| {
+            PrecompileError::other("addOneOffLockWhitelistAddress: the value is not a long")
+        })?;
 
     if !is_whitelist_change_authorized(config, tx_ctx.rsk_sender) {
         return Ok(encode_int_result(gas_cost, -10));
     }
 
-    let (mut entries, disable_h) = load_one_off_whitelist(ctx);
-
-    // Duplicates across BOTH whitelists (rskj LockWhitelist.isWhitelisted)
-    if entries.iter().any(|(h, _)| h == &hash160)
-        || load_unlimited_whitelist(ctx).contains(&hash160)
-    {
-        return Ok(encode_int_result(gas_cost, -1));
-    }
-
-    entries.push((hash160, max_val));
-    store_one_off_whitelist(ctx, &entries, disable_h);
-
-    Ok(encode_int_result(gas_cost, 1))
+    // rskj reads the whitelist from here on, so it writes it back however the
+    // call ends.
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let mut whitelist = LockWhitelist::load(ctx, hardfork_cfg.has_rskip87(block_number));
+    let code = if whitelist.contains(&hash160) {
+        -1
+    } else {
+        whitelist.one_off.push((hash160, max_val));
+        1
+    };
+    whitelist.save(ctx);
+    Ok(encode_int_result(gas_cost, code))
 }
 
 /// `addUnlimitedLockWhitelistAddress(string address)` → int256
@@ -1087,6 +1239,7 @@ pub fn add_unlimited_lock_whitelist_address<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let addr_str = match abi_decode_string_arg(args, 0) {
@@ -1094,7 +1247,7 @@ pub fn add_unlimited_lock_whitelist_address<CTX: crate::RskContextTr>(
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
 
-    let hash160 = match btc_address_to_hash160(&addr_str) {
+    let hash160 = match btc_address_to_hash160(&addr_str, config) {
         Ok(h) => h,
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
@@ -1103,19 +1256,18 @@ pub fn add_unlimited_lock_whitelist_address<CTX: crate::RskContextTr>(
         return Ok(encode_int_result(gas_cost, -10));
     }
 
-    let mut entries = load_unlimited_whitelist(ctx);
-
-    // Duplicates across BOTH whitelists (rskj LockWhitelist.isWhitelisted)
-    if entries.iter().any(|h| h == &hash160)
-        || load_one_off_whitelist(ctx).0.iter().any(|(h, _)| h == &hash160)
-    {
-        return Ok(encode_int_result(gas_cost, -1));
-    }
-
-    entries.push(hash160);
-    store_unlimited_whitelist(ctx, &entries);
-
-    Ok(encode_int_result(gas_cost, 1))
+    // rskj reads the whitelist from here on, so it writes it back however the
+    // call ends.
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let mut whitelist = LockWhitelist::load(ctx, hardfork_cfg.has_rskip87(block_number));
+    let code = if whitelist.contains(&hash160) {
+        -1
+    } else {
+        whitelist.unlimited.push(hash160);
+        1
+    };
+    whitelist.save(ctx);
+    Ok(encode_int_result(gas_cost, code))
 }
 
 /// `removeLockWhitelistAddress(string address)` → int256
@@ -1131,6 +1283,7 @@ pub fn remove_lock_whitelist_address<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     if !is_whitelist_change_authorized(config, tx_ctx.rsk_sender) {
@@ -1142,30 +1295,17 @@ pub fn remove_lock_whitelist_address<CTX: crate::RskContextTr>(
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
 
-    let hash160 = match btc_address_to_hash160(&addr_str) {
-        Ok(h) => h,
-        Err(_) => return Ok(encode_int_result(gas_cost, -2)),
+    // rskj reads the whitelist before it parses the address, so it writes it
+    // back however the call ends, for an address that doesn't parse too.
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let mut whitelist = LockWhitelist::load(ctx, hardfork_cfg.has_rskip87(block_number));
+    let code = match btc_address_to_hash160(&addr_str, config) {
+        Err(_) => -2,
+        Ok(hash160) if whitelist.remove(&hash160) => 1,
+        Ok(_) => -1,
     };
-
-    // Try to remove from one-off whitelist first
-    let (mut one_off, disable_h) = load_one_off_whitelist(ctx);
-    let before_len = one_off.len();
-    one_off.retain(|(h, _)| h != &hash160);
-    if one_off.len() < before_len {
-        store_one_off_whitelist(ctx, &one_off, disable_h);
-        return Ok(encode_int_result(gas_cost, 1));
-    }
-
-    // Try unlimited whitelist
-    let mut unlimited = load_unlimited_whitelist(ctx);
-    let before_len = unlimited.len();
-    unlimited.retain(|h| h != &hash160);
-    if unlimited.len() < before_len {
-        store_unlimited_whitelist(ctx, &unlimited);
-        return Ok(encode_int_result(gas_cost, 1));
-    }
-
-    Ok(encode_int_result(gas_cost, -1))
+    whitelist.save(ctx);
+    Ok(encode_int_result(gas_cost, code))
 }
 
 /// `setLockWhitelistDisableBlockDelay(int256 delay)` → int256
@@ -1179,55 +1319,94 @@ pub fn set_lock_whitelist_disable_block_delay<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other(
-            "setLockWhitelistDisableBlockDelay: args too short",
-        ));
-    }
+    // rskj `BridgeSupport.setLockWhitelistDisableBlockDelay` reads the BTC
+    // chain's height before anything asks who is calling, and seeds the chain
+    // where nothing has yet (`ensureBtcBlockStore`), whoever calls.
+    super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg)?;
+    let best_height = super::btc_store::load_chain_head(ctx)
+        .map(|h| h.height as i32)
+        .unwrap_or(0);
 
     if !is_whitelist_change_authorized(config, tx_ctx.rsk_sender) {
         return Ok(encode_int_result(gas_cost, -10));
     }
 
-    let (entries, disable_h) = load_one_off_whitelist(ctx);
-    if disable_h < i32::MAX {
-        return Ok(encode_int_result(gas_cost, -1)); // delay already set
-    }
-
-    let delay = U256::from_be_slice(&args[..32]).to::<u64>() as i64;
-    let best_height = super::btc_store::load_chain_head(ctx)
-        .map(|h| h.height as i64)
-        .unwrap_or(0);
-    if delay + best_height <= best_height {
-        return Ok(encode_int_result(gas_cost, -2)); // invalid delay
-    }
-
-    store_one_off_whitelist(ctx, &entries, (best_height + delay) as i32);
-
-    Ok(encode_int_result(gas_cost, 1))
+    // rskj reads the whitelist from here on, so it writes it back however the
+    // call ends but a throw.
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let mut whitelist = LockWhitelist::load(ctx, hardfork_cfg.has_rskip87(block_number));
+    let code = if whitelist.disable_height < i32::MAX {
+        -1 // delay already set
+    } else {
+        // rskj `disableBlockDelayBI.intValueExact()`: a delay no int holds
+        // throws. The sum is Java int arithmetic, so one that wraps is not
+        // above the height either.
+        let delay = crate::abi::Args::new(args)
+            .int(0)
+            .and_then(|delay| delay.int_value_exact())
+            .ok_or_else(|| {
+                PrecompileError::other("setLockWhitelistDisableBlockDelay: the delay is not an int")
+            })?;
+        if delay.wrapping_add(best_height) <= best_height {
+            -2 // invalid delay
+        } else {
+            whitelist.disable_height = best_height.wrapping_add(delay);
+            1
+        }
+    };
+    whitelist.save(ctx);
+    Ok(encode_int_result(gas_cost, code))
 }
 
 // ---------------------------------------------------------------------------
 // Read-only governance methods
 // ---------------------------------------------------------------------------
 
-/// `getActivePowpegRedeemScript()` → bytes
+/// `getActivePowpegRedeemScript()` → bytes: rskj
+/// `FederationSupportImpl.getActiveFederationRedeemScript`, the active
+/// federation's redeem script in the format it was stored with, or the genesis
+/// federation's with none stored. rskj answers no bytes before RSKIP293, and
+/// the method opens with RSKIP293, so there is always a script to answer.
 pub fn get_active_powpeg_redeem_script<CTX: crate::RskContextTr>(
-    _ctx: &mut CTX,
+    ctx: &mut CTX,
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // Return empty bytes (no federation configured yet)
-    Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let (_keys, redeem) =
+        super::peg::active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
+    Ok(PrecompileOutput::new(
+        gas_cost,
+        super::getters::abi_encode_bytes(&redeem).into(),
+    ))
 }
 
-/// `getActiveFederationCreationBlockHeight()` → uint256
+/// `getActiveFederationCreationBlockHeight()` → uint256: rskj
+/// `FederationSupportImpl.getActiveFederationCreationBlockHeight` (RSKIP186).
+/// Once the block run is the activation age past the next federation's
+/// creation block, that block, though no `updateCollections` has moved it to
+/// the active federation's cell yet; until then the active federation's, or 0
+/// where neither is stored.
 pub fn get_active_federation_creation_block_height<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let val = bridge_load_u256(ctx, ACTIVE_FEDERATION_CREATION_BLOCK_HEIGHT_KEY);
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let val = if !hardfork_cfg.has_rskip186(block_number) {
+        U256::ZERO
+    } else {
+        let activation_age = federation_activation_age(config, hardfork_cfg, block_number);
+        match get_next_federation_creation_block_height(ctx) {
+            Some(next) if block_number >= next.saturating_add(activation_age) => U256::from(next),
+            _ => bridge_load_u256(ctx, ACTIVE_FEDERATION_CREATION_BLOCK_HEIGHT_KEY),
+        }
+    };
     let output = val.to_be_bytes::<32>();
     Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()))
 }
@@ -1254,7 +1433,7 @@ fn serialize_pending_federation_btc_keys(members: &[StoredMember]) -> Vec<u8> {
     keys.sort();
     let encoded_keys: Vec<Vec<u8>> = keys
         .iter()
-        .map(|k| serialization::rlp_encode_element(k))
+        .map(|k| serialization::rlp_encode_element(super::federation::key_encoding(k)))
         .collect();
     serialization::rlp_encode_list(&encoded_keys)
 }
@@ -1312,23 +1491,12 @@ fn decode_bytes_arg(args: &[u8]) -> Result<Vec<u8>, PrecompileError> {
     decode_bytes_arg_at(args, 0)
 }
 
-/// Decode the `index`-th `bytes` ABI argument (head word `index` holds the
-/// payload offset).
+/// Decode the `index`-th `bytes` ABI argument, as rskj's decoder does.
 fn decode_bytes_arg_at(args: &[u8], index: usize) -> Result<Vec<u8>, PrecompileError> {
-    let head = index * 32;
-    if args.len() < head + 32 {
-        return Err(PrecompileError::other("bytes arg: too short"));
-    }
-    let offset = U256::from_be_slice(&args[head..head + 32]).to::<usize>();
-    if offset + 32 > args.len() {
-        return Err(PrecompileError::other("bytes arg: offset out of bounds"));
-    }
-    let len = U256::from_be_slice(&args[offset..offset + 32]).to::<usize>();
-    let start = offset + 32;
-    if start + len > args.len() {
-        return Err(PrecompileError::other("bytes arg: data out of bounds"));
-    }
-    Ok(args[start..start + len].to_vec())
+    crate::abi::Args::new(args)
+        .bytes(index)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| PrecompileError::other("bytes arg: malformed"))
 }
 
 pub(crate) fn encode_int_result(gas_cost: u64, value: i64) -> PrecompileOutput {
@@ -1486,5 +1654,984 @@ mod tests {
 
         // The promoted active-height cell encodes as serializeLong = RLP bigint.
         assert_eq!(serialization::rlp_encode_u64(next_creation), vec![0x83, 0x46, 0xfe, 0xed]);
+    }
+
+    /// rskj's testnet constants activate a federation 60 blocks after its
+    /// commitment before RSKIP383 (fingerroot500, #4,015,800), 120 until
+    /// RSKIP419 (lovell700, #6,110,487), then 2,400. Mainnet has no middle step:
+    /// 18,500 before RSKIP383, 40,320 after.
+    #[test]
+    fn testnets_activation_age_has_a_step_before_lovell() {
+        use super::super::constants::BridgeConstants;
+        use crate::hardfork::RskHardforkConfig;
+        let (testnet, hf) = (BridgeConstants::testnet(), RskHardforkConfig::testnet());
+        for (block, age) in [
+            (4_015_799, 60),
+            (4_015_800, 120),
+            (6_110_486, 120),
+            (6_110_487, 2_400),
+        ] {
+            assert_eq!(
+                federation_activation_age(&testnet, &hf, block),
+                age,
+                "testnet #{block}"
+            );
+        }
+        let (mainnet, hf) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        for (block, age) in [
+            (5_467_999, 18_500),
+            (5_468_000, 40_320),
+            (7_338_023, 40_320),
+            (7_338_024, 40_320),
+        ] {
+            assert_eq!(
+                federation_activation_age(&mainnet, &hf, block),
+                age,
+                "mainnet #{block}"
+            );
+        }
+    }
+
+    /// rskj `addOneOffLockWhitelistAddress` parses the address first, -2 where
+    /// it does not parse, then reads the value with `longValueExact`, which
+    /// throws for one beyond a Java long -- all before the sender is checked.
+    #[test]
+    fn a_one_off_value_beyond_a_long_throws_before_the_sender_check() {
+        use crate::abi::encode::{self, Arg};
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let hardforks = crate::hardfork::RskHardforkConfig::mainnet();
+        let tx_ctx = crate::precompiles::BridgeTxContext::default();
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        let mut call = |address: &str, value: [u8; 32]| {
+            let args = encode::args(&[Arg::Bytes(address.as_bytes()), Arg::Word(value)]);
+            add_one_off_lock_whitelist_address(&mut ctx, &args, 0, &config, &hardforks, &tx_ctx)
+                .map(|out| i64::from_be_bytes(out.bytes[24..32].try_into().unwrap()))
+        };
+        let address = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
+        let mut beyond = [0u8; 32];
+        beyond[23] = 1; // 2^64
+        assert!(call(address, beyond).is_err());
+        assert_eq!(call("not an address", beyond).unwrap(), -2);
+        assert_eq!(
+            call(address, encode::int(1_000)).unwrap(),
+            -10,
+            "then the sender"
+        );
+    }
+
+    /// rskj `LockingCapSupportImpl.increaseLockingCap` takes the most the cap
+    /// may grow to with bitcoinj's `Coin.multiply`, which is Guava's
+    /// `LongMath.checkedMultiply`: where the current cap times the increments
+    /// multiplier passes a Java long, it throws, and the Bridge call fails. A
+    /// new cap below the current one is refused before that product is taken,
+    /// and answers false.
+    #[test]
+    fn a_cap_whose_limit_passes_a_long_fails_the_increase() {
+        use crate::abi::encode::{self, Arg};
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let key =
+            alloy_primitives::hex::decode(config.increase_locking_cap_authorizer_keys[0]).unwrap();
+        let tx_ctx = crate::precompiles::BridgeTxContext {
+            rsk_sender: super::super::federation::rsk_address_from_public_key(&key).unwrap(),
+            ..Default::default()
+        };
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        // Mainnet's multiplier is 2, and twice this passes i64::MAX.
+        let cap: i64 = (1 << 62) + 1;
+        bridge_store_u256(&mut ctx, LOCKING_CAP_KEY, U256::from(cap));
+        let mut increase = |new_cap: i64| {
+            let args = encode::args(&[Arg::Word(encode::int(new_cap))]);
+            increase_locking_cap(&mut ctx, &args, 0, &config, &tx_ctx).map(|out| out.bytes[31] == 1)
+        };
+        assert!(
+            !increase(cap - 1).unwrap(),
+            "below the current cap: refused before the product is taken"
+        );
+        assert!(
+            increase(cap).is_err(),
+            "the product passes a long: the call fails"
+        );
+        assert_eq!(
+            bridge_load_u256(&mut ctx, LOCKING_CAP_KEY),
+            U256::from(cap),
+            "and the cap is as it was"
+        );
+    }
+
+    /// rustock's own regtest has three federation-change authorizers, the first
+    /// three of rskj's regtest ('auth-a' to 'auth-c'), so two decide. rskj's
+    /// regtest has five, and three decide there (`BridgeConstants::rskj_regtest`).
+    #[test]
+    fn two_of_regtests_three_authorizers_decide_a_federation_change() {
+        use revm::MainContext;
+        fn create<CTX: crate::RskContextTr>(
+            ctx: &mut CTX,
+            sender: alloy_primitives::Address,
+        ) -> i64 {
+            let config = super::super::constants::BridgeConstants::regtest();
+            let hardforks = crate::hardfork::RskHardforkConfig::regtest();
+            let tx_ctx = crate::precompiles::BridgeTxContext {
+                rsk_sender: sender,
+                ..Default::default()
+            };
+            let out = create_federation(ctx, 0, &config, &hardforks, &tx_ctx).unwrap();
+            i64::from_be_bytes(out.bytes[24..32].try_into().unwrap())
+        }
+        let regtest = super::super::constants::BridgeConstants::regtest();
+        let authorizers = federation_change_authorizers(&regtest);
+        assert_eq!(authorizers.len(), 3);
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        assert_eq!(create(&mut ctx, authorizers[0]), 1);
+        let pending = |ctx: &mut _| bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
+        assert!(pending(&mut ctx).is_empty(), "one vote waits");
+        assert_eq!(create(&mut ctx, authorizers[1]), 1);
+        assert!(!pending(&mut ctx).is_empty(), "two decide");
+    }
+
+    /// rskj's regtest has five federation-change authorizers, 'auth-a' to
+    /// 'auth-e' (`FederationRegTestConstants`), and a change takes three of
+    /// them (`AddressBasedAuthorizer`, MAJORITY): the last two vote as the
+    /// first three do.
+    #[test]
+    fn three_of_rskj_regtests_five_authorizers_decide_a_federation_change() {
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::rskj_regtest();
+        let hardforks = crate::hardfork::RskHardforkConfig::rskj_regtest();
+        let authorizers = federation_change_authorizers(&config);
+        assert_eq!(authorizers.len(), 5);
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        let mut create = |sender: alloy_primitives::Address| {
+            let tx_ctx = crate::precompiles::BridgeTxContext {
+                rsk_sender: sender,
+                ..Default::default()
+            };
+            let out = create_federation(&mut ctx, 0, &config, &hardforks, &tx_ctx).unwrap();
+            let answer = i64::from_be_bytes(out.bytes[24..32].try_into().unwrap());
+            let pending = !bridge_load_bytes_named(&mut ctx, PENDING_FEDERATION_KEY).is_empty();
+            (answer, pending)
+        };
+        assert_eq!(create(authorizers[3]), (1, false), "one vote waits");
+        assert_eq!(create(authorizers[4]), (1, false), "two wait");
+        assert_eq!(create(authorizers[0]), (1, true), "three decide");
+    }
+
+    /// rskj reads a new member's keys before it looks for the pending
+    /// federation (`FederationSupportImpl.executeVoteFederationChangeFunction`,
+    /// then `addFederatorPublicKeyMultikey`): with no pending federation, a key
+    /// Bouncy Castle can't decode answers -10 and a readable one -1, before
+    /// RSKIP123 and after it.
+    #[test]
+    fn an_unreadable_key_answers_minus_10_with_no_pending_federation() {
+        use crate::abi::encode::{self, Arg};
+        use crate::precompiles::BridgeTxContext;
+        use revm::MainContext;
+        // The generator, compressed, and a prefix no encoding has.
+        let good = alloy_primitives::hex::decode(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        let mut bad = good.clone();
+        bad[0] = 0x05;
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+        let authorizer =
+            alloy_primitives::hex::decode(config.federation_change_authorizer_keys[0]).unwrap();
+        let authorized = BridgeTxContext {
+            rsk_sender: super::super::federation::rsk_address_from_public_key(&authorizer).unwrap(),
+            ..BridgeTxContext::default()
+        };
+        let add = |block: u64, keys: &[&[u8]]| {
+            let mut ctx = revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default());
+            let args: Vec<Arg> = keys.iter().map(|key| Arg::Bytes(key)).collect();
+            let args = encode::args(&args);
+            let out = if keys.len() == 1 {
+                add_federator_public_key(&mut ctx, &args, 0, &config, &cfg, &authorized)
+            } else {
+                add_federator_public_key_multikey(&mut ctx, &args, 0, &config, &cfg, &authorized)
+            }
+            .unwrap();
+            i64::from_be_bytes(out.bytes[24..32].try_into().unwrap())
+        };
+        let (before, after) = (1_000_000u64, 2_000_000u64);
+        assert!(!cfg.has_rskip123(before) && cfg.has_rskip123(after));
+        assert_eq!(add(before, &[&bad]), -10);
+        assert_eq!(add(before, &[&good]), -1);
+        assert_eq!(add(after, &[&good, &good, &bad]), -10);
+        assert_eq!(add(after, &[&good, &good, &good]), -1);
+    }
+
+    /// rskj builds the genesis federation in the format its constants name
+    /// (`FederationSupportImpl.getGenesisFederation`), so the first federation
+    /// change moves rskj's regtest one into the old slot as P2SH-P2WSH ERP
+    /// (4000) and retires it under its own P2SH-P2WSH script, whatever block
+    /// 1's heights say. Under heights where block 1 predates every ERP
+    /// federation, as mainnet's, the format and script taken from the creation
+    /// block's heights, as before, were standard multisig's. Both handovers:
+    /// the legacy one, and RSKIP419's of a proposed federation.
+    #[test]
+    fn the_genesis_federation_leaves_in_its_own_format() {
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::rskj_regtest();
+        let hardforks = crate::hardfork::RskHardforkConfig::mainnet();
+        assert!(!hardforks.has_rskip201(1));
+        let ctx_at = |block: u64| {
+            revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default())
+        };
+        let members: Vec<StoredMember> = super::super::peg::genesis_federation_keys(
+            &super::super::constants::BridgeConstants::testnet(),
+        )
+        .into_iter()
+        .map(StoredMember::from_btc)
+        .collect();
+        let old_format =
+            |ctx: &mut _| bridge_load_bytes_named(ctx, OLD_FEDERATION_FORMAT_VERSION_KEY);
+
+        // hop401: multikey cells (RSKIP123), the legacy handover, and RSKIP186's
+        // retired script, which before RSKIP377 is the federation's own.
+        let block = 5_000_000u64;
+        assert!(hardforks.has_rskip123(block) && hardforks.has_rskip186(block));
+        assert!(!hardforks.has_rskip377(block) && !hardforks.has_rskip419(block));
+        let mut ctx = ctx_at(block);
+        commit_pending_federation(&mut ctx, &members, &config, &hardforks);
+        assert_eq!(old_format(&mut ctx), serialization::rlp_encode_u64(4000));
+        // 2MvQSG61B4LtKLECeo1dRDeDWXgJfnr3fC7's script
+        let regtest_federation: [u8; 20] = hex::decode("22a65d9485781e6cdc0e49fc405ba628365e28c7")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            bridge_load_bytes_named(&mut ctx, LAST_RETIRED_FEDERATION_P2SH_SCRIPT_KEY),
+            serialization::rlp_encode_list(&[serialization::rlp_encode_element(
+                &super::super::peg::p2sh_output_script_program(&regtest_federation),
+            )])
+        );
+
+        // lovell700: RSKIP419 promotes the proposed federation.
+        let block = 7_400_000u64;
+        assert!(hardforks.has_rskip419(block));
+        let mut ctx = ctx_at(block);
+        bridge_store_bytes_named(
+            &mut ctx,
+            PROPOSED_FEDERATION_KEY,
+            &super::super::federation::serialize_federation_multikey(&members, 1_000, block - 10),
+        );
+        commit_proposed_federation(&mut ctx, &config, &hardforks);
+        assert_eq!(old_format(&mut ctx), serialization::rlp_encode_u64(4000));
+    }
+
+    /// From RSKIP377 a handover keeps, as the last retired federation's script,
+    /// the output script of its members' multisig, the default branch of its
+    /// ERP script, P2SH-P2WSH for a P2SH-P2WSH federation
+    /// (`FederationSupportImpl.getFederationMembersP2SHScript`,
+    /// `ErpFederation.getDefaultP2SHScript`), where before RSKIP377 it kept the
+    /// federation's own. rskj's regtest genesis federation, a P2SH-P2WSH ERP
+    /// one, handed over both ways: the legacy commit, between fingerroot500 and
+    /// lovell700, and RSKIP419's of a proposed federation.
+    #[test]
+    fn from_rskip377_the_last_retired_script_is_its_members_multisigs() {
+        use bitcoin::hashes::Hash as _;
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::rskj_regtest();
+        let hardforks = crate::hardfork::RskHardforkConfig::mainnet();
+        let ctx_at = |block: u64| {
+            revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default())
+        };
+        let genesis = super::super::peg::genesis_federation_keys(&config);
+        let multisig =
+            super::super::peg::build_federation_redeem_script(&genesis, genesis.len() / 2 + 1);
+        let witness_program = [
+            &[0x00, 0x20][..],
+            &bitcoin::hashes::sha256::Hash::hash(&multisig).to_byte_array(),
+        ]
+        .concat();
+        let members_script = super::super::peg::p2sh_output_script_program(
+            &super::super::peg::redeem_script_hash160_pub(&witness_program),
+        );
+        let expected =
+            serialization::rlp_encode_list(&[serialization::rlp_encode_element(&members_script)]);
+        let members: Vec<StoredMember> = super::super::peg::genesis_federation_keys(
+            &super::super::constants::BridgeConstants::testnet(),
+        )
+        .into_iter()
+        .map(StoredMember::from_btc)
+        .collect();
+        let retired =
+            |ctx: &mut _| bridge_load_bytes_named(ctx, LAST_RETIRED_FEDERATION_P2SH_SCRIPT_KEY);
+
+        let block = 6_000_000u64;
+        assert!(hardforks.has_rskip377(block) && !hardforks.has_rskip419(block));
+        let mut ctx = ctx_at(block);
+        commit_pending_federation(&mut ctx, &members, &config, &hardforks);
+        assert_eq!(retired(&mut ctx), expected, "the legacy commit");
+
+        let block = 7_400_000u64;
+        assert!(hardforks.has_rskip419(block));
+        let mut ctx = ctx_at(block);
+        bridge_store_bytes_named(
+            &mut ctx,
+            PROPOSED_FEDERATION_KEY,
+            &super::super::federation::serialize_federation_multikey(&members, 1_000, block - 10),
+        );
+        commit_proposed_federation(&mut ctx, &config, &hardforks);
+        assert_eq!(retired(&mut ctx), expected, "a proposed federation's");
+    }
+
+    /// rskj answers `getActivePowpegRedeemScript` with the active federation's
+    /// redeem script (`FederationSupportImpl.getActiveFederationRedeemScript`),
+    /// where rustock answered no bytes at all. The vectors are RSKj's public
+    /// nodes' answers, one for each federation format each network has had
+    /// since the method opened: each federation is stored with the members its
+    /// script names and the format its creation block gives it, and asked at
+    /// the block RSKj was asked at. With nothing stored, the genesis federation
+    /// answers: on RSKj's regtest, the P2SH-P2WSH ERP script an independent
+    /// port of RSKj's `P2shErpRedeemScriptBuilder` computes.
+    #[test]
+    fn the_active_powpeg_redeem_script_is_rskjs() {
+        use super::super::constants::BridgeConstants;
+        use crate::hardfork::RskHardforkConfig;
+        use revm::MainContext;
+        let ctx_at = |block: u64| {
+            revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default())
+        };
+        let answer = |script: &[u8]| super::super::getters::abi_encode_bytes(script);
+
+        let mut formats = std::collections::BTreeSet::new();
+        let vectors = include_str!("testdata/active_powpeg_redeem_scripts.txt");
+        for line in vectors
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        {
+            let [network, block, creation, script] =
+                line.split_whitespace().collect::<Vec<_>>()[..]
+            else {
+                panic!("{line}");
+            };
+            let (config, forks) = match network {
+                "mainnet" => (BridgeConstants::mainnet(), RskHardforkConfig::mainnet()),
+                _ => (BridgeConstants::testnet(), RskHardforkConfig::testnet()),
+            };
+            let (block, creation): (u64, u64) = (block.parse().unwrap(), creation.parse().unwrap());
+            let script = hex::decode(script).unwrap();
+            // The members, as the script names them: past OP_NOTIF and the threshold.
+            let mut at = usize::from(script[0] == 0x64) + 1;
+            let mut members = Vec::new();
+            while script[at] == 0x21 {
+                members.push(StoredMember::from_btc(
+                    script[at + 1..at + 34].try_into().unwrap(),
+                ));
+                at += 34;
+            }
+            let format = federation_format_version(&forks, creation);
+            formats.insert((network, format));
+            let mut ctx = ctx_at(block);
+            bridge_store_bytes_named(
+                &mut ctx,
+                NEW_FEDERATION_KEY,
+                &super::super::federation::serialize_federation_multikey(&members, 0, creation),
+            );
+            bridge_store_bytes_named(
+                &mut ctx,
+                NEW_FEDERATION_FORMAT_VERSION_KEY,
+                &serialization::rlp_encode_u64(format),
+            );
+            let out = get_active_powpeg_redeem_script(&mut ctx, 0, &config, &forks).unwrap();
+            assert_eq!(out.bytes.to_vec(), answer(&script), "{network} #{block}");
+        }
+        let expected_formats = [
+            ("mainnet", 1000),
+            ("mainnet", 2000),
+            ("mainnet", 3000),
+            ("mainnet", 4000),
+            ("testnet", 2000),
+            ("testnet", 3000),
+            ("testnet", 4000),
+        ];
+        assert_eq!(formats.into_iter().collect::<Vec<_>>(), expected_formats);
+
+        let regtest_genesis = hex::decode(concat!(
+            "64522102cd53fc53a07f211641a677d250f6de99caf620e8e77071e811a28b3bcddf0be1210362634ab57dae9cb373a5",
+            "d536e66a8c4f67468bbcfb063809bab643072d78a1242103c5946b3fbae03a654237da863c9ed534e0878657175b132b",
+            "8ca630f245df04db53ae6702f401b2755321029cecea902067992d52c38b28bf0bb2345bda9b21eca76b16a17c477a64",
+            "e433012103284178e5fbcc63c54c3b38e3ef88adf2da6c526313650041b0ef955763634ebd2103ab0e2cd7ed158687fc",
+            "13b88019990860cdb72b1f5777b58513312550ea1584bc2103b9fc46657cf72a1afa007ecf431de1cd27ff5cc8829fa6",
+            "25b66ca47b967e6b2454ae68",
+        ))
+        .unwrap();
+        let out = get_active_powpeg_redeem_script(
+            &mut ctx_at(1),
+            0,
+            &BridgeConstants::rskj_regtest(),
+            &RskHardforkConfig::regtest(),
+        )
+        .unwrap();
+        assert_eq!(out.bytes.to_vec(), answer(&regtest_genesis));
+    }
+
+    /// rskj wraps `commitFederation`'s argument in a `Keccak256` before it
+    /// looks at anything else (`executeVoteFederationChangeFunction`), and a
+    /// `Keccak256` of other than 32 bytes throws an `IllegalArgumentException`
+    /// nothing there catches. The call fails, where a hash of the right length
+    /// that names no pending federation is answered -1.
+    #[test]
+    fn commit_federation_throws_for_a_hash_that_is_not_32_bytes() {
+        use crate::abi::encode::{self, Arg};
+        use crate::precompiles::BridgeTxContext;
+        use revm::MainContext;
+
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+        let authorizer =
+            alloy_primitives::hex::decode(config.federation_change_authorizer_keys[0]).unwrap();
+        let authorized = BridgeTxContext {
+            rsk_sender: super::super::federation::rsk_address_from_public_key(&authorizer).unwrap(),
+            ..BridgeTxContext::default()
+        };
+        let commit = |hash: &[u8], tx_ctx: &BridgeTxContext| {
+            let mut ctx =
+                revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+            let args = encode::args(&[Arg::Bytes(hash)]);
+            commit_federation(&mut ctx, &args, 0, &config, &cfg, tx_ctx)
+        };
+        let code =
+            |out: PrecompileOutput| i64::from_be_bytes(out.bytes[24..32].try_into().unwrap());
+
+        assert!(commit(&[0x11; 31], &authorized).is_err());
+        assert!(commit(&[0x11; 33], &authorized).is_err());
+        assert!(commit(&[], &authorized).is_err());
+        assert_eq!(code(commit(&[0x11; 32], &authorized).unwrap()), -1);
+        // A caller who may not vote is turned away before the hash is read.
+        let stranger = BridgeTxContext::default();
+        assert_eq!(code(commit(&[0x11; 31], &stranger).unwrap()), -10);
+    }
+
+    /// rskj reads a federator's keys with Bouncy Castle's `decodePoint`
+    /// (`BtcECKey.fromPublicOnly`, `ECKey.fromPublicOnly`), which takes the
+    /// hybrid encoding, 06 or 07 and then x and y, beside the compressed and
+    /// the uncompressed ones, and `FederationMember` keeps each key compressed.
+    #[test]
+    fn a_federators_key_comes_in_any_encoding_bouncy_castle_decodes() {
+        use crate::abi::encode::{self, Arg};
+        use crate::precompiles::BridgeTxContext;
+        use revm::MainContext;
+
+        // The generator, whose y is even.
+        const GX: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        const GY: &str = "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+        let encoded = |prefix: u8, with_y: bool| {
+            let mut key = vec![prefix];
+            key.extend(alloy_primitives::hex::decode(GX).unwrap());
+            if with_y {
+                key.extend(alloy_primitives::hex::decode(GY).unwrap());
+            }
+            key
+        };
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+        let block = 2_000_000u64;
+        assert!(cfg.has_rskip123(block));
+        let authorizer =
+            alloy_primitives::hex::decode(config.federation_change_authorizer_keys[0]).unwrap();
+        let authorized = BridgeTxContext {
+            rsk_sender: super::super::federation::rsk_address_from_public_key(&authorizer).unwrap(),
+            ..BridgeTxContext::default()
+        };
+        // One authorizer's vote to add the key, as all three of a member's, to
+        // a pending federation that has no members yet.
+        let add = |key: &[u8]| {
+            let mut ctx = revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default());
+            store_pending_federation(&mut ctx, Some(&[]), true);
+            let args = encode::args(&[Arg::Bytes(key), Arg::Bytes(key), Arg::Bytes(key)]);
+            let out =
+                add_federator_public_key_multikey(&mut ctx, &args, 0, &config, &cfg, &authorized)
+                    .unwrap();
+            i64::from_be_bytes(out.bytes[24..32].try_into().unwrap())
+        };
+        assert_eq!(add(&encoded(0x02, false)), 1, "compressed");
+        assert_eq!(add(&encoded(0x03, false)), 1, "compressed, the other y");
+        assert_eq!(add(&encoded(0x04, true)), 1, "uncompressed");
+        assert_eq!(add(&encoded(0x06, true)), 1, "hybrid");
+        assert_eq!(add(&encoded(0x07, true)), -10, "hybrid, naming the other y");
+        assert_eq!(
+            add(&encoded(0x03, true)),
+            -10,
+            "a compressed key's prefix on 65 bytes"
+        );
+        assert_eq!(
+            add(&encoded(0x04, false)),
+            -10,
+            "an uncompressed key's prefix on 33"
+        );
+    }
+
+    /// From RSKIP419 a committed federation is proposed first, and
+    /// `createPendingFederation` answers -4, PROPOSED_FEDERATION_ALREADY_EXISTS,
+    /// while one is stored: after it looks for a pending federation, before it
+    /// looks for a federation awaiting activation or retiring. The dry run
+    /// answers the same, so the vote isn't counted. Before RSKIP419 a proposed
+    /// federation is none to rskj.
+    #[test]
+    fn from_rskip419_no_federation_is_created_while_one_is_proposed() {
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+        let authorizers = federation_change_authorizers(&config);
+        let deciding = authorizers.len() / 2 + 1;
+        // The deciding authorizers' answers to createFederation at `block`, with
+        // a proposed federation stored or not, and whether a pending federation
+        // was created.
+        let votes = |block: u64, proposed: bool| {
+            let mut ctx = revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default());
+            if proposed {
+                let members = [
+                    StoredMember::from_btc([0x02; 33]),
+                    StoredMember::from_btc([0x03; 33]),
+                ];
+                bridge_store_bytes_named(
+                    &mut ctx,
+                    PROPOSED_FEDERATION_KEY,
+                    &super::super::federation::serialize_federation_multikey(
+                        &members,
+                        0,
+                        block - 1,
+                    ),
+                );
+            }
+            let answers: Vec<i64> = authorizers[..deciding]
+                .iter()
+                .map(|authorizer| {
+                    let tx_ctx = crate::precompiles::BridgeTxContext {
+                        rsk_sender: *authorizer,
+                        ..Default::default()
+                    };
+                    let out = create_federation(&mut ctx, 0, &config, &cfg, &tx_ctx).unwrap();
+                    i64::from_be_bytes(out.bytes[24..32].try_into().unwrap())
+                })
+                .collect();
+            let pending = !bridge_load_bytes_named(&mut ctx, PENDING_FEDERATION_KEY).is_empty();
+            (answers, pending)
+        };
+        let lovell = 7_338_024;
+        assert!(cfg.has_rskip419(lovell) && !cfg.has_rskip419(lovell - 1));
+        let created = (vec![1; deciding], true);
+        assert_eq!(votes(lovell - 1, true), created, "before RSKIP419");
+        assert_eq!(votes(lovell, true), (vec![-4; deciding], false));
+        assert_eq!(votes(lovell, false), created);
+    }
+
+    /// rskj builds the federation as a commit goes through, and the build
+    /// throws for one Bitcoin could not spend from: more than 20 keys
+    /// (`ScriptBuilder.createMultiSigOutputScript`), or an ERP redeem script
+    /// longer than a scriptSig element holds, less a flyover prefix, or for a
+    /// P2SH-P2WSH federation than a witness script may be
+    /// (`ErpFederation.validateRedeemScript`). The dry run builds nothing, so
+    /// the votes before the deciding one are taken; the deciding one throws.
+    #[test]
+    fn a_federation_bitcoin_could_not_spend_from_is_not_committed() {
+        use crate::precompiles::BridgeTxContext;
+        use revm::MainContext;
+        use sha3::{Digest, Keccak256};
+
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+        let member = |i: u8| {
+            let secp = bitcoin::secp256k1::Secp256k1::new();
+            let secret = bitcoin::secp256k1::SecretKey::from_slice(&[i + 1; 32]).unwrap();
+            let key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+            StoredMember::from_btc(key.serialize())
+        };
+        let authorizers = federation_change_authorizers(&config);
+        let deciding = authorizers.len() / 2 + 1;
+        // Each authorizer's vote, up to the deciding one, to commit a pending
+        // federation of `n` members at `block`: its answer, or none where the
+        // call throws.
+        let votes = |block: u64, n: u8| -> Vec<Option<i64>> {
+            let mut ctx = revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default());
+            let members: Vec<StoredMember> = (0..n).map(member).collect();
+            store_pending_federation(&mut ctx, Some(&members), true);
+            let hash = Keccak256::digest(serialize_pending_federation_btc_keys(&members));
+            let args = crate::abi::encode::args(&[crate::abi::encode::Arg::Bytes(&hash)]);
+            authorizers[..deciding]
+                .iter()
+                .map(|authorizer| {
+                    let tx_ctx = BridgeTxContext {
+                        rsk_sender: *authorizer,
+                        ..BridgeTxContext::default()
+                    };
+                    commit_federation(&mut ctx, &args, 0, &config, &cfg, &tx_ctx)
+                        .ok()
+                        .map(|out| i64::from_be_bytes(out.bytes[24..32].try_into().unwrap()))
+                })
+                .collect()
+        };
+        let committed = vec![Some(1); deciding];
+        let mut thrown = committed.clone();
+        *thrown.last_mut().unwrap() = None;
+
+        // A standard multisig, before RSKIP201: 20 keys and no more.
+        let standard = 2_000_000;
+        assert_eq!(federation_format_version(&cfg, standard), 1000);
+        assert_eq!(votes(standard, 20), committed);
+        assert_eq!(votes(standard, 21), thrown);
+
+        // A P2SH ERP federation's redeem script goes in a scriptSig: 486
+        // bytes and no more.
+        let p2sh_erp = 5_000_000;
+        assert_eq!(federation_format_version(&cfg, p2sh_erp), 3000);
+        let size = |n: u8| {
+            let mut keys: Vec<[u8; 33]> = (0..n).map(|i| member(i).btc).collect();
+            keys.sort();
+            super::super::peg::build_committed_federation_redeem_script(
+                &keys, &config, &cfg, p2sh_erp,
+            )
+            .len()
+        };
+        let largest = (2..20u8).rev().find(|n| size(*n) <= 486).unwrap();
+        assert!(size(largest + 1) > 486);
+        assert_eq!(votes(p2sh_erp, largest), committed);
+        assert_eq!(votes(p2sh_erp, largest + 1), thrown);
+
+        // From Reed a federation is a P2SH-P2WSH one, its redeem script in a
+        // witness, where 20 members' fits: 20 keys and no more.
+        let p2sh_p2wsh = 8_100_000;
+        assert_eq!(federation_format_version(&cfg, p2sh_p2wsh), 4000);
+        let mut keys: Vec<[u8; 33]> = (0..20).map(|i| member(i).btc).collect();
+        keys.sort();
+        let redeem = super::super::peg::build_committed_federation_redeem_script(
+            &keys, &config, &cfg, p2sh_p2wsh,
+        );
+        assert!(redeem.len() <= 3600 - 34);
+        assert_eq!(votes(p2sh_p2wsh, 20), committed);
+        assert_eq!(votes(p2sh_p2wsh, 21), thrown);
+    }
+
+    /// A member whose key is the point at infinity takes two bytes of a redeem
+    /// script where another takes 34: bitcoinj's `ScriptBuilder.data` pushes
+    /// its encoding, the one byte 00. So a P2SH ERP federation of a key more
+    /// than a scriptSig holds is built, and committed, when one of its keys is
+    /// that point.
+    #[test]
+    fn the_point_at_infinity_takes_two_bytes_of_the_redeem_scripts_size() {
+        use crate::precompiles::BridgeTxContext;
+        use revm::MainContext;
+        use sha3::{Digest, Keccak256};
+
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+        let block = 5_000_000u64;
+        assert_eq!(federation_format_version(&cfg, block), 3000);
+        let member = |i: u8| {
+            let secp = bitcoin::secp256k1::Secp256k1::new();
+            let secret = bitcoin::secp256k1::SecretKey::from_slice(&[i + 1; 32]).unwrap();
+            let key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+            StoredMember::from_btc(key.serialize())
+        };
+        // Nine members of 33-byte keys fit what a scriptSig holds, ten don't.
+        let size = |n: u8| {
+            let mut keys: Vec<[u8; 33]> = (0..n).map(|i| member(i).btc).collect();
+            keys.sort();
+            super::super::peg::build_committed_federation_redeem_script(&keys, &config, &cfg, block)
+                .len()
+        };
+        assert!(size(9) <= MAX_P2SH_REDEEM_SCRIPT_SIZE && size(10) > MAX_P2SH_REDEEM_SCRIPT_SIZE);
+        let authorizers = federation_change_authorizers(&config);
+        let deciding = authorizers.len() / 2 + 1;
+        let votes = |members: &[StoredMember]| -> Vec<Option<i64>> {
+            let mut ctx = revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default());
+            store_pending_federation(&mut ctx, Some(members), true);
+            let hash = Keccak256::digest(serialize_pending_federation_btc_keys(members));
+            let args = crate::abi::encode::args(&[crate::abi::encode::Arg::Bytes(&hash)]);
+            authorizers[..deciding]
+                .iter()
+                .map(|authorizer| {
+                    let tx_ctx = BridgeTxContext {
+                        rsk_sender: *authorizer,
+                        ..BridgeTxContext::default()
+                    };
+                    commit_federation(&mut ctx, &args, 0, &config, &cfg, &tx_ctx)
+                        .ok()
+                        .map(|out| i64::from_be_bytes(out.bytes[24..32].try_into().unwrap()))
+                })
+                .collect()
+        };
+        let committed = vec![Some(1); deciding];
+        let mut thrown = committed.clone();
+        *thrown.last_mut().unwrap() = None;
+        let ten: Vec<StoredMember> = (0..10).map(member).collect();
+        assert_eq!(votes(&ten), thrown, "ten keys of 33 bytes");
+        let mut nine_and_infinity: Vec<StoredMember> = (0..9).map(member).collect();
+        nine_and_infinity.push(StoredMember::from_btc(
+            super::super::federation::INFINITY_KEY,
+        ));
+        assert_eq!(
+            votes(&nine_and_infinity),
+            committed,
+            "nine, and the point at infinity"
+        );
+    }
+
+    /// A Bridge call that reads the whitelist writes it back as the call
+    /// returns, whatever it answers (upstream #291): `save()` writes whatever
+    /// the call loaded. The changes read it after the sender check, the adds
+    /// only once the address parses, and a removal before it parses. On a store
+    /// that never held the whitelist, the cells show which answers read it.
+    #[test]
+    fn a_whitelist_change_writes_the_whitelist_back_once_it_has_read_it() {
+        use crate::abi::encode::{self, Arg};
+        use crate::precompiles::BridgeTxContext;
+        use revm::MainContext;
+
+        /// The call's answer, then the one-off and unlimited cells after it.
+        fn run<CTX: crate::RskContextTr>(
+            mut ctx: CTX,
+            call: impl FnOnce(&mut CTX) -> Result<PrecompileOutput, PrecompileError>,
+        ) -> (i64, String, String) {
+            let out = call(&mut ctx).unwrap();
+            let code = i64::from_be_bytes(out.bytes[24..32].try_into().unwrap());
+            let mut cell =
+                |key: &str| alloy_primitives::hex::encode(bridge_load_bytes_named(&mut ctx, key));
+            (
+                code,
+                cell(LOCK_WHITELIST_KEY),
+                cell(UNLIMITED_LOCK_WHITELIST_KEY),
+            )
+        }
+        let fresh =
+            || revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        let config = super::super::constants::BridgeConstants::mainnet();
+        // Block 0, where regtest has RSKIP87 and mainnet doesn't.
+        let (all, mainnet) = (
+            crate::hardfork::RskHardforkConfig::regtest(),
+            crate::hardfork::RskHardforkConfig::mainnet(),
+        );
+        let authorizer =
+            alloy_primitives::hex::decode(config.whitelist_authorizer_keys[0]).unwrap();
+        let authorized = BridgeTxContext {
+            rsk_sender: super::super::federation::rsk_address_from_public_key(&authorizer).unwrap(),
+            ..BridgeTxContext::default()
+        };
+        let stranger = BridgeTxContext::default();
+        let address = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
+        let hash160 = btc_address_to_hash160(address, &config).unwrap();
+        let string = |s: &str| encode::args(&[Arg::Bytes(s.as_bytes())]);
+        let one_off =
+            |s: &str| encode::args(&[Arg::Bytes(s.as_bytes()), Arg::Word(encode::int(1_000))]);
+        let delay = |n: i64| encode::args(&[Arg::Word(encode::int(n))]);
+        let read = |code: i64| (code, "c5847fffffff".to_string(), "c0".to_string());
+        let unread = |code: i64| (code, String::new(), String::new());
+        // The address on the one-off list, in a store with no unlimited cell.
+        let listed = || {
+            let mut ctx = fresh();
+            store_one_off_whitelist(&mut ctx, &[(hash160, 1_000)], i32::MAX);
+            ctx
+        };
+        let listed_cell = alloy_primitives::hex::encode(serialize_one_off_whitelist(
+            &[(hash160, 1_000)],
+            i32::MAX,
+        ));
+
+        // The address on the unlimited list.
+        let unlimited_listed = || {
+            let mut ctx = fresh();
+            store_one_off_whitelist(&mut ctx, &[], i32::MAX);
+            store_unlimited_whitelist(&mut ctx, &[hash160]);
+            ctx
+        };
+        let unlimited_cell =
+            alloy_primitives::hex::encode(serialize_unlimited_whitelist(&[hash160]));
+
+        let add = |ctx, args: Vec<u8>, tx: &BridgeTxContext, hardforks| {
+            run(ctx, |ctx| {
+                add_one_off_lock_whitelist_address(ctx, &args, 0, &config, hardforks, tx)
+            })
+        };
+        assert_eq!(add(fresh(), one_off(address), &stranger, &all), unread(-10));
+        assert_eq!(
+            add(fresh(), one_off("not an address"), &authorized, &all),
+            unread(-2)
+        );
+        assert_eq!(
+            add(listed(), one_off(address), &authorized, &all),
+            (-1, listed_cell.clone(), "c0".to_string()),
+            "already listed, and written back"
+        );
+        assert_eq!(
+            add(listed(), one_off(address), &authorized, &mainnet),
+            (-1, listed_cell.clone(), String::new())
+        );
+        assert_eq!(
+            add(unlimited_listed(), one_off(address), &authorized, &all),
+            (-1, "c5847fffffff".to_string(), unlimited_cell.clone()),
+            "listed as unlimited"
+        );
+        let unlimited = |ctx, args: Vec<u8>| {
+            run(ctx, |ctx| {
+                add_unlimited_lock_whitelist_address(ctx, &args, 0, &config, &all, &authorized)
+            })
+        };
+        assert_eq!(unlimited(fresh(), string("not an address")), unread(-2));
+        assert_eq!(
+            unlimited(listed(), string(address)),
+            (-1, listed_cell, "c0".to_string())
+        );
+        assert_eq!(
+            unlimited(unlimited_listed(), string(address)),
+            (-1, "c5847fffffff".to_string(), unlimited_cell)
+        );
+
+        let remove = |ctx, args: Vec<u8>, tx: &BridgeTxContext, hardforks| {
+            run(ctx, |ctx| {
+                remove_lock_whitelist_address(ctx, &args, 0, &config, hardforks, tx)
+            })
+        };
+        assert_eq!(
+            remove(fresh(), string(address), &stranger, &all),
+            unread(-10)
+        );
+        assert_eq!(
+            remove(fresh(), string("not an address"), &authorized, &all),
+            read(-2),
+            "read before the address is parsed"
+        );
+        assert_eq!(
+            remove(fresh(), string(address), &authorized, &all),
+            read(-1)
+        );
+        assert_eq!(
+            remove(fresh(), string(address), &authorized, &mainnet),
+            (-1, "c5847fffffff".to_string(), String::new()),
+            "the unlimited cell is written from RSKIP87 on"
+        );
+        assert_eq!(
+            remove(unlimited_listed(), string(address), &authorized, &all),
+            read(1)
+        );
+
+        let set = |ctx, args: Vec<u8>, tx: &BridgeTxContext, hardforks| {
+            run(ctx, |ctx| {
+                set_lock_whitelist_disable_block_delay(ctx, &args, 0, &config, hardforks, tx)
+            })
+        };
+        assert_eq!(set(fresh(), delay(100), &stranger, &all), unread(-10));
+        assert_eq!(set(fresh(), delay(0), &authorized, &all), read(-2));
+        assert_eq!(
+            set(fresh(), delay(0), &authorized, &mainnet),
+            (-2, "c5847fffffff".to_string(), String::new())
+        );
+        let disabled = || {
+            let mut ctx = fresh();
+            store_one_off_whitelist(&mut ctx, &[], 50);
+            ctx
+        };
+        assert_eq!(
+            set(disabled(), delay(100), &authorized, &all),
+            (-1, "c132".to_string(), "c0".to_string())
+        );
+        let mut ctx = fresh();
+        let beyond_an_int = encode::args(&[Arg::Word(encode::int(1 << 31))]);
+        assert!(set_lock_whitelist_disable_block_delay(
+            &mut ctx,
+            &beyond_an_int,
+            0,
+            &config,
+            &all,
+            &authorized
+        )
+        .is_err());
+        assert!(
+            bridge_load_bytes_named(&mut ctx, LOCK_WHITELIST_KEY).is_empty(),
+            "a throw ends the call before it saves"
+        );
+    }
+
+    /// rskj `setLockWhitelistDisableBlockDelay` reads the BTC chain's height
+    /// first, which seeds a chain nothing has seeded yet, whoever calls; the
+    /// disable height is then counted from the checkpoint.
+    #[test]
+    fn the_disable_delay_counts_from_the_seeded_btc_chain() {
+        use crate::abi::encode::{self, Arg};
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let hardforks = crate::hardfork::RskHardforkConfig::regtest();
+        let checkpoint = config.btc_checkpoint.unwrap().1 as i32;
+        let authorizer =
+            alloy_primitives::hex::decode(config.whitelist_authorizer_keys[0]).unwrap();
+        let authorized = crate::precompiles::BridgeTxContext {
+            rsk_sender: super::super::federation::rsk_address_from_public_key(&authorizer).unwrap(),
+            ..crate::precompiles::BridgeTxContext::default()
+        };
+        let args = encode::args(&[Arg::Word(encode::int(100))]);
+        let fresh =
+            || revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+
+        let mut ctx = fresh();
+        let stranger = crate::precompiles::BridgeTxContext::default();
+        set_lock_whitelist_disable_block_delay(&mut ctx, &args, 0, &config, &hardforks, &stranger)
+            .unwrap();
+        assert_eq!(
+            super::super::btc_store::load_chain_head(&mut ctx).map(|head| head.height as i32),
+            Some(checkpoint),
+            "seeded before the sender check"
+        );
+
+        let mut ctx = fresh();
+        set_lock_whitelist_disable_block_delay(
+            &mut ctx,
+            &args,
+            0,
+            &config,
+            &hardforks,
+            &authorized,
+        )
+        .unwrap();
+        assert_eq!(
+            LockWhitelist::load(&mut ctx, true).disable_height,
+            checkpoint + 100
+        );
     }
 }

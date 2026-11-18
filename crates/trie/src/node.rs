@@ -557,6 +557,11 @@ impl TrieNode {
             if val.as_ref().is_some_and(|v| v.len() != vlen as usize) {
                 return None;
             }
+            // rskj `fromMessageRskip107`: "The message had more data than
+            // expected" -- nothing may follow the value's length.
+            if r.pos < data.len() {
+                return None;
+            }
             long_value_len = Some(vlen);
             (val, Some(vh))
         } else if r.pos < data.len() {
@@ -694,6 +699,43 @@ impl TrieNode {
         Some(subnodes)
     }
 
+    /// Every node from this one toward `key`, **leaf first, root last**,
+    /// whether or not the trie holds the key.
+    ///
+    /// Where it does, this is [`nodes_on_path`](Self::nodes_on_path). Where it
+    /// does not, the path runs down to the node at which the key leaves the
+    /// trie, and that node shows it on its own terms: its shared path parts
+    /// from the key's, or the key ends inside it, or the child the key would
+    /// take is empty, or the key ends at it and it holds no value. The nodes
+    /// above it tie it to the root, which is what makes the path a proof of
+    /// absence.
+    ///
+    /// `Err` with the hash the store could not produce when a reference on the
+    /// way cannot be followed: an incomplete store proves nothing either way,
+    /// and answering as though the key were absent would be a false proof.
+    pub fn try_nodes_toward(
+        &self,
+        key: &TrieKeySlice,
+        store: &dyn TrieStore,
+    ) -> Result<Vec<TrieNode>, B256> {
+        let common = key.common_path(&self.shared_path);
+        if common.length() < self.shared_path.length() || common.length() == key.length() {
+            return Ok(vec![self.clone()]);
+        }
+
+        let bit = key.get(common.length());
+        let child_ref = if bit == 0 { &self.left } else { &self.right };
+        let child = match child_ref.try_resolve(store) {
+            Resolution::Found(c) => c,
+            Resolution::Absent => return Ok(vec![self.clone()]),
+            Resolution::Missing(h) => return Err(h),
+        };
+        let sub_key = key.slice(common.length() + 1, key.length());
+        let mut nodes = child.try_nodes_toward(&sub_key, store)?;
+        nodes.push(self.clone());
+        Ok(nodes)
+    }
+
     /// Every node the search for `key` visits, whether or not the key is
     /// there.
     ///
@@ -716,33 +758,9 @@ impl TrieNode {
         key: &TrieKeySlice,
         store: &dyn TrieStore,
     ) -> Option<Vec<TrieNode>> {
-        // The search cannot continue past here: this node's own path is
-        // longer than what is left of the key, or disagrees with it. Either
-        // way this node is where the answer is decided, so it is the proof.
-        if self.shared_path.length() > key.length() {
-            return Some(vec![self.clone()]);
-        }
-        let common = key.common_path(&self.shared_path);
-        if common.length() < self.shared_path.length() {
-            return Some(vec![self.clone()]);
-        }
-        if common.length() == key.length() {
-            return Some(vec![self.clone()]);
-        }
-
-        let bit = key.get(common.length());
-        let child_ref = if bit == 0 { &self.left } else { &self.right };
-        match child_ref.try_resolve(store) {
-            // No child on that side: the trie ends here, and this node says so.
-            Resolution::Absent => Some(vec![self.clone()]),
-            Resolution::Missing(_) => None,
-            Resolution::Found(child) => {
-                let sub_key = key.slice(common.length() + 1, key.length());
-                let mut subnodes = child.nodes_to_divergence(&sub_key, store)?;
-                subnodes.push(self.clone());
-                Some(subnodes)
-            }
-        }
+        // The walk is `try_nodes_toward`'s, which also says which node the
+        // store could not produce.
+        self.try_nodes_toward(key, store).ok()
     }
 
     /// Like [`get`](Self::get), but says which node was missing instead of
@@ -1288,6 +1306,105 @@ mod tests {
         // Nonexistent key
         let key = TrieKeySlice::from_key(&[200]);
         assert_eq!(root.get(&key, &store), None);
+    }
+
+    /// A trie that branches, so that paths are more than a node or two deep.
+    fn branching(store: &MemoryTrieStore) -> TrieNode {
+        let mut root = TrieNode::empty();
+        for i in 0u8..50 {
+            root = root.put(&TrieKeySlice::from_key(&[i, 7]), &[i], store);
+        }
+        root
+    }
+
+    /// Each node is a child of the one after it, and the last is `root`.
+    fn assert_chained(nodes: &[TrieNode], root: &TrieNode, store: &MemoryTrieStore) {
+        assert_eq!(
+            nodes.last().expect("a path").compute_hash(store),
+            root.compute_hash(store)
+        );
+        for pair in nodes.windows(2) {
+            let (child, parent) = (&pair[0], &pair[1]);
+            let message = child.to_message(store);
+            let linked = [&parent.left, &parent.right].iter().any(|r| {
+                r.resolve(store)
+                    .is_some_and(|c| c.to_message(store) == message)
+            });
+            assert!(
+                linked,
+                "a node on the path is not a child of the one above it"
+            );
+        }
+    }
+
+    /// A key the trie holds gets the path `nodes_on_path` gives it.
+    #[test]
+    fn nodes_toward_a_present_key_are_its_path() {
+        let store = MemoryTrieStore::new();
+        let root = branching(&store);
+        let key = TrieKeySlice::from_key(&[21, 7]);
+
+        let toward = root
+            .try_nodes_toward(&key, &store)
+            .expect("a complete store");
+        let on_path = root.nodes_on_path(&key, &store).expect("present");
+        let messages = |nodes: &[TrieNode]| {
+            nodes
+                .iter()
+                .map(|n| n.to_message(&store))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(messages(&toward), messages(&on_path));
+    }
+
+    /// A key the trie does not hold still gets a path, tied to the root, down
+    /// to the node where it leaves the trie -- whichever way it leaves.
+    #[test]
+    fn nodes_toward_an_absent_key_end_where_it_leaves_the_trie() {
+        let store = MemoryTrieStore::new();
+        let root = branching(&store);
+        let absent: [&[u8]; 4] = [
+            &[200, 7],   // parts from every key early
+            &[21, 8],    // shares the first byte of one, then parts
+            &[21],       // ends inside the path to one
+            &[21, 7, 1], // runs on past one
+        ];
+        for key in absent {
+            let slice = TrieKeySlice::from_key(key);
+            assert_eq!(
+                root.try_get(&slice, &store),
+                Ok(None),
+                "{key:?} is in the trie"
+            );
+            let nodes = root
+                .try_nodes_toward(&slice, &store)
+                .expect("a complete store");
+            assert_chained(&nodes, &root, &store);
+        }
+
+        // Running on past a key ends at that key's own node, which has no
+        // child for the rest.
+        let past = root
+            .try_nodes_toward(&TrieKeySlice::from_key(&[21, 7, 1]), &store)
+            .expect("a complete store");
+        assert_eq!(past[0].value, Some(vec![21]));
+    }
+
+    /// A store that cannot follow the path proves nothing, and says so rather
+    /// than answering that the key is absent.
+    #[test]
+    fn nodes_toward_through_an_incomplete_store_are_an_error() {
+        let store = MemoryTrieStore::new();
+        let mut root = branching(&store);
+        root.save(&store, true);
+
+        // The same root, read back against a store holding none of its
+        // descendants.
+        let empty = MemoryTrieStore::new();
+        let detached = TrieNode::from_message(&root.to_message(&store), &empty);
+        assert!(detached
+            .try_nodes_toward(&TrieKeySlice::from_key(&[21, 8]), &empty)
+            .is_err());
     }
 
     #[test]

@@ -36,3 +36,30 @@ RSKIP-108, which is what rskj does.
 
 **Verdict: spec is stale.** Notation ambiguity in the RSKIP; the implementation
 follows rskj's 10-byte prefix.
+
+---
+
+# storage-state — RSKIPs the audit skipped (#149)
+
+## RSKIP-144 — parallel transaction execution
+
+**Verdict: matches rskj.** Not a closed window, as #149 has it: that holds
+for mainnet only.
+
+`reference.conf` puts RSKIP144 at reed810, which mainnet never schedules
+(`main.conf`: -1) and testnet does from #7,139,600. Testnet blocks have run in
+sublists since: #7,690,880, for one, declares edges `[1, 2]`, two parallel
+sublists and the sequential one.
+
+rustock schedules it the same way (`has_rskip144`, a check of reed810's own
+height, so that mainnet's later upgrades do not imply it) and runs a block's
+sublists as rskj's `BlockExecutor.executeParallel` does
+(`RskExecutor::execute_block_in_parallel`): the block's precompile
+maintenance first, then the parallel sublists against the state it leaves,
+each committed in order, then the sequential sublist on what they left,
+carrying their fees and the accounts they deleted (the second for RSKIP-131,
+in `evm.md`).
+
+The check against the chain: every testnet block from genesis to #8,294,684
+has been re-run and matches its header, so every block in that range that
+runs in sublists has been run in them.

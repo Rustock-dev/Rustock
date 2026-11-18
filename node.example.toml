@@ -122,6 +122,9 @@
 # inbound_cidr_prefix = 24          # default
 # bootnodes = ["127.0.0.1:30304"]   # default: unset — replaces the chain's built-in list; port is listen+1
 # banned_peers = ["203.0.113.0/24"] # default: unset — refused at connection time; rskj's peer.bannedPeerIPs
+# A block a peer sends whole is refused when its coinbase is one of these
+# 20-byte addresses, hex with or without 0x (rskj's peer.bannedMiners).
+# banned_miners = ["0x1111111111111111111111111111111111111111"] # default: unset
 # no_peer_punishment = false        # default — count scoring events but never act on them
 # Never learn node ids from peers and never dial them. With `bootnodes` this
 # pins the node to exactly the addresses named there, which is what makes a
@@ -361,11 +364,38 @@
 # coinbase = "0x…"                  # default: unset — REQUIRED when enabled
 # extra_data = ""                   # default — client string, cut to fit rskj's 32-byte [1, "<version>-<commit>", extra] field
 # refresh_secs = 60                 # default
-# min_gas_price = 0                 # default: unset — wei to steer the block minimum toward, 1% per block (rskj miner.minGasPrice)
+# min_gas_price = 0                 # default — wei to steer the block minimum toward, 1% per block (rskj miner.minGasPrice); with a stable price on, the one until it is fetched
+# gas_limit_target = 6800000        # default: unset — rskj targetgaslimit: 6,800,000, or 7,500,000 on a regtest; a 1024th a block toward it
+# force_gas_limit = true            # default — rskj forcegaslimit; false follows the gas the parent used, up to the target
 # submission_rate_limit_ms = 0      # default — refuse a second submission inside this window (rskj workSubmissionRateLimitInMills)
 # update_work_on_new_transaction = false  # default — rebuild when arrivals pay a tenth of the candidate's fees (rskj updateWorkOnNewTransaction)
 # timed = "10s"                     # default: unset — mine on rskj's regtest clock (timedMine): exponential delays with this median
 # flush_every = 10                  # default — mined blocks between trie flushes (rskj blockchain.flushNumberOfBlocks)
+
+# A minimum gas price held stable in a currency (rskj miner.stableGasPrice):
+# min_stable_gas_price over the price of a bitcoin in that currency, fetched
+# from a web API's JSON (HTTP_GET) or from a contract's answer to a call on
+# this node (ETH_CALL), and kept for refresh_rate. A bitcoin priced outside
+# min_valid_price to max_valid_price is no price, and until a price is had the
+# block minimum steers toward min_gas_price above. A duration is written as
+# rskj writes one: a number of milliseconds, or "2 seconds", "6 hours".
+[mining.stable_gas_price]
+# enabled = false                   # default
+# refresh_rate = "6 hours"          # default: unset — none: every block the miner builds asks for a fresh price
+# min_stable_gas_price = 4265280000000  # default: unset — a gas unit's price in the currency, times 10^18: here 0.00000426528 USD
+# min_valid_price = 0               # default
+# max_valid_price = 9223372036854775807  # default
+
+[mining.stable_gas_price.source]
+# method = "HTTP_GET"               # default: unset — HTTP_GET or ETH_CALL; required when enabled
+
+[mining.stable_gas_price.source.params]
+# url = "https://domain.info/ticker"  # default: unset — HTTP_GET: the API that answers the price
+# json_path = "/USD/buy"            # default: unset — HTTP_GET: a JSON pointer to the price in its answer
+# timeout = "2 seconds"             # default: unset — HTTP_GET: to connect, and for each read
+# from = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd825"  # default: unset — ETH_CALL: who calls
+# to = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826"    # default: unset — ETH_CALL: the contract called
+# data = "0x8300df49"               # default: unset — ETH_CALL: the call's data
 
 # Per-account virtual gas quota (rskj TxQuotaChecker). An account accumulates
 # quota while idle and spends it when broadcasting, so one that floods the
@@ -396,7 +426,6 @@
 # genesis = "genesis.json"          # default: unset — an rskj genesis JSON file, instead of rustock's regtest genesis
 # skip_pow_validation = false       # default — rskj's miner.server.skipPowValidation
 # consensus_rules = { rskip97 = 0 } # default: unset — rskj's blockchain.config.consensusRules; -1 disables
-# min_gas_limit = 3000000           # default: unset (regtest: 1) — rskj's regtest minimum
-# max_gas_limit = 1000000000        # default: unset (regtest: 10000000) — rskj has no upper bound
+# min_gas_limit = 3000000           # default: unset (3000000) — rskj's minimum, on every network; it has no maximum
 # hardforks = { reed810 = 9002504 }  # default: unset — rskj's blockchain.config.hardforkActivationHeights; -1 takes an upgrade off
 # allow_overrides = false            # default — take these on a copy of mainnet or testnet too (genesis excepted)

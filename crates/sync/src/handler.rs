@@ -1,12 +1,13 @@
 use crate::events::SyncEvent;
 use crate::manager::SyncManager;
-use alloy_primitives::B512;
+use alloy_primitives::{Address, B512};
 use crate::snap::server::SnapServer;
 use rustock_networking::protocol::{
     BlockHashResponse, BlockHeadersResponse, BlockHeadersWithUnclesResponse, BlockIdentifier,
     BodyResponse, HeaderWithUncles,
     P2pHandler, P2pMessage, RskMessage, RskSubMessage, SkeletonResponse,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
@@ -70,6 +71,39 @@ pub struct SyncHandler {
     /// applying mainnet's to a testnet peer is a category error that happens to
     /// be harmless only because testnet totals are too small to trip it.
     checkpoint: Option<rustock_core::checkpoint::DifficultyCheckpoint>,
+    /// Coinbases whose blocks are not taken from a peer that sends them
+    /// whole: rskj's `peer.bannedMiners` (`NodeMessageHandler.bannedMiners`).
+    banned_miners: HashSet<Address>,
+}
+
+/// rskj's `peer.bannedMiners` entries as its `NodeMessageHandler` reads them,
+/// `new RskAddress(String)` each (L134-136): a `0x` prefix dropped, an odd
+/// number of digits read with a leading zero (`HexUtils.stringHexToByteArray`),
+/// and anything but 20 bytes refused, which keeps rskj from starting.
+pub fn parse_banned_miners(entries: &[String]) -> Result<HashSet<Address>, String> {
+    entries
+        .iter()
+        .map(|entry| {
+            let digits = entry.strip_prefix("0x").unwrap_or(entry);
+            let digits = if digits.len() % 2 == 1 {
+                format!("0{digits}")
+            } else {
+                digits.to_string()
+            };
+            // Checked here, so a second `0x` is refused as rskj's decoder
+            // refuses it rather than dropped as `hex::decode` would.
+            if !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(format!("{entry:?} is not hex"));
+            }
+            let bytes = alloy_primitives::hex::decode(&digits)
+                .map_err(|e| format!("{entry:?} is not hex: {e}"))?;
+            if bytes.len() != Address::len_bytes() {
+                let len = bytes.len();
+                return Err(format!("{entry:?} is {len} bytes; an address is 20"));
+            }
+            Ok(Address::from_slice(&bytes))
+        })
+        .collect()
 }
 
 impl SyncHandler {
@@ -82,6 +116,7 @@ impl SyncHandler {
             serve_ceiling: None,
             checkpoint_defence: rustock_core::checkpoint::CheckpointDefence::NONE,
             checkpoint: None,
+            banned_miners: HashSet::new(),
         }
     }
 
@@ -107,6 +142,13 @@ impl SyncHandler {
     /// Serve nothing above `height`. See [`Self::serve_ceiling`].
     pub fn with_serve_ceiling(mut self, height: Option<u64>) -> Self {
         self.serve_ceiling = height;
+        self
+    }
+
+    /// Refuse a block a peer sends whole when its coinbase is one of these:
+    /// rskj's `peer.bannedMiners`. See [`parse_banned_miners`].
+    pub fn with_banned_miners(mut self, banned_miners: HashSet<Address>) -> Self {
+        self.banned_miners = banned_miners;
         self
     }
 
@@ -267,11 +309,21 @@ impl SyncHandler {
         let store = &self.manager.store;
         // Above the simulated head this node has nothing to say, even though
         // the block is on disk.
-        if let Some(h) = store.header(hash).ok().flatten() {
+        let header = store.header(hash).ok().flatten();
+        if let Some(h) = &header {
             if !self.may_serve(h.number) {
                 return None;
             }
         }
+        // rskj `NodeBlockProcessor.processBodyRequest` sends the header's
+        // RSKIP-351 extension beside the body, which a peer needs for a
+        // header it got compressed. A header that holds only its commitment
+        // has none to send, and a body without it is no use to the peer.
+        let extension = match &header {
+            Some(h) if h.extension_data.is_some() => return None,
+            Some(h) => h.extension(),
+            None => None,
+        };
         let (transactions, uncles) = store.body(hash).ok()??;
 
         trace!(
@@ -284,9 +336,43 @@ impl SyncHandler {
             id: request_id,
             transactions,
             uncles,
+            extension,
         };
         Some(P2pMessage::RskMessage(RskMessage::new(
             RskSubMessage::BodyResponse(resp),
+        )))
+    }
+
+    /// Answer a `GetBlockMessage` with the whole block: rskj
+    /// `NodeBlockProcessor.processGetBlock` (L147-157), which answers from any
+    /// chain it holds, and first remembers that the asker holds the block now,
+    /// so it is not announced back to it.
+    ///
+    /// A peer sends one to the node that announced a block it lacks
+    /// (`processNewBlockHashesMessage`), so without an answer this node's
+    /// announcements could not be followed. A block whose header this node
+    /// holds compressed has no full form to send, and one without its body is
+    /// not whole; neither is answered, as rskj answers nothing for a block it
+    /// lacks.
+    fn serve_get_block(&self, peer: B512, hash: alloy_primitives::B256) -> Option<P2pMessage> {
+        let store = &self.manager.store;
+        let header = store.header(hash).ok()??;
+        if !self.may_serve(header.number) || header.extension_data.is_some() {
+            return None;
+        }
+        let (transactions, ommers) = store.body(hash).ok()??;
+        self.manager.note_block_holder(hash, peer);
+        trace!(
+            target: "rustock::sync",
+            "Serving block #{} {:?} to {:?}",
+            header.number, hash, &peer.0[..4]
+        );
+        Some(P2pMessage::RskMessage(RskMessage::new(
+            RskSubMessage::Block(Box::new(rustock_core::Block {
+                header,
+                transactions,
+                ommers,
+            })),
         )))
     }
 
@@ -331,10 +417,14 @@ impl SyncHandler {
     /// the plain request would return, each paired with the uncle headers it
     /// references.
     ///
-    /// The uncles come out of the body, which is the only place they exist. A
-    /// block whose body this node no longer holds therefore ends the run --
-    /// never an empty uncle list, which would be a quiet lie about the chain's
-    /// work. Peers learn which blocks are answerable from the served range this
+    /// The uncles come out of the body, or once the body is gone, out of the
+    /// freezer's uncle store, which keeps them by height for the canonical
+    /// chain: where a snapshot sync puts the uncles it was sent for every
+    /// block it fetched no body for. Served from bodies alone, a node that
+    /// synced so could not serve the sync it had just done (#270). A block
+    /// whose uncles this node holds in neither place ends the run -- never an
+    /// empty uncle list, which would be a quiet lie about the chain's work.
+    /// Peers learn which blocks are answerable from the served range this
     /// node announces.
     fn serve_headers_with_uncles_request(
         &self,
@@ -358,9 +448,9 @@ impl SyncHandler {
             let uncles = if header.uncle_count == 0 {
                 Vec::new()
             } else {
-                match store.body(header.hash()) {
-                    Ok(Some((_txs, ommers))) => ommers,
-                    _ => break,
+                match crate::total_difficulty::held_uncles(store, header.hash(), &header) {
+                    Some(uncles) => uncles,
+                    None => break,
                 }
             };
 
@@ -598,6 +688,29 @@ impl P2pHandler for SyncHandler {
                         identifiers: blocks.clone(),
                     });
                 }
+                RskSubMessage::Block(block) => {
+                    // rskj `NodeMessageHandler.allowByMinerNotBanned`
+                    // (L244-256), which `controlMessageIngress` asks before the
+                    // block is queued: one mined by a banned coinbase is not
+                    // taken. An empty coinbase is rskj's null address, which
+                    // no listed address is, the zero address included.
+                    let banned = block
+                        .header
+                        .coinbase()
+                        .filter(|miner| self.banned_miners.contains(miner));
+                    if let Some(miner) = banned {
+                        trace!(
+                            target: "rustock::sync",
+                            "Received block mined by banned miner {miner} from peer {:?}, not taken",
+                            &id.0[..4]
+                        );
+                        return None;
+                    }
+                    let _ = self.event_tx.send(SyncEvent::NewBlock {
+                        peer: id,
+                        block: block.clone(),
+                    });
+                }
 
                 RskSubMessage::BodyResponse(r) => {
                     trace!(
@@ -610,6 +723,7 @@ impl P2pHandler for SyncHandler {
                         id: r.id,
                         transactions: r.transactions.clone(),
                         uncles: r.uncles.clone(),
+                        extension: r.extension.clone(),
                     });
                 }
 
@@ -632,6 +746,9 @@ impl P2pHandler for SyncHandler {
                 }
                 RskSubMessage::BodyRequest(r) => {
                     return self.serve_body_request(r.id, r.hash);
+                }
+                RskSubMessage::GetBlock(hash) => {
+                    return self.serve_get_block(id, *hash);
                 }
 
                 // --- Snapshot sync ---

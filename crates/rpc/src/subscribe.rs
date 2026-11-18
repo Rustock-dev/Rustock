@@ -200,15 +200,22 @@ fn notification(id: &str, result: Value) -> Value {
 
 /// A block header in the shape `eth_getBlockByNumber` returns, minus the
 /// body-dependent fields a header notification has no business carrying.
-fn header_dto(header: &Header, hash: B256) -> Value {
-    use crate::helpers::{to_hex_b256, to_hex_bytes, to_hex_u256, to_hex_u64};
+pub(crate) fn header_dto(header: &Header, hash: B256) -> Value {
+    use crate::helpers::{
+        to_hex_b256, to_hex_bytes, to_hex_quantity_bytes, to_hex_u256, to_hex_u64,
+    };
     let mut out = Map::new();
     out.insert("hash".into(), Value::String(to_hex_b256(&hash)));
     out.insert("parentHash".into(), Value::String(to_hex_b256(&header.parent_hash)));
     out.insert("sha3Uncles".into(), Value::String(to_hex_b256(&header.ommers_hash)));
     out.insert(
         "miner".into(),
-        Value::String(format!("0x{}", hex::encode(header.beneficiary.as_slice()))),
+        // `toJsonHex(getCoinbase().getBytes())`, which writes the null
+        // address's no bytes as `0x00`.
+        Value::String(header.coinbase().map_or_else(
+            || "0x00".to_owned(),
+            |coinbase| format!("0x{}", hex::encode(coinbase.as_slice())),
+        )),
     );
     out.insert("stateRoot".into(), Value::String(to_hex_b256(&header.state_root)));
     out.insert(
@@ -222,13 +229,16 @@ fn header_dto(header: &Header, hash: B256) -> Value {
     );
     out.insert("difficulty".into(), Value::String(to_hex_u256(&header.difficulty)));
     out.insert("number".into(), Value::String(to_hex_u64(header.number)));
-    out.insert("gasLimit".into(), Value::String(to_hex_u256(&header.gas_limit)));
+    out.insert(
+        "gasLimit".into(),
+        Value::String(to_hex_quantity_bytes(&header.gas_limit_bytes())),
+    );
     out.insert("gasUsed".into(), Value::String(to_hex_u64(header.gas_used)));
     out.insert("timestamp".into(), Value::String(to_hex_u64(header.timestamp)));
     out.insert("extraData".into(), Value::String(to_hex_bytes(header.extra_data.as_ref())));
     out.insert(
         "minimumGasPrice".into(),
-        Value::String(to_hex_u256(&header.minimum_gas_price)),
+        Value::String(to_hex_quantity_bytes(&header.minimum_gas_price_bytes())),
     );
     Value::Object(out)
 }

@@ -1,7 +1,10 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
 
+mod bootstrap_import;
 mod config_file;
+mod https;
 mod public_ip;
+mod stable_gas_price;
 use rustock_core::config::ChainConfig;
 use rustock_core::validation::HeaderVerifier;
 use rustock_storage::BlockStore;
@@ -245,6 +248,16 @@ struct Args {
     /// `banned-peers.txt` inside the data directory, and reloaded at start-up.
     #[arg(long, value_name = "ADDRESS_OR_CIDR")]
     banned_peers: Vec<String>,
+
+    /// Coinbases whose blocks this node won't take from peers, as rskj's
+    /// `peer.bannedMiners`. Repeatable; each a 20-byte address in hex, with
+    /// or without `0x`.
+    ///
+    /// What is refused is a block a peer sends whole
+    /// (`NodeMessageHandler.allowByMinerNotBanned`); the same block fetched
+    /// while syncing is taken, as on rskj.
+    #[arg(long, value_name = "ADDRESS")]
+    banned_miners: Vec<String>,
 
     /// Record peer scoring but never act on it.
     ///
@@ -1050,9 +1063,37 @@ struct Args {
 
     /// Minimum gas price to steer mined blocks toward, in wei, as rskj's
     /// `miner.minGasPrice`: one RSKIP-09 step (1% of the parent's) per
-    /// block. Absent, each block inherits its parent's.
-    #[arg(long, value_name = "WEI")]
-    mining_min_gas_price: Option<u64>,
+    /// block, toward 0 unless set, rskj's default. With the config file's
+    /// `[mining.stable_gas_price]` on, the price that stands in until a
+    /// stable one is fetched. A price below zero steers as zero does, as in
+    /// rskj.
+    #[arg(
+        long,
+        value_name = "WEI",
+        default_value_t = 0,
+        allow_negative_numbers = true
+    )]
+    mining_min_gas_price: i64,
+
+    /// rskj's `miner.stableGasPrice`: the config file's
+    /// `[mining.stable_gas_price]`, which has no flag, as rskj has none.
+    #[arg(skip)]
+    mining_stable_gas_price: Option<config_file::StableGasPriceSection>,
+
+    /// Gas limit to steer mined blocks toward, as rskj's `targetgaslimit`:
+    /// one step, a 1024th of the parent's, per block. Absent, rskj's:
+    /// 7,500,000 on a regtest, as its `regtest.conf` sets it, and 6,800,000
+    /// on mainnet and testnet. A target under the chain's minimum gas limit
+    /// is the minimum.
+    #[arg(long, value_name = "GAS")]
+    mining_gas_limit_target: Option<u64>,
+
+    /// Steer the gas limit toward the target whatever the parent block used,
+    /// as rskj's `forcegaslimit`, on by default. `false` follows the gas the
+    /// parent used instead: up when it used more than two thirds of its gas
+    /// limit, down otherwise, never past the target.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    mining_force_gas_limit: bool,
 
     /// Refuse a merged-mining submission within this many milliseconds of
     /// the previous one, as rskj's `miner.server.workSubmissionRateLimitInMills`.
@@ -1370,10 +1411,10 @@ struct Args {
     /// Private keys this node may sign with, one 32-byte hex key per line.
     ///
     /// Off by default, and the only way the node ever holds a key for
-    /// signing. Without it `eth_accounts` is empty and `eth_sign`,
-    /// `eth_signTransaction` and `eth_sendTransaction` report as unknown
-    /// methods, so a node with no wallet is indistinguishable from one
-    /// built without the feature.
+    /// signing. Without it `eth_accounts` is empty, `eth_sign` and
+    /// `eth_sendTransaction` are refused as rskj refuses them with its
+    /// wallet off, and `eth_signTransaction`, which rskj doesn't have, is an
+    /// unknown method.
     ///
     /// A file rather than a flag taking the key itself, because a private
     /// key on the command line is visible in `ps` to every user on the
@@ -1402,6 +1443,8 @@ struct Args {
 
     /// Regtest: start from this rskj genesis JSON file instead of the
     /// built-in genesis, so blocks an rskj node mined from it connect here.
+    /// The chain is then rskj's regtest: its `regtest.conf` schedule, its
+    /// Bridge constants and its genesis federation.
     #[arg(long, value_name = "FILE")]
     genesis: Option<std::path::PathBuf>,
 
@@ -1413,7 +1456,8 @@ struct Args {
 
     /// Regtest: override an rskj consensus rule, as `name=height` (`-1`
     /// disables it), like rskj's `blockchain.config.consensusRules`.
-    /// Repeatable. Supported: rskip97.
+    /// Repeatable. Supported: rskip97, rskip136, rskip144, rskip351,
+    /// rskip535, rskip536 and rskipUMM.
     #[arg(long, value_name = "NAME=HEIGHT")]
     consensus_rule: Vec<String>,
 
@@ -1421,23 +1465,23 @@ struct Args {
     #[arg(long, value_name = "GAS")]
     min_gas_limit: Option<u64>,
 
-    /// Regtest: largest gas limit a header may declare (rskj has none).
-    #[arg(long, value_name = "GAS")]
-    max_gas_limit: Option<u64>,
-
     /// Regtest: schedule an rskj network upgrade, as `name=height` (`-1`
     /// takes it off the ladder), like rskj's
     /// `blockchain.config.hardforkActivationHeights`. Repeatable. Names are
-    /// rskj's, orchid to vetiver900. bahamas, afterBridgeSync and hop401 are
-    /// accepted at the height this node already reads them at; orchid060 and
-    /// tbd1000 are accepted and change nothing (tbd1000 only turns on
-    /// RSKIP-559, pegout sorting in the Bridge, which this node does not
-    /// implement).
+    /// rskj's: orchid to vetiver900, and afterBridgeSync, where the
+    /// federators' and authorizers' Bridge transactions start to be paid.
+    /// bahamas, orchid060 and hop401 are accepted at the height this node
+    /// already reads them at; tbd1000 is accepted and changes nothing (it is
+    /// rskj's upgrade for RSKIP559, which no network schedules and this node
+    /// doesn't implement). An upgrade left out below a scheduled one, or
+    /// scheduled out of its order, is refused, but for reed810 and
+    /// arrowhead631: this node reads a rule from the upgrade in force, and
+    /// would read such a schedule otherwise than rskj.
     #[arg(long, value_name = "NAME=HEIGHT")]
     hardfork: Vec<String>,
 
-    /// Take --hardfork, --consensus-rule, --skip-pow-validation and the
-    /// gas-limit bounds on mainnet and testnet too, for replaying blocks
+    /// Take --hardfork, --consensus-rule, --skip-pow-validation and
+    /// --min-gas-limit on mainnet and testnet too, for replaying blocks
     /// mined on a copy of the chain under rules it has not activated. Never
     /// for a node that follows the real network. --genesis stays refused:
     /// a genesis file would make this another chain.
@@ -1479,6 +1523,31 @@ struct Args {
     /// connects. Off by default, and then no clock is read.
     #[arg(long, value_name = "FILE")]
     breakdown_log: Option<std::path::PathBuf>,
+
+    /// Start from the newest state copy Rootstock publishes, as rskj's
+    /// `--import` does: read each trusted signer's index, take the highest
+    /// height at which more than half of them (and at least two) sign the
+    /// same copy, check those signatures, download the copy, check its
+    /// SHA-256 against the signed hash, and load its blocks and state. The
+    /// node then starts from there and syncs on as usual.
+    ///
+    /// Mainnet and testnet use rskj's publishing URL and keys. Unlike rskj's,
+    /// this does not delete a database that holds a chain: it refuses to
+    /// start instead.
+    #[arg(long, default_value_t = false)]
+    import: bool,
+
+    /// With --import: where the copies are published, in place of the
+    /// network's (rskj's `database.import.url`). Each signer's index is read
+    /// from `<url><key>/index.json`.
+    #[arg(long, value_name = "URL")]
+    import_url: Option<String>,
+
+    /// With --import: a public key whose signatures count, in uncompressed
+    /// hex. Repeat it for each key; together they replace the network's
+    /// (rskj's `database.import.trusted-keys`).
+    #[arg(long, value_name = "HEX")]
+    import_trusted_key: Vec<String>,
 }
 
 /// Apply the file underneath the command line, one setting per line so the
@@ -1502,7 +1571,6 @@ fn apply_file_config(
     });
     apply(matches, "consensus_rule", rules.as_ref(), &mut a.consensus_rule);
     apply_opt(matches, "min_gas_limit", f.chain.min_gas_limit.as_ref(), &mut a.min_gas_limit);
-    apply_opt(matches, "max_gas_limit", f.chain.max_gas_limit.as_ref(), &mut a.max_gas_limit);
     let hardforks = f.chain.hardforks.as_ref().map(|r| {
         r.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>()
     });
@@ -1578,6 +1646,14 @@ fn apply_file_config(
             }
         }
     }
+    // Combined in the same way.
+    if let Some(banned) = &f.peers.banned_miners {
+        for entry in banned {
+            if !a.banned_miners.contains(entry) {
+                a.banned_miners.push(entry.clone());
+            }
+        }
+    }
     // Unlike `banned_peers` this one **replaces** rather than combines: the
     // flag exists to say "bootstrap from these and nothing else", and merging
     // it with a file's list would quietly defeat that.
@@ -1646,13 +1722,22 @@ fn apply_file_config(
     apply(matches, "mining_extra_data", f.mining.extra_data.as_ref(), &mut a.mining_extra_data);
     apply(matches, "mining_refresh_secs", f.mining.refresh_secs.as_ref(),
         &mut a.mining_refresh_secs);
-    apply_opt(matches, "mining_min_gas_price", f.mining.min_gas_price.as_ref(), &mut a.mining_min_gas_price);
+    apply(matches, "mining_min_gas_price", f.mining.min_gas_price.as_ref(), &mut a.mining_min_gas_price);
+    apply_opt(matches, "mining_gas_limit_target", f.mining.gas_limit_target.as_ref(),
+        &mut a.mining_gas_limit_target);
+    apply(matches, "mining_force_gas_limit", f.mining.force_gas_limit.as_ref(),
+        &mut a.mining_force_gas_limit);
     apply(matches, "mining_submission_rate_limit_ms", f.mining.submission_rate_limit_ms.as_ref(),
         &mut a.mining_submission_rate_limit_ms);
     apply(matches, "mining_update_work_on_new_transaction",
         f.mining.update_work_on_new_transaction.as_ref(), &mut a.mining_update_work_on_new_transaction);
     apply_opt(matches, "mine_timed", f.mining.timed.as_ref(), &mut a.mine_timed);
     apply(matches, "flush_every", f.mining.flush_every.as_ref(), &mut a.flush_every);
+    // rskj `miner.stableGasPrice`, which has no flag. A section that says
+    // only what rskj's defaults say is left out: the node runs the same.
+    if let Some(section) = f.mining.stable_gas_price.as_ref().filter(|s| !s.is_default()) {
+        a.mining_stable_gas_price = Some(section.clone());
+    }
 
     apply(matches, "account_tx_rate_limit", f.account_tx_rate_limit.enabled.as_ref(),
         &mut a.account_tx_rate_limit);
@@ -1818,10 +1903,21 @@ fn resolve_local_offset() -> Option<time::UtcOffset> {
 fn main() -> Result<()> {
     // Before anything spawns a thread.
     let local_offset = resolve_local_offset();
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run(local_offset))
+    // The node runs on a thread with a stack it sets, the same on every OS.
+    // The process's own main thread has the OS's: 8 MiB on Linux and macOS but
+    // 1 MiB on Windows, which a debug build overflows while clap builds the
+    // parser for this many options.
+    std::thread::Builder::new()
+        .name("main".into())
+        .stack_size(8 << 20)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(run(local_offset))
+        })?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
@@ -2141,8 +2237,49 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         BlockStore::open(&args.data_dir)?
     });
 
+    // Where the trie lives, as the flags choose it: `--import` writes into it,
+    // and the node opens it further down.
+    let layout = trie_layout(&args)?;
+
+    // `--import`: Rootstock's newest signed copy goes in before anything reads
+    // the chain, as rskj's `--import` runs before its node starts.
+    if args.import {
+        anyhow::ensure!(
+            !read_only,
+            "--import loads a chain into the store, and this store is opened read-only"
+        );
+        let signers = bootstrap_import::Signers::for_network(
+            args.network_id,
+            args.import_url.as_deref(),
+            &args.import_trusted_key,
+        )?;
+        let data_dir = std::path::Path::new(&args.data_dir);
+        bootstrap_import::refuse_held_chain(&store, data_dir)?;
+        let trie = bootstrap_import::TrieTarget::open(
+            &layout.backend,
+            layout.engine,
+            layout.expected_keys,
+            &layout.trie_dir,
+            &store,
+        )?;
+        bootstrap_import::import(
+            &bootstrap_import::Web,
+            &signers,
+            data_dir,
+            &store,
+            &trie,
+            &config,
+        )
+        .await?;
+    } else {
+        bootstrap_import::refuse_unfinished(std::path::Path::new(&args.data_dir))?;
+    }
+
     let genesis_hash = setup_genesis(&store, &config)?;
     info!("Genesis Hash: {:?}", genesis_hash);
+    if !read_only && rewrite_old_genesis(&store, &config, genesis_hash)? {
+        info!("Block 0 written again, with its difficulty as its genesis file writes it");
+    }
 
     let verifier = Arc::new(HeaderVerifier::default_rsk(config.clone()));
     // The manager takes ownership below; snapshot sync needs the same rules.
@@ -2283,43 +2420,22 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     };
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let sync_handler = Arc::new(
-        SyncHandler::new(sync_manager.clone(), event_tx)
-            .with_serve_ceiling(args.simulate_height)
-            .with_checkpoint_defence(checkpoint_defence)
-            .with_checkpoint(snap_checkpoint_for(args.network_id)),
-    );
-    let gc_config = rustock_storage::epoch_store::EpochConfig {
-        epochs: args.gc_epochs,
-        burial_depth: args.gc_burial,
-        rotate_bytes: args.gc_rotate_mb * (1 << 20),
-    };
-    let rotate_bytes = gc_config.rotate_bytes;
-    let backend = rustock_storage::epoch_store::TrieBackend::parse(&args.trie_backend, gc_config)?;
-    let engine = rustock_storage::TrieEngine::parse(&args.trie_engine)?;
-    // An epoch's key count is bounded by when it rotates, so the default
-    // is computed rather than configured.
-    let expected_keys = if args.trie_expected_keys > 0 {
-        args.trie_expected_keys
-    } else {
-        rustock_storage::epoch_backend::keys_for_rotation(rotate_bytes)
-    };
-    if matches!(backend, rustock_storage::epoch_store::TrieBackend::Single)
-        && engine == rustock_storage::TrieEngine::FlatDb
-    {
-        anyhow::bail!(
-            "--trie-backend single keeps nodes in a column family of the node's main \
-             database, which only rocksdb can provide; use --trie-backend external or \
-             epoch to run flatdb"
-        );
-    }
-
-    // The node only ever holds an `Arc<dyn TrieStore>`, so this is the entire
-    // extent of the choice: nothing downstream knows which store it got.
-    let trie_dir = args.trie_dir.clone().unwrap_or_else(|| {
-        let suffix = if backend.is_collecting() { "trie-epochs" } else { "trie" };
-        std::path::Path::new(&args.data_dir).join(suffix).to_string_lossy().into_owned()
-    });
+    // The miner's: it tells the sync service of every block it commits (#323).
+    let mined_events = event_tx.clone();
+    let sync_handler = Arc::new(sync_handler_for(
+        sync_manager.clone(),
+        event_tx,
+        args.simulate_height,
+        checkpoint_defence,
+        args.network_id,
+        &args.banned_miners,
+    )?);
+    let TrieLayout {
+        backend,
+        engine,
+        expected_keys,
+        trie_dir,
+    } = layout;
     // Always say where the trie is. With three backends and a migration in the
     // field, "which trie is this node actually reading?" is the first question
     // worth answering in any log, and the answer should not depend on which
@@ -2347,7 +2463,8 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     // against a blank trie -- no error, no missing file, just a node that cannot
     // execute anything and looks like it needs a resync. That is worth stopping
     // for; the operator can always choose a backend, but they cannot recover
-    // state that was quietly declared absent.
+    // state that was quietly declared absent. A new database, whose trie is
+    // empty until block 0's state is built below, starts (`trie_is_missing`).
     {
         let has_chain = store.exec_head()?.is_some() || store.head()?.is_some();
         let detached_dir_populated = std::path::Path::new(&trie_dir)
@@ -2355,7 +2472,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             .map(|mut d| d.next().is_some())
             .unwrap_or(false);
 
-        if !backend.is_detached() && has_chain && store.trie_cf_is_empty() {
+        if trie_is_missing(&store, &backend)? {
             anyhow::bail!(
                 "This database has no trie in it, but --trie-backend is \"{}\".\n\
                  \n\
@@ -2572,13 +2689,6 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         info!("Sender cache disabled (--sigcache=false); every sender is recovered");
     }
 
-    // The checks that read the chain's activations and constants, as rskj's
-    // TxPendingValidator does: the RSKIP252 per-transaction price cap, the
-    // sublist gas limit under RSKIP144, the free Bridge transactions.
-    // The same ladder `hardfork_cfg` below is built from, needed earlier
-    // because the pool is constructed before it.
-    let hardfork_cfg_for_pool =
-        rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64);
     let mut pool_builder = rustock_sync::TransactionPool::new(
         pool_config,
         config.chain_id.into(),
@@ -2586,10 +2696,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         trie_store_for_pool.clone(),
     )
     .with_gas_price_tracker(gas_price_tracker.clone())
-    .with_chain_rules(rustock_sync::txpool::ChainRules::for_chain(
-        hardfork_cfg_for_pool,
-        config.min_sequential_set_gas_limit,
-    ));
+    .with_chain_rules(pool_chain_rules(&config)?);
     if let Some(cache) = &sender_cache {
         pool_builder = pool_builder.with_sender_cache(cache.clone());
     }
@@ -2688,10 +2795,9 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         None
     };
 
-    let mut block_processor = rustock_execution::BlockProcessor::new(
-        hardfork_cfg.clone(),
-        store.clone(),
-    );
+    // The same chain configuration the header verifier uses, and fork
+    // detection on: see `rule_keeping_processor`.
+    let mut block_processor = rule_keeping_processor(&hardfork_cfg, &store, &config);
     if let Some(cache) = &btc_block_cache {
         block_processor = block_processor.with_btc_block_cache(cache.clone());
     }
@@ -2699,7 +2805,12 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         block_processor = block_processor.with_sender_cache(cache.clone());
     }
     block_processor = block_processor.with_execution_threads(args.execution_threads);
-    if !args.no_peg_event_recording {
+    // The peg events the Bridge logs nothing for, recorded as blocks are
+    // committed. One store, which the miner's processor shares, so a block
+    // this node mines is recorded as a peer's block is.
+    let legacy_events = if args.no_peg_event_recording {
+        None
+    } else {
         let dir = args
             .peg_events_dir
             .clone()
@@ -2707,14 +2818,18 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         match rustock_storage::legacy_event_store::LegacyEventStore::open(&dir) {
             Ok(st) => {
                 info!("Recording unlogged peg events to {dir}");
-                block_processor = block_processor.with_legacy_event_store(std::sync::Arc::new(st));
+                Some(std::sync::Arc::new(st))
             }
             // A diagnostic store failing to open must not stop the node from
             // following the chain. Say so loudly and carry on without it.
-            Err(e) => tracing::warn!(
-                "peg event recording disabled: cannot open {dir}: {e}"
-            ),
+            Err(e) => {
+                tracing::warn!("peg event recording disabled: cannot open {dir}: {e}");
+                None
+            }
         }
+    };
+    if let Some(st) = &legacy_events {
+        block_processor = block_processor.with_legacy_event_store(st.clone());
     }
     if config.genesis_spec.is_some() {
         // A chain from an rskj genesis file is rskj's regtest, Bridge
@@ -2724,9 +2839,10 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         );
     }
     info!(
-        "Block processor wired (hardfork config: {:?}, execution threads: {})",
+        "Block processor wired (hardfork config: {:?}, execution threads: {}, fork detection: {})",
         hardfork_cfg,
-        block_processor.execution_threads()
+        block_processor.execution_threads(),
+        block_processor.validates_fork_detection()
     );
 
     if let Some(count) = args.measure_block_reads {
@@ -3477,6 +3593,10 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         });
     }
 
+    // Where a block the miner keeps beside the chain leaves the peg decisions
+    // the Bridge logs nothing for, for the sync service to store once the
+    // chain takes the block up.
+    let unlogged_holder = sync_service.unlogged_holder();
     // Supervise the sync task: a panic inside it would otherwise be swallowed
     // by tokio and leave the node running but silently stalled.
     let sync_handle = tokio::spawn(sync_service.start());
@@ -3487,6 +3607,12 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         }
     });
 
+    // rskj's `ETH_CALL` stable gas price runs a call on the node's own
+    // `EthModule`, which rskj has whether it serves RPC or not. The state a
+    // call runs on is built further down, once the miner is: the price's
+    // fetches, on a thread of their own, wait for it, as rskj's wait on its
+    // `getEthModule()`.
+    let node_calls: Arc<std::sync::OnceLock<rustock_rpc::server::RpcState>> = Arc::default();
     // The miner. It shares the store and trie store with sync but holds its
     // own block processor: `BlockProcessor` is a handle over those two, and
     // the sync service has taken ownership of the one built above.
@@ -3515,17 +3641,34 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         let mining_config = rustock_execution::MiningConfig {
             coinbase_address,
             extra_data,
-            // rskj `miner.minGasPrice`, through `MinimumGasPriceCalculator`.
-            min_gas_price_target: args.mining_min_gas_price.map(alloy_primitives::U256::from),
+            // rskj `targetgaslimit` and `forcegaslimit`, through
+            // `GasLimitCalculator`.
+            gas_limit_target: mining_gas_limit_target(
+                config.chain_id,
+                args.mining_gas_limit_target,
+            ),
+            force_gas_limit: args.mining_force_gas_limit,
+            // rskj `miner.minGasPrice`, through `MinimumGasPriceCalculator`;
+            // or with `miner.stableGasPrice` on, a price held stable in a
+            // currency, that one standing in until it is fetched.
+            min_gas_price: stable_gas_price::create(
+                args.mining_min_gas_price,
+                args.mining_stable_gas_price.as_ref(),
+                config.chain_id,
+                node_eth_call(node_calls.clone()),
+            )?,
             ..Default::default()
         };
-        // The miner's processor is wired like the node's: the same caches,
-        // threads and, on a chain from an rskj genesis file, rskj's regtest
-        // Bridge constants. A bare processor here ran REMASC against the
-        // built-in federation, so the first payout (block 15 on regtest)
-        // reached a state root no node with the right constants reproduces.
-        let mut miner_processor =
-            rustock_execution::BlockProcessor::new(hardfork_cfg.clone(), store.clone());
+        // The miner's processor is wired like the node's: the same rules
+        // (`rule_keeping_processor`), caches, threads, store of the peg
+        // events the Bridge logs nothing for and, on a chain from an
+        // rskj genesis file, rskj's regtest Bridge constants. A bare
+        // processor here ran REMASC against the built-in federation, so the
+        // first payout (block 15 on regtest) reached a state root no node
+        // with the right constants reproduces; and one without fork
+        // detection let the miner name an uncle, or store a block of its
+        // own, that the node's processor refuses.
+        let mut miner_processor = rule_keeping_processor(&hardfork_cfg, &store, &config);
         if let Some(cache) = &btc_block_cache {
             miner_processor = miner_processor.with_btc_block_cache(cache.clone());
         }
@@ -3533,6 +3676,9 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             miner_processor = miner_processor.with_sender_cache(cache.clone());
         }
         miner_processor = miner_processor.with_execution_threads(args.execution_threads);
+        if let Some(st) = &legacy_events {
+            miner_processor = miner_processor.with_legacy_event_store(st.clone());
+        }
         if config.genesis_spec.is_some() {
             miner_processor = miner_processor.with_bridge_constants(
                 rustock_execution::bridge::constants::BridgeConstants::rskj_regtest(),
@@ -3545,20 +3691,43 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             hardfork_cfg.clone(),
             mining_config,
         );
-        let chain = Arc::new(rustock_execution::mining::StoreChainAccess::with_flush_every(
-            store.clone(),
-            trie_store_for_pool.clone(),
-            // What the sync service's import path does for a block that
-            // arrived from a peer, done here for one this node mined.
-            Some({
-                let pool = pool.clone();
-                Arc::new(move |block: &rustock_core::Block| {
-                    pool.remove_mined(&block.transactions);
-                    pool.evict_outdated(block.header.number);
-                })
-            }),
-            args.flush_every,
-        ));
+        // What the sync service's import path does for a block that arrived
+        // from a peer, done here for one this node mined; then what rskj's
+        // `EthereumImpl.addNewMinedBlock` does with a mined block once it is
+        // connected: the sync service takes its state as the node's, or weighs
+        // it where it was kept beside the chain, and the peers are sent it,
+        // best or not. The pool drops what a best block mined, as rskj's
+        // `TransactionPoolImpl.processBest` does; a block beside the chain
+        // leaves it, and a switch to it later takes them out then.
+        let on_committed: Arc<
+            dyn Fn(&rustock_core::Block, rustock_execution::mining::ImportResult) + Send + Sync,
+        > = {
+            let pool = pool.clone();
+            let broadcast = rustock_sync::on_mined(
+                peer_store.clone(),
+                mined_events.clone(),
+                tokio::runtime::Handle::current(),
+            );
+            Arc::new(
+                move |block: &rustock_core::Block,
+                      result: rustock_execution::mining::ImportResult| {
+                    if result == rustock_execution::mining::ImportResult::ImportedBest {
+                        pool.remove_mined(&block.transactions);
+                        pool.evict_outdated(block.header.number);
+                    }
+                    broadcast(block);
+                },
+            )
+        };
+        let chain = Arc::new(
+            rustock_execution::mining::StoreChainAccess::with_flush_every(
+                store.clone(),
+                trie_store_for_pool.clone(),
+                Some(on_committed),
+                args.flush_every,
+            )
+            .with_leave_unlogged(unlogged_holder),
+        );
         let mut server = rustock_execution::MinerServer::new(
             builder,
             chain,
@@ -3682,7 +3851,11 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         None => None,
     };
 
-    if !args.no_rpc {
+    // The node's state for calls: for its RPC, and for a stable gas price
+    // from a contract, which rskj's node calls whether it serves RPC or not.
+    let calls_for_price =
+        args.mine && stable_gas_price::calls_this_node(args.mining_stable_gas_price.as_ref());
+    if !args.no_rpc || calls_for_price {
         let trie_store: Arc<dyn rustock_trie::TrieStore> = match &detached_for_readers {
             Some(t) => t.clone(),
             None => Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone())),
@@ -3703,6 +3876,12 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             trie_store: if args.spv { None } else { Some(trie_store) },
             proof_fetcher: proof_fetcher.clone(),
             hardfork_cfg: Some(hardfork_cfg),
+            // A chain from an rskj genesis file is rskj's regtest, Bridge
+            // federation included, for a call as for a block.
+            bridge_constants: config
+                .genesis_spec
+                .is_some()
+                .then(rustock_execution::bridge::constants::BridgeConstants::rskj_regtest),
             filter_store: Arc::new(rustock_rpc::logs::FilterStore::new()),
             tx_pool: Some(Arc::new(PoolAdapter(pool.clone()))),
 
@@ -3751,29 +3930,43 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             scoring: Some(scoring.clone()),
             events: events.clone(),
         };
-        // The WebSocket server shares the same `RpcState`, so every method
-        // available over HTTP works over the socket too -- plus
-        // `eth_subscribe`, which only means anything on a connection that
-        // stays open.
-        if args.ws {
-            let ws_host = args.rpc_host.clone();
-            let ws_port = args.ws_port;
-            let ws_state = rpc_state.clone();
+        // The price's calls run on the same state, without the miner the RPC
+        // reaches through it: the miner holds the price.
+        if calls_for_price {
+            let _ = node_calls.set(rustock_rpc::server::RpcState {
+                miner: None,
+                auto_miner: None,
+                ..rpc_state.clone()
+            });
+        }
+        if !args.no_rpc {
+            // The WebSocket server shares the same `RpcState`, so every method
+            // available over HTTP works over the socket too -- plus
+            // `eth_subscribe`, which only means anything on a connection that
+            // stays open.
+            if args.ws {
+                let ws_host = args.rpc_host.clone();
+                let ws_port = args.ws_port;
+                let ws_state = rpc_state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        rustock_rpc::ws::start_ws_server(&ws_host, ws_port, ws_state).await
+                    {
+                        tracing::error!("RPC WebSocket server error: {}", e);
+                    }
+                });
+            }
+
+            let rpc_host = args.rpc_host.clone();
+            let rpc_port = args.rpc_port;
             tokio::spawn(async move {
-                if let Err(e) = rustock_rpc::ws::start_ws_server(&ws_host, ws_port, ws_state).await
+                if let Err(e) =
+                    rustock_rpc::server::start_rpc_server(&rpc_host, rpc_port, rpc_state).await
                 {
-                    tracing::error!("RPC WebSocket server error: {}", e);
+                    tracing::error!("RPC server error: {}", e);
                 }
             });
         }
-
-        let rpc_host = args.rpc_host.clone();
-        let rpc_port = args.rpc_port;
-        tokio::spawn(async move {
-            if let Err(e) = rustock_rpc::server::start_rpc_server(&rpc_host, rpc_port, rpc_state).await {
-                tracing::error!("RPC server error: {}", e);
-            }
-        });
     }
 
     // Independent of the RPC server: metrics are useful on a node that
@@ -3909,13 +4102,39 @@ fn run_import_blocks(
 
 /// The execution ladder for `config`: the chain's own, with the operator's
 /// `--hardfork` and `--consensus-rule` overrides applied. Also returns the
-/// names accepted without effect.
+/// names accepted without effect. A chain from an rskj genesis file is
+/// rskj's regtest, on its `regtest.conf`'s schedule.
 fn hardfork_config(
     config: &ChainConfig,
 ) -> Result<(rustock_execution::RskHardforkConfig, Vec<String>)> {
-    rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64)
+    let ladder = if config.genesis_spec.is_some() {
+        rustock_execution::RskHardforkConfig::rskj_regtest()
+    } else {
+        rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64)
+    };
+    ladder
         .with_rskj_overrides(&config.hardfork_overrides, &config.consensus_rule_overrides)
         .map_err(anyhow::Error::msg)
+}
+
+/// The checks the pool makes that read the chain's activations and
+/// constants, as rskj's `TxPendingValidator` does: the RSKIP252
+/// per-transaction price cap, the sublist gas limit under RSKIP144 and the
+/// free Bridge transactions. On the ladder the block processor runs, the
+/// operator's overrides included. A chain from an rskj genesis file is
+/// rskj's regtest, whose federators' and authorizers' Bridge calls are free,
+/// as the block processor counts them.
+fn pool_chain_rules(config: &ChainConfig) -> Result<rustock_sync::txpool::ChainRules> {
+    let (ladder, _) = hardfork_config(config)?;
+    let rules =
+        rustock_sync::txpool::ChainRules::for_chain(ladder, config.min_sequential_set_gas_limit);
+    Ok(if config.genesis_spec.is_some() {
+        rules.with_bridge_constants(
+            &rustock_execution::bridge::constants::BridgeConstants::rskj_regtest(),
+        )
+    } else {
+        rules
+    })
 }
 
 /// `name=height` as rskj's config writes it, `-1` for never.
@@ -3995,8 +4214,35 @@ fn run_export_blocks(
     Ok(())
 }
 
+/// The gas limit a miner steers toward: `--mining-gas-limit-target`, or
+/// rskj's `targetgaslimit` where none is set, 6,800,000, and on a regtest
+/// 7,500,000, which rskj's `regtest.conf` sets.
+fn mining_gas_limit_target(chain_id: u8, set: Option<u64>) -> u64 {
+    set.unwrap_or(if matches!(chain_id, 30 | 31) {
+        rustock_execution::mining::GAS_LIMIT_TARGET
+    } else {
+        rustock_execution::mining::REGTEST_GAS_LIMIT_TARGET
+    })
+}
+
+/// rskj `EthModule.call`, as its `EthCallMinGasPriceProvider` makes one: the
+/// node's own `eth_call`, run once the node's state is open to calls, and
+/// its answer, or its error.
+fn node_eth_call(
+    node: Arc<std::sync::OnceLock<rustock_rpc::server::RpcState>>,
+) -> stable_gas_price::EthCaller {
+    Arc::new(move |params: &serde_json::Value| {
+        let response = rustock_rpc::call::eth_call(serde_json::Value::from(1), params, node.wait());
+        match (response.result, response.error) {
+            (_, Some(error)) => anyhow::bail!("{} (code {})", error.message, error.code),
+            (Some(serde_json::Value::String(output)), None) => Ok(output),
+            (other, None) => anyhow::bail!("an answer that is no hex string: {other:?}"),
+        }
+    })
+}
+
 /// Apply the regtest chain options (`--genesis`, `--skip-pow-validation`,
-/// `--consensus-rule`, `--hardfork`, `--min-gas-limit`, `--max-gas-limit`).
+/// `--consensus-rule`, `--hardfork`, `--min-gas-limit`).
 /// Refused on mainnet and testnet, whose rules are not the operator's to
 /// change, unless `--allow-chain-overrides` says this is a copy of the
 /// chain; `--genesis` is refused there regardless.
@@ -4005,17 +4251,16 @@ fn apply_chain_options(mut config: ChainConfig, args: &Args) -> Result<ChainConf
         || args.skip_pow_validation
         || !args.consensus_rule.is_empty()
         || !args.hardfork.is_empty()
-        || args.min_gas_limit.is_some()
-        || args.max_gas_limit.is_some();
+        || args.min_gas_limit.is_some();
     if !any {
         return Ok(config);
     }
     let real_chain = matches!(config.chain_id, 30 | 31);
     anyhow::ensure!(
         !real_chain || args.allow_chain_overrides,
-        "--genesis, --skip-pow-validation, --consensus-rule, --hardfork and the gas-limit \
-         bounds are regtest options; --allow-chain-overrides takes all but --genesis on \
-         a copy of mainnet or testnet"
+        "--genesis, --skip-pow-validation, --consensus-rule, --hardfork and \
+         --min-gas-limit are regtest options; --allow-chain-overrides takes all but \
+         --genesis on a copy of mainnet or testnet"
     );
     anyhow::ensure!(
         !(real_chain && args.genesis.is_some()),
@@ -4043,6 +4288,20 @@ fn apply_chain_options(mut config: ChainConfig, args: &Args) -> Result<ChainConf
         let (name, height) = parse_rskj_height("--consensus-rule", rule)?;
         match name.as_str() {
             "rskip97" => config.activation_heights.rskip97 = height,
+            // The ladder reads these from the overrides, and the header's
+            // layout from the activation heights: both must move.
+            "rskip144" | "rskip351" | "rskip535" => {
+                let heights = &mut config.activation_heights;
+                let field = match name.as_str() {
+                    "rskip144" => &mut heights.rskip144,
+                    "rskip351" => &mut heights.rskip351,
+                    _ => &mut heights.rskip535,
+                };
+                *field = height;
+                config.consensus_rule_overrides.push((name, height));
+            }
+            // The header's layout alone reads it.
+            "rskipUMM" => config.activation_heights.rskip_umm = height,
             _ => config.consensus_rule_overrides.push((name, height)),
         }
     }
@@ -4053,9 +4312,6 @@ fn apply_chain_options(mut config: ChainConfig, args: &Args) -> Result<ChainConf
     }
     if let Some(gas) = args.min_gas_limit {
         config.min_gas_limit = gas;
-    }
-    if let Some(gas) = args.max_gas_limit {
-        config.max_gas_limit = gas;
     }
     config.skip_pow_validation = args.skip_pow_validation;
     if let Some(path) = &args.genesis {
@@ -4202,6 +4458,62 @@ fn build_genesis_state(config: &ChainConfig, trie_store: &dyn TrieStore) -> Resu
     Ok(root)
 }
 
+/// Where the node keeps its trie, as the flags choose it: what `--import`
+/// writes into, and what the node then opens.
+struct TrieLayout {
+    backend: rustock_storage::epoch_store::TrieBackend,
+    engine: rustock_storage::TrieEngine,
+    expected_keys: u64,
+    trie_dir: String,
+}
+
+fn trie_layout(args: &Args) -> Result<TrieLayout> {
+    let gc_config = rustock_storage::epoch_store::EpochConfig {
+        epochs: args.gc_epochs,
+        burial_depth: args.gc_burial,
+        rotate_bytes: args.gc_rotate_mb * (1 << 20),
+    };
+    let rotate_bytes = gc_config.rotate_bytes;
+    let backend = rustock_storage::epoch_store::TrieBackend::parse(&args.trie_backend, gc_config)?;
+    let engine = rustock_storage::TrieEngine::parse(&args.trie_engine)?;
+    // An epoch's key count is bounded by when it rotates, so the default
+    // is computed rather than configured.
+    let expected_keys = if args.trie_expected_keys > 0 {
+        args.trie_expected_keys
+    } else {
+        rustock_storage::epoch_backend::keys_for_rotation(rotate_bytes)
+    };
+    if matches!(backend, rustock_storage::epoch_store::TrieBackend::Single)
+        && engine == rustock_storage::TrieEngine::FlatDb
+    {
+        anyhow::bail!(
+            "--trie-backend single keeps nodes in a column family of the node's main \
+             database, which only rocksdb can provide; use --trie-backend external or \
+             epoch to run flatdb"
+        );
+    }
+
+    // The node only ever holds an `Arc<dyn TrieStore>`, so this is the entire
+    // extent of the choice: nothing downstream knows which store it got.
+    let trie_dir = args.trie_dir.clone().unwrap_or_else(|| {
+        let suffix = if backend.is_collecting() {
+            "trie-epochs"
+        } else {
+            "trie"
+        };
+        std::path::Path::new(&args.data_dir)
+            .join(suffix)
+            .to_string_lossy()
+            .into_owned()
+    });
+    Ok(TrieLayout {
+        backend,
+        engine,
+        expected_keys,
+        trie_dir,
+    })
+}
+
 fn setup_genesis(store: &BlockStore, config: &ChainConfig) -> Result<alloy_primitives::B256> {
     if let Some(genesis) = store.canonical_hash(0)? {
         return Ok(genesis);
@@ -4215,6 +4527,71 @@ fn setup_genesis(store: &BlockStore, config: &ChainConfig) -> Result<alloy_primi
     store.put_canonical_hash(0, hash)?;
     store.set_head(hash)?;
     Ok(hash)
+}
+
+/// A store written before block 0 kept its difficulty as its genesis file
+/// writes it holds the block with the value's own bytes: read back, it
+/// hashes to another hash than its key, the network's genesis hash, and so
+/// does the copy of it a peer is sent. Such a block 0 is written again as
+/// the chain's own header, which hashes to that key. Returns whether it was.
+///
+/// Nothing is written where the chain's header is not this store's block 0,
+/// or where the store's reads back to its key already.
+fn rewrite_old_genesis(
+    store: &BlockStore,
+    config: &ChainConfig,
+    hash: alloy_primitives::B256,
+) -> Result<bool> {
+    // Under the chain's own heights, which a header's hash depends on.
+    let genesis = config
+        .genesis_header()
+        .with_activations(&config.activation_heights);
+    if genesis.hash() != hash {
+        return Ok(false);
+    }
+    match store.header(hash)? {
+        Some(stored) if stored.hash() != hash => {
+            store.put_header_with_hash(hash, &genesis)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Whether the node would start against a trie that isn't there: blocks ran
+/// here, so the trie holds the state they left, and the trie it would read,
+/// the main database's own, is empty (see `examples/detach_trie.rs`). A new
+/// database holds block 0's header (`setup_genesis`) and no trie until block
+/// 0's state is built (`load_or_build_state`), and a node that has run no
+/// block builds that state again whatever its trie holds, so neither is
+/// refused.
+fn trie_is_missing(
+    store: &BlockStore,
+    backend: &rustock_storage::epoch_store::TrieBackend,
+) -> Result<bool> {
+    Ok(!backend.is_detached() && store.exec_head()?.is_some() && store.trie_cf_is_empty())
+}
+
+/// A block processor that holds a block to what every node holds it to: the
+/// chain's own constants, for the header rules an uncle meets, and fork
+/// detection on, as rskj runs `ForkDetectionDataRule` on every block it
+/// imports and on every uncle. The node's processor and the miner's are both
+/// built from it, so a block this node mines meets the rules a peer's does
+/// (rskj connects both through `blockchain.tryToConnect`).
+///
+/// Fork detection reads the 449 headers below each block's parent: a few
+/// milliseconds a block, which a node following the chain can spare and a
+/// bulk replay -- the reason it is a switch at all -- turns off for itself.
+/// The headers are here: the walk writes those under the checkpoint, and
+/// pruning keeps thousands more than 449.
+fn rule_keeping_processor(
+    hardfork_cfg: &rustock_execution::RskHardforkConfig,
+    store: &Arc<BlockStore>,
+    config: &Arc<ChainConfig>,
+) -> rustock_execution::BlockProcessor {
+    rustock_execution::BlockProcessor::new(hardfork_cfg.clone(), store.clone())
+        .with_chain_config(config.clone())
+        .with_fork_detection_validation(true)
 }
 
 /// Runs an rskj database import and returns; the node is not started.
@@ -4954,6 +5331,28 @@ fn snap_checkpoint_for(
     }
 }
 
+/// The handler the node serves peers through, as the arguments shape it: the
+/// serve ceiling (`--simulate-height`), the checkpoint defences, the chain's
+/// checkpoint, and rskj's `peer.bannedMiners` (`--banned-miners`). rskj
+/// reads the banned miners as addresses where its `NodeMessageHandler` is
+/// built, and doesn't start with one that isn't; nor does this.
+fn sync_handler_for(
+    manager: Arc<SyncManager>,
+    events: tokio::sync::mpsc::UnboundedSender<rustock_sync::SyncEvent>,
+    simulate_height: Option<u64>,
+    checkpoint_defence: rustock_core::checkpoint::CheckpointDefence,
+    network_id: u64,
+    banned_miners: &[String],
+) -> anyhow::Result<SyncHandler> {
+    let banned_miners = rustock_sync::parse_banned_miners(banned_miners)
+        .map_err(|e| anyhow::anyhow!("--banned-miners: {e}"))?;
+    Ok(SyncHandler::new(manager, events)
+        .with_serve_ceiling(simulate_height)
+        .with_checkpoint_defence(checkpoint_defence)
+        .with_checkpoint(snap_checkpoint_for(network_id))
+        .with_banned_miners(banned_miners))
+}
+
 /// Seconds as `2h 04m 31s`, for progress lines a human reads.
 fn fmt_duration(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
@@ -5459,6 +5858,23 @@ mod genesis_tests {
         Args::parse_from(argv)
     }
 
+    /// rskj's miner aims for its `targetgaslimit`: 6,800,000 where its
+    /// configuration sets none, as on mainnet and testnet, and 7,500,000 on
+    /// its regtest, whose `regtest.conf` sets it. A target set is the target,
+    /// and the force switch is on unless set off, as rskj's `forcegaslimit`.
+    #[test]
+    fn a_miner_aims_for_rskjs_gas_limit_target() {
+        assert_eq!(mining_gas_limit_target(30, None), 6_800_000);
+        assert_eq!(mining_gas_limit_target(31, None), 6_800_000);
+        assert_eq!(mining_gas_limit_target(33, None), 7_500_000);
+        assert_eq!(mining_gas_limit_target(33, Some(9_000_000)), 9_000_000);
+
+        assert!(regtest_args(&[]).mining_force_gas_limit);
+        let off = regtest_args(&["--mining-force-gas-limit", "false", "--mining-gas-limit-target", "8000000"]);
+        assert!(!off.mining_force_gas_limit);
+        assert_eq!(off.mining_gas_limit_target, Some(8_000_000));
+    }
+
     /// The lab's rskj regtest genesis (`tests/fixtures/rskj-regtest-genesis.json`,
     /// sixteen funded accounts, 25M gas limit). rskj gives it this hash:
     /// block 1 of every chain mined from it names it as parent. Getting there
@@ -5479,6 +5895,67 @@ mod genesis_tests {
         assert_eq!(config.genesis_alloc().len(), 16);
     }
 
+    /// A chain from an rskj genesis file runs on rskj's regtest schedule:
+    /// its blocks as their sublists from block 1, with the header's edges
+    /// there too, the union Bridge open, and the free Bridge calls never
+    /// paid. An operator's `--consensus-rule` still moves a rule, as the
+    /// import of rskj's older regtest blocks needs. rustock's own regtest is
+    /// another chain and keeps its own schedule.
+    #[test]
+    fn an_rskj_genesis_file_runs_on_rskjs_regtest_schedule() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/rskj-regtest-genesis.json"
+        );
+        let config =
+            apply_chain_options(ChainConfig::regtest(), &regtest_args(&["--genesis", path]))
+                .unwrap();
+        let (ladder, _) = hardfork_config(&config).unwrap();
+        assert!(!ladder.runs_sublists(0) && ladder.runs_sublists(1));
+        let heights = &config.activation_heights;
+        assert!(!heights.edges_active(0) && heights.edges_active(1));
+        assert!(ladder.has_rskip502(0) && ladder.has_rskip529(0));
+        assert!(!ladder.has_are_bridge_txs_paid(1_000_000));
+
+        let older = regtest_args(&["--genesis", path, "--consensus-rule", "rskip144=-1"]);
+        let config = apply_chain_options(ChainConfig::regtest(), &older).unwrap();
+        let (ladder, _) = hardfork_config(&config).unwrap();
+        assert!(ladder.has_rskip351(1) && !ladder.runs_sublists(1));
+
+        let own = apply_chain_options(ChainConfig::regtest(), &regtest_args(&[])).unwrap();
+        let (ladder, _) = hardfork_config(&own).unwrap();
+        assert!(!ladder.runs_sublists(1) && !ladder.has_rskip502(0));
+        assert!(ladder.has_are_bridge_txs_paid(0));
+    }
+
+    /// The pool checks a transaction on the ladder the block processor runs,
+    /// the operator's overrides included, where it read the chain's bare
+    /// schedule: under perf-lab's seed schedule, whose blocks run as their
+    /// sublists from #9,002,504, it held a transaction to the whole block's
+    /// gas, not to the larger sublist's as rskj's pool does. From an rskj
+    /// genesis file the pool is on rskj's regtest, as the processor is.
+    #[test]
+    fn the_pool_checks_on_the_ladder_the_processor_runs() {
+        let seed = apply_chain_options(ChainConfig::mainnet(), &mainnet_args(SEED_FLAGS)).unwrap();
+        let rules = pool_chain_rules(&seed).unwrap();
+        assert!(rules.hardfork_cfg.runs_sublists(9_003_580));
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/rskj-regtest-genesis.json"
+        );
+        let rskj = apply_chain_options(ChainConfig::regtest(), &regtest_args(&["--genesis", path]))
+            .unwrap();
+        let rules = pool_chain_rules(&rskj).unwrap();
+        assert!(rules.hardfork_cfg.runs_sublists(1));
+        assert!(!rules.hardfork_cfg.has_are_bridge_txs_paid(1_000_000));
+        let constants = rustock_execution::bridge::constants::BridgeConstants::rskj_regtest();
+        assert_eq!(
+            rules.free_bridge_senders,
+            rustock_execution::executor::free_bridge_senders(&constants)
+        );
+    }
+
     #[test]
     fn chain_options_apply_on_regtest_only() {
         let args = regtest_args(&[
@@ -5486,20 +5963,58 @@ mod genesis_tests {
             "--consensus-rule",
             "rskip97=0",
             "--min-gas-limit",
-            "3000000",
-            "--max-gas-limit",
-            "18446744073709551615",
+            "5000000",
         ]);
         let config = apply_chain_options(ChainConfig::regtest(), &args).unwrap();
         assert!(config.skip_pow_validation);
         assert_eq!(config.activation_heights.rskip97, Some(0));
-        assert_eq!((config.min_gas_limit, config.max_gas_limit), (3_000_000, u64::MAX));
+        assert_eq!(config.min_gas_limit, 5_000_000);
 
         let disabled = regtest_args(&["--consensus-rule", "rskip97=-1"]);
         let config = apply_chain_options(ChainConfig::regtest(), &disabled).unwrap();
         assert_eq!(config.activation_heights.rskip97, None);
 
-        let unknown = regtest_args(&["--consensus-rule", "rskip144=0"]);
+        // RSKIP-144 moves apart from reed810, for the header's layout and
+        // the ladder both, as an rskj node replaying older regtest blocks
+        // would set it.
+        let moved = regtest_args(&["--consensus-rule", "rskip144=-1"]);
+        let config = apply_chain_options(ChainConfig::regtest(), &moved).unwrap();
+        assert_eq!(config.activation_heights.rskip144, None);
+        let (ladder, _) = hardfork_config(&config).unwrap();
+        assert!(!ladder.has_rskip144(1));
+        let moved = regtest_args(&["--consensus-rule", "rskip144=5"]);
+        let config = apply_chain_options(ChainConfig::regtest(), &moved).unwrap();
+        assert_eq!(config.activation_heights.rskip144, Some(5));
+        let (ladder, _) = hardfork_config(&config).unwrap();
+        assert!(!ladder.has_rskip144(4) && ladder.has_rskip144(5));
+        // Only the header's layout reads RSKIPUMM.
+        let umm = regtest_args(&["--consensus-rule", "rskipUMM=5"]);
+        let config = apply_chain_options(ChainConfig::regtest(), &umm).unwrap();
+        assert_eq!(config.activation_heights.rskip_umm, Some(5));
+
+        // Moving reed810 on a copy of mainnet moves RSKIP144 and RSKIP351
+        // with it, in the header's heights as on the ladder.
+        let reed810 =
+            mainnet_args(&["--allow-chain-overrides", "--hardfork", "reed810=9000000"]);
+        let config = apply_chain_options(ChainConfig::mainnet(), &reed810).unwrap();
+        let heights = &config.activation_heights;
+        assert_eq!(
+            (heights.rskip144, heights.rskip351),
+            (Some(9_000_000), Some(9_000_000))
+        );
+        let (ladder, _) = hardfork_config(&config).unwrap();
+        assert!(ladder.runs_sublists(9_000_000) && !ladder.runs_sublists(8_999_999));
+        // Below mainnet's earlier upgrades, reed810 would bring their rules
+        // down with it on this ladder: refused.
+        let low = mainnet_args(&["--allow-chain-overrides", "--hardfork", "reed810=100"]);
+        assert!(apply_chain_options(ChainConfig::mainnet(), &low).is_err());
+        // An upgrade left out below a scheduled one is refused: rskj would
+        // have its rules off, and this ladder on from the later upgrade.
+        let hole = regtest_args(&["--hardfork", "lovell700=-1"]);
+        assert!(apply_chain_options(ChainConfig::regtest(), &hole).is_err());
+
+        // A rule this node does not schedule on its own is refused.
+        let unknown = regtest_args(&["--consensus-rule", "rskip126=0"]);
         assert!(apply_chain_options(ChainConfig::regtest(), &unknown).is_err());
 
         let mainnet = Args::parse_from(["rustock-cli", "--skip-pow-validation"]);
@@ -5529,7 +6044,7 @@ mod genesis_tests {
         "--consensus-rule", "rskipUMM=2392700", "--consensus-rule", "rskip351=9002504",
         "--consensus-rule", "rskip535=9002504", "--consensus-rule", "rskip536=8804200",
         "--skip-pow-validation",
-        "--min-gas-limit", "3000000", "--max-gas-limit", "18446744073709551615",
+        "--min-gas-limit", "3000000",
     ];
 
     /// Without the opt-in, mainnet is mainnet: every override refused, and a
@@ -5548,7 +6063,7 @@ mod genesis_tests {
         assert_eq!(plain.activation_heights.rskip144, None);
         // 3,000,000 since the rskj parity fix (rskj `Constants.getMinGasLimit`);
         // this asserts mainnet's own defaults, so it tracks them.
-        assert_eq!((plain.min_gas_limit, plain.max_gas_limit), (3_000_000, 1_000_000_000));
+        assert_eq!(plain.min_gas_limit, 3_000_000);
         assert!(!plain.skip_pow_validation);
         assert!(plain.hardfork_overrides.is_empty());
         let (ladder, unmodelled) = hardfork_config(&plain).unwrap();
@@ -5566,14 +6081,19 @@ mod genesis_tests {
         let config = apply_chain_options(ChainConfig::mainnet(), &mainnet_args(SEED_FLAGS)).unwrap();
         assert_eq!(config.chain_id, 30);
         assert_eq!(config.activation_heights.rskip144, Some(9_002_504));
+        // The header's layout reads RSKIP351 and RSKIP535 here, the ladder
+        // below; RSKIPUMM only here.
+        assert_eq!(config.activation_heights.rskip351, Some(9_002_504));
+        assert_eq!(config.activation_heights.rskip535, Some(9_002_504));
+        assert_eq!(config.activation_heights.rskip_umm, Some(2_392_700));
         assert_eq!(config.activation_heights.orchid, 729_000);
         assert_eq!(config.activation_heights.rskip97, Some(729_000));
         assert_eq!(config.activation_heights.papyrus200, 2_392_700);
         assert!(config.skip_pow_validation);
-        assert_eq!((config.min_gas_limit, config.max_gas_limit), (3_000_000, u64::MAX));
+        assert_eq!(config.min_gas_limit, 3_000_000);
         assert!(config.genesis_spec.is_none(), "mainnet's genesis stays");
         let (ladder, unmodelled) = hardfork_config(&config).unwrap();
-        assert_eq!(unmodelled, vec!["orchid060".to_string(), "tbd1000".to_string()]);
+        assert_eq!(unmodelled, vec!["tbd1000".to_string()]);
         assert!(!ladder.has_rskip144(9_002_503));
         assert!(ladder.has_rskip144(9_003_580));
         assert!(ladder.has_rskip351(9_003_580));
@@ -5681,5 +6201,157 @@ mod genesis_tests {
         let m = build_genesis_state(&ChainConfig::mainnet(), &store_m).unwrap();
         let t = build_genesis_state(&ChainConfig::testnet(), &store_t).unwrap();
         assert_ne!(m.compute_hash(&store_m), t.compute_hash(&store_t));
+    }
+
+    /// A store from before block 0 kept its difficulty as its genesis file
+    /// writes it: its block 0 reads back to another hash than its key, the
+    /// network's genesis hash. `rewrite_old_genesis` writes the chain's header
+    /// in its place, once; a store whose block 0 reads back to its key is left
+    /// as it is, and so is one that holds another chain's.
+    #[test]
+    fn an_old_stores_block_0_is_written_again_to_read_back_to_its_hash() {
+        for config in [ChainConfig::mainnet(), ChainConfig::testnet()] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = BlockStore::open(dir.path())
+                .unwrap()
+                .with_activations(config.activation_heights.clone());
+            let hash = config.known_genesis_hash().unwrap();
+            let old = rustock_core::Header {
+                kept: None,
+                ..config.genesis_header()
+            }
+            .with_activations(&config.activation_heights);
+            store.put_header_with_hash(hash, &old).unwrap();
+            store.put_canonical_hash(0, hash).unwrap();
+            assert_ne!(store.header(hash).unwrap().unwrap().hash(), hash);
+
+            assert!(rewrite_old_genesis(&store, &config, hash).unwrap());
+            assert_eq!(store.header(hash).unwrap().unwrap().hash(), hash);
+            assert!(!rewrite_old_genesis(&store, &config, hash).unwrap(), "once");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = ChainConfig::mainnet();
+        let store = BlockStore::open(dir.path())
+            .unwrap()
+            .with_activations(config.activation_heights.clone());
+        let hash = setup_genesis(&store, &config).unwrap();
+        assert!(!rewrite_old_genesis(&store, &config, hash).unwrap());
+        assert!(!rewrite_old_genesis(&store, &ChainConfig::testnet(), hash).unwrap());
+    }
+
+    /// The node's block processor and its miner's are built by the same
+    /// function, and it turns fork detection on: a block this node mines, and
+    /// the uncles it names, meet the rule a peer's block meets.
+    #[test]
+    fn the_processor_the_node_and_its_miner_run_checks_fork_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let config = Arc::new(ChainConfig::regtest());
+        let (ladder, _) = hardfork_config(&config).unwrap();
+        assert!(rule_keeping_processor(&ladder, &store, &config).validates_fork_detection());
+    }
+
+    /// A new database holds block 0's header and no trie until block 0's
+    /// state is built, after the check: it starts on the default backend, on
+    /// every network. One whose blocks ran and whose own trie is empty is
+    /// refused, as upstream's check refuses it, and one whose trie is there
+    /// isn't.
+    #[test]
+    fn a_new_database_starts_and_one_whose_trie_is_gone_does_not() {
+        use rustock_storage::epoch_store::TrieBackend;
+        for config in [
+            ChainConfig::mainnet(),
+            ChainConfig::testnet(),
+            ChainConfig::regtest(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = BlockStore::open(dir.path())
+                .unwrap()
+                .with_activations(config.activation_heights.clone());
+            let hash = setup_genesis(&store, &config).unwrap();
+            assert!(store.trie_cf_is_empty());
+            assert!(!trie_is_missing(&store, &TrieBackend::Single).unwrap());
+
+            store
+                .set_exec_head(hash, alloy_primitives::B256::repeat_byte(1))
+                .unwrap();
+            assert!(trie_is_missing(&store, &TrieBackend::Single).unwrap());
+            assert!(!trie_is_missing(&store, &TrieBackend::External).unwrap());
+
+            rustock_storage::RocksDbTrieStore::from_db(store.db().clone()).put(b"node", b"bytes");
+            assert!(!trie_is_missing(&store, &TrieBackend::Single).unwrap());
+        }
+    }
+}
+
+#[cfg(test)]
+mod sync_handler_tests {
+    use super::*;
+    use rustock_networking::protocol::{P2pHandler, P2pMessage, RskMessage, RskSubMessage};
+
+    type Built = (
+        SyncHandler,
+        tokio::sync::mpsc::UnboundedReceiver<rustock_sync::SyncEvent>,
+        tempfile::TempDir,
+    );
+
+    /// The handler `run` builds from `argv`, its events, and its store's
+    /// directory.
+    fn handler_from(argv: &[&str]) -> anyhow::Result<Built> {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SyncManager::new(
+            Arc::new(BlockStore::open(dir.path()).unwrap()),
+            Arc::new(HeaderVerifier::new()),
+            Arc::new(rustock_networking::peers::PeerStore::new()),
+        ));
+        let (events, received) = tokio::sync::mpsc::unbounded_channel();
+        let args = Args::parse_from(argv);
+        let handler = sync_handler_for(
+            manager,
+            events,
+            args.simulate_height,
+            rustock_core::checkpoint::CheckpointDefence::NONE,
+            args.network_id,
+            &args.banned_miners,
+        )?;
+        Ok((handler, received, dir))
+    }
+
+    /// `--banned-miners` reaches the handler: a block a peer sends whole,
+    /// mined by a coinbase named there, is not taken, and one mined by
+    /// anyone else is.
+    #[tokio::test]
+    async fn a_miner_banned_on_the_command_line_is_refused_by_the_handler() {
+        let banned = "0xbabababababababababababababababababababa";
+        let (handler, mut received, _dir) =
+            handler_from(&["rustock-cli", "--banned-miners", banned]).unwrap();
+        let sent = |coinbase: alloy_primitives::Address| {
+            let mut header = ChainConfig::regtest().genesis_header();
+            header.number = 1;
+            header.beneficiary = coinbase;
+            let block = rustock_core::Block {
+                header,
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+            };
+            P2pMessage::RskMessage(RskMessage::new(RskSubMessage::Block(Box::new(block))))
+        };
+        let peer = alloy_primitives::B512::repeat_byte(4);
+
+        handler.handle_message(peer, &sent(banned.parse().unwrap()));
+        let taken = received.try_recv().is_ok();
+        assert!(!taken, "the banned miner's block was taken");
+        handler.handle_message(peer, &sent(alloy_primitives::Address::repeat_byte(0x0c)));
+        let taken = received.try_recv().is_ok();
+        assert!(taken, "another miner's block was refused");
+    }
+
+    /// An entry that isn't an address stops the node starting, as on rskj.
+    #[test]
+    fn a_banned_miner_that_is_not_an_address_stops_the_start() {
+        let refused = handler_from(&["rustock-cli", "--banned-miners", "0xbaba"]);
+        let err = refused.err().expect("a two-byte address was taken");
+        assert!(err.to_string().contains("--banned-miners"), "{err}");
     }
 }

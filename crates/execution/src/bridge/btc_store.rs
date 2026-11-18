@@ -54,6 +54,14 @@ impl StoredBlock {
         self.header.block_hash()
     }
 
+    /// Whether the chain work fits the legacy format's 12 bytes. bitcoinj's
+    /// `StoredBlock.serializeCompactLegacy` throws for one that does not
+    /// (`Utils.bigIntegerToBytes`), where [`Self::serialize_compact_legacy`]
+    /// keeps its low 12 bytes.
+    pub fn fits_legacy(&self) -> bool {
+        self.chain_work.bit_len() <= LEGACY_CHAIN_WORK_SIZE * 8
+    }
+
     /// Serialize in the legacy compact format (96 bytes).
     /// Layout: `[chain_work: 12B BE][height: 4B BE][header: 80B]`
     pub fn serialize_compact_legacy(&self) -> Vec<u8> {
@@ -206,19 +214,39 @@ pub fn put_stored_block<CTX: crate::RskContextTr>(ctx: &mut CTX, block: &StoredB
     store_raw_bytes(ctx, key, &data);
 }
 
-/// Load a StoredBlock by its hash.
+/// Load a StoredBlock by its hash: rskj `RepositoryBtcBlockStoreWithCache.get`,
+/// which reads storage alone, never its cache.
 ///
-/// Three layers, in this order, and the order is the correctness argument:
-///
-/// 1. **This block's own writes.** Always authoritative, never cached -- they
-///    are not committed yet and may still be discarded.
-/// 2. **The cache**, when one is installed. Safe to consult here because the
-///    key is the block's own hash and the value at that key never changes.
-/// 3. **The parent trie.** A value found here is what the cache records. A
-///    value *not* found here records nothing: see
-///    [`crate::bridge::btc_block_cache`] for why negative caching would turn a
-///    missing trie node into a wrong consensus answer.
+/// This block's own writes come first: they are not committed yet and may
+/// still be discarded. Then the parent trie. The cache is the node's, not the
+/// chain's: it keeps the blocks the node read on whatever RSK chain it ran,
+/// and after the node follows another chain it can hold a block this one never
+/// stored. Answered from the cache, a header naming such a block as its parent
+/// would be taken where rskj finds no parent, and a block known by its hash
+/// where rskj knows none. A block read from the trie is recorded in the cache
+/// for the main-chain walk ([`get_stored_block_walking_the_main_chain`]); a
+/// block not found records nothing (see [`crate::bridge::btc_block_cache`]).
 pub fn get_stored_block<CTX: crate::RskContextTr>(ctx: &mut CTX, hash: &BlockHash) -> Option<StoredBlock> {
+    stored_block(ctx, hash, false)
+}
+
+/// A step of the walk down the main chain from its head: rskj
+/// `getStoredBlockAtMainChainDepth`, which asks its cache before storage
+/// (`getFromCache`, then `get`). Only that walk may: every block it reaches
+/// from the head this chain stored, and a block's hash fixes its header, so
+/// its height and chain work too, whichever chain stored it.
+pub fn get_stored_block_walking_the_main_chain<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    hash: &BlockHash,
+) -> Option<StoredBlock> {
+    stored_block(ctx, hash, true)
+}
+
+fn stored_block<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    hash: &BlockHash,
+    cache_first: bool,
+) -> Option<StoredBlock> {
     let key = btc_hash_to_storage_key(hash);
 
     // 1. The overlay wins over everything.
@@ -230,15 +258,15 @@ pub fn get_stored_block<CTX: crate::RskContextTr>(ctx: &mut CTX, hash: &BlockHas
         return StoredBlock::deserialize_compact(&data);
     }
 
-    // 2. The cache, if the node installed one.
+    // 2. The cache, if the node installed one, on the main-chain walk alone.
     let cache = ctx.chain_mut().btc_block_cache.clone();
-    if let Some(cache) = &cache {
+    if let Some(cache) = cache.as_ref().filter(|_| cache_first) {
         if let Some(block) = cache.get(hash) {
             return Some(block);
         }
     }
 
-    // 3. The parent trie -- the only read a cache stands in front of.
+    // 3. The parent trie.
     let data = ctx.chain_mut().raw_storage.get_from_trie(BRIDGE_ADDR, key).unwrap_or_default();
     if data.is_empty() {
         // Deliberately not recorded. An absence here may be a genuinely
@@ -253,15 +281,64 @@ pub fn get_stored_block<CTX: crate::RskContextTr>(ctx: &mut CTX, hash: &BlockHas
     Some(block)
 }
 
+/// rskj `BridgeSupport.getBlockKeepingTestnetConsensus`, the lookup
+/// `getBtcTransactionConfirmations` and its gas cost make: the stored block
+/// `hash` names, except at testnet's block #5,148,285, where Bitcoin block
+/// `00000000e8e7...f379` is the block rskj hard-codes, at height 2,817,125,
+/// whatever the store holds. rskj's cache held that block when its storage
+/// didn't, so nodes answered differently, and rskj fixed the answer.
+pub fn get_block_keeping_testnet_consensus<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &super::constants::BridgeConstants,
+    hash: &BlockHash,
+) -> Option<StoredBlock> {
+    const RSK_BLOCK: u64 = 5_148_285;
+    const BTC_BLOCK: &str = "00000000e8e7b540df01a7067e020fd7e2026bf86289def2283a35120c1af379";
+    const HEADER: &str = "000000203b5d178405c4e6e7dc07d63d6de5db1342044791721654760c00000000000000796cf6743a036300b43fb3abe6703d04a7999751b6d5744f20327d1175320bd37b954e66ffff001d56dc11ce";
+    const CHAIN_WORK: &str = "000000000000000000000000000000000000000000000ddeb5fbcd969312a77c";
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    if block_number == RSK_BLOCK
+        && matches!(config.btc_network, super::constants::BtcNetwork::Testnet)
+        && hash.to_string() == BTC_BLOCK
+    {
+        let header = alloy_primitives::hex::decode(HEADER).expect("the header is hex");
+        let header = deserialize::<BtcHeader>(&header).expect("the header is 80 bytes");
+        let work = alloy_primitives::hex::decode(CHAIN_WORK).expect("the chain work is hex");
+        return Some(StoredBlock::new(
+            header,
+            2_817_125,
+            U256::from_be_slice(&work),
+        ));
+    }
+    get_stored_block(ctx, hash)
+}
+
 // ---------------------------------------------------------------------------
 // Raw byte storage: one variable-length value per unitrie key
 // (rskj Repository.addStorageBytes / getStorageBytes).
 // ---------------------------------------------------------------------------
 
+/// Write a cell of the BTC block store. rskj's store
+/// (`RepositoryBtcBlockStoreWithCache.put`, `setChainHead`) writes straight
+/// into the repository the Bridge was given, not through the Bridge's storage
+/// provider, which writes only when a method returns (and which the height
+/// index, `setMainChainBlock`, goes through). A transaction's own call to the
+/// Bridge is given the transaction's repository, which
+/// `TransactionExecutor.go` commits however the call ended, so these writes
+/// stay though the method then throws or the call runs out of gas. A
+/// contract's call is given a repository of its own, which a failed call
+/// rolls back (`Program.callToPrecompiledAddress`).
 fn store_raw_bytes<CTX: crate::RskContextTr>(ctx: &mut CTX, base_key: U256, data: &[u8]) {
-    ctx.chain_mut()
-        .raw_storage
-        .put(BRIDGE_ADDR, base_key, Some(data.to_vec()));
+    use revm::context_interface::JournalTr;
+    // A transaction's own call runs in the first frame. Before RSKIP136 its
+    // cost is worked out before that frame opens, at depth 0.
+    let transactions_own_call = ctx.journal().depth() <= 1;
+    let raw = &mut ctx.chain_mut().raw_storage;
+    if transactions_own_call {
+        raw.put_kept(BRIDGE_ADDR, base_key, Some(data.to_vec()));
+    } else {
+        raw.put(BRIDGE_ADDR, base_key, Some(data.to_vec()));
+    }
 }
 
 fn load_raw_bytes<CTX: crate::RskContextTr>(ctx: &mut CTX, base_key: U256) -> Vec<u8> {
@@ -309,20 +386,7 @@ pub fn compact_target_to_u256(bits: CompactTarget) -> U256 {
     }
 }
 
-/// Check if a block hash meets the proof-of-work target.
-/// The hash (interpreted as a LE U256) must be ≤ target.
-pub fn check_proof_of_work(header: &BtcHeader) -> bool {
-    let target = compact_target_to_u256(header.bits);
-    let hash = header.block_hash();
-    let raw = hash.to_raw_hash();
-    let hash_bytes: &[u8; 32] = raw.as_byte_array();
-    // bitcoin crate stores hashes in "internal byte order" (raw SHA256 output).
-    // For PoW, these bytes are interpreted as a little-endian 256-bit number
-    // (matching Bitcoin Core's UintToArith256). Valid blocks have trailing
-    // zero bytes in internal order (leading zeros in display order).
-    let hash_u256 = U256::from_le_bytes(*hash_bytes);
-    hash_u256 <= target
-}
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -334,6 +398,9 @@ mod tests {
     use bitcoin::block::Version;
     use bitcoin::hashes::Hash;
     use bitcoin::{CompactTarget, TxMerkleNode};
+
+    use crate::bridge::btc_rules::verify_header;
+    use crate::bridge::constants::BtcNetwork;
 
     fn test_header(version: i32, nonce: u32) -> BtcHeader {
         BtcHeader {
@@ -522,7 +589,10 @@ mod tests {
     #[test]
     fn rskj_mainnet_849137_passes_pow() {
         let header = parse_mainnet_header();
-        assert!(check_proof_of_work(&header), "mainnet block 849137 should pass PoW");
+        assert!(
+            verify_header(&header, BtcNetwork::Mainnet),
+            "mainnet block 849137 should pass PoW"
+        );
     }
 
     /// Verify compute_work produces a non-zero result for mainnet difficulty.
@@ -556,7 +626,10 @@ mod tests {
             let bytes = hex_to_bytes(hdr_hex);
             assert_eq!(bytes.len(), 80, "header {i} wrong size");
             let hdr: BtcHeader = deserialize(&bytes).expect("header {i} deserialize");
-            assert!(check_proof_of_work(&hdr), "mainnet block at index {i} should pass PoW");
+            assert!(
+                verify_header(&hdr, BtcNetwork::Mainnet),
+                "mainnet block at index {i} should pass PoW"
+            );
         }
     }
 
@@ -583,6 +656,38 @@ mod tests {
             computed_cw_849137, cw_849137,
             "chain work accumulation 849134→849137 mismatch"
         );
+    }
+
+    /// Bitcoin block 849,138, the one rskj's mainnet constants name
+    /// (`blockWithTooMuchChainWorkHeight`): its chain work, 849,137's plus one
+    /// block of work at the same bits, is the first at or above 2^95, so the
+    /// top bit of a 12-byte field is set and the field read as signed is
+    /// negative, where 849,137's is not. Unsigned it still fits the legacy 12
+    /// bytes, as it does the 32 of the second format.
+    #[test]
+    fn mainnet_849138_is_the_first_chain_work_to_set_the_top_bit_of_12_bytes() {
+        let cw_849137 = U256::from_str_radix("7fffdc6f043e4a69ea179a7a", 16).unwrap();
+        let cw_849138 = cw_849137 + compute_work(CompactTarget::from_consensus(0x17035d25));
+        assert_eq!(
+            cw_849138,
+            U256::from_str_radix("800028897aa1dce163ead2cf", 16).unwrap()
+        );
+        let top_bit = U256::from(1u8) << 95;
+        assert!(cw_849137 < top_bit);
+        assert!(cw_849138 >= top_bit && cw_849138 < top_bit << 1);
+        assert_eq!(
+            crate::bridge::constants::BridgeConstants::mainnet()
+                .block_with_too_much_chain_work_height,
+            849_138
+        );
+
+        // 849,137's header, carrying 849,138's work through both formats.
+        let block = StoredBlock::new(parse_mainnet_header(), 849_138, cw_849138);
+        let legacy =
+            StoredBlock::deserialize_compact_legacy(&block.serialize_compact_legacy()).unwrap();
+        assert_eq!(legacy.chain_work, cw_849138);
+        let v2 = StoredBlock::deserialize_compact_v2(&block.serialize_compact_v2()).unwrap();
+        assert_eq!(v2.chain_work, cw_849138);
     }
 
     /// Verify auto-detect correctly identifies legacy vs V2 format for

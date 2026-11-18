@@ -45,6 +45,19 @@ use tracing::{debug, info, warn};
 /// concludes the chain does not connect to ours.
 const EMPTY_HEADER_REPLIES_ALLOWED: u32 = 5;
 
+/// Header requests the walk may have outstanding for each peer that can take
+/// them.
+///
+/// Header and skeleton requests are messages every peer serves, so their
+/// budget grows with the peers there are, where a state download is held to
+/// `SnapConfig::max_in_flight` by the few peers that serve state. On mainnet
+/// that budget of eight left forty peers mostly idle through a walk of
+/// hours. Two keeps a peer busy while its last answer is on the way, without
+/// queueing work behind a slow one.
+const HEADER_REQUESTS_PER_PEER: usize = 2;
+/// And never more than this in all, however many peers there are.
+const MAX_HEADER_REQUESTS: usize = 64;
+
 /// Chunk answers in a row that add nothing before the session gives up.
 ///
 /// A peer declining to serve is ordinary -- it may be pruned, or on another
@@ -100,8 +113,15 @@ pub enum SnapFailure {
     OverstatedDifficulty { claimed: U256, ceiling: U256 },
     #[error("the peer would not substantiate its claimed difficulty: {why}")]
     UnsubstantiatedClaim { why: String },
+    #[error(
+        "the peer offered a state {window} blocks above the checkpoint, more than the {most} \
+         a chain this build can follow has grown"
+    )]
+    ImplausibleHeight { window: u64, most: u64 },
     #[error("block #{number}: the {what} are not the ones its header commits to")]
     BadBody { number: u64, what: &'static str },
+    #[error("block #{number} breaks a rule every block is held to: {reason}")]
+    InvalidBlock { number: u64, reason: String },
 }
 
 /// What an answer revealed about the peer that sent it.
@@ -168,6 +188,11 @@ pub struct SnapSession {
     /// Requests this session has outstanding, as last reported by the driver.
     /// See [`Self::note_in_flight`].
     in_flight: usize,
+    /// Peers that can take header requests, and those that can take them
+    /// with uncles, as last counted by the driver. See
+    /// [`Self::note_header_peers`].
+    header_peers: usize,
+    uncle_peers: usize,
     /// The block whose state is being downloaded, once one has been offered.
     checkpoint: Option<Header>,
     /// Its cumulative difficulty, as offered and then vouched for by the
@@ -213,6 +238,10 @@ pub struct SnapSession {
     last_report: Instant,
     /// Block answers in a row that added nothing.
     fruitless_blocks: u32,
+    /// The rules that read a block alone, which each block this session
+    /// keeps is held to: see [`Self::check_block`]. `None` holds a block to
+    /// its header's commitments only.
+    block_rules: Option<Arc<rustock_execution::BlockProcessor>>,
 }
 
 impl SnapSession {
@@ -230,6 +259,8 @@ impl SnapSession {
             phase: Phase::AwaitingStatus,
             failure: None,
             in_flight: 0,
+            header_peers: 0,
+            uncle_peers: 0,
             checkpoint: None,
             checkpoint_td: U256::ZERO,
             offered: Vec::new(),
@@ -248,7 +279,48 @@ impl SnapSession {
             phase_started: Instant::now(),
             last_report: Instant::now(),
             fruitless_blocks: 0,
+            block_rules: None,
         }
+    }
+
+    /// Hold every block this session keeps to the rules `processor` has for
+    /// a snapshot's blocks: see [`Self::check_block`].
+    pub fn with_block_rules(mut self, processor: Arc<rustock_execution::BlockProcessor>) -> Self {
+        self.block_rules = Some(processor);
+        self
+    }
+
+    /// Whether this session was given the node's rules for a snapshot's
+    /// blocks, for a test of the service that opens it.
+    #[cfg(test)]
+    pub(crate) fn holds_blocks_to_rules(&self) -> bool {
+        self.block_rules.is_some()
+    }
+
+    /// What rskj holds each block of a snapshot to before it keeps it
+    /// (`SnapshotProcessor.areBlockPairsValid`), past its header's own rules
+    /// and those against its parent, which are the walk's: the body its
+    /// header commits to, and, with the node's rules in hand
+    /// ([`Self::with_block_rules`]), those that read a block's contents --
+    /// its transactions' gas prices and signatures, REMASC's place, the
+    /// sublist edges (`BlockProcessor::validate_snapshot_block`).
+    ///
+    /// The body is its transactions, as rskj's `BlockRootValidationRule` has
+    /// it, and its uncles too, whose difficulty the totals count.
+    ///
+    /// These blocks are never executed -- they are fetched because contracts
+    /// can read them -- so nothing downstream would ever check them.
+    fn check_block(&self, block: &Block, parent: Option<&Header>) -> Result<(), SnapFailure> {
+        check_body_matches_header(block)?;
+        if let Some(rules) = &self.block_rules {
+            rules
+                .validate_snapshot_block(block, parent)
+                .map_err(|e| SnapFailure::InvalidBlock {
+                    number: block.header.number,
+                    reason: e.to_string(),
+                })?;
+        }
+        Ok(())
     }
 
     pub fn phase(&self) -> Phase {
@@ -291,6 +363,12 @@ impl SnapSession {
         Vec::new()
     }
 
+    /// End the session as a failure, for tests of what follows one.
+    #[cfg(test)]
+    pub(crate) fn fail_for_test(&mut self, why: SnapFailure) {
+        self.fail(why);
+    }
+
     /// What to do now. Safe to call as often as the caller likes: it returns
     /// only work that is not already outstanding.
     /// Tell this session how many of its requests are still outstanding.
@@ -307,6 +385,29 @@ impl SnapSession {
         self.in_flight = n;
     }
 
+    /// Tell this session how many peers can take its header requests, and how
+    /// many of those can send uncles with them, which sets the header phases'
+    /// budget. See [`HEADER_REQUESTS_PER_PEER`].
+    pub fn note_header_peers(&mut self, headers: usize, uncles: usize) {
+        self.header_peers = headers;
+        self.uncle_peers = uncles;
+    }
+
+    /// What may be outstanding at once in the current phase.
+    fn budget(&self) -> usize {
+        let per_peer = |peers: usize| {
+            peers
+                .saturating_mul(HEADER_REQUESTS_PER_PEER)
+                .min(MAX_HEADER_REQUESTS)
+        };
+        let cap = match self.phase {
+            Phase::VerifyingHeaders => per_peer(self.header_peers),
+            Phase::AscendingHeaders => per_peer(self.uncle_peers),
+            _ => 0,
+        };
+        cap.max(self.config.max_in_flight).max(1)
+    }
+
     /// Moves to a new phase, restarting the clock the progress lines report
     /// against.
     fn set_phase(&mut self, phase: Phase) {
@@ -314,7 +415,9 @@ impl SnapSession {
             self.phase_started = Instant::now();
             // Report the new phase promptly rather than up to five seconds
             // later: the first line is the one that says what is happening.
-            self.last_report = Instant::now() - Duration::from_secs(5);
+            // (`Instant` counts from boot, so this can't go below it.)
+            let now = Instant::now();
+            self.last_report = now.checked_sub(Duration::from_secs(5)).unwrap_or(now);
         }
         self.phase = phase;
     }
@@ -418,7 +521,7 @@ impl SnapSession {
         // that let the budget be exceeded by one on *every* call, which is
         // unbounded growth wearing a smaller number. When the queue is full
         // the right answer is to ask for nothing and wait for an answer.
-        let budget = self.config.max_in_flight.max(1).saturating_sub(self.in_flight);
+        let budget = self.budget().saturating_sub(self.in_flight);
         if budget == 0 {
             return Vec::new();
         }
@@ -535,9 +638,11 @@ impl SnapSession {
 
     /// A peer's offer of a state it can serve.
     ///
-    /// The blocks are checked for shape only -- that they form a chain, that
-    /// difficulty rises along it. Whether this chain is *the* chain is settled
-    /// by the header walk that follows, not here.
+    /// The blocks are checked for shape -- that they form a chain, that
+    /// difficulty rises along it -- and each for what a block is held to on
+    /// its own ([`Self::check_block`]): they are kept, bodies and all, once
+    /// the walk vouches for the chain. Whether this chain is *the* chain is
+    /// settled by the header walk that follows, not here.
     pub fn on_status(
         &mut self,
         blocks: &[Block],
@@ -556,6 +661,13 @@ impl SnapSession {
         }
         if let Err(why) = check_chain_shape(blocks, difficulties) {
             return self.fail(why);
+        }
+
+        for (i, block) in blocks.iter().enumerate() {
+            let parent = i.checked_sub(1).map(|below| &blocks[below].header);
+            if let Err(why) = self.check_block(block, parent) {
+                return self.fail(why);
+            }
         }
 
         let header = checkpoint.header.clone();
@@ -629,6 +741,12 @@ impl SnapSession {
                 );
             }
             if header.number > checkpoint.number && !walk_is_cheaper {
+                if window > crate::sampler::MAX_SAMPLED_WINDOW {
+                    return self.fail(SnapFailure::ImplausibleHeight {
+                        window,
+                        most: crate::sampler::MAX_SAMPLED_WINDOW,
+                    });
+                }
                 self.gate = Some(crate::sampler::SamplingGate::new(
                     checkpoint,
                     self.checkpoint_td,
@@ -655,16 +773,22 @@ impl SnapSession {
                         "ascending the header chain from #{number} to #{}, with uncles",
                         header.number
                     );
-                    self.ascent = Some(super::forward::ForwardSync::new(
-                        number,
-                        hash,
-                        work,
-                        header.number,
-                        header.hash(),
-                        self.config.archive_uncles,
-                        self.store.clone(),
-                        self.verifier.clone(),
-                    ));
+                    // Bodies come only for the blocks from `blocks_wanted_to`
+                    // up, so the uncles sent beside every header under it
+                    // are the only copy this node will get.
+                    self.ascent = Some(
+                        super::forward::ForwardSync::new(
+                            number,
+                            hash,
+                            work,
+                            header.number,
+                            header.hash(),
+                            self.config.archive_uncles,
+                            self.store.clone(),
+                            self.verifier.clone(),
+                        )
+                        .with_bodies_from(self.blocks_wanted_to),
+                    );
                 }
                 _ => {
                     warn!(
@@ -677,11 +801,14 @@ impl SnapSession {
             }
         }
 
-        self.walk = Some(super::headers::HeaderWalk::new(
-            header.clone(),
-            self.store.clone(),
-            self.verifier.clone(),
-        ));
+        self.walk = Some(
+            super::headers::HeaderWalk::new(
+                header.clone(),
+                self.store.clone(),
+                self.verifier.clone(),
+            )
+            .with_bodies_from(self.blocks_wanted_to),
+        );
 
         self.checkpoint = Some(header);
         // The walk is built either way, but the gate — when there is one —
@@ -890,6 +1017,17 @@ impl SnapSession {
     }
 
     pub fn on_headers(&mut self, point: u64, headers: &[Header]) -> Vec<Action> {
+        if self.phase == Phase::AscendingHeaders {
+            // The ascent asked for these with their uncles, and totals the work
+            // exactly, so bare headers are no answer to it. Hand the range back
+            // to be asked again. The driver has already struck the request off,
+            // so nothing would time it out, and left marked as asked it was
+            // never asked again: one bare answer stopped the ascent there.
+            if let Some(ascent) = self.ascent.as_mut() {
+                ascent.release_headers(point);
+            }
+            return self.poll();
+        }
         self.ingest_headers(point, headers, &std::collections::HashMap::new())
     }
 
@@ -920,6 +1058,11 @@ impl SnapSession {
         if headers.is_empty() {
             // That peer cannot fill this range; another might. Give up only
             // once several in a row have come back empty.
+            //
+            // The range is handed back first, which is all the walk does with
+            // an empty run. Left marked as asked, it was never asked again,
+            // and when it was the frontier nothing could move the walk past it.
+            let _ = walk.on_headers(point, headers, proven);
             self.empty_header_replies += 1;
             if self.empty_header_replies >= EMPTY_HEADER_REPLIES_ALLOWED {
                 return self.fail(SnapFailure::NoCommonAncestor);
@@ -1007,8 +1150,13 @@ impl SnapSession {
         }
     }
 
-    /// Ask again for a skeleton nobody answered. See above: both phases.
+    /// Ask again for a skeleton nobody answered: in both header phases, and in
+    /// the sampling gate before them, which asks for skeletons too and waits
+    /// for every one of them before it judges.
     pub fn release_skeleton_request(&mut self, start: u64) {
+        if let Some(gate) = self.gate.as_mut() {
+            gate.release_skeleton(start);
+        }
         if let Some(walk) = self.walk.as_mut() {
             walk.release(&super::headers::Want::Skeleton { start });
         }
@@ -1028,6 +1176,44 @@ impl SnapSession {
 
     fn start_state_download(&mut self) -> Vec<Action> {
         let checkpoint = self.checkpoint.clone();
+
+        // The claim is judged before anything is written. Everything after this
+        // makes the checkpoint this node's own -- its total difficulty, the
+        // canonical index under it, the head -- and the next session's walk
+        // stops at the first block it finds there. Written first and refused
+        // after, a claim turned down here was taken on the next attempt without
+        // a walk: on mainnet the second session "verified" the chain in four
+        // seconds, on the strength of the first one's refused total.
+        //
+        // The walk has read every header from the checkpoint, its first, down
+        // to a block this node already trusted, and counted each run as it
+        // joined the chain. Uncles it could not count: they travel in bodies,
+        // which a header walk never fetches, and rskj peers send none
+        // alongside. Taken for a ceiling, with only the checkpoint's own
+        // uncles allowed for, that floor refused every honest peer on mainnet:
+        // #9381160 carries 6.24e28, and its headers alone 3.54e28.
+        //
+        // What the walk did see bounds the uncles it did not, and
+        // `HeaderWalk::work_ceiling` adds that bound to the floor. With every
+        // uncle sent, the ceiling is the exact work.
+        //
+        // The claim is written as this node's own total difficulty at the
+        // checkpoint, so it is worth bounding rather than accepting.
+        let judged = self.walk.as_ref().and_then(|walk| {
+            Some((
+                walk.established_difficulty()?,
+                walk.work_ceiling(self.config.min_difficulty)?,
+                walk.uncles_omitted(),
+            ))
+        });
+        if let Some((_, ceiling, _)) = judged {
+            if self.checkpoint_td > ceiling {
+                return self.fail(SnapFailure::OverstatedDifficulty {
+                    claimed: self.checkpoint_td,
+                    ceiling,
+                });
+            }
+        }
 
         // The walk reached a block this node already had, so everything above
         // it is anchored to work this node had already accepted. Only now do
@@ -1066,43 +1252,21 @@ impl SnapSession {
             let _ = self.store.set_head(hash);
         }
 
-        // The walk has read every header from the checkpoint down to a block
-        // this node already trusted, so the work of that chain is known. The
-        // claimed cumulative difficulty may exceed it only by the checkpoint
-        // block's own contribution -- the one header the walk never visits as
-        // a candidate.
-        //
-        // That contribution includes the checkpoint's uncles, whose headers
-        // are not in hand here: only `uncle_count` is. An uncle is a sibling,
-        // computed from the same parent, so its difficulty is close to the
-        // block's own; `difficulty * (1 + uncle_count)` is therefore a sound
-        // upper bound without pretending to a precision the data does not
-        // support. Bounding it low instead would reject every honest peer
-        // whose totals are right, which is what the header-only bound did.
-        //
-        // The claim is written as this node's own total difficulty at the
-        // checkpoint, so it is worth establishing rather than accepting.
-        if let Some(established) = self.walk.as_ref().and_then(|w| w.established_difficulty()) {
-            let ceiling = established.saturating_add(
-                checkpoint.as_ref().map_or(U256::ZERO, |h| {
-                    h.difficulty
-                        .saturating_mul(U256::from(1u64).saturating_add(U256::from(h.uncle_count)))
-                }),
-            );
-            if self.checkpoint_td > ceiling {
-                return self.fail(SnapFailure::OverstatedDifficulty {
-                    claimed: self.checkpoint_td,
-                    ceiling,
-                });
-            }
+        let frontier = self.walk.as_ref().map_or(0, |w| w.frontier());
+        let at = checkpoint.as_ref().map_or(0, |h| h.number);
+        match judged {
+            Some((established, ceiling, uncles)) => info!(
+                target: "rustock::snap",
+                "header chain verified back to #{frontier}: work {established} counted, at most \
+                 {ceiling} with the {uncles} uncles a header walk cannot see, against {} claimed; \
+                 downloading state at #{at}",
+                self.checkpoint_td
+            ),
+            None => info!(
+                target: "rustock::snap",
+                "header chain verified back to #{frontier}; downloading state at #{at}"
+            ),
         }
-
-        info!(
-            target: "rustock::snap",
-            "header chain verified back to #{}; downloading state at #{}",
-            self.walk.as_ref().map_or(0, |w| w.frontier()),
-            checkpoint.as_ref().map_or(0, |h| h.number)
-        );
         self.set_phase(Phase::DownloadingState);
         self.poll()
     }
@@ -1125,12 +1289,18 @@ impl SnapSession {
         // much: it costs it nothing to lie, but the lie only wastes our
         // requests, and the alternative is guessing from an empty payload.
         if refusal != Refusal::None {
-            self.chunk_fault = Some(if refusal.worth_asking_again() {
+            let realign = refusal.worth_asking_again();
+            self.chunk_fault = Some(if realign {
                 ChunkFault::Realign
             } else {
                 ChunkFault::Declined
             });
             debug!(target: "rustock::snap", "peer refused offset {from}: {refusal:?}");
+            if realign {
+                if let Some(download) = self.download.as_mut() {
+                    download.realign(from);
+                }
+            }
             return self.fruitless(from);
         }
 
@@ -1152,16 +1322,23 @@ impl SnapSession {
 
         // An rskj chunk proves itself by rebuilding to the root, which has
         // already happened -- there is no way to inspect one without
-        // reconstructing it. What is left is to keep the nodes.
+        // reconstructing it. The rebuild placed it too, so what is left is to
+        // check it answers what was asked, and keep the nodes.
         let proof = match arrived {
             super::client::Arrived::Rebuilt(rebuilt) => {
                 let Some(download) = self.download.as_mut() else { return Vec::new() };
-                let progress = download.accept_rebuilt(from, &rebuilt);
-                self.fruitless_chunks = 0;
-                return if progress.complete {
-                    self.finish_state_download()
-                } else {
-                    self.poll()
+                return match download.accept_rebuilt(from, &rebuilt) {
+                    Ok(progress) => self.taken(progress),
+                    Err(e) => {
+                        debug!(target: "rustock::snap", "rskj chunk from offset {from} refused: {e}");
+                        self.chunk_fault = Some(match e {
+                            // Nothing it could be counted for: about the
+                            // offset and the shape of the trie, not the peer.
+                            ChunkError::Empty => ChunkFault::Realign,
+                            other => ChunkFault::Misbehaved(other),
+                        });
+                        self.fruitless(from)
+                    }
                 };
             }
             super::client::Arrived::Proved(proof) => proof,
@@ -1178,19 +1355,13 @@ impl SnapSession {
 
         let Some(download) = self.download.as_mut() else { return Vec::new() };
         match download.accept(from, &proof) {
-            Ok(progress) => {
-                self.fruitless_chunks = 0;
-                if progress.complete {
-                    return self.finish_state_download();
-                }
-            }
+            Ok(progress) => self.taken(progress),
             Err(e) => {
                 debug!(target: "rustock::snap", "chunk from offset {from} refused: {e}");
                 self.chunk_fault = Some(ChunkFault::Misbehaved(e));
-                return self.fruitless(from);
+                self.fruitless(from)
             }
         }
-        self.poll()
     }
 
     /// An answer that added nothing: put the range back, and count it.
@@ -1198,6 +1369,32 @@ impl SnapSession {
         if let Some(download) = self.download.as_mut() {
             download.release(from);
         }
+        self.no_progress()
+    }
+
+    /// A chunk the download took: the last one, one that moved it on, or one
+    /// that moved it nothing.
+    ///
+    /// A chunk taken that moves nothing is asked for again and comes back the
+    /// same, so it counts as an answer that added nothing. Counted only by
+    /// whether it was taken, each one started the count again: a node longer
+    /// than rskj's window held testnet's download at 94% for hours that way,
+    /// without a word. Nothing is given back to the download, which ended the
+    /// request when it took the chunk.
+    fn taken(&mut self, progress: super::client::Progress) -> Vec<Action> {
+        if progress.complete {
+            return self.finish_state_download();
+        }
+        if progress.advanced == 0 {
+            return self.no_progress();
+        }
+        self.fruitless_chunks = 0;
+        self.poll()
+    }
+
+    /// One more answer in a row that added nothing; at the limit, the session
+    /// stops and lets the caller try a different set of peers.
+    fn no_progress(&mut self) -> Vec<Action> {
         self.fruitless_chunks += 1;
         if self.fruitless_chunks >= FRUITLESS_CHUNKS_ALLOWED {
             return self.fail(SnapFailure::NoProgress(self.fruitless_chunks));
@@ -1261,21 +1458,33 @@ impl SnapSession {
         }
 
         let mut oldest = self.blocks_cursor;
-        for (block, td) in blocks.iter().zip(difficulties.iter()) {
+        for (i, (block, td)) in blocks.iter().zip(difficulties.iter()).enumerate() {
             let hash = block.header.hash();
 
-            // These blocks are never executed -- they are fetched because
-            // contracts can read them -- so nothing downstream would ever
-            // check them. Bind each body to the header this node verified for
-            // itself during the walk: the right chain, and the right contents
-            // for that chain.
+            // Bind each block to the header this node verified for itself
+            // during the walk -- the right chain -- and hold it to what a
+            // block is held to on its own: the right contents for that
+            // chain, under the rules a block's body meets.
             if !self.is_ours(block.header.number, hash) {
                 return self.fail(SnapFailure::BrokenChain);
             }
-            if let Err(why) = check_body_matches_header(block) {
+            let parent = match i.checked_sub(1) {
+                Some(below) => Some(blocks[below].header.clone()),
+                None => self.store.header(block.header.parent_hash).ok().flatten(),
+            };
+            if let Err(why) = self.check_block(block, parent.as_ref()) {
                 return self.fail(why);
             }
 
+            // The header with it, as the block carries it. From RSKIP-351 on the
+            // walk's copy came compressed and holds only the commitment to the
+            // block's extension: its logs bloom, execution edges and base
+            // event. rskj stores these blocks whole
+            // (`SnapshotProcessor.processSnapBlocksResponse`, then
+            // `BlockConnectorHelper.startConnecting`'s `saveBlock`). The hash
+            // checked above commits to the extension, so nothing unchecked
+            // comes with it.
+            let _ = self.store.put_header_with_hash(hash, &block.header);
             let _ = self.store.put_body(hash, &block.transactions, &block.ommers);
             let _ = self.store.put_total_difficulty(hash, *td);
             oldest = oldest.min(block.header.number);

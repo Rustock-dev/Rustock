@@ -1,3 +1,4 @@
+pub(crate) mod abi;
 pub mod breakdown;
 pub mod bridge;
 pub mod collision;
@@ -6,7 +7,9 @@ pub mod env;
 pub mod executor;
 pub mod gas_estimator;
 pub mod hardfork;
+pub mod internal_tx;
 pub mod mining;
+pub(crate) mod native;
 pub mod precompiles;
 pub mod processor;
 pub mod raw_storage;
@@ -28,7 +31,9 @@ impl<T: revm::context_interface::ContextTr<Chain = raw_storage::RskChainExt>> Rs
 pub use database::RskDatabase;
 pub use bridge::btc_block_cache::{BtcBlockCache, CacheStatsSnapshot};
 pub use raw_storage::{RawStorage, RskChainExt};
-pub use executor::{BlockExecutionResult, ExecutionError, RskExecutor, TxExecutionResult};
+pub use executor::{
+    BlockExecutionResult, ExecutionError, GasEstimate, LocalSender, RskExecutor, TxExecutionResult,
+};
 pub use hardfork::{RskHardforkConfig, RskNetworkUpgrade, RSK_MAINNET_CHAIN_ID};
 pub use precompiles::{
     rsk_precompiles, is_rsk_precompile,
@@ -40,6 +45,9 @@ pub use remasc::RemascConfig;
 pub mod tracer;
 pub mod supply;
 pub use state::apply_state_changes;
+
+#[cfg(test)]
+mod rskj_tests;
 
 /// A context for reading Bridge state at a committed state root.
 ///

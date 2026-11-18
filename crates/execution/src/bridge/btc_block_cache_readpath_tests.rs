@@ -220,6 +220,40 @@ fn an_absent_block_is_never_remembered() {
     assert_eq!(cache.stats.snapshot().inserts, 0);
 }
 
+/// The cache is the node's, not the chain's: after the node follows another
+/// RSK chain it can hold a block this chain never stored. rskj looks a block
+/// up by its hash in storage alone (`RepositoryBtcBlockStoreWithCache.get`),
+/// so a header naming such a block as its parent has none and a getter
+/// knows no such block; only its walk down the main chain asks the cache
+/// (`getStoredBlockAtMainChainDepth`). A block only the cache holds is found
+/// by no lookup of its hash, and the walk down this chain still answers
+/// this chain's blocks.
+#[test]
+fn a_block_only_the_cache_holds_is_not_this_chains() {
+    let (store, root, blocks) = btc_chain_in_trie(10, 0);
+    let dyn_store: Arc<dyn TrieStore> = store.clone();
+    let cache = Arc::new(BtcBlockCache::with_default_capacity());
+    let head = blocks.last().unwrap();
+    let elsewhere = StoredBlock::new(
+        header_at(head.header.block_hash(), 7_777),
+        head.height + 1,
+        head.chain_work + U256::from(100u64),
+    );
+    let hash = elsewhere.header.block_hash();
+    cache.insert(hash, elsewhere);
+    let mut ctx = ctx_over(dyn_store, root, Some(cache));
+
+    assert!(super::btc_store::get_stored_block(&mut ctx, &hash).is_none());
+    for block in &blocks {
+        match main_chain_block_at_height(&mut ctx, block.height, false, None) {
+            MainChainLookup::Found(found) => {
+                assert_eq!(found.header.block_hash(), block.header.block_hash())
+            }
+            other => panic!("height {}: {}", block.height, outcome(&other)),
+        }
+    }
+}
+
 // --------------------------------------------------- the read-set property --
 
 /// **The property that keeps trie snapshots self-contained.**

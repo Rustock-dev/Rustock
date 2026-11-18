@@ -106,6 +106,13 @@ struct Run {
     /// rather than when it arrives: a run that has not linked yet is still
     /// only a peer's word, and writing it would publish an unproven chain.
     blocks: Vec<(u64, B256)>,
+    /// What each of `blocks` adds to the chain's work, in the same order: its
+    /// own difficulty and its proven uncles', rskj's
+    /// `Block.getCumulativeDifficulty`.
+    ///
+    /// Kept so that the commit can give every block its own total, as rskj
+    /// gives every block it stores one.
+    difficulties: Vec<U256>,
 }
 
 /// Ascends from an anchor toward a target height, proving the work as it goes.
@@ -133,6 +140,9 @@ pub struct ForwardSync {
 
     /// Whether to archive uncle headers; see `SnapConfig::archive_uncles`.
     archive_uncles: bool,
+    /// The blocks under this height have their uncles archived as their run
+    /// is committed: see [`Self::with_bodies_from`].
+    uncles_below: u64,
 
     /// Where skeleton starts are measured from, and how far apart.
     skeleton_base: u64,
@@ -202,6 +212,7 @@ impl ForwardSync {
             target,
             target_hash,
             archive_uncles,
+            uncles_below: target.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH),
             skeleton_base: anchor_number,
             skeleton_span: span,
             skeleton_todo,
@@ -214,6 +225,21 @@ impl ForwardSync {
             counted_uncles: std::collections::VecDeque::new(),
             done: anchor_number >= target,
         }
+    }
+
+    /// The lowest block whose body the sync goes on to fetch. The uncles sent
+    /// beside every header under it are archived as its run is committed:
+    /// they are the only copy this node will get, and without them it can
+    /// neither re-derive its own chain's work nor serve `rsk/63`.
+    ///
+    /// Without this they were archived only under the freeze horizon, 20,000
+    /// blocks below the target, on the reasoning that every block above it is
+    /// inside the body window and gets its uncles with its body. The window is
+    /// 6,000 blocks (rskj's `BLOCKS_REQUIRED`), so the blocks between got
+    /// neither, and their uncles were lost (#270).
+    pub fn with_bodies_from(mut self, lowest: u64) -> Self {
+        self.uncles_below = lowest;
+        self
     }
 
     pub fn done(&self) -> bool {
@@ -321,19 +347,25 @@ impl ForwardSync {
             }
         }
 
-        // The stretch above the last grid point, which no skeleton identifier
-        // covers. Asked for from the target's own hash, the one hash that is
-        // known without a skeleton. Without this the ascent can never satisfy
-        // `have_number >= target` for a target off the grid, and stalls at
-        // 99.9% having done all the work.
-        let grid_top = (self.target / HEADER_CHUNK) * HEADER_CHUNK;
-        if self.target > grid_top
-            && self.have_number < self.target
+        // The chunk under the target, asked for from the target's own hash: the
+        // one hash above the prefix that is known without a skeleton.
+        //
+        // Off the grid, no skeleton identifier names the target, and without
+        // this the ascent could never satisfy `have_number >= target`: it
+        // stalled at 99.9% having done all the work. On the grid, a skeleton
+        // names it only if the peer answering reaches that far. A peer still
+        // behind the target ends its skeleton at its own best block instead,
+        // and the ascent was then left with no point above the prefix, no run
+        // to bridge down from, and nothing to ask for. Asked for whatever its
+        // alignment, the run under the target is always there to bridge down
+        // from.
+        if self.have_number < self.target
             && out.len() < budget
             && !self.headers_sent.contains(&self.target)
             && !self.satisfied.contains(&self.target)
         {
-            let count = (self.target - grid_top).min(self.target - self.have_number);
+            let below = ((self.target - 1) / HEADER_CHUNK) * HEADER_CHUNK;
+            let count = (self.target - below).min(self.target - self.have_number);
             self.headers_sent.insert(self.target);
             out.push(Want::Headers {
                 from: self.target_hash,
@@ -354,16 +386,29 @@ impl ForwardSync {
         out
     }
 
-    /// Write a consumed run to the canonical index, and move the head and the
-    /// accumulated work with it.
+    /// Write a consumed run to the canonical index with each block's total
+    /// difficulty, and move the head with it.
+    ///
+    /// `below` is the total of the block the run builds on. Each block's total
+    /// is its parent's plus what it adds, as rskj's
+    /// `BlockChainImpl.internalTryToConnect` gives every block it connects one
+    /// (`parentTotalDifficulty.add(block.getCumulativeDifficulty())`). The
+    /// BlockHeader contract's `getCumulativeWork` reads it for any of the last
+    /// 4,000 blocks, and stops the node at a block whose total is missing:
+    /// writing the newest block's alone left every other block without one.
     ///
     /// The head is what `SnapSession::anchor` reads on the next start, so this
-    /// is the whole of resuming. The work is recorded against the new head for
-    /// the same reason: it is the figure the ascent would otherwise have to
-    /// re-derive by walking from genesis again.
-    fn commit(&self, run: &Run) {
-        for (number, hash) in &run.blocks {
-            if let Err(e) = self.store.put_canonical_hash(*number, *hash) {
+    /// is the whole of resuming. The newest block's total is the figure the
+    /// ascent would otherwise have to re-derive by walking from genesis again.
+    fn commit(&self, run: &Run, below: U256) {
+        let mut total = below;
+        for ((number, hash), difficulty) in run.blocks.iter().zip(&run.difficulties) {
+            total = total.saturating_add(*difficulty);
+            if let Err(e) = self
+                .store
+                .put_canonical_hash(*number, *hash)
+                .and_then(|()| self.store.put_total_difficulty(*hash, total))
+            {
                 warn!(
                     target: "rustock::snap",
                     "forward sync: could not index #{number}: {e}"
@@ -379,15 +424,12 @@ impl ForwardSync {
         // own chain's work and cannot serve `rsk/63` to anyone else -- which
         // is to say, cannot serve the sync it just performed.
         //
-        // Only below the freeze horizon. Nearer the target the chain can still
-        // move, and the freezer is for settled history; those blocks are
-        // inside the body window the sync fetches anyway, so their uncles
-        // arrive with the bodies.
+        // Only below the blocks whose bodies the sync fetches: those bring
+        // their uncles with them (`with_bodies_from`).
         if self.archive_uncles {
           if let Some(freezer) = self.store.freezer() {
-            let horizon = self.target.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH);
             for (number, uncles) in &run.uncle_headers {
-                if *number < horizon {
+                if *number < self.uncles_below {
                     if let Err(e) = freezer.put_uncles(*number, uncles) {
                         warn!(
                             target: "rustock::snap",
@@ -400,7 +442,6 @@ impl ForwardSync {
           }
         }
 
-        let _ = self.store.put_total_difficulty(run.newest, self.work);
         if let Err(e) = self.store.set_head(run.newest) {
             warn!(target: "rustock::snap", "forward sync: could not move the head: {e}");
         }
@@ -436,10 +477,14 @@ impl ForwardSync {
                     self.skeleton_todo.push(*start);
                 }
             }
-            Want::Headers { point, .. } => {
-                self.headers_sent.remove(point);
-            }
+            Want::Headers { point, .. } => self.release_headers(*point),
         }
+    }
+
+    /// Hand back the header request for `point`, so it is asked again: for one
+    /// nobody answered, and for an answer this walk cannot use.
+    pub fn release_headers(&mut self, point: u64) {
+        self.headers_sent.remove(&point);
     }
 
     /// Skeleton identifiers: where to ask, and nothing more.
@@ -482,7 +527,9 @@ impl ForwardSync {
             }
             for uncle in &entry.uncles {
                 let hash = uncle.hash();
-                self.verifier.verify(uncle, None).map_err(|e| {
+                // An uncle's own rules, which are not a trunk header's; its
+                // parent is not held here, so only the rules that need none.
+                self.verifier.verify_uncle(uncle).map_err(|e| {
                     AscentError::UncleProofOfWork {
                         number: entry.header.number,
                         hash,
@@ -509,6 +556,11 @@ impl ForwardSync {
         let mut uncle_headers: Vec<(u64, Vec<Header>)> =
             entries.iter().map(|e| (e.header.number, e.uncles.clone())).collect();
         uncle_headers.reverse();
+        let mut difficulties: Vec<U256> = entries
+            .iter()
+            .map(HeaderWithUncles::cumulative_difficulty)
+            .collect();
+        difficulties.reverse();
         self.satisfied.insert(point);
         self.runs.insert(
             oldest.number,
@@ -520,6 +572,7 @@ impl ForwardSync {
                 work,
                 uncles,
                 blocks,
+                difficulties,
                 uncle_headers,
             },
         );
@@ -598,6 +651,7 @@ impl ForwardSync {
                 return;
             }
             let run = self.runs.remove(&(self.have_number + 1)).expect("just read");
+            let below = self.work;
             self.work = self.work.saturating_add(run.work);
             self.counted_uncles.extend(run.uncles.iter().copied());
             self.have_number = run.newest_number;
@@ -620,7 +674,7 @@ impl ForwardSync {
             // every run that links is permanently true, and writing it means a
             // sync that is interrupted resumes from where it stopped instead
             // of starting again at genesis.
-            self.commit(&run);
+            self.commit(&run, below);
             self.points.remove(&run.newest_number);
             self.satisfied.remove(&run.newest_number);
 

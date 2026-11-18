@@ -291,7 +291,10 @@ mod tests {
                 .with_single_cert(vec![CertificateDer::from(der(cert))], key)
                 .unwrap();
         let acceptor = TlsAcceptor::from(Arc::new(config));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Bound to the address `localhost` resolves to first, which the lookup
+        // tries first. On Windows that is ::1, and Windows takes two seconds to
+        // refuse a connection, longer than SHORT, before trying 127.0.0.1.
+        let listener = TcpListener::bind("localhost:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = hits.clone();
@@ -330,7 +333,8 @@ mod tests {
     }
 
     async fn raw_listener(reply: &'static [u8]) -> Server {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Where `localhost` resolves first, as in `serve_tls`.
+        let listener = TcpListener::bind("localhost:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = hits.clone();
@@ -508,7 +512,15 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let err = lookup_err(&trusting_test_ca(), &format!("https://localhost:{port}/")).await;
+        // Windows takes two seconds to refuse each of `localhost`'s two
+        // addresses, so this lookup is given longer than SHORT to fail.
+        let url = format!("https://localhost:{port}/");
+        let err = format!(
+            "{:#}",
+            lookup_with(&trusting_test_ca(), &url, Duration::from_secs(10))
+                .await
+                .unwrap_err()
+        );
         assert!(err.contains("connect failed"), "{err}");
     }
 

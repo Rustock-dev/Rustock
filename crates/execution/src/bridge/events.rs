@@ -73,7 +73,8 @@ pub fn log_legacy_release_btc<CTX: crate::RskContextTr>(
 /// (rskj BrigeEventLoggerLegacyImpl.logCommitFederation):
 /// data = RLP[ RLP[oldFedAddressHash160, RLP[oldKeys...]],
 ///             RLP[newFedAddressHash160, RLP[newKeys...]],
-///             activationBlockNumber as a DECIMAL ASCII string ].
+///             activationBlockNumber as a DECIMAL ASCII string ],
+/// each key its encoding (`getPubKey()`), `00` for the point at infinity.
 pub fn log_legacy_commit_federation<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     old_fed_hash160: &[u8; 20],
@@ -82,9 +83,13 @@ pub fn log_legacy_commit_federation<CTX: crate::RskContextTr>(
     new_keys: &[[u8; 33]],
     activation_block: u64,
 ) {
+    use super::federation::key_encoding;
     use super::serialization::{rlp_encode_element, rlp_encode_list};
     let fed_data = |hash160: &[u8; 20], keys: &[[u8; 33]]| {
-        let key_items: Vec<Vec<u8>> = keys.iter().map(|k| rlp_encode_element(k)).collect();
+        let key_items: Vec<Vec<u8>> = keys
+            .iter()
+            .map(|k| rlp_encode_element(key_encoding(k)))
+            .collect();
         rlp_encode_list(&[rlp_encode_element(hash160), rlp_encode_list(&key_items)])
     };
     let data = rlp_encode_list(&[
@@ -182,8 +187,10 @@ pub fn log_solidity_release_btc<CTX: crate::RskContextTr>(
 /// oldFederationBtcAddress, bytes newFederationBtcPublicKeys, string
 /// newFederationBtcAddress, int256 activationHeight)` — RSKIP146 federation
 /// commit event (rskj logCommitFederationInSolidityFormat). The key bytes
-/// are the federation's sorted compressed BTC pubkeys flat-concatenated;
-/// the addresses are Base58Check P2SH strings.
+/// are the federation's sorted BTC pubkeys flat-concatenated, each its
+/// encoding (`flatKeysAsByteArray` of `getPubKey()`): 33 compressed bytes,
+/// or the one byte `00` for the point at infinity; the addresses are
+/// Base58Check P2SH strings.
 pub fn log_solidity_commit_federation<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     old_keys: &[[u8; 33]],
@@ -212,8 +219,13 @@ fn commit_federation_event_data(
     new_fed_address: &str,
     activation_block: u64,
 ) -> Vec<u8> {
-    let old_flat = old_keys.concat();
-    let new_flat = new_keys.concat();
+    let flat = |keys: &[[u8; 33]]| -> Vec<u8> {
+        keys.iter()
+            .flat_map(|key| super::federation::key_encoding(key).iter().copied())
+            .collect()
+    };
+    let old_flat = flat(old_keys);
+    let new_flat = flat(new_keys);
     let dynamics: [&[u8]; 4] = [
         &old_flat,
         old_fed_address.as_bytes(),

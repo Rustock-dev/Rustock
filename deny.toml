@@ -136,8 +136,9 @@ allow = [
     "Unlicense",
     "Zlib",
     # webpki-roots, which carries Mozilla's CA bundle: used by rustock-cli to
-    # verify the external-IP lookup, and by lettre under the optional `smtp`
-    # feature. CDLA-Permissive-2.0 is a permissive data licence with no
+    # verify the external-IP lookup, Rootstock's server for --import and a
+    # stable minimum gas price's web source, and by lettre under the optional
+    # `smtp` feature. CDLA-Permissive-2.0 is a permissive data licence with no
     # copyleft or attribution burden; it covers the certificate data, not code.
     "CDLA-Permissive-2.0",
     # quoted_printable, via lettre, under the optional `smtp` feature only.

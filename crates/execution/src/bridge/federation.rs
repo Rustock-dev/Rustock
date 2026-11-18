@@ -209,7 +209,9 @@ fn address_cache() -> &'static std::sync::RwLock<
 
 /// RSK address of a federation member from its secp256k1 public key
 /// (compressed or uncompressed): keccak256 of the uncompressed point's
-/// 64 coordinate bytes, last 20 bytes (rskj ECKey.getAddress).
+/// 64 coordinate bytes, last 20 bytes (rskj ECKey.getAddress). The one byte
+/// `00`, which Bouncy Castle decodes as the point at infinity, has an address
+/// too: see [`derive_rsk_address_from_public_key`].
 pub fn rsk_address_from_public_key(key: &[u8]) -> Option<alloy_primitives::Address> {
     // A poisoned lock means some other thread panicked mid-update. That is a
     // reason to stop trusting the cache, not a reason to fail: the answer is
@@ -235,6 +237,13 @@ pub fn rsk_address_from_public_key(key: &[u8]) -> Option<alloy_primitives::Addre
 fn derive_rsk_address_from_public_key(key: &[u8]) -> Option<alloy_primitives::Address> {
     use k256::elliptic_curve::sec1::ToEncodedPoint;
     use sha3::Digest;
+    // rskj `ECKey.getAddress` hashes the key's uncompressed encoding less its
+    // first byte. The point at infinity's encoding is the one byte 00 alone,
+    // whatever the compression, so nothing is left to hash.
+    if key == [0x00] {
+        let digest = sha3::Keccak256::digest(b"");
+        return Some(alloy_primitives::Address::from_slice(&digest[12..]));
+    }
     let parsed = k256::PublicKey::from_sec1_bytes(key).ok()?;
     let point = parsed.to_encoded_point(false);
     let digest = sha3::Keccak256::digest(&point.as_bytes()[1..]);
@@ -511,10 +520,125 @@ mod tests {
         let b = rsk_address_from_public_key(uncompressed.as_bytes()).expect("uncompressed derives");
         assert_eq!(a, b, "one key, one federator, one address");
     }
+
+    /// rskj reads a member key with Bouncy Castle's `decodePoint`, which
+    /// takes the one byte 00 as the point at infinity, and only that byte: a
+    /// 00 prefix on more bytes is refused ("Incorrect length for infinity
+    /// encoding"). The member keeps the point, whose encoding is 00 again
+    /// (`getPubKey()`), so a federation writes 00 for it in each of its
+    /// forms, reads it back, and sorts it before every other key.
+    #[test]
+    fn a_member_key_of_the_point_at_infinity_is_kept_as_its_one_byte() {
+        use super::super::serialization::{rlp_encode_element, rlp_encode_list, rlp_encode_u64};
+        assert_eq!(member_key_from_encoding(&[0x00]), Some(INFINITY_KEY));
+        assert_eq!(member_key_from_encoding(&[0u8; 33]), None, "00 on 33 bytes");
+        assert_eq!(key_encoding(&INFINITY_KEY), [0x00]);
+        let real = [0x02; 33];
+        assert_eq!(member_key_from_encoding(&real), Some(real));
+        assert_eq!(key_encoding(&real), real);
+
+        let infinity = StoredMember::from_btc(INFINITY_KEY);
+        let other = StoredMember::from_btc(real);
+        assert!(infinity < other, "00 sorts first");
+        // serializeFederationMember: RLP[btc, rsk, mst], each 00.
+        assert_eq!(infinity.to_rlp(), [0xc3, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            StoredMember::from_stored(&infinity.to_rlp()),
+            Some(infinity)
+        );
+        // Before RSKIP123 a member is its BTC key alone: the one byte.
+        assert_eq!(StoredMember::from_stored(&[0x00]), Some(infinity));
+        let mixed = StoredMember {
+            btc: real,
+            rsk: INFINITY_KEY,
+            mst: real,
+        };
+        assert_eq!(StoredMember::from_stored(&mixed.to_rlp()), Some(mixed));
+
+        // A stored federation's two forms, its members sorted.
+        assert_eq!(
+            serialize_federation_only_btc_keys(&[real, INFINITY_KEY], 5, 7),
+            rlp_encode_list(&[
+                rlp_encode_u64(5),
+                rlp_encode_u64(7),
+                rlp_encode_list(&[vec![0x00], rlp_encode_element(&real)]),
+            ])
+        );
+        assert_eq!(
+            serialize_federation_multikey(&[other, infinity], 5, 7),
+            rlp_encode_list(&[
+                rlp_encode_u64(5),
+                rlp_encode_u64(7),
+                rlp_encode_list(&[
+                    rlp_encode_element(&[0xc3, 0x00, 0x00, 0x00]),
+                    rlp_encode_element(&other.to_rlp()),
+                ]),
+            ])
+        );
+    }
+
+    /// rskj `ECKey.getAddress` hashes the key's uncompressed encoding less
+    /// its first byte. The point at infinity's is the one byte 00, so its
+    /// address is the last 20 bytes of the Keccak-256 hash of nothing.
+    #[test]
+    fn the_point_at_infinitys_address_is_that_of_the_hash_of_nothing() {
+        let address: alloy_primitives::Address = "0xdcc703c0e500b653ca82273b7bfad8045d85a470"
+            .parse()
+            .unwrap();
+        assert_eq!(rsk_address_from_public_key(&[0x00]), Some(address));
+        assert_eq!(member_rsk_address(&INFINITY_KEY), Some(address));
+        assert_eq!(
+            rsk_address_from_public_key(&[0u8; 33]),
+            None,
+            "00 on 33 bytes"
+        );
+    }
+}
+
+/// A member key that is the point at infinity. rskj reads a federator's keys
+/// with Bouncy Castle's `decodePoint` (`BtcECKey.fromPublicOnly`,
+/// `ECKey.fromPublicOnly`), which takes the one byte `00` as that point, and
+/// keeps it: its encoding is `00` again, compressed or not, so `00` is what a
+/// federation with such a member serializes, hashes, writes in its redeem
+/// scripts, logs and answers with. A member's keys are 33 bytes each here, and
+/// this value, which no compressed key can be (one starts with 02 or 03),
+/// stands for that one byte: [`member_key_from_encoding`] reads it and
+/// [`key_encoding`] writes it back. It sorts before every other key, as `00`
+/// does in the unsigned lexicographic order rskj sorts keys and members by
+/// (`BtcECKey.PUBKEY_COMPARATOR`, `BTC_RSK_MST_PUBKEYS_COMPARATOR`), and two of
+/// them are equal, as two points at infinity are.
+pub const INFINITY_KEY: [u8; 33] = [0; 33];
+
+/// The bytes rskj has for a member key (`getPubKey()`): the one byte `00` for
+/// the point at infinity, the 33 compressed bytes for any other.
+pub fn key_encoding(key: &[u8; 33]) -> &[u8] {
+    if *key == INFINITY_KEY {
+        &[0x00]
+    } else {
+        key
+    }
+}
+
+/// A member key from the bytes rskj writes for one: `00`, the point at
+/// infinity, or a compressed key's 33 bytes. Anything else is `None`.
+pub fn member_key_from_encoding(bytes: &[u8]) -> Option<[u8; 33]> {
+    if bytes == [0x00] {
+        return Some(INFINITY_KEY);
+    }
+    <[u8; 33]>::try_from(bytes)
+        .ok()
+        .filter(|key| *key != INFINITY_KEY)
+}
+
+/// The RSK address of a member key, as rskj's `ECKey.getAddress` derives it:
+/// [`rsk_address_from_public_key`] of the key's encoding.
+pub fn member_rsk_address(key: &[u8; 33]) -> Option<alloy_primitives::Address> {
+    rsk_address_from_public_key(key_encoding(key))
 }
 
 /// A federation member as stored in bridge state: compressed BTC, RSK and
-/// MST public keys (rskj `FederationMember`). Legacy (pre-RSKIP123) members
+/// MST public keys (rskj `FederationMember`), any of them possibly the point
+/// at infinity ([`INFINITY_KEY`]). Legacy (pre-RSKIP123) members
 /// carry only a BTC key, with rsk = mst = btc
 /// (`FederationMember.getFederationMemberFromKey`). The derived ordering is
 /// rskj's `BTC_RSK_MST_PUBKEYS_COMPARATOR` (lexicographic by btc, rsk, mst).
@@ -531,33 +655,36 @@ impl StoredMember {
     }
 
     /// rskj `BridgeSerializationUtils.serializeFederationMember`:
-    /// `RLP[btcKey, rskKey, mstKey]`, all compressed.
+    /// `RLP[btcKey, rskKey, mstKey]`, each key's encoding: compressed, or `00`
+    /// for the point at infinity.
     pub fn to_rlp(&self) -> Vec<u8> {
         use super::serialization::{rlp_encode_element, rlp_encode_list};
         rlp_encode_list(&[
-            rlp_encode_element(&self.btc),
-            rlp_encode_element(&self.rsk),
-            rlp_encode_element(&self.mst),
+            rlp_encode_element(key_encoding(&self.btc)),
+            rlp_encode_element(key_encoding(&self.rsk)),
+            rlp_encode_element(key_encoding(&self.mst)),
         ])
     }
 
-    /// Decode a member from either stored shape: a bare 33-byte compressed
-    /// BTC key (pre-RSKIP123) or `RLP[btc, rsk, mst]` (post-RSKIP123). rskj
+    /// Decode a member from either stored shape: a bare BTC key, 33 compressed
+    /// bytes or the point at infinity's `00` (pre-RSKIP123), or
+    /// `RLP[btc, rsk, mst]` (post-RSKIP123). rskj
     /// picks the format by the presence of the format-version cell; the two
-    /// shapes are unambiguous (a compressed key starts with 0x02/0x03, an
-    /// RLP list with >= 0xc0), so shape detection is equivalent.
+    /// shapes are unambiguous (a compressed key starts with 0x02/0x03, the
+    /// point at infinity is one byte, an RLP list starts with >= 0xc0 and is
+    /// never 33 bytes long), so shape detection is equivalent.
     pub fn from_stored(data: &[u8]) -> Option<Self> {
-        if data.len() == 33 {
-            return Some(Self::from_btc(data.try_into().ok()?));
+        if data.len() == 33 || data == [0x00] {
+            return Some(Self::from_btc(member_key_from_encoding(data)?));
         }
         let keys = super::serialization::rlp_decode_list(data)?;
         if keys.len() != 3 {
             return None;
         }
         Some(Self {
-            btc: keys[0].as_slice().try_into().ok()?,
-            rsk: keys[1].as_slice().try_into().ok()?,
-            mst: keys[2].as_slice().try_into().ok()?,
+            btc: member_key_from_encoding(&keys[0])?,
+            rsk: member_key_from_encoding(&keys[1])?,
+            mst: member_key_from_encoding(&keys[2])?,
         })
     }
 }
@@ -595,7 +722,10 @@ pub fn serialize_federation_only_btc_keys(
     use super::serialization::{rlp_encode_element, rlp_encode_list, rlp_encode_u64};
     let mut sorted = keys.to_vec();
     sorted.sort();
-    let key_items: Vec<Vec<u8>> = sorted.iter().map(|k| rlp_encode_element(k)).collect();
+    let key_items: Vec<Vec<u8>> = sorted
+        .iter()
+        .map(|k| rlp_encode_element(key_encoding(k)))
+        .collect();
     rlp_encode_list(&[
         rlp_encode_u64(creation_time_millis),
         rlp_encode_u64(creation_block),
@@ -630,7 +760,10 @@ pub fn load_stored_federation<CTX: crate::RskContextTr>(
     storage_key: &str,
 ) -> Option<StoredFederation> {
     use super::serialization::{rlp_decode_list, rlp_decode_u64};
-    use super::storage::bridge_load_bytes_named;
+    use super::storage::{bridge_load_bytes_named, NEW_FEDERATION_KEY};
+    if storage_key == NEW_FEDERATION_KEY {
+        ctx.chain_mut().new_federation_read = true;
+    }
     let data = bridge_load_bytes_named(ctx, storage_key);
     if data.is_empty() {
         return None;

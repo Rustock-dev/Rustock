@@ -14,6 +14,7 @@ use rustock_core::validation::merged_mining::{
     BLOCK_HEADER_HASH_SIZE, CoinbaseCompressionError, RSK_TAG, compress_coinbase,
     compute_coinbase_hash, find_last_subsequence,
 };
+use rustock_core::selection_rule::{should_we_add_this_block, Contender};
 use rustock_core::{Block, Header};
 use rustock_storage::BlockStore;
 use rustock_trie::TrieStore;
@@ -27,6 +28,7 @@ use crate::mining::merkle::{self, MerkleProofError};
 use crate::mining::template::{
     BlockTemplate, BlockTemplateBuilder, PendingTransactionSource, TemplateError,
 };
+use crate::silent::SilentRecord;
 
 /// What `mnr_getWork` answers with. rskj `co.rsk.mine.MinerWork`.
 #[derive(Debug, Clone)]
@@ -54,12 +56,19 @@ pub struct SubmittedBlockInfo {
 
 /// The outcomes rskj's `ImportResult` can report for a mined block. A miner
 /// reads this to tell "my block won" from "my block was valid but somebody
-/// else's arrived first".
+/// else's arrived first", and from "a rule refuses my block".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportResult {
     ImportedBest,
     ImportedNotBest,
     Exist,
+    /// rskj `BlockChainImpl.internalTryToConnect`: the store holds no parent
+    /// for the block. Nothing is stored.
+    NoParent,
+    /// rskj `BlockChainImpl.tryToConnect`: a block that passes its proof of
+    /// work and that a rule then refuses, or whose connecting fails in any
+    /// other way, a failing store included. Nothing is stored.
+    InvalidBlock,
 }
 
 impl ImportResult {
@@ -68,6 +77,8 @@ impl ImportResult {
             ImportResult::ImportedBest => "IMPORTED_BEST",
             ImportResult::ImportedNotBest => "IMPORTED_NOT_BEST",
             ImportResult::Exist => "EXIST",
+            ImportResult::NoParent => "NO_PARENT",
+            ImportResult::InvalidBlock => "INVALID_BLOCK",
         }
     }
 }
@@ -84,8 +95,6 @@ pub enum SubmitError {
     NoTagInCoinbase,
     #[error("no work outstanding for {hash}: it was never handed out, or it has aged out of the cache")]
     UnknownWork { hash: B256 },
-    #[error("the parent of this work ({parent}) is no longer the executed head ({head:?}); the chain moved on")]
-    ParentNoLongerHead { parent: B256, head: Option<B256> },
     /// rskj `MinerClientImpl.mineBlock` returns false while
     /// `hasBetterBlockToSync()`: a node still catching up does not mine.
     #[error("not mining: the node has a better block to sync")]
@@ -98,7 +107,7 @@ pub enum SubmitError {
     Compression(#[from] CoinbaseCompressionError),
     #[error("building the merkle proof: {0}")]
     MerkleProof(#[from] MerkleProofError),
-    #[error("the completed block does not satisfy the merged-mining rule: {0}")]
+    #[error("the completed block fails a rule every node holds it to: {0}")]
     SelfCheck(rustock_core::validation::ValidationError),
     #[error("re-executing the completed block: {0}")]
     Execution(String),
@@ -106,6 +115,17 @@ pub enum SubmitError {
     Storage(String),
     #[error("building work: {0}")]
     Template(#[from] TemplateError),
+}
+
+/// How a submission answers a solved block whose proof of work holds and
+/// that a rule then refuses, or that the node fails to connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refused {
+    /// As rskj answers a miner: OK, with `INVALID_BLOCK`
+    /// (`MinerServerImpl.processSolution`, `BlockChainImpl.tryToConnect`).
+    Answered,
+    /// As the node's own miner reads it: the error.
+    Failed,
 }
 
 /// How the node's chain state is read and advanced. Split out so the server
@@ -118,6 +138,8 @@ pub trait ChainAccess: Send + Sync {
     fn executed_head(&self) -> Result<Option<B256>, String>;
     /// Whether a block with this hash is already stored.
     fn has_block(&self, hash: B256) -> Result<bool, String>;
+    /// The header stored under `hash`, named by that key.
+    fn header(&self, hash: B256) -> Result<Option<Header>, String>;
     /// Uncles to include in a block mined on `parent_hash`.
     fn select_uncles(&self, block_number: u64, parent_hash: B256) -> Result<Vec<Header>, String>;
     /// Store a fully executed block and make it the head if it wins.
@@ -129,6 +151,19 @@ pub trait ChainAccess: Send + Sync {
         &self,
         block: &Block,
         state_root: B256,
+        laps: &mut Laps,
+    ) -> Result<CommitOutcome, String>;
+    /// Store a block whose parent is no longer the executed head, executed
+    /// beside the chain against its own parent's state, and answer whether
+    /// it takes the head, without moving the head: the sync service makes
+    /// that switch, as it does for a peer's block executed beside the chain,
+    /// once the hook has told it of the block. `unlogged` holds the peg
+    /// decisions the block made that the Bridge logs no event for, which are
+    /// stored by height, so only once the chain takes the block up.
+    fn commit_mined_block_beside(
+        &self,
+        block: &Block,
+        unlogged: Vec<SilentRecord>,
         laps: &mut Laps,
     ) -> Result<CommitOutcome, String>;
 }
@@ -150,8 +185,8 @@ pub struct CommitOutcome {
 pub struct StoreChainAccess {
     pub store: Arc<BlockStore>,
     pub trie_store: Arc<dyn TrieStore>,
-    /// Called with every block this commits, so a transaction pool can
-    /// drop what has just been mined.
+    /// Called with every block this commits, and what the commit made of
+    /// it, so a transaction pool can drop what has just been mined.
     ///
     /// A locally mined block does not travel the sync service's import
     /// path, which is the only place that called `remove_mined`. So
@@ -164,7 +199,15 @@ pub struct StoreChainAccess {
     /// A closure rather than a pool handle because this crate does not
     /// know what a pool is, and should not have to in order to say "this
     /// block is now committed".
-    pub on_committed: Option<Arc<dyn Fn(&Block) + Send + Sync>>,
+    ///
+    /// Called once the block is stored and, if it won, the head and the
+    /// executed head: rskj's `EthereumImpl.addNewMinedBlock` (L60-68) tells
+    /// the rest of the node after `blockchain.tryToConnect` has connected
+    /// it, so whatever the hook tells sees the chain with the block on it.
+    /// For a block beside the chain ([`ChainAccess::commit_mined_block_beside`])
+    /// the head hasn't moved when it is called: the sync service it tells
+    /// makes the switch.
+    pub on_committed: Option<Arc<dyn Fn(&Block, ImportResult) + Send + Sync>>,
     /// Best blocks between trie flushes: rskj's
     /// `blockchain.flushNumberOfBlocks`, whose `BlockChainFlusher` flushes
     /// every tenth block a node mines or connects. 1 flushes every block.
@@ -178,6 +221,14 @@ pub struct StoreChainAccess {
     pub flush_every: u64,
     /// Best blocks committed since the last flush.
     pub since_flush: std::sync::atomic::AtomicU64,
+    /// Where [`ChainAccess::commit_mined_block_beside`] leaves the peg
+    /// decisions the Bridge logs no event for that a block it keeps beside
+    /// the chain made, with the block's hash and height. They are stored by
+    /// height, so not before the chain takes the block up, which is the sync
+    /// service's to do: it holds them till then, as it holds those of a
+    /// peer's block executed beside the chain. They are left before the
+    /// block is stored, so that no path can take the block up without them.
+    pub leave_unlogged: Option<Arc<dyn Fn(B256, u64, Vec<SilentRecord>) + Send + Sync>>,
 }
 
 impl StoreChainAccess {
@@ -186,7 +237,7 @@ impl StoreChainAccess {
     pub fn new(
         store: Arc<BlockStore>,
         trie_store: Arc<dyn TrieStore>,
-        on_committed: Option<Arc<dyn Fn(&Block) + Send + Sync>>,
+        on_committed: Option<Arc<dyn Fn(&Block, ImportResult) + Send + Sync>>,
     ) -> Self {
         Self::with_flush_every(store, trie_store, on_committed, 1)
     }
@@ -194,7 +245,7 @@ impl StoreChainAccess {
     pub fn with_flush_every(
         store: Arc<BlockStore>,
         trie_store: Arc<dyn TrieStore>,
-        on_committed: Option<Arc<dyn Fn(&Block) + Send + Sync>>,
+        on_committed: Option<Arc<dyn Fn(&Block, ImportResult) + Send + Sync>>,
         flush_every: u64,
     ) -> Self {
         Self {
@@ -203,7 +254,18 @@ impl StoreChainAccess {
             on_committed,
             flush_every: flush_every.max(1),
             since_flush: std::sync::atomic::AtomicU64::new(0),
+            leave_unlogged: None,
         }
+    }
+
+    /// Leave the peg decisions of a block kept beside the chain with `leave`
+    /// ([`Self::leave_unlogged`]).
+    pub fn with_leave_unlogged(
+        mut self,
+        leave: Arc<dyn Fn(B256, u64, Vec<SilentRecord>) + Send + Sync>,
+    ) -> Self {
+        self.leave_unlogged = Some(leave);
+        self
     }
 
     /// Count a best block and say whether it is time to flush. The counter
@@ -218,6 +280,61 @@ impl StoreChainAccess {
         } else {
             false
         }
+    }
+
+    /// Store a mined block's header, body and total difficulty, each keyed
+    /// by its hash, and return the total.
+    ///
+    /// Deliberately not `put_block`: that writes the canonical
+    /// `number -> hash` pointer unconditionally, which would hand the
+    /// height to a block that lost to the head and leave the canonical
+    /// chain naming a block that is not on it. Header and body are safe to
+    /// store either way, being keyed by hash.
+    fn store_mined(&self, block: &Block, hash: B256) -> Result<U256, String> {
+        let parent_td = self
+            .store
+            .total_difficulty(block.header.parent_hash)
+            .map_err(|e| e.to_string())?
+            .unwrap_or(U256::ZERO);
+        let td = parent_td + cumulative_difficulty(block);
+        self.store
+            .put_header_with_hash(hash, &block.header)
+            .map_err(|e| e.to_string())?;
+        self.store
+            .put_body(hash, &block.transactions, &block.ommers)
+            .map_err(|e| e.to_string())?;
+        self.store
+            .put_total_difficulty(hash, td)
+            .map_err(|e| e.to_string())?;
+        Ok(td)
+    }
+
+    /// Whether a mined block of total difficulty `td` takes the head. rskj
+    /// connects a mined block through `blockchain.tryToConnect`, as it does a
+    /// peer's: it takes the head by `SelectionRule.shouldWeAddThisBlock`,
+    /// which settles a tie in total difficulty by fees and then hashes.
+    fn takes_head(&self, block: &Block, hash: B256, td: U256) -> Result<bool, String> {
+        let (current_td, current) = match self.store.head().map_err(|e| e.to_string())? {
+            Some(head) => {
+                let td = self
+                    .store
+                    .total_difficulty(head)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(U256::ZERO);
+                let current = self.store.contender(head, td).map_err(|e| e.to_string())?;
+                (td, current)
+            }
+            None => (U256::ZERO, None),
+        };
+        let mined = Contender {
+            total_difficulty: td,
+            paid_fees: block.header.paid_fees,
+            hash,
+        };
+        Ok(match &current {
+            Some(current) => should_we_add_this_block(&mined, current),
+            None => td > current_td,
+        })
     }
 }
 
@@ -268,6 +385,16 @@ impl ChainAccess for StoreChainAccess {
         self.store.header(hash).map(|h| h.is_some()).map_err(|e| e.to_string())
     }
 
+    fn header(&self, hash: B256) -> Result<Option<Header>, String> {
+        // Named by the key it is stored under, as `mainchain` names each: a
+        // genesis from an rskj file hashes otherwise when recomputed.
+        let header = self.store.header(hash).map_err(|e| e.to_string())?;
+        Ok(header.map(|mut header| {
+            header.cached_hash = Some(hash);
+            header
+        }))
+    }
+
     fn executed_head(&self) -> Result<Option<B256>, String> {
         match self.store.exec_head().map_err(|e| e.to_string())? {
             Some((hash, _)) => Ok(Some(hash)),
@@ -311,42 +438,11 @@ impl ChainAccess for StoreChainAccess {
             });
         }
 
-        let parent_td = self
-            .store
-            .total_difficulty(block.header.parent_hash)
-            .map_err(|e| e.to_string())?
-            .unwrap_or(U256::ZERO);
-        let td = parent_td + cumulative_difficulty(block);
-
-        // Deliberately not `put_block`: that writes the canonical
-        // `number -> hash` pointer unconditionally, which would hand the
-        // height to a block that lost the total-difficulty comparison two
-        // lines below and leave the canonical chain naming a block that is
-        // not on it. Header and body are safe to store either way, being
-        // keyed by hash.
-        self.store.put_header_with_hash(hash, &block.header).map_err(|e| e.to_string())?;
-        self.store
-            .put_body(hash, &block.transactions, &block.ommers)
-            .map_err(|e| e.to_string())?;
-        self.store.put_total_difficulty(hash, td).map_err(|e| e.to_string())?;
-
-        let current_td = match self.store.head().map_err(|e| e.to_string())? {
-            Some(head) => self
-                .store
-                .total_difficulty(head)
-                .map_err(|e| e.to_string())?
-                .unwrap_or(U256::ZERO),
-            None => U256::ZERO,
-        };
-
+        let td = self.store_mined(block, hash)?;
+        let takes_head = self.takes_head(block, hash, td)?;
         switch_chain += laps.lap();
 
-        if let Some(hook) = &self.on_committed {
-            hook(block);
-        }
-        on_best_block += laps.lap();
-
-        let result = if td > current_td {
+        let result = if takes_head {
             self.store.update_canonical_chain(hash).map_err(|e| e.to_string())?;
             self.store.set_exec_head(hash, state_root).map_err(|e| e.to_string())?;
             switch_chain += laps.lap();
@@ -357,17 +453,79 @@ impl ChainAccess for StoreChainAccess {
             if self.flush_due() {
                 self.trie_store.flush();
             }
-            on_best_block += laps.lap();
             ImportResult::ImportedBest
         } else {
             ImportResult::ImportedNotBest
         };
+
+        // Only now, with the block stored and, if it won, the head: rskj's
+        // `EthereumImpl.addNewMinedBlock` (L60-68) broadcasts a mined block
+        // once `blockchain.tryToConnect` has connected it, and the node's sync
+        // service, told from here, reads the executed head this just set
+        // (#323).
+        if let Some(hook) = &self.on_committed {
+            hook(block, result);
+        }
+        on_best_block += laps.lap();
 
         info!(
             target: "rustock::mining",
             "Mined block #{} {:?} imported: {}", number, hash, result.as_str()
         );
         Ok(CommitOutcome { result, switch_chain, on_best_block })
+    }
+
+    fn commit_mined_block_beside(
+        &self,
+        block: &Block,
+        unlogged: Vec<SilentRecord>,
+        laps: &mut Laps,
+    ) -> Result<CommitOutcome, String> {
+        let hash = block.hash();
+        let number = block.header.number;
+        if self.store.has_block(hash).map_err(|e| e.to_string())? {
+            return Ok(CommitOutcome {
+                result: ImportResult::Exist,
+                switch_chain: laps.lap(),
+                on_best_block: std::time::Duration::ZERO,
+            });
+        }
+        // Its state durable before the store may adopt its branch on the
+        // strength of it, as the sync service makes durable a block it
+        // executes beside the chain.
+        self.trie_store.flush();
+        // Its peg decisions where the sync service takes them from, before the
+        // block is stored and any path can take it onto the chain.
+        if !unlogged.is_empty() {
+            if let Some(leave) = &self.leave_unlogged {
+                leave(hash, number, unlogged);
+            }
+        }
+        let td = self.store_mined(block, hash)?;
+        // rskj answers what `internalTryToConnect` made of the block:
+        // `IMPORTED_BEST` where the selection rule takes it, and
+        // `IMPORTED_NOT_BEST` where it extends a chain beside the best one.
+        let result = if self.takes_head(block, hash, td)? {
+            ImportResult::ImportedBest
+        } else {
+            ImportResult::ImportedNotBest
+        };
+        let switch_chain = laps.lap();
+        // The peers are sent it, best or not, and the sync service weighs it.
+        if let Some(hook) = &self.on_committed {
+            hook(block, result);
+        }
+        let on_best_block = laps.lap();
+
+        info!(
+            target: "rustock::mining",
+            "Mined block #{} {:?} imported beside the chain: {}", number, hash, result.as_str()
+        );
+        Ok(CommitOutcome {
+            result,
+            switch_chain,
+            on_best_block,
+        })
     }
 }
 
@@ -684,6 +842,16 @@ impl MinerServer {
     /// A full Bitcoin block, from which everything else is derivable.
     /// rskj `mnr_submitBitcoinBlock`.
     pub fn submit_bitcoin_block(&self, raw_block: &[u8]) -> Result<SubmittedBlockInfo, SubmitError> {
+        self.submit_bitcoin_block_as(raw_block, Refused::Answered)
+    }
+
+    /// [`MinerServer::submit_bitcoin_block`], answering a block a rule refuses
+    /// as `refused` says.
+    pub(crate) fn submit_bitcoin_block_as(
+        &self,
+        raw_block: &[u8],
+        refused: Refused,
+    ) -> Result<SubmittedBlockInfo, SubmitError> {
         use bitcoin::consensus::Decodable;
 
         let mut reader = raw_block;
@@ -702,6 +870,7 @@ impl MinerServer {
             &coinbase::encode_header(&btc_block.header),
             &coinbase_bytes,
             proof,
+            refused,
         )
     }
 
@@ -716,7 +885,7 @@ impl MinerServer {
     ) -> Result<SubmittedBlockInfo, SubmitError> {
         let hashes = merkle::parse_wire_hashes(tx_hashes)?;
         let proof = merkle::proof_from_tx_hashes(&hashes)?;
-        self.complete_and_import(raw_header, raw_coinbase, proof)
+        self.complete_and_import(raw_header, raw_coinbase, proof, Refused::Answered)
     }
 
     /// Header, coinbase and the merkle branch itself -- the cheapest form, and
@@ -731,7 +900,7 @@ impl MinerServer {
     ) -> Result<SubmittedBlockInfo, SubmitError> {
         let hashes = merkle::parse_wire_hashes(merkle_hashes)?;
         let proof = merkle::proof_from_merkle_hashes(&hashes)?;
-        self.complete_and_import(raw_header, raw_coinbase, proof)
+        self.complete_and_import(raw_header, raw_coinbase, proof, Refused::Answered)
     }
 
     /// The common tail of all three submit paths: match the solution to the
@@ -742,6 +911,7 @@ impl MinerServer {
         raw_btc_header: &[u8],
         raw_coinbase: &[u8],
         merkle_proof: Vec<u8>,
+        refused: Refused,
     ) -> Result<SubmittedBlockInfo, SubmitError> {
         // The clock of the connect, rskj `internalTryToConnect`'s scope:
         // from matching the solution to its template to the block being best
@@ -774,37 +944,95 @@ impl MinerServer {
         block.header.bitcoin_merged_mining_merkle_proof = Some(Bytes::from(merkle_proof));
         debug_assert_eq!(hash_before, block.header.hash_for_merged_mining());
 
-        // The same solution submitted twice: rskj's `addNewMinedBlock`
-        // answers `EXIST` and the submission is `OK`. Checked before the
-        // parent, which the first submission moved.
-        let completed_hash = block.hash();
-        if self.chain.has_block(completed_hash).map_err(SubmitError::Storage)? {
-            return Ok(SubmittedBlockInfo {
-                block_imported_result: ImportResult::Exist,
-                block_hash: completed_hash,
-                block_included_height: block.header.number,
-            });
-        }
-
-        let head = self.chain.executed_head().map_err(SubmitError::Storage)?;
-        if head != Some(template.parent_hash()) {
-            return Err(SubmitError::ParentNoLongerHead {
-                parent: template.parent_hash(),
-                head,
-            });
-        }
-        t.preamble = laps.lap();
-
-        // The same rule every peer will run. Failing here means the node built
-        // something it would itself reject, which is worth catching before it
-        // is stored and announced rather than after.
+        // rskj `processSolution` holds the solution to the proof of work before
+        // it connects anything (`isValid`, `ProofOfWorkRule`), and answers
+        // ERROR when it fails: the same rule every peer will run, so failing it
+        // means the node built something it would itself reject.
         MergedMiningRule { config: self.chain_config.clone() }
             .validate(&block.header)
             .map_err(SubmitError::SelfCheck)?;
-        // RSKIP179: a solution found in a Bitcoin block timestamped five
-        // minutes or more from the template is one every peer rejects.
-        rustock_core::validation::BitcoinTimestampRule { config: self.chain_config.clone() }
-            .validate(&block.header)
+
+        // Then `ethereum.addNewMinedBlock`, whose `blockchain.tryToConnect`
+        // the miner is answered OK with: what it made of the block. A block a
+        // rule refuses is `INVALID_BLOCK` there, and is not stored; so is one
+        // whose connecting fails in any other way, the node's own store
+        // included, as `BlockChainImpl.tryToConnect` catches every `Throwable`
+        // and answers `INVALID_BLOCK`. The node's own miner reads the error.
+        let completed_hash = block.hash();
+        let number = block.header.number;
+        match self.connect_mined(&block, &template, &mut laps, &mut t) {
+            Err(error) if refused == Refused::Answered => {
+                warn!(target: "rustock::mining", "Mined block #{number} {completed_hash} is invalid: {error}");
+                Ok(SubmittedBlockInfo {
+                    block_imported_result: ImportResult::InvalidBlock,
+                    block_hash: completed_hash,
+                    block_included_height: number,
+                })
+            }
+            connected => connected,
+        }
+    }
+
+    /// rskj `BlockChainImpl.internalTryToConnect` for a solved block of this
+    /// node's work, in its order: a block already stored, the parent, the
+    /// rules, the run, the store. A rule that refuses the block and a store
+    /// that fails to read or write are both errors here; the caller answers
+    /// what rskj answers for them.
+    fn connect_mined(
+        &self,
+        block: &Block,
+        template: &BlockTemplate,
+        laps: &mut Laps,
+        t: &mut ConnectTimings,
+    ) -> Result<SubmittedBlockInfo, SubmitError> {
+        let completed_hash = block.hash();
+        let number = block.header.number;
+        let answer = |result| SubmittedBlockInfo {
+            block_imported_result: result,
+            block_hash: completed_hash,
+            block_included_height: number,
+        };
+
+        // The same solution submitted twice: rskj's `addNewMinedBlock`
+        // answers `EXIST` and the submission is `OK`. Checked before the
+        // parent, which the first submission moved.
+        if self.chain.has_block(completed_hash).map_err(SubmitError::Storage)? {
+            return Ok(answer(ImportResult::Exist));
+        }
+
+        // The work's parent may no longer be the executed head: the chain moved
+        // on while the solution was found. rskj connects such a block as it
+        // connects any (`BlockChainImpl.internalTryToConnect`): against its own
+        // parent's state, beside the chain, stored whether it is best or not,
+        // and answers what that made of it.
+        let head = self.chain.executed_head().map_err(SubmitError::Storage)?;
+        let beside = head != Some(template.parent_hash());
+        t.preamble = laps.lap();
+
+        // A parent the store doesn't hold is `NO_PARENT`, before any rule.
+        let Some(parent) = self
+            .chain
+            .header(template.parent_hash())
+            .map_err(SubmitError::Storage)?
+        else {
+            return Ok(answer(ImportResult::NoParent));
+        };
+        // rskj then holds a mined block to every rule a peer's block is held
+        // to before running it (`BlockValidatorImpl`): the header's own and
+        // against its parent, the body's, the uncles' and fork detection.
+        // RSKIP179 among them: a solution found in a Bitcoin block timestamped
+        // five minutes or more from the template is one every peer rejects.
+        (rustock_core::validation::BitcoinTimestampRule {
+            config: self.chain_config.clone(),
+        })
+        .validate(&block.header)
+        .map_err(SubmitError::SelfCheck)?;
+        rustock_core::validation::HeaderVerifier::default_rsk(self.chain_config.clone())
+            .verify(&block.header, Some(&parent))
+            .map_err(SubmitError::SelfCheck)?;
+        self.builder
+            .processor()
+            .validate_block(block)
             .map_err(SubmitError::SelfCheck)?;
         t.initial_validation = laps.lap();
 
@@ -814,14 +1042,19 @@ impl MinerServer {
             .map_err(SubmitError::Template)?;
         // `process_and_commit`, in its two halves, so the receipts can be
         // timed apart from execution. The timed processor reads the clock
-        // only when measuring; the plain one never does.
+        // only when measuring; the plain one never does. A block beside the
+        // chain keeps what it keys by hash, its receipts and transactions, as
+        // it runs; what it keys by height waits for the chain to take it up
+        // (`BlockProcessor::process_beside`).
         let processor = self.builder.processor();
         let trie_store = self.builder.trie_store();
         let mut process = crate::ProcessTimings::default();
-        let executed = if laps.enabled() {
-            processor.process_block_timed(&block, &state_root, trie_store, &mut process)
+        let executed = if beside {
+            processor.process_beside(block, &state_root, trie_store)
+        } else if laps.enabled() {
+            processor.process_block_timed(block, &state_root, trie_store, &mut process)
         } else {
-            processor.process_block(&block, &state_root, trie_store)
+            processor.process_block(block, &state_root, trie_store)
         }
         .map_err(|e| SubmitError::Execution(e.to_string()))?;
         laps.lap();
@@ -829,14 +1062,24 @@ impl MinerServer {
         t.execute = process.execute;
         t.trie_save = process.trie_save;
         t.post_execute_validation = process.post_validation;
+        if beside {
+            let outcome = self
+                .chain
+                .commit_mined_block_beside(block, executed.unlogged_peg_events, laps)
+                .map_err(SubmitError::Storage)?;
+            // The head hasn't moved by this. If the block takes it, the sync
+            // service's switch moves it and tells the miner of its new best
+            // block, which builds new work then.
+            return Ok(answer(outcome.result));
+        }
         processor
-            .commit_receipts(&block, &executed)
+            .commit_receipts(block, &executed)
             .map_err(|e| SubmitError::Execution(e.to_string()))?;
         t.save_receipts = laps.lap();
 
         let outcome = self
             .chain
-            .commit_mined_block(&block, executed.state_root_hash, &mut laps)
+            .commit_mined_block(block, executed.state_root_hash, laps)
             .map_err(SubmitError::Storage)?;
         t.switch_chain = outcome.switch_chain;
         t.on_best_block = outcome.on_best_block;
@@ -845,7 +1088,7 @@ impl MinerServer {
         if let (Some(sink), ImportResult::ImportedBest) = (&self.breakdown, outcome.result) {
             sink(&t.breakdown_line(
                 block.header.number,
-                block.hash(),
+                completed_hash,
                 block.transactions.len(),
                 block.header.gas_used,
             ));
@@ -856,11 +1099,7 @@ impl MinerServer {
             warn!(target: "rustock::mining", "Could not rebuild work after a submission: {e}");
         }
 
-        Ok(SubmittedBlockInfo {
-            block_imported_result: outcome.result,
-            block_hash: block.hash(),
-            block_included_height: block.header.number,
-        })
+        Ok(answer(outcome.result))
     }
 
     /// The cached template a solution answers. Templates are not removed:

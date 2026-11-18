@@ -69,8 +69,8 @@ pub struct FileConfig {
 }
 
 /// Regtest chain settings, for a chain that has to match one an rskj node
-/// runs: its genesis file, its consensus-rule overrides, its gas-limit
-/// bounds, and whether proof of work is checked.
+/// runs: its genesis file, its consensus-rule overrides, its minimum gas
+/// limit, and whether proof of work is checked.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainSection {
@@ -82,7 +82,6 @@ pub struct ChainSection {
     /// (-1 disables).
     pub consensus_rules: Option<std::collections::BTreeMap<String, i64>>,
     pub min_gas_limit: Option<u64>,
-    pub max_gas_limit: Option<u64>,
     /// rskj `blockchain.config.hardforkActivationHeights`, as `name = height`
     /// (-1 takes the upgrade off the ladder).
     pub hardforks: Option<std::collections::BTreeMap<String, i64>>,
@@ -207,6 +206,9 @@ pub struct PeersSection {
     /// Addresses or CIDR blocks refused at connection time, as rskj's
     /// `peer.bannedPeerIPs`.
     pub banned_peers: Option<Vec<String>>,
+    /// Coinbases whose blocks are refused when a peer sends them whole, as
+    /// rskj's `peer.bannedMiners`.
+    pub banned_miners: Option<Vec<String>>,
     /// Discovery bootstrap addresses, `HOST:PORT`. **Replaces** the chain's
     /// built-in list rather than adding to it, which is what makes a private
     /// two-node network possible.
@@ -334,11 +336,89 @@ pub struct MiningSection {
     pub coinbase: Option<String>,
     pub extra_data: Option<String>,
     pub refresh_secs: Option<u64>,
-    pub min_gas_price: Option<u64>,
+    pub min_gas_price: Option<i64>,
+    pub gas_limit_target: Option<u64>,
+    pub force_gas_limit: Option<bool>,
     pub submission_rate_limit_ms: Option<u64>,
     pub update_work_on_new_transaction: Option<bool>,
     pub timed: Option<String>,
     pub flush_every: Option<u64>,
+    /// rskj `miner.stableGasPrice`, which has no flag: rskj sets it in its
+    /// configuration only.
+    pub stable_gas_price: Option<StableGasPriceSection>,
+}
+
+/// rskj `miner.stableGasPrice`: a minimum gas price held stable in a
+/// currency, its keys as rskj names them, in this file's snake case.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StableGasPriceSection {
+    pub enabled: Option<bool>,
+    pub refresh_rate: Option<DurationValue>,
+    pub min_stable_gas_price: Option<i64>,
+    pub min_valid_price: Option<i64>,
+    pub max_valid_price: Option<i64>,
+    pub source: Option<StableGasPriceSource>,
+}
+
+impl StableGasPriceSection {
+    /// Whether the section says only what rskj's defaults say: off, every
+    /// price a valid one, and no source, its tables empty if they are there.
+    /// A node with it runs as one without it.
+    pub fn is_default(&self) -> bool {
+        let Self {
+            enabled,
+            refresh_rate,
+            min_stable_gas_price,
+            min_valid_price,
+            max_valid_price,
+            source,
+        } = self;
+        *enabled != Some(true)
+            && refresh_rate.is_none()
+            && min_stable_gas_price.is_none()
+            && min_valid_price.is_none_or(|price| price == 0)
+            && max_valid_price.is_none_or(|price| price == i64::MAX)
+            && source.as_ref().is_none_or(|source| {
+                source.method.is_none()
+                    && source
+                        .params
+                        .as_ref()
+                        .is_none_or(|params| *params == StableGasPriceParams::default())
+            })
+    }
+}
+
+/// rskj `miner.stableGasPrice.source`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StableGasPriceSource {
+    /// `HTTP_GET`, `ETH_CALL` or `FIXED`, as rskj names them.
+    pub method: Option<String>,
+    pub params: Option<StableGasPriceParams>,
+}
+
+/// rskj `miner.stableGasPrice.source.params`: `url`, `json_path` and
+/// `timeout` for `HTTP_GET`; `from`, `to` and `data` for `ETH_CALL`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StableGasPriceParams {
+    pub url: Option<String>,
+    pub json_path: Option<String>,
+    pub timeout: Option<DurationValue>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub data: Option<String>,
+}
+
+/// A duration as rskj's HOCON writes one: a number of milliseconds, or a
+/// number and a unit (`"6 hours"`).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum DurationValue {
+    Millis(i64),
+    FractionalMillis(f64),
+    Text(String),
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -453,6 +533,12 @@ pub const ONE_SHOT: &[&str] = &[
     "verify_state",
     "trie_shape",
     "measure_block_reads",
+    // --import loads a copy into an empty data directory and refuses one
+    // that holds a chain, so a file that turned it on would stop every start
+    // after the first.
+    "import",
+    "import_url",
+    "import_trusted_key",
 ];
 
 /// Every runtime setting the file can supply. Kept beside the merge so the two
@@ -492,6 +578,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "max_inbound_per_cidr",
     "inbound_cidr_prefix",
     "banned_peers",
+    "banned_miners",
     "bootnodes",
     "no_peer_punishment",
     "btc_block_cache_entries",
@@ -525,6 +612,8 @@ pub const CONFIGURABLE: &[&str] = &[
     "mining_extra_data",
     "mining_refresh_secs",
     "mining_min_gas_price",
+    "mining_gas_limit_target",
+    "mining_force_gas_limit",
     "mining_submission_rate_limit_ms",
     "mining_update_work_on_new_transaction",
     "mine_timed",
@@ -560,7 +649,6 @@ pub const CONFIGURABLE: &[&str] = &[
     "skip_pow_validation",
     "consensus_rule",
     "min_gas_limit",
-    "max_gas_limit",
 ];
 
 #[cfg(test)]

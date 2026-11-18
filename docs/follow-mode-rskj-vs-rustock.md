@@ -10,6 +10,11 @@ log at the tip and find it re-executing blocks several times an hour, with no
 equivalent in rskj. Neither design is wrong. They pay for the same guarantee in
 different currencies.
 
+**Since 14 November 2026 rustock has rskj's shape** (§8): every block is
+executed on arrival against its own parent's state, a heavier branch is adopted
+only once it is executed, and a switch runs nothing again. Sections 1 to 7
+describe the design it replaced, and why it was replaced.
+
 ## 1. The symptom
 
 A rustock node following mainnet logs pairs like this:
@@ -118,11 +123,14 @@ Three properties follow, and they are the whole difference:
 
 `SelectionRule.shouldWeAddThisBlock` compares total difficulty first, then — on
 a tie — paid fees (a challenger with more than 2× the incumbent's fees wins),
-and finally the lower block hash, provided fees are at least half the
-incumbent's. Note that this is a *selection* rule evaluated after execution, not
-a reason to defer execution.
+and finally the lower block hash, provided the incumbent's fees are less than
+2× the challenger's. Note that this is a *selection* rule evaluated after
+execution, not a reason to defer execution. rustock takes its head by the same
+rule (`rustock_core::selection_rule`; §99 of the compatibility catalogue).
 
 ## 3. rustock: one executed head, rolled back when it is wrong
+
+*Until 14 November 2026. See §8 for the design that replaced it.*
 
 **Source**: `crates/sync/src/service.rs` (`record_execution` at :202,
 `EXECUTION_OFF_CHAIN_GRACE` at :58, the rollback at :2110, the resume log at
@@ -346,3 +354,84 @@ economics — which is a better position than either client occupies today.
 What this does *not* fix: reorg cost. rustock would still re-execute after a
 reorg where rskj does not. §1's update shows that cost is now 0.4–0.9% of
 blocks rather than 14%, so it is no longer the part worth optimising.
+
+### Revisited, 14 November 2026
+
+That last paragraph measured the cost in throughput, and throughput was the
+wrong measure. A reorg's cost is a *delay*: from the switch until the new
+branch has run again, execution sat at the fork point, so the miner built
+there and every query was answered from there, on the next tick, after a grace
+period, once the bodies had been fetched. And because a heavier chain was
+adopted on its headers alone, a miner with the hashrate to produce such a chain
+could stretch that delay at will by withholding the bodies. A delay an attacker
+controls is not a running cost.
+
+So rule 2 is adopted too, in the one form that does not collide with §5:
+nothing durable names a losing branch's state. See §8.
+
+## 8. Since 14 November 2026: rskj's shape
+
+**Source**: `crates/sync/src/service/beside.rs`;
+`crates/storage/src/position.rs` (`adoption_waits_for_execution`,
+`executed_climb`); `BlockStore::deferred_head` in `crates/storage/src/lib.rs`;
+`BlockProcessor::process_beside` in `crates/execution/src/processor.rs`.
+
+rustock now meets a fork the way rskj does, by three rules.
+
+1. **Every block is executed as it arrives, against its own parent's state**,
+   on the chain or beside it. A block beside the chain commits what is keyed by
+   its hash -- its receipts and the transaction index -- and leaves the
+   executed head alone; what is keyed by height (the Bridge event index, and
+   the peg decisions the Bridge logs nothing for) waits until the chain takes
+   the block up. A block that breaks a consensus rule is remembered and never
+   run again; one that failed for a fault of this node's own is tried again.
+2. **A heavier branch is adopted only once this node has executed it past its
+   executed head** -- rskj's rule that only a connected block can be best.
+   Until then the store holds it back: the head, the canonical index and
+   execution stay on the chain they are on, and the node fetches what the
+   branch lacks -- its bodies, and any headers below it it does not hold -- and
+   executes it beside the chain. A branch none of whose bodies come for 60 s is
+   given up, and weighed again only if its headers come again, so withholding
+   bodies cannot hold the node.
+3. **A switch is a pointer move.** When the store adopts the branch, execution
+   goes straight to the highest block of it this node has executed, in the
+   same call that delivered the deciding block: nothing runs again, and there
+   is no tick, grace period or download in between. What executing those blocks
+   would have done is done then: the in-memory root, the miner's best block,
+   subscribers (the blocks left retracted first, as rskj's logs emitter
+   retracts them), the transaction pool, the gas price, the Bridge index.
+
+| | rskj | rustock until 14 Nov 2026 | rustock now |
+|---|---|---|---|
+| A competing block is executed | on arrival | once its chain has won | on arrival |
+| Execution context | the block's own parent | the executed head | the block's own parent |
+| A heavier chain known by headers alone | not best until connected | adopted; execution pulled to the fork point | held back until executed |
+| Reorg cost | pointer move | roll back, fetch, re-execute, on later ticks | pointer move |
+| Bodies withheld | stays on what it has connected | held at the fork point | stays on its chain; branch given up after 60 s |
+
+**How a losing branch's state is kept, given §5.** Nothing durable names it.
+The witness that this node executed a block is the block's own receipts,
+hashed against its header, together with its state root resolving in the trie
+at the moment of asking -- the same pair `fast_forward_state` asks for. When
+the epoch collector has reclaimed a sibling's state, the answer is simply "not
+executed here", and the branch is executed again if the chain ever needs it,
+which §5 shows takes an abandonment spanning the whole epoch window. So rule 2
+costs no storage beyond what the collector already keeps.
+
+**What went.** The reconcile's orphan recovery -- adopting a branch stored at
+the next height for being there, or retreating below the fork when it could not
+be proved -- is gone: such a branch is now fetched, executed beside the chain,
+and weighed like any other. The reconcile keeps its safety net for an executed
+head stranded by anything else, and the invariant checks of §3 stay as they
+are.
+
+**Tests** (`crates/sync/src/service/beside/tests.rs`), each failing with the
+new behaviour switched off: a competing block is executed on arrival and not
+adopted while lighter; a heavier branch executed as it came is switched to in
+the call that tips it, with each block run once; heavier headers without bodies
+move neither the head nor execution; a held-back branch whose bodies never
+come is given up; an invalid block is never adopted however heavy its branch;
+a block that failed for a local fault is tried again; a branch stored by
+headers alone is executed and adopted at its tip; and a block whose ancestry
+was never downloaded has it asked for, with nothing rolled back. The store's
+half is covered in `crates/storage/src/position.rs`.

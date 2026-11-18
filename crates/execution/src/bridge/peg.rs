@@ -65,14 +65,18 @@ pub struct ReleaseRequest {
     pub rsk_tx_hash: Option<[u8; 32]>,
 }
 
+/// rskj `ReleaseRequestQueue.Entry.equals`: the same destination, amount and
+/// creation hash, no hash being equal to no hash.
+fn same_release_request(a: &ReleaseRequest, b: &ReleaseRequest) -> bool {
+    a.btc_dest_hash160 == b.btc_dest_hash160
+        && a.amount_satoshis == b.amount_satoshis
+        && a.rsk_tx_hash == b.rsk_tx_hash
+}
+
 // ---------------------------------------------------------------------------
 // registerBtcTransaction
 // ---------------------------------------------------------------------------
 
-/// `registerBtcTransaction(bytes btcTxSerialized, int256 height, bytes pmtSerialized)`
-///
-/// The core peg-in method. Verifies a BTC transaction is included in the
-/// BTC header chain, classifies it, and credits RBTC to the sender.
 /// rskj BridgeSupport.shouldMarkRejectedPeginAsProcessed: only between
 /// RSKIP459 (lovell700) and RSKIP551 (vetiver900) are rejected
 /// non-refundable peg-ins marked as processed.
@@ -95,6 +99,153 @@ fn pegin_below_minimum(live_output_values: &[u64], min: u64, rskip293: bool) -> 
     }
 }
 
+/// How rskj's `validationsForRegisterBtcTransaction` turns a transaction
+/// down. `registerBtcTransaction` swallows a false and fails the transaction
+/// on a throw; `registerFlyoverBtcTransaction` answers a false with its
+/// validations code and a throw with GENERIC_ERROR.
+enum Invalid {
+    /// `return false`.
+    Swallowed(&'static str),
+    /// A throw of anything else: the `VerificationException` of a transaction
+    /// without inputs, a `BlockStoreException`, or the `NullPointerException`
+    /// of a block the store does not have.
+    Thrown(&'static str),
+    /// A throw of `BridgeIllegalArgumentException`, which is also what a
+    /// partial merkle tree's `VerificationException` is rethrown as: as
+    /// `Thrown` from RSKIP88, but before it `Bridge.execute` answers it with
+    /// null, a success with no output.
+    IllegalArgument(&'static str),
+}
+
+/// rskj `BridgeSupport.validationsForRegisterBtcTransaction`. Its order is
+/// load-bearing: a transaction that fails more than one check gets the answer
+/// of the first, so one with too few confirmations and a malformed tree is
+/// turned down quietly and never reaches the throw.
+#[allow(clippy::too_many_arguments)]
+fn validations_for_register_btc_transaction<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    btc_tx_hash: &[u8; 32],
+    height: i32,
+    pmt_data: &[u8],
+    btc_tx_data: &[u8],
+) -> Result<(), Invalid> {
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let rskip143 = hardfork_cfg.has_rskip143(block_number);
+
+    // validateHeightAndConfirmations: a negative height throws, which this
+    // catches and answers false. The block itself counts as one confirmation,
+    // and the caller's height is the one checked.
+    if height < 0 {
+        return Err(Invalid::Swallowed("negative height"));
+    }
+    let best_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
+    let confirmations = best_height as i64 - i64::from(height) + 1;
+    if confirmations < config.btc2rsk_minimum_acceptable_confirmations as i64 {
+        return Err(Invalid::Swallowed("insufficient confirmations"));
+    }
+
+    // A tree of the wrong size throws `BridgeIllegalArgumentException`.
+    if !PartialMerkleTree::has_expected_size(pmt_data) {
+        return Err(Invalid::IllegalArgument(
+            "PartialMerkleTree doesn't have expected size",
+        ));
+    }
+    // `BridgeUtils.calculateMerkleRoot` builds the tree and walks it, and a
+    // VerificationException from either, bitcoinj's ProtocolException being
+    // one, is rethrown as a `BridgeIllegalArgumentException` (BridgeSupport
+    // l.3389-3396). A transaction that is not among its matches gets null
+    // back, which is false.
+    let pmt = PartialMerkleTree::parse(pmt_data)
+        .ok_or(Invalid::IllegalArgument("failed to parse PMT"))?;
+    let pmt_result = pmt
+        .extract_matches()
+        .ok_or(Invalid::IllegalArgument("PMT verification failed"))?;
+    if !pmt_result.matched_hashes.contains(btc_tx_hash) {
+        return Err(Invalid::Swallowed("tx not in PMT"));
+    }
+
+    // `BridgeUtils.validateInputsCount` throws for a transaction with no
+    // inputs. It runs before any block is looked at, and a one-leaf tree
+    // proves any bytes at all, so a crafted transaction reaches it.
+    if !has_inputs(btc_tx_data, rskip143) {
+        return Err(Invalid::Thrown("the transaction has no inputs"));
+    }
+
+    // `getStoredBlockAtMainChainHeight(height).getHeader()`: the store throws
+    // below RSKIP199's search limit, and where its walk runs out it answers
+    // null, on which `getHeader()` throws.
+    let rskip199 = hardfork_cfg.has_rskip199(block_number);
+    let lookup =
+        super::btc_chain::main_chain_block_at_height(ctx, height as u32, rskip199, Some(config));
+    let stored_block = match lookup {
+        super::btc_chain::MainChainLookup::Found(block) => block,
+        super::btc_chain::MainChainLookup::Absent => {
+            return Err(Invalid::Thrown("no stored block at the height"))
+        }
+        super::btc_chain::MainChainLookup::StoreError => {
+            return Err(Invalid::Thrown("the block store refused the height"))
+        }
+    };
+
+    // isBlockMerkleRootValid: the block's merkle root, or from RSKIP143 the
+    // witness merkle root registered with its coinbase. The coinbase
+    // information is keyed by the block hash in DISPLAY byte order (rskj
+    // `Sha256Hash.toString()`; see set_coinbase_information), and holds the
+    // witness root in display order too (rskj registerBtcCoinbaseTransaction
+    // wraps the ABI argument, BridgeSupport l.2574), while the tree's root is
+    // in internal order -- so both are reversed.
+    let block_merkle_root = *stored_block
+        .header
+        .merkle_root
+        .to_raw_hash()
+        .as_byte_array();
+    let root_valid = pmt_result.merkle_root == block_merkle_root
+        || (rskip143 && {
+            let mut block_hash = *stored_block
+                .header
+                .block_hash()
+                .to_raw_hash()
+                .as_byte_array();
+            block_hash.reverse();
+            get_coinbase_information(ctx, &block_hash).is_some_and(|mut witness_root| {
+                witness_root.reverse();
+                pmt_result.merkle_root == witness_root
+            })
+        });
+    if !root_valid {
+        return Err(Invalid::Swallowed("merkle root mismatch"));
+    }
+    Ok(())
+}
+
+/// rskj `BridgeUtils.validateInputsCount`, false where it throws: for a
+/// transaction whose input count reads zero and, from RSKIP143, is not a
+/// segwit transaction with inputs, and for one too short for bitcoinj's
+/// `VarInt` to read, which throws `ArrayIndexOutOfBoundsException` instead.
+fn has_inputs(tx: &[u8], rskip143: bool) -> bool {
+    // `getInputsCount` reads the count after the version. A segwit
+    // transaction has its zero marker there, then its flag, then its count,
+    // which `getInputsCountForSegwit` reads when the flag is 1.
+    let count =
+        |offset| rustock_core::partial_merkle_tree::var_int(tx, offset).map(|(value, _)| value);
+    match count(4) {
+        None => false,
+        Some(0) if rskip143 => match count(5) {
+            None => false,
+            Some(1) => count(6).is_some_and(|inputs| inputs != 0),
+            Some(_) => true,
+        },
+        Some(0) => false,
+        Some(_) => true,
+    }
+}
+
+/// `registerBtcTransaction(bytes btcTxSerialized, int256 height, bytes pmtSerialized)`
+///
+/// The core peg-in method. Verifies a BTC transaction is included in the
+/// BTC header chain, classifies it, and credits RBTC to the sender.
 pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
@@ -103,26 +254,18 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     hardfork_cfg: &RskHardforkConfig,
     tx_ctx: &BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 96 {
+    // rskj `Bridge.registerBtcTransaction`: the transaction, the height as
+    // `intValue()`, the partial merkle tree, all as its decoder reads them.
+    let decoded = crate::abi::Args::new(args);
+    let (Some(btc_tx_data), Some(height), Some(pmt_data)) =
+        (decoded.bytes(0), decoded.int(1), decoded.bytes(2))
+    else {
         return Err(PrecompileError::other(
-            "registerBtcTransaction: args too short",
+            "registerBtcTransaction: malformed arguments",
         ));
-    }
-
-    // Parse ABI arguments:
-    // arg0: bytes btcTxSerialized (dynamic)
-    // arg1: int256 height
-    // arg2: bytes pmtSerialized (dynamic)
-
-    let btc_tx_offset = U256::from_be_slice(&args[0..32]).to::<usize>();
-    let btc_block_height = {
-        let raw = U256::from_be_slice(&args[32..64]);
-        raw.to::<u64>()
     };
-    let pmt_offset = U256::from_be_slice(&args[64..96]).to::<usize>();
-
-    let btc_tx_data = read_dynamic_bytes(args, btc_tx_offset)?;
-    let pmt_data = read_dynamic_bytes(args, pmt_offset)?;
+    let (btc_tx_data, pmt_data) = (btc_tx_data.to_vec(), pmt_data.to_vec());
+    let btc_block_height = height.int_value();
 
     // Compute BTC tx hash
     let btc_tx_hash = calculate_btc_tx_hash(&btc_tx_data);
@@ -130,117 +273,37 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // A fresh bridge BTC store must be seeded with the rskj checkpoint
     // before any chain lookups.
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let use_v2 = hardfork_cfg.has_stored_block_v2(block_number);
-    let rskip199 = hardfork_cfg.has_rskip199(block_number);
-    super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
+    super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg)?;
 
     // rskj wraps the registerBtcTransaction body in
     // `try { ... } catch (RegisterBtcTransactionException e) { log }`: an
-    // already-processed tx or any failed validation
-    // (validationsForRegisterBtcTransaction → "Could not validate
-    // transaction") is logged and the call returns SUCCESSFULLY without
-    // registering anything. Mirror that — these are a no-op success, not a
-    // failed tx. Only a malformed BTC tx (parsed below, a separate
-    // exception) propagates and fails the tx.
-    // rskj's validation failures are NOT all equivalent, and treating them as
-    // if they were diverged mainnet #9,227,292.
+    // already-processed transaction, or validations that answer false, are
+    // logged and the call succeeds without registering anything. A throw from
+    // the validations is not that exception: it escapes the catch, reaches
+    // `Bridge.execute`'s outer handler, becomes a `VMException`, and charges
+    // the sender the full gas limit (quirks-frozen-bugs.md §9d). Treating the
+    // two alike diverged mainnet #9,227,292.
     //
-    // `BridgeSupport.registerBtcTransaction` wraps its body in
-    // `catch (RegisterBtcTransactionException e) { log }`, so a validation that
-    // *returns false* is a silent no-op success. But
-    // `validationsForRegisterBtcTransaction` also **throws**
-    // `BridgeIllegalArgumentException` for a malformed partial merkle tree, and
-    // that is not a `RegisterBtcTransactionException` -- it escapes the catch,
-    // reaches `Bridge.execute`'s outer handler, becomes a `VMException`, and
-    // charges the sender the full gas limit (quirks-frozen-bugs.md §9d).
-    //
-    // Order is load-bearing too: rskj validates height and confirmations FIRST
-    // and returns false there, so a transaction with bad confirmations *and* a
-    // malformed PMT is swallowed, never reaching the throw.
-    enum Invalid {
-        /// `return false` in rskj: logged, call succeeds, nothing registered.
-        Swallowed(&'static str),
-        /// `throw BridgeIllegalArgumentException`: escapes the catch and fails
-        /// the transaction with the full gas limit charged.
-        Thrown(&'static str),
-    }
-
-    let validation = (|| -> Result<(), Invalid> {
-        // Check if already processed (rskj: RegisterBtcTransactionException).
-        if is_btc_tx_processed(ctx, &btc_tx_hash) {
-            return Err(Invalid::Swallowed("transaction already processed"));
-        }
-
-        // Height and confirmations come first, and are swallowed
-        // (BridgeUtils.validateHeightAndConfirmations -> return false). The
-        // block itself counts as one confirmation, and the CALLER-supplied
-        // height is what gets validated.
-        let best_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
-        let confirmations = best_height as i64 - btc_block_height as i64 + 1;
-        if confirmations < config.btc2rsk_minimum_acceptable_confirmations as i64 {
-            return Err(Invalid::Swallowed("insufficient confirmations"));
-        }
-
-        // PMT size: rskj THROWS BridgeIllegalArgumentException here.
-        if !PartialMerkleTree::has_expected_size(&pmt_data) {
-            return Err(Invalid::Thrown("PartialMerkleTree doesn't have expected size"));
-        }
-        // `BridgeUtils.calculateMerkleRoot` constructs the PMT and walks it;
-        // a VerificationException from either is rethrown as
-        // BridgeIllegalArgumentException, so both of these throw.
-        let pmt = PartialMerkleTree::parse(&pmt_data)
-            .ok_or(Invalid::Thrown("failed to parse PMT"))?;
-        let pmt_result = pmt
-            .extract_matches()
-            .ok_or(Invalid::Thrown("PMT verification failed"))?;
-
-        // Tx not among the matched hashes: `calculateMerkleRoot` returns null,
-        // so the caller returns false -- swallowed.
-        if !pmt_result.matched_hashes.contains(&btc_tx_hash) {
-            return Err(Invalid::Swallowed("tx not in PMT"));
-        }
-
-        // Look up the BTC block on the main chain at the caller-supplied
-        // height (walks the chain pre-RSKIP199, indexed lookup afterwards).
-        let stored_block =
-            super::btc_chain::stored_block_at_main_chain_height(ctx, btc_block_height as u32, rskip199)
-                .ok_or(Invalid::Swallowed("BTC block not found at height"))?;
-        let block_hash = stored_block.header.block_hash();
-
-        // Verify merkle root matches
-        let block_merkle_root = {
-            let raw = stored_block.header.merkle_root.to_raw_hash();
-            *raw.as_byte_array()
-        };
-        let root_valid = if pmt_result.merkle_root == block_merkle_root {
-            true
-        } else {
-            // Post-RSKIP143: also accept witness merkle root. The coinbase
-            // information is keyed by the block hash in DISPLAY byte order
-            // (rskj `Sha256Hash.toString()`; see set_coinbase_information),
-            // the reverse of rust-bitcoin's internal order.
-            let block_hash_bytes = {
-                let mut raw = *block_hash.to_raw_hash().as_byte_array();
-                raw.reverse();
-                raw
-            };
-            match get_coinbase_information(ctx, &block_hash_bytes) {
-                // The stored witness merkle root is in DISPLAY byte order
-                // (rskj registerBtcCoinbaseTransaction wraps the ABI arg and
-                // reverses it for the commitment, BridgeSupport l.2574), while
-                // the PMT merkle root is internal order — compare reversed.
-                Some(mut witness_root) => {
-                    witness_root.reverse();
-                    pmt_result.merkle_root == witness_root
-                }
-                None => false,
-            }
-        };
-        if !root_valid {
-            return Err(Invalid::Swallowed("merkle root mismatch"));
-        }
-        Ok(())
-    })();
+    // rskj then parses the transaction with bitcoinj and runs its `verify()`
+    // on it (BridgeSupport l.400-401). A throw from either fails the
+    // transaction too.
+    // The processed transactions' map as the call found it. rskj's `save()`
+    // writes back the map the check below reads, unless the call saves nothing.
+    let processed_map = bridge_storage_key(BTC_TX_HASHES_ALREADY_PROCESSED_KEY);
+    let processed_map_found = bridge_load_raw(ctx, processed_map);
+    let validation = if is_btc_tx_processed(ctx, &btc_tx_hash) {
+        Err(Invalid::Swallowed("transaction already processed"))
+    } else {
+        validations_for_register_btc_transaction(
+            ctx,
+            config,
+            hardfork_cfg,
+            &btc_tx_hash,
+            btc_block_height,
+            &pmt_data,
+            &btc_tx_data,
+        )
+    };
     match validation {
         Ok(()) => {}
         Err(Invalid::Swallowed(m)) => {
@@ -250,19 +313,30 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             );
             return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
         }
-        Err(Invalid::Thrown(m)) => {
+        // Before RSKIP88 `Bridge.execute` answers a
+        // `BridgeIllegalArgumentException` with null: the call succeeds with no
+        // output and saves nothing.
+        Err(Invalid::IllegalArgument(m)) if !hardfork_cfg.has_rskip88(block_number) => {
+            tracing::debug!(
+                "registerBtcTransaction: {m}; before RSKIP88, a success with no output"
+            );
+            // The map read above stays as it was found.
+            bridge_store_raw(ctx, processed_map, processed_map_found);
+            return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+        }
+        Err(Invalid::Thrown(m) | Invalid::IllegalArgument(m)) => {
             tracing::debug!(
                 "registerBtcTransaction: {m}; throwing \
-                 (rskj BridgeIllegalArgumentException escapes the catch)"
+                 (the throw escapes rskj's catch)"
             );
             return Err(PrecompileError::other(m));
         }
     }
 
-    // Parse the BTC transaction
-    let btc_tx: BtcTransaction = deserialize(&btc_tx_data).map_err(|_| {
-        PrecompileError::other("registerBtcTransaction: invalid BTC transaction")
-    })?;
+    // The transaction as bitcoinj reads the bytes, which the tree above has
+    // proved as they were given: bitcoinj takes more ways of writing one than
+    // the standard, and every hash from here on is of what it read.
+    let btc_tx = read_btc_transaction(&btc_tx_data).map_err(PrecompileError::other)?;
 
     // rskj re-checks "already processed" using the witness-stripped txid
     // (BridgeSupport.registerBtcTransaction l.404, `btcTx.getHash(false)`):
@@ -285,18 +359,13 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // version, not the current block — an ERP federation keeps its ERP script
     // even after a later template hardfork (rskj getActiveFederation /
     // getRetiringFederation → Federation.getRedeemScript()).
-    let (federation_keys, fed_redeem) =
+    let (_, fed_redeem) =
         active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number_now);
     // getActiveFederationAddress is format-aware: a P2SH-P2WSH (format 4000,
     // RSKIP305) federation is recognized at its P2SH-P2WSH address, so peg-in /
     // UTXO-registration output matching must use that script, not a plain P2SH.
     let active_format = active_federation_format(ctx, config, hardfork_cfg, block_number_now);
     let fed_script = p2sh_output_script(&federation_output_hash160(&fed_redeem, active_format));
-    // rskj isPegOutTx compares against each federation's STANDARD redeem script
-    // (getStandardRedeemScript) — for an ERP federation this is the default
-    // multisig branch only, not the full ERP/flyover-wrapped redeem.
-    let fed_standard_redeem =
-        build_federation_redeem_script(&federation_keys, federation_keys.len() / 2 + 1);
     let retiring_format =
         federation_format_version(ctx, super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY);
     let retiring = retiring_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number_now)
@@ -304,8 +373,6 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             let script = p2sh_output_script(&federation_output_hash160(&redeem, retiring_format));
             (redeem, script)
         });
-    let retiring_standard_redeem = retiring_federation_keys(ctx, config, hardfork_cfg, block_number_now)
-        .map(|keys| build_federation_redeem_script(&keys, keys.len() / 2 + 1));
 
     // rskj marks processed txs with the RSK execution block number
     // (BridgeSupport.markTxAsProcessed), not the BTC block height.
@@ -314,22 +381,39 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // frames down that have no block of their own.
     crate::silent::set_position(rsk_height, tx_ctx.tx_index);
 
+    // rskj `PegUtils.getTransactionType` reads the pegout index from RSKIP379
+    // for a transaction in a Bitcoin block at least the index's start height
+    // high, and there, and only there, looks for the SVP transactions first.
+    // Below that height the legacy rules classify it.
+    let pegout_index = pegout_tx_index_enabled(config, hardfork_cfg, rsk_height, btc_block_height);
+
     // RSKIP419: an SVP fund/spend transaction is recognized by its
-    // signature-stripped txid matching the stored unsigned hash. rskj's
-    // PegUtils.getTransactionType checks this BEFORE the pegin/pegout
-    // classification; the matched tx is handled by registerSvpFundTx /
-    // registerSvpSpendTx (= registerNewUtxos + the SVP state transition) and
-    // nothing else.
-    if hardfork_cfg.has_rskip419(rsk_height) {
-        if let Some(without_sigs) = multisig_txid_without_signatures(&btc_tx) {
-            let fund_hash = super::serialization::rlp_decode_element(&bridge_load_bytes_named(
-                ctx,
-                super::storage::SVP_FUND_TX_HASH_UNSIGNED_KEY,
-            ));
-            let spend_hash = super::serialization::rlp_decode_element(&bridge_load_bytes_named(
-                ctx,
-                super::storage::SVP_SPEND_TX_HASH_UNSIGNED_KEY,
-            ));
+    // signature-stripped txid matching the stored unsigned hash; the matched
+    // tx is handled by registerSvpFundTx / registerSvpSpendTx (=
+    // registerNewUtxos + the SVP state transition) and nothing else. rskj
+    // strips the signatures only when a hash is stored to compare with, and
+    // what the stripping throws fails the call.
+    if pegout_index && hardfork_cfg.has_rskip419(rsk_height) {
+        let fund_hash = super::serialization::rlp_decode_element(&bridge_load_bytes_named(
+            ctx,
+            super::storage::SVP_FUND_TX_HASH_UNSIGNED_KEY,
+        ));
+        let spend_hash = super::serialization::rlp_decode_element(&bridge_load_bytes_named(
+            ctx,
+            super::storage::SVP_SPEND_TX_HASH_UNSIGNED_KEY,
+        ));
+        let without_sigs = if fund_hash.is_some() || spend_hash.is_some() {
+            multisig_tx_hash_without_signatures(&btc_tx, hardfork_cfg.has_rskip305(rsk_height)).map_err(
+                |why| {
+                    PrecompileError::other(format!(
+                        "registerBtcTransaction: rskj aborts stripping this transaction's signatures ({why})"
+                    ))
+                },
+            )?
+        } else {
+            None
+        };
+        if let Some(without_sigs) = without_sigs {
             let is_fund = fund_hash.as_deref() == Some(&without_sigs[..]);
             let is_spend = spend_hash.as_deref() == Some(&without_sigs[..]);
             if is_fund || is_spend {
@@ -399,107 +483,127 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         config.legacy_minimum_pegin_tx_value
     };
 
-    // rskj PegUtilsLegacy.getTransactionType — PEGOUT_OR_MIGRATION detection.
-    // An input "spends" a federation when its scriptSig redeem hashes to that
-    // federation's P2SH; isPegOutTx/migration compare the input's STANDARD
-    // (default-branch) redeem (extractStandardRedeemScript) to each fed's
-    // standard P2SH, while txIsFromOldFederation compares the FULL redeem.
-    let active_std_hash160 = redeem_script_hash160(&fed_standard_redeem);
-    let retiring_std_hash160 = retiring_standard_redeem.as_ref().map(|r| redeem_script_hash160(r));
-    // lastRetiredFederationP2SHScript (RSKIP186): the P2SH of the last fully
-    // retired federation, stored as serializeScript = RLP([program]).
-    let retired_hash160: Option<[u8; 20]> = if hardfork_cfg.has_rskip186(rsk_height) {
+    // `getLastRetiredFederationP2SHScript` (RSKIP186): the P2SH script of the
+    // last federation to retire, as `setLastRetiredFederationScript` stored it
+    // (`serializeScript`, the RLP of [program]).
+    let retired_p2sh: Option<Vec<u8>> = if hardfork_cfg.has_rskip186(rsk_height) {
         let raw = super::storage::bridge_load_bytes_named(
             ctx,
             super::storage::LAST_RETIRED_FEDERATION_P2SH_SCRIPT_KEY,
         );
-        rlp_decode_list(&raw)
-            .and_then(|items| items.into_iter().next())
-            .filter(|p| p.len() == 23)
-            .map(|p| p[2..22].try_into().expect("23-byte P2SH program"))
+        rlp_decode_list(&raw).and_then(|items| items.into_iter().next())
     } else {
         None
     };
-    // rskj `PegUtilsLegacy.isPegOutTx` builds BOTH `createP2SHOutputScript` and
-    // (post-RSKIP305) `createP2SHP2WSHOutputScript` of the input's STANDARD
-    // redeem and matches either against each federation's
-    // `getFederationStandardP2SHScript` (`getDefaultP2SHScript`, which is the
-    // P2SH-P2WSH form for a segwit federation). The input's standard redeem is
-    // the same redeem the federation stored, so checking the input's legacy AND
-    // witness-program hashes against a federation's stored hash matches it
-    // whichever form that hash was stored in (a segwit retired/retiring/active
-    // fed stores the witness-program hash; #8,569,377).
-    let has_rskip305 = hardfork_cfg.has_rskip305(rsk_height);
-    let input_matches_fed = |full: &[u8], target: [u8; 20]| -> bool {
-        let std = build_federation_redeem_script(
-            &super::release_tx::spending_redeem_keys(full),
-            super::release_tx::redeem_script_threshold(full),
-        );
-        redeem_script_hash160(&std) == target
-            || (has_rskip305 && federation_output_hash160(&std, 4000) == target)
-    };
-
-    // rskj `BitcoinUtils.extractRedeemScriptFromInput`: a segwit (P2SH-P2WSH)
-    // input carries its redeem in the witness (last item), not the scriptSig
-    // (which is just the witness-program push) — so classification must read it
-    // from there to recognize a segwit peg-out/migration.
-    let input_redeem = |i: &bitcoin::TxIn| -> Option<Vec<u8>> {
-        if !i.witness.is_empty() {
-            i.witness.last().map(|r| r.to_vec())
-        } else {
-            super::release_tx::extract_redeem_script(i.script_sig.as_bytes())
-        }
-    };
-    // (1) txIsFromOldFederation (RSKIP199): any input spends the hardcoded old
-    //     federation address — unconditionally a migration.
-    let tx_from_old_fed = hardfork_cfg.has_rskip199(rsk_height)
-        && btc_tx.input.iter().any(|i| {
-            input_redeem(i)
-                .is_some_and(|r| redeem_script_hash160(&r) == config.old_federation_address_hash160)
-        });
-    // (4) isPegOutTx(liveFeds): an input's standard redeem matches the active
-    //     or retiring federation.
-    let spends_live_fed = btc_tx.input.iter().any(|i| {
-        input_redeem(i).is_some_and(|r| {
-            input_matches_fed(&r, active_std_hash160)
-                || retiring_std_hash160.is_some_and(|t| input_matches_fed(&r, t))
-        })
-    });
-    // (3) isMigrationTx: an input spends the retired or retiring federation AND
-    //     an output funds the active federation (moveFromRetiringOrRetired &&
-    //     moveToActive).
-    let spends_retired_or_retiring = btc_tx.input.iter().any(|i| {
-        input_redeem(i).is_some_and(|r| {
-            retired_hash160.is_some_and(|t| input_matches_fed(&r, t))
-                || retiring_std_hash160.is_some_and(|t| input_matches_fed(&r, t))
-        })
-    });
     let active_output_values: Vec<u64> = btc_tx
         .output
         .iter()
         .filter(|o| o.script_pubkey == fed_script)
         .map(|o| o.value.to_sat())
         .collect();
-    let move_to_active = if hardfork_cfg.has_rskip293(rsk_height) {
-        !active_output_values.is_empty() && active_output_values.iter().all(|v| *v >= min_pegin)
-    } else {
-        active_output_values.iter().sum::<u64>() >= min_pegin
-    };
-    let is_migration = spends_retired_or_retiring && move_to_active;
 
-    if tx_from_old_fed || is_migration || spends_live_fed {
+    // Peg-in value: the outputs paying any live federation
+    // (rskj computeTotalAmountSent over the live-federations wallet).
+    let pays_live_federation = |script: &bitcoin::ScriptBuf| {
+        *script == fed_script || retiring.as_ref().is_some_and(|(_, rs)| *script == *rs)
+    };
+    let live_output_values: Vec<u64> = btc_tx
+        .output
+        .iter()
+        .filter(|o| pays_live_federation(&o.script_pubkey))
+        .map(|o| o.value.to_sat())
+        .collect();
+    let total_value: u64 = live_output_values.iter().sum();
+    // rskj PegUtilsLegacy.isValidPegInTx minimum gate: under RSKIP293 it checks
+    // EACH UTXO (isAnyUTXOAmountBelowMinimum), otherwise the total amount sent
+    // (valueSentToMe.isLessThan). Crucially, an EMPTY live-output set is not
+    // "below minimum" under RSKIP293 (anyMatch over an empty stream is false),
+    // so a tx that pays no live federation (e.g. only a now-retired one, once
+    // the retiring federation has been cleared earlier in the block) is still a
+    // valid peg-in — processed with amount 0 (pegin_btc amount=0, destination
+    // account created). Pre-RSKIP293 a 0 total is below minimum → not a peg-in.
+    // Below the index's height this gate decides whether the transaction is a
+    // peg-in at all, before RSKIP379 and after: one it turns down is neither a
+    // migration nor a pegout here, so rskj leaves it alone.
+    let not_a_peg_in = !pegout_index
+        && pegin_below_minimum(
+            &live_output_values,
+            min_pegin,
+            hardfork_cfg.has_rskip293(rsk_height),
+        );
+    // rskj `PegUtils.getTransactionTypeUsingPegoutIndex`: a transaction whose
+    // first input's sighash the index holds is a pegout or a migration, else one
+    // paying a live federation is a peg-in, and anything else is left
+    // unregistered. Below the index's height, `PegUtilsLegacy.getTransactionType`
+    // (`super::peg_legacy`), which leaves unregistered a transaction it refuses
+    // as a peg-in for an input and finds neither a migration nor a pegout.
+    let pegout_or_migration = if pegout_index {
+        let sig_hash = sig_hash_for_pegout_index(&btc_tx).map_err(|why| {
+            PrecompileError::other(format!(
+                "registerBtcTransaction: rskj aborts stripping this transaction's signatures ({why})"
+            ))
+        })?;
+        if sig_hash.is_some_and(|hash| has_pegout_tx_sig_hash(ctx, &hash)) {
+            Some("PEGOUT_OR_MIGRATION")
+        } else if live_output_values.is_empty() {
+            tracing::debug!("registerBtcTransaction: unknown to the pegout index and pays no live federation; not registered");
+            return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+        } else {
+            None
+        }
+    } else {
+        use super::peg_legacy::{LegacyRules, LiveFederation, PegType};
+        let rskip293 = hardfork_cfg.has_rskip293(rsk_height);
+        let old_federation_p2sh =
+            p2sh_output_script_program(&config.old_federation_address_hash160);
+        let rules = LegacyRules {
+            rskip199: hardfork_cfg.has_rskip199(rsk_height),
+            rskip201: hardfork_cfg.has_rskip201(rsk_height),
+            rskip305: hardfork_cfg.has_rskip305(rsk_height),
+            old_federation_p2sh: &old_federation_p2sh,
+            active: LiveFederation {
+                p2sh: fed_script.as_bytes(),
+                redeem: fed_redeem.as_slice(),
+                format: active_format,
+            },
+            retiring: retiring.as_ref().map(|(redeem, script)| LiveFederation {
+                p2sh: script.as_bytes(),
+                redeem: redeem.as_slice(),
+                format: retiring_format,
+            }),
+            retired_p2sh: retired_p2sh.as_deref(),
+            live_below_minimum: pegin_below_minimum(&live_output_values, min_pegin, rskip293),
+            active_below_minimum: pegin_below_minimum(&active_output_values, min_pegin, rskip293),
+        };
+        let peg_type = rules.transaction_type(&btc_tx).map_err(|why| {
+            PrecompileError::other(format!(
+                "registerBtcTransaction: rskj aborts classifying this transaction ({why})"
+            ))
+        })?;
+        match peg_type {
+            PegType::FromOldFederation => Some("FROM_OLD_FEDERATION"),
+            PegType::Migration => Some("MIGRATION"),
+            PegType::Pegout => Some("PEGOUT"),
+            PegType::Unknown {
+                refused_for_an_input: true,
+            } => {
+                tracing::debug!("registerBtcTransaction: refused as a peg-in for an input, and neither a migration nor a pegout; not registered");
+                return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+            }
+            PegType::PegIn
+            | PegType::Unknown {
+                refused_for_an_input: false,
+            } => None,
+        }
+    };
+
+    if let Some(kind) = pegout_or_migration {
         record_pegin(
             SilentKind::BtcTxMarkedProcessed,
             &btc_tx,
             tx_ctx,
             active_output_values.iter().sum(),
-            if tx_from_old_fed {
-                "FROM_OLD_FEDERATION"
-            } else if is_migration {
-                "MIGRATION"
-            } else {
-                "PEGOUT"
-            },
+            kind,
             vec![],
         );
         let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, rsk_height);
@@ -516,27 +620,6 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // Peg-in value: the outputs paying any live federation
-    // (rskj computeTotalAmountSent over the live-federations wallet).
-    let pays_live_federation = |script: &bitcoin::ScriptBuf| {
-        *script == fed_script || retiring.as_ref().is_some_and(|(_, rs)| *script == *rs)
-    };
-    let live_output_values: Vec<u64> = btc_tx
-        .output
-        .iter()
-        .filter(|o| pays_live_federation(&o.script_pubkey))
-        .map(|o| o.value.to_sat())
-        .collect();
-    let total_value: u64 = live_output_values.iter().sum();
-
-    // rskj PegUtilsLegacy.isValidPegInTx minimum gate: under RSKIP293 it checks
-    // EACH UTXO (isAnyUTXOAmountBelowMinimum), otherwise the total amount sent
-    // (valueSentToMe.isLessThan). Crucially, an EMPTY live-output set is not
-    // "below minimum" under RSKIP293 (anyMatch over an empty stream is false),
-    // so a tx that pays no live federation (e.g. only a now-retired one, once
-    // the retiring federation has been cleared earlier in the block) is still a
-    // valid peg-in — processed with amount 0 (pegin_btc amount=0, destination
-    // account created). Pre-RSKIP293 a 0 total is below minimum → not a peg-in.
     let rskip379 = hardfork_cfg.has_rskip379(rsk_height);
     // RSKIP379 (Arrowhead600) moves the minimum-value gate to
     // `PegUtils.allUTXOsToFedAreAboveMinimumPeginValue`, which EXPLICITLY rejects
@@ -544,15 +627,27 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // empty (or any-below-minimum) set is below minimum — the OPPOSITE of the
     // pre-379 legacy rule where `anyMatch`/`!isAnyUTXOAmountBelowMinimum` is
     // vacuously satisfied by an empty set (a valid amount-0 peg-in, #5,171,600).
-    let below_min = if rskip379 {
-        live_output_values.is_empty() || live_output_values.iter().any(|&v| v < min_pegin)
-    } else {
-        pegin_below_minimum(&live_output_values, min_pegin, hardfork_cfg.has_rskip293(rsk_height))
-    };
+    // It applies to every peg-in, whichever rules classified it.
+    let evaluated = rskip379 && !not_a_peg_in;
+    // rskj `registerPegIn` and `legacyRegisterPegin` begin with
+    // `computeTotalAmountSent`, which reads the active federation's UTXOs and,
+    // while one retires, the retiring federation's: `save()` writes them back
+    // as the call returns, whatever becomes of the peg-in.
+    if !not_a_peg_in {
+        let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, rsk_height);
+        write_back_utxos(ctx, active_utxo_key);
+        if retiring.is_some() {
+            write_back_utxos(ctx, super::storage::OLD_FEDERATION_BTC_UTXOS_KEY);
+        }
+    }
+    let below_min = not_a_peg_in
+        || (evaluated
+            && (live_output_values.is_empty()
+                || live_output_values.iter().any(|&v| v < min_pegin)));
     if below_min {
-        // Pre-RSKIP379: rskj getTransactionType returns UNKNOWN (neither a
+        // Not a peg-in: rskj getTransactionType returns UNKNOWN (neither a
         // migration nor a peg-out), so registerBtcTransaction ignores it silently.
-        // Post-RSKIP379: evaluatePegin returns (NO_REFUND, INVALID_AMOUNT), and
+        // A peg-in from RSKIP379: evaluatePegin returns (NO_REFUND, INVALID_AMOUNT), and
         // BridgeSupport.handleNonRefundablePegin logs rejected_pegin(INVALID_AMOUNT=5)
         // then unrefundable_pegin(NonRefundablePeginReason.INVALID_AMOUNT=3); it
         // marks the tx processed only when shouldMarkRejectedPeginAsProcessed
@@ -566,17 +661,17 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             vec![
                 ("minimumSat", FieldValue::U64(min_pegin)),
                 ("fedOutputs", FieldValue::U64(live_output_values.len() as u64)),
-                // Whether the chain also logged this. Before RSKIP379 it did
-                // not, which is the gap these records exist to fill.
-                ("logged", FieldValue::Flag(rskip379)),
+                // Whether the chain also logged this. Where it isn't a peg-in it
+                // did not, which is the gap these records exist to fill.
+                ("logged", FieldValue::Flag(evaluated)),
             ],
         );
-        if rskip379 {
+        if evaluated {
             let hash = btc_txid_event_bytes(&btc_tx);
             super::events::log_rejected_pegin(ctx, &hash, 5);
             super::events::log_unrefundable_pegin(ctx, &hash, 3);
         }
-        if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
+        if evaluated && should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
             set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         }
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
@@ -623,12 +718,21 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         match super::pegin_instructions::build_pegin_instructions(&btc_tx) {
             Ok(opt) => opt,
             Err(_) => {
-                // processPegIn: parse exception. RSKIP181 logs
-                // PEGIN_V1_INVALID_PAYLOAD(4); refund to the sender (the only
-                // refund address available — a malformed payload has no v1
-                // refund), then mark processed.
-                if hardfork_cfg.has_rskip181(rsk_height) {
-                    super::events::log_rejected_pegin(ctx, &btc_txid_event_bytes(&btc_tx), 4);
+                // rskj `PeginInformation.parse` threw: before RSKIP379 into
+                // `legacyRegisterPegin`'s catch, from it into `evaluatePegin`'s,
+                // which makes a (REFUND or NO_REFUND, PEGIN_V1_INVALID_PAYLOAD) of
+                // it. Both log rejected_pegin(PEGIN_V1_INVALID_PAYLOAD=4) (before
+                // RSKIP379 from RSKIP181), then refund to the sender, the only
+                // refund address a payload that did not parse leaves, or, with no
+                // sender, log unrefundable_pegin(LEGACY_PEGIN_UNDETERMINED_SENDER=1),
+                // the version being still 0 (`refundTxSender`,
+                // `handleNonRefundablePegin`). A refund marks the transaction
+                // processed; no refund does too before RSKIP379, and from it only
+                // between RSKIP459 and RSKIP551.
+                let hash = btc_txid_event_bytes(&btc_tx);
+                let logs = hardfork_cfg.has_rskip181(rsk_height);
+                if logs {
+                    super::events::log_rejected_pegin(ctx, &hash, 4);
                 }
                 match &sender {
                     Some(s) => {
@@ -665,14 +769,25 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                         ],
                     ),
                 }
-                if let Some(sender) = &sender {
-                    let (refund_hash160, refund_is_p2sh) = sender_refund_target(sender);
-                    emit_pegin_rejection_release(
-                        ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_value, &fed_redeem,
-                        &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
-                    );
+                let mark = match &sender {
+                    Some(sender) => {
+                        let (refund_hash160, refund_is_p2sh) = sender_refund_target(sender);
+                        emit_pegin_rejection_release(
+                            ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_value, &fed_redeem,
+                            &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
+                        )?;
+                        true
+                    }
+                    None => {
+                        if logs {
+                            super::events::log_unrefundable_pegin(ctx, &hash, 1);
+                        }
+                        !rskip379 || should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height)
+                    }
+                };
+                if mark {
+                    set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
                 }
-                set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
                 return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
             }
         }
@@ -688,14 +803,17 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
 
     // ---- Version 1 (RSKIP170 OP_RETURN) peg-in ----
     if let Some(instr) = instructions {
-        // processPegInVersion1: NO whitelist, only the locking cap.
-        if !cap_ok(ctx) {
+        // processPegInVersion1: NO whitelist, only the locking cap. From
+        // RSKIP379 `evaluatePegin` registers a v1 peg-in with `executePegIn`,
+        // and the cap isn't asked.
+        if !rskip379 && !cap_ok(ctx) {
             if hardfork_cfg.has_rskip181(rsk_height) {
                 super::events::log_rejected_pegin(ctx, &btc_txid_event_bytes(&btc_tx), 1); // PEGIN_CAP_SURPASSED
             }
             // refundTxSender: refund to the v1 refund address if present, else
-            // the BtcLockSender address; if neither, no refund (a non-refundable
-            // peg-in — unrefundable_pegin event not modeled, see TODO).
+            // the BtcLockSender address; if neither, no refund, and from RSKIP181
+            // unrefundable_pegin(PEGIN_V1_REFUND_ADDRESS_NOT_SET=2), the version
+            // being 1. The transaction is marked processed either way.
             match v1_refund_target(&instr, sender.as_ref()) {
                 Some((h, p2sh)) => {
                     let mut extra = refund_fields(&h, p2sh, config);
@@ -737,7 +855,9 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                 emit_pegin_rejection_release(
                     ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_value, &fed_redeem,
                     &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
-                );
+                )?;
+            } else if hardfork_cfg.has_rskip181(rsk_height) {
+                super::events::log_unrefundable_pegin(ctx, &btc_txid_event_bytes(&btc_tx), 2);
             }
             set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
             return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
@@ -746,13 +866,14 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         // executePegIn: credit the v1 destination from the OP_RETURN payload.
         let dest = RskAddress::from(instr.rsk_destination);
         if !rbtc_amount.is_zero() {
-            let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, dest, rbtc_amount);
+            let _ = bridge_transfer(ctx, dest, rbtc_amount);
         } else {
             // transferTo(dest, 0) still creates+persists the account (RSK keeps
             // empty touched accounts — see the legacy path below).
             let _ = ctx.journal_mut().load_account(dest);
             ctx.journal_mut().touch_account(dest);
         }
+        crate::tracer::record_precompile_transfer(ctx, BRIDGE_ADDR, dest, rbtc_amount);
         // RSKIP170 is required for v1, so pegin_btc (protocolVersion = 1).
         super::events::log_pegin_btc(ctx, dest, &btc_txid_event_bytes(&btc_tx), total_value, 1);
         record_pegin(
@@ -787,8 +908,13 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         // (NO_REFUND, LEGACY_PEGIN_UNDETERMINED_SENDER). Post-RSKIP379
         // `handleNonRefundablePegin` logs rejected_pegin(LEGACY_PEGIN_UNDETERMINED_SENDER=3)
         // then unrefundable_pegin(NonRefundablePeginReason.LEGACY_PEGIN_UNDETERMINED_SENDER=1),
-        // and marks the tx processed only when RSKIP459 && !RSKIP551. Pre-379 the
-        // legacy path aborts silently (sender could not be determined).
+        // and marks the tx processed only when RSKIP459 && !RSKIP551. Before
+        // RSKIP379 `PeginInformation.parse` throws, finding neither a sender nor
+        // instructions, and from RSKIP170 `legacyRegisterPegin`'s catch logs
+        // rejected_pegin(PEGIN_V1_INVALID_PAYLOAD=4) (from RSKIP181), then
+        // `refundTxSender`, with no refund address, unrefundable_pegin(
+        // LEGACY_PEGIN_UNDETERMINED_SENDER=1) (from RSKIP181), and marks the tx
+        // processed (testnet #4,513,687). Before RSKIP170 it does none of that.
         record_pegin(
             SilentKind::PeginRejectedNoRefund,
             &btc_tx,
@@ -796,9 +922,9 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             total_value,
             "LEGACY_PEGIN_UNDETERMINED_SENDER",
             vec![
-                // Post-RSKIP379 this path logs rejected_pegin then
-                // unrefundable_pegin; pre-379 it aborts silently.
-                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip379(rsk_height))),
+                // From RSKIP181 this path logs rejected_pegin then
+                // unrefundable_pegin, before RSKIP379 and after it.
+                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip181(rsk_height))),
                 ("senderType", FieldValue::Text("UNDETERMINED".into())),
                 ("inputShape", FieldValue::Text(undetermined_input_shape(&btc_tx).into())),
                 (
@@ -818,7 +944,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                     ),
                 ),
                 ("peginVersion", FieldValue::U64(0)),
-                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip379(rsk_height))),
+                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip181(rsk_height))),
             ],
         );
         if hardfork_cfg.has_rskip379(rsk_height) {
@@ -828,6 +954,13 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
                 set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
             }
+        } else if hardfork_cfg.has_rskip170(rsk_height) {
+            if hardfork_cfg.has_rskip181(rsk_height) {
+                let hash = btc_txid_event_bytes(&btc_tx);
+                super::events::log_rejected_pegin(ctx, &hash, 4);
+                super::events::log_unrefundable_pegin(ctx, &hash, 1);
+            }
+            set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         }
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     };
@@ -854,33 +987,81 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // can lock; other processable types are refunded ("Btc tx type not
     // supported, returning funds to sender") without consulting the
     // whitelist or the locking cap.
-    let (sender_hash160, sender_is_p2sh, sender_pubkey, lockable): ([u8; 20], bool, Option<&[u8]>, bool) =
-        match &sender {
-            PeginSender::P2pkh { pubkey } => (pubkey_hash160(pubkey), false, Some(pubkey), true),
-            PeginSender::P2shP2wpkh { pubkey, p2sh_hash } => {
-                (*p2sh_hash, true, Some(pubkey), true)
-            }
-            PeginSender::P2shMultisig { p2sh_hash } | PeginSender::P2shP2wsh { p2sh_hash } => {
-                (*p2sh_hash, true, None, false)
-            }
-        };
+    let (sender_hash160, sender_is_p2sh, sender_rsk_address, lockable) = match &sender {
+        PeginSender::P2pkh {
+            btc_hash160,
+            rsk_address,
+        } => (*btc_hash160, false, Some(*rsk_address), true),
+        PeginSender::P2shP2wpkh {
+            p2sh_hash,
+            rsk_address,
+        } => (*p2sh_hash, true, Some(*rsk_address), true),
+        PeginSender::P2shMultisig { p2sh_hash } | PeginSender::P2shP2wsh { p2sh_hash } => {
+            (*p2sh_hash, true, None, false)
+        }
+    };
 
-    // Lock whitelist gate (rskj verifyLockSenderIsWhitelisted): the matching
-    // one-off entry is consumed on success; rejection generates a refund
-    // peg-out back to the sender (generateRejectionRelease).
+    // RSKIP379 (`registerPegIn`): `PegUtils.evaluateLegacyPegin` registers a
+    // P2PKH or P2SH-P2WPKH sender's peg-in with `executePegIn`, asking neither
+    // the lock whitelist nor the locking cap, and refunds a multisig or
+    // P2SH-P2WSH sender's, unless its outputs pay live federations of
+    // different types (`hasOutputsToDifferentTypesOfFeds`): that one is turned
+    // down with no refund, logging rejected_pegin(LEGACY_PEGIN_MULTISIG_SENDER=2)
+    // and unrefundable_pegin(OUTPUTS_SENT_TO_DIFFERENT_TYPES_OF_FEDS=4), and
+    // marked processed only between RSKIP459 and RSKIP551
+    // (`handleNonRefundablePegin`). Reading the outputs throws for one that is
+    // neither P2PKH nor P2SH, which rskj doesn't catch: the call fails.
+    if rskip379 && !lockable {
+        let different = outputs_to_different_types_of_feds(
+            &btc_tx,
+            (&fed_script, active_format),
+            retiring.as_ref().map(|(_, script)| (script, retiring_format)),
+        )
+        .map_err(|why| {
+            PrecompileError::other(format!(
+                "registerBtcTransaction: rskj aborts reading this transaction's outputs ({why})"
+            ))
+        })?;
+        if different {
+            record_pegin(
+                SilentKind::PeginRejectedNoRefund,
+                &btc_tx,
+                tx_ctx,
+                total_value,
+                "LEGACY_PEGIN_MULTISIG_SENDER",
+                vec![
+                    ("senderType", FieldValue::Text(sender_type_name(Some(&sender)).into())),
+                    ("peginVersion", FieldValue::U64(0)),
+                    ("logged", FieldValue::Flag(true)),
+                ],
+            );
+            let hash = btc_txid_event_bytes(&btc_tx);
+            super::events::log_rejected_pegin(ctx, &hash, 2);
+            super::events::log_unrefundable_pegin(ctx, &hash, 4);
+            if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
+                set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
+            }
+            return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+        }
+    }
+
+    // Before RSKIP379, the lock whitelist gate (rskj
+    // verifyLockSenderIsWhitelisted): the matching one-off entry is consumed on
+    // success; rejection generates a refund peg-out back to the sender
+    // (generateRejectionRelease).
     // Locking cap gate (rskj verifyLockDoesNotSurpassLockingCap, RSKIP134):
     // evaluated only when the whitelist passed (rskj short-circuits the &&,
     // so a whitelist rejection never lazily initializes the cap). A cap
     // rejection produces the same refund release as a whitelist one.
     let allowed = lockable
-        && whitelist_allows_and_consume(
-            ctx,
-            &sender_hash160,
-            total_value,
-            btc_block_height,
-            hardfork_cfg.has_rskip87(rsk_height),
-        )
-        && cap_ok(ctx);
+        && (rskip379
+            || (whitelist_allows_and_consume(
+                ctx,
+                &sender_hash160,
+                total_value,
+                btc_block_height,
+                hardfork_cfg.has_rskip87(rsk_height),
+            ) && cap_ok(ctx)));
     tracing::debug!(
         "pegin lock check: sender {} amount {} btc_height {} -> {}",
         to_hex(&sender_hash160),
@@ -952,20 +1133,20 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         emit_pegin_rejection_release(
             ctx, &btc_tx, &sender_hash160, sender_is_p2sh, total_value, &fed_redeem,
             &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
-        );
+        )?;
         set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // RSK destination: rskj's legacy peg-in credits the address derived from
-    // the sender's public key (ethereumj ECKey.getAddress over the
-    // UNCOMPRESSED point — mainnet #267,460 used a 65-byte pubkey).
-    let rsk_destination = sender_pubkey.and_then(super::federation::rsk_address_from_public_key);
+    // RSK destination: rskj's legacy peg-in credits the address its sender
+    // parser derived from the sender's public key (ethereumj ECKey.getAddress
+    // over the UNCOMPRESSED point — mainnet #267,460 used a 65-byte pubkey).
+    let rsk_destination = sender_rsk_address;
 
     // Credit the derived destination address (transfer from Bridge balance)
     if let Some(dest) = rsk_destination {
         if !rbtc_amount.is_zero() {
-            let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, dest, rbtc_amount);
+            let _ = bridge_transfer(ctx, dest, rbtc_amount);
         } else {
             // rskj executePegIn always calls transferTo(dest, amount); a 0-value
             // transfer still creates and persists the destination account (RSK
@@ -974,6 +1155,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             let _ = ctx.journal_mut().load_account(dest);
             ctx.journal_mut().touch_account(dest);
         }
+        crate::tracer::record_precompile_transfer(ctx, BRIDGE_ADDR, dest, rbtc_amount);
 
         // Peg-in events: lock_btc from RSKIP146, pegin_btc from RSKIP170
         // (a legacy peg-in past RSKIP170 logs pegin_btc with protocolVersion 0).
@@ -1085,7 +1267,8 @@ fn record_pegin(
     }
     let mut fields = vec![
         ("btcTxHash", FieldValue::Bytes(btc_txid_event_bytes(btc_tx).to_vec())),
-        ("rskTxHash", FieldValue::Bytes(tx_ctx.rsk_tx_hash.to_vec())),
+        // The transaction in the block, by which a record is found again.
+        ("rskTxHash", FieldValue::Bytes(tx_ctx.origin_tx_hash.to_vec())),
         ("amountSat", FieldValue::U64(amount_sat)),
         ("reason", FieldValue::Text(reason.to_string())),
     ];
@@ -1158,7 +1341,7 @@ fn refund_fields(
 /// hash160 and whether it is a P2SH address.
 fn sender_refund_target(sender: &PeginSender) -> ([u8; 20], bool) {
     match sender {
-        PeginSender::P2pkh { pubkey } => (pubkey_hash160(pubkey), false),
+        PeginSender::P2pkh { btc_hash160, .. } => (*btc_hash160, false),
         PeginSender::P2shP2wpkh { p2sh_hash, .. }
         | PeginSender::P2shMultisig { p2sh_hash }
         | PeginSender::P2shP2wsh { p2sh_hash } => (*p2sh_hash, true),
@@ -1176,6 +1359,42 @@ fn v1_refund_target(
         return Some((refund.hash160, refund.is_p2sh));
     }
     sender.map(sender_refund_target)
+}
+
+/// rskj `PegUtils.hasOutputsToDifferentTypesOfFeds`, which RSKIP379's
+/// `evaluateLegacyPegin` asks of a multisig or P2SH-P2WSH sender's peg-in:
+/// whether the live federations its outputs pay, each a federation's P2SH
+/// script and format version, are two of different format versions. Every
+/// output is read by bitcoinj's `Script.getPubKeyHash` and matched against
+/// each live federation's P2SH hash, the active one first
+/// (`BridgeBtcWallet.getDestinationFederation`), so a P2PKH output to a
+/// federation's hash counts as paying it. An output that is neither P2PKH nor
+/// P2SH throws, which rskj doesn't catch: `Err`, and the call fails.
+fn outputs_to_different_types_of_feds(
+    tx: &BtcTransaction,
+    active: (&bitcoin::ScriptBuf, u64),
+    retiring: Option<(&bitcoin::ScriptBuf, u64)>,
+) -> Result<bool, &'static str> {
+    let hash_of = |script: &bitcoin::ScriptBuf| -> [u8; 20] {
+        script.as_bytes()[2..22].try_into().expect("a federation's 23-byte P2SH script")
+    };
+    let (mut pays_active, mut pays_retiring) = (false, false);
+    for output in &tx.output {
+        let hash = super::rskj_sender_compat::pub_key_hash(output.script_pubkey.as_bytes())?;
+        if hash == hash_of(active.0) {
+            pays_active = true;
+        } else if retiring.is_some_and(|(script, _)| hash == hash_of(script)) {
+            pays_retiring = true;
+        }
+    }
+    match (pays_active, retiring) {
+        (true, Some((_, retiring_format))) if pays_retiring => Ok(active.1 != retiring_format),
+        _ if pays_active || pays_retiring => Ok(false),
+        // An empty set's `iterator.next()`. RSKIP379's minimum check, which
+        // comes first, wants an output to a live federation, so it isn't
+        // reached.
+        _ => Err("NoSuchElementException: the outputs pay no live federation"),
+    }
 }
 
 /// rskj `generateRejectionRelease`: build an empty-wallet refund of all the
@@ -1196,7 +1415,7 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
     tx_ctx: &BridgeTxContext,
-) {
+) -> Result<(), PrecompileError> {
     // TODO(rustock): a rejected peg-in paying BOTH live federations would
     // need per-input redeem scripts in the refund; none exists on
     // mainnet pre-wasabi. Inputs paying the retiring federation use its
@@ -1215,13 +1434,28 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
             coinbase: btc_tx.is_coinbase(),
         })
         .collect();
-    let refund_redeem = if pegin_utxos
-        .iter()
-        .all(|u| retiring.as_ref().is_some_and(|(_, rs)| u.script == rs.to_bytes()))
-    {
-        &retiring.as_ref().expect("checked above").0
-    } else {
-        fed_redeem
+    // rskj `getFederationFromTxOutputs`: the refund is built for the active
+    // federation where the payment pays it, and for the retiring one where it
+    // pays that one alone. That federation's format decides where what spends
+    // an input goes: the scriptSig, or for a P2SH-P2WSH federation the
+    // witness (`ReleaseTransactionBuilder.setSrConfiguration`).
+    let retiring_redeem = retiring
+        .as_ref()
+        .filter(|(_, script)| {
+            pegin_utxos
+                .iter()
+                .all(|utxo| utxo.script == script.to_bytes())
+        })
+        .map(|(redeem, _)| redeem.as_slice());
+    let (refund_redeem, format) = match retiring_redeem {
+        Some(redeem) => (
+            redeem,
+            federation_format_version(ctx, super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY),
+        ),
+        None => (
+            fed_redeem,
+            active_federation_format(ctx, config, hardfork_cfg, rsk_height),
+        ),
     };
     let fee_per_kb = get_effective_fee_per_kb(ctx, config);
     let tx_version = if hardfork_cfg.has_rskip201(rsk_height) { 2 } else { 1 };
@@ -1230,13 +1464,17 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
     } else {
         p2pkh_output_script(refund_hash160)
     };
+    // bitcoinj throws where it cannot size the inputs
+    // (`release_tx::signatures_required`), and so does the peg-in's
+    // registration: nothing of it is kept, and it is not marked processed.
     let built = super::release_tx::build_empty_wallet_to(
         &pegin_utxos,
         &refund_script,
         refund_redeem,
         fee_per_kb,
         tx_version,
-    );
+        format >= 4000,
+    )?;
     tracing::debug!(
         "pegin rejection release: utxos {} fee_per_kb {} built {:?}",
         pegin_utxos.len(),
@@ -1260,6 +1498,7 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
             &btc_txid_event_bytes(&built.tx),
             total_value,
         );
+        process_release_transaction_info(ctx, &built, hardfork_cfg, rsk_height);
         store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
     } else {
         // The refund was due and could not be built -- in practice the inputs
@@ -1281,86 +1520,174 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
             ],
         );
     }
+    Ok(())
 }
 
-/// rskj `BtcLockSender.TxType`: the peg-in sender classification derived
-/// from the FIRST input. `hash160` is the sender's BTC address hash (pubkey
-/// hash for P2PKH, script hash for the P2SH variants) — what rskj's
-/// `senderBtcAddress` carries into the whitelist check and the refund.
+/// rskj `BtcLockSender`: what a peg-in's FIRST input says of its sender, as
+/// one of the four parsers reads it. Each variant carries what the parser
+/// derives. The hash is the sender's Bitcoin address's (`getBTCAddress`: a
+/// public key's hash for P2PKH, a script's for the P2SH variants), which is
+/// what the whitelist is asked about and what a refund pays. The two
+/// single-key shapes also have an RSK address (`getRskAddress`), which a
+/// version 0 peg-in credits.
 enum PeginSender {
-    P2pkh { pubkey: Vec<u8> },
-    P2shP2wpkh { pubkey: Vec<u8>, p2sh_hash: [u8; 20] },
-    P2shMultisig { p2sh_hash: [u8; 20] },
-    P2shP2wsh { p2sh_hash: [u8; 20] },
+    P2pkh {
+        btc_hash160: [u8; 20],
+        rsk_address: alloy_primitives::Address,
+    },
+    P2shP2wpkh {
+        p2sh_hash: [u8; 20],
+        rsk_address: alloy_primitives::Address,
+    },
+    P2shMultisig {
+        p2sh_hash: [u8; 20],
+    },
+    P2shP2wsh {
+        p2sh_hash: [u8; 20],
+    },
 }
+
+/// A public key as rskj's sender parsers read one, with bitcoinj's
+/// `BtcECKey.fromPublicOnly` and then its own `ECKey.fromPublicOnly`. Both are
+/// Bouncy Castle's `decodePoint`, which takes what libsecp256k1 takes, hybrid
+/// keys among it, and also the one byte 0x00, the point at infinity.
+struct SenderKey {
+    /// `BtcECKey.isCompressed()`: the key came in 33 bytes.
+    compressed: bool,
+    /// `BtcECKey.getPubKeyHash()`. bitcoinj encodes the point again before it
+    /// hashes it, compressed if it came compressed and uncompressed if not,
+    /// so a hybrid key hashes as its uncompressed form.
+    btc_hash160: [u8; 20],
+    /// `ECKey.getAddress()`: the hash of the uncompressed point less its first
+    /// byte. Of the point at infinity that is the hash of nothing.
+    rsk_address: alloy_primitives::Address,
+}
+
+/// `None` where `decodePoint` throws.
+fn decode_sender_key(key: &[u8]) -> Option<SenderKey> {
+    use sha3::Digest;
+    let rsk_address = |coordinates: &[u8]| {
+        alloy_primitives::Address::from_slice(&sha3::Keccak256::digest(coordinates)[12..])
+    };
+    if key == [0x00] {
+        return Some(SenderKey {
+            compressed: false,
+            btc_hash160: pubkey_hash160(key),
+            rsk_address: rsk_address(&[]),
+        });
+    }
+    let point = bitcoin::secp256k1::PublicKey::from_slice(key).ok()?;
+    let uncompressed = point.serialize_uncompressed();
+    let compressed = key.len() == 33;
+    Some(SenderKey {
+        compressed,
+        btc_hash160: if compressed {
+            pubkey_hash160(&point.serialize())
+        } else {
+            pubkey_hash160(&uncompressed)
+        },
+        rsk_address: rsk_address(&uncompressed[1..]),
+    })
+}
+
+/// `new Script(redeemScript)` and then `isSentToMultiSig()`, as both multisig
+/// sender parsers run them before their `try`: a redeem script bitcoinj can't
+/// parse throws, and so does one its parser dispatch throws for.
+fn is_multisig_redeem(redeem: &[u8]) -> Result<bool, &'static str> {
+    use super::rskj_sender_compat::{self as bitcoinj, Verdict};
+    if !bitcoinj::parses_as_script(redeem) {
+        return Err("ScriptException parsing the sender's redeem script");
+    }
+    match bitcoinj::is_sent_to_multisig(redeem) {
+        Verdict::Multisig => Ok(true),
+        Verdict::NotMultisig => Ok(false),
+        Verdict::RskjThrows(why) => Err(why),
+    }
+}
+
 /// rskj `BtcLockSenderProvider.tryGetBtcLockSender`: try P2PKH, then
 /// P2SH-P2WPKH, then P2SH-MULTISIG, then P2SH-P2WSH — all on the first
 /// input. Returns `None` when no parser matches (rskj then returns from
 /// registerBtcTransaction WITHOUT marking the tx as processed).
+///
+/// Each parser answers false for what it catches and throws for what it does
+/// outside its `try`, which nothing between it and `Bridge.execute` catches:
+/// the `Err`.
 fn classify_pegin_sender(
     tx: &BtcTransaction,
 ) -> Result<Option<PeginSender>, &'static str> {
-    use super::release_tx::{parse_chunks, Chunk};
+    use super::rskj_sender_compat as bitcoinj;
     let Some(first) = tx.input.first() else { return Ok(None) };
-    let Some(chunks) = parse_chunks(first.script_sig.as_bytes()) else { return Ok(None) };
 
-    // P2PKH: scriptSig is exactly [sig, pubkey] with a valid curve point
-    // (rskj derives both the BTC and RSK addresses from it).
-    if let [Chunk::Data(_sig), Chunk::Data(pubkey)] = chunks.as_slice() {
-        if compress_pubkey(pubkey).is_some() {
-            return Ok(Some(PeginSender::P2pkh { pubkey: pubkey.clone() }));
+    // The first parser tried opens with `getScriptSig()`, which parses the
+    // script, and the later ones read the script it parsed.
+    let Some(chunks) = bitcoinj::chunk_data(first.script_sig.as_bytes()) else {
+        return Err("ScriptException parsing the first input's scriptSig");
+    };
+
+    // P2PKH: a scriptSig of two chunks whose second is a public key, from
+    // which rskj derives both the BTC and RSK addresses. The first chunk is
+    // never looked at. An opcode in the key's place has no data, and decoding
+    // it throws as decoding what isn't a key does: inside the `try`.
+    if chunks.len() == 2 {
+        if let Some(key) = chunks[1].as_deref().and_then(decode_sender_key) {
+            return Ok(Some(PeginSender::P2pkh {
+                btc_hash160: key.btc_hash160,
+                rsk_address: key.rsk_address,
+            }));
         }
     }
 
     let witness: Vec<&[u8]> = first.witness.iter().collect();
 
     // P2SH-P2WPKH: single-chunk scriptSig, witness [sig, compressed pubkey];
-    // P2SH hash = hash160(0x0014 || hash160(pubkey)).
+    // P2SH hash = hash160(0x0014 || hash160(pubkey)). The key is decoded
+    // before the `try`, and one that isn't compressed is not this parser's.
     if chunks.len() == 1 && witness.len() == 2 {
-        let pubkey = witness[1];
-        if pubkey.len() == 33 && compress_pubkey(pubkey).is_some() {
+        let Some(key) = decode_sender_key(witness[1]) else {
+            return Err("IllegalArgumentException decoding the witness's public key");
+        };
+        if key.compressed {
             let mut redeem = vec![0x00, 0x14];
-            redeem.extend_from_slice(&pubkey_hash160(pubkey));
+            redeem.extend_from_slice(&key.btc_hash160);
             return Ok(Some(PeginSender::P2shP2wpkh {
-                pubkey: pubkey.to_vec(),
                 p2sh_hash: pubkey_hash160(&redeem),
+                rsk_address: key.rsk_address,
             }));
         }
     }
 
     // P2SH-MULTISIG: scriptSig [.., sigs.., redeem] with a multisig redeem;
-    // P2SH hash = hash160(redeem).
+    // P2SH hash = hash160(redeem). A scriptSig that ends in an opcode has no
+    // data to build the redeem script from: a NullPointerException.
     //
     // The predicate lives in `rskj_sender_compat` rather than here: it is a
     // faithful port of bitcoinj's parser dispatch, kept apart so that it can be
     // switched off and deleted when the RSKIP retiring this path activates.
-    if super::rskj_sender_compat::enabled() && chunks.len() >= 3 {
-        if let Some(Chunk::Data(redeem)) = chunks.last() {
-            match super::rskj_sender_compat::is_sent_to_multisig(redeem) {
-                super::rskj_sender_compat::Verdict::Multisig => {
-                    return Ok(Some(PeginSender::P2shMultisig {
-                        p2sh_hash: pubkey_hash160(redeem),
-                    }));
-                }
-                super::rskj_sender_compat::Verdict::RskjThrows(why) => return Err(why),
-                super::rskj_sender_compat::Verdict::NotMultisig => {}
-            }
+    if bitcoinj::enabled() && chunks.len() >= 3 {
+        let Some(redeem) = chunks[chunks.len() - 1].as_deref() else {
+            return Err(
+                "NullPointerException: the scriptSig ends in an opcode, not a redeem script",
+            );
+        };
+        if is_multisig_redeem(redeem)? {
+            return Ok(Some(PeginSender::P2shMultisig {
+                p2sh_hash: pubkey_hash160(redeem),
+            }));
         }
     }
 
     // P2SH-P2WSH: single-chunk scriptSig, witness [.., sigs.., redeem] with
     // a multisig redeem; P2SH hash = hash160(0x0020 || sha256(redeem)).
-    if super::rskj_sender_compat::enabled() && chunks.len() == 1 && witness.len() >= 3 {
+    if bitcoinj::enabled() && chunks.len() == 1 && witness.len() >= 3 {
         let redeem = witness[witness.len() - 1];
-        match super::rskj_sender_compat::is_sent_to_multisig(redeem) {
-            super::rskj_sender_compat::Verdict::Multisig => {
-                use sha2::Digest;
-                let mut merged = vec![0x00, 0x20];
-                merged.extend_from_slice(&sha2::Sha256::digest(redeem));
-                return Ok(Some(PeginSender::P2shP2wsh { p2sh_hash: pubkey_hash160(&merged) }));
-            }
-            super::rskj_sender_compat::Verdict::RskjThrows(why) => return Err(why),
-            super::rskj_sender_compat::Verdict::NotMultisig => {}
+        if is_multisig_redeem(redeem)? {
+            use sha2::Digest;
+            let mut merged = vec![0x00, 0x20];
+            merged.extend_from_slice(&sha2::Sha256::digest(redeem));
+            return Ok(Some(PeginSender::P2shP2wsh {
+                p2sh_hash: pubkey_hash160(&merged),
+            }));
         }
     }
 
@@ -1461,17 +1788,19 @@ fn whitelist_allows_and_consume<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     sender_hash160: &[u8; 20],
     amount: u64,
-    height: u64,
+    height: i32,
     rskip87: bool,
 ) -> bool {
-    // rskj `getLockWhitelist()` deserializes BOTH cells together, so reaching
-    // this function reads both even where the decision needs only one.
-    let (mut one_off, disable_h) = load_one_off_whitelist(ctx);
-    let unlimited = load_unlimited_whitelist(ctx);
-    let disabled = (height as i64) > (disable_h as i64);
+    let mut whitelist = super::storage::LockWhitelist::load(ctx, rskip87);
+    let disabled = height > whitelist.disable_height;
 
-    let allowed = if let Some(pos) = one_off.iter().position(|(h, _)| h == sender_hash160) {
-        let allowed = disabled || amount <= one_off[pos].1;
+    let one_off = whitelist
+        .one_off
+        .iter()
+        .position(|(h, _)| h == sender_hash160);
+    let allowed = if let Some(pos) = one_off {
+        let entry_max = whitelist.one_off[pos].1;
+        let allowed = disabled || amount <= entry_max;
         if allowed {
             // A one-off entry is spent here and gone from the next block's
             // state, with nothing logged to say it was ever used.
@@ -1480,30 +1809,32 @@ fn whitelist_allows_and_consume<CTX: crate::RskContextTr>(
                 vec![
                     ("senderHash160", FieldValue::Bytes(sender_hash160.to_vec())),
                     ("amountSat", FieldValue::U64(amount)),
-                    ("entryMaxSat", FieldValue::U64(one_off[pos].1)),
+                    ("entryMaxSat", FieldValue::U64(entry_max)),
                     ("whitelistDisabled", FieldValue::Flag(disabled)),
                 ],
             );
             // rskj consumes the matching one-off entry only on success.
-            one_off.remove(pos);
+            whitelist.one_off.remove(pos);
         }
         allowed
     } else if disabled {
         true
     } else {
-        unlimited.contains(sender_hash160)
+        whitelist.unlimited.contains(sender_hash160)
     };
 
     // Unconditional, including on rejection: rskj's save() writes the
     // whitelist back because the call loaded it, not because it changed it.
     // See `save_lock_whitelist` -- this write is why testnet #6,602 has a
     // `lockWhitelist` cell at all.
-    super::storage::save_lock_whitelist(ctx, &one_off, disable_h, &unlimited, rskip87);
+    whitelist.save(ctx);
     allowed
 }
 
 /// rskj `BridgeSupport.registerNewUtxos`: register every output paying the
-/// given federation script into the given UTXO storage set.
+/// given federation script into the given UTXO storage set. rskj reads the
+/// set whether or not the transaction pays the federation, and `save()`
+/// writes it back, the empty list where the cell held nothing.
 fn register_federation_outputs<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     btc_tx: &BtcTransaction,
@@ -1524,9 +1855,6 @@ fn register_federation_outputs<CTX: crate::RskContextTr>(
             coinbase: btc_tx.is_coinbase(),
         })
         .collect();
-    if new_utxos.is_empty() {
-        return;
-    }
     let mut utxos = load_utxos_at(ctx, utxo_key);
     utxos.extend(new_utxos);
     store_utxos_at(ctx, utxo_key, &utxos);
@@ -1568,14 +1896,41 @@ fn flyover_code_output(code: i64) -> Bytes {
     Bytes::copy_from_slice(&value.to_be_bytes::<32>())
 }
 
+/// rskj `BridgeUtils.deserializeBtcAddressWithVersion`, for a Flyover BTC
+/// address argument, and `serializeBtcAddressWithVersion` of the address it
+/// builds: the 21 bytes, `[version || hash160]`, that the derivation hash and
+/// the refund read. `None` where rskj throws, which
+/// `Bridge.registerFlyoverBtcTransaction` answers with GENERIC_ERROR.
+///
+/// Before RSKIP284 (`BridgeUtilsLegacy.deserializeBtcAddressWithVersionLegacy`)
+/// the version is `addressBytes[0]`, a signed Java byte, and the bytes after
+/// the 21st are ignored; an array shorter than 21 throws in its `arraycopy`.
+/// From RSKIP284 the array must be exactly 21 bytes, and the version is read
+/// unsigned. Either way bitcoinj's `Address(params, version, hash160)` then
+/// refuses a negative version (`VersionedChecksummedBytes`) and one its
+/// network doesn't accept (`WrongNetworkException`): mainnet 0 and 5, testnet
+/// and regtest 111 and 196. So before RSKIP284 a testnet P2SH address, version
+/// 196 or `0xc4`, which is -60 as a signed byte, is refused (testnet
+/// #2,122,593). That also makes the written version one byte in both eras:
+/// `BigInteger.valueOf(version).toByteArray()` is one byte for the versions
+/// that get through before RSKIP284 (0 to 127), and `intToBytesNoLeadZeroes`
+/// is from it.
+fn flyover_btc_address(bytes: &[u8], config: &BridgeConstants, rskip284: bool) -> Option<[u8; 21]> {
+    if rskip284 && bytes.len() != 21 {
+        return None;
+    }
+    let address: [u8; 21] = bytes.get(..21)?.try_into().ok()?;
+    let version = if rskip284 { i32::from(address[0]) } else { i32::from(address[0] as i8) };
+    let accepted = [super::getters::p2pkh_version(config), super::getters::p2sh_version(config)];
+    accepted.iter().any(|&v| i32::from(v) == version).then_some(address)
+}
+
 /// rskj `PegUtils.getFlyoverDerivationHash`:
 /// `keccak256(derivationArgumentsHash(32) || userRefundAddrBytes ||
 /// lbcAddress(20) || lpBtcAddrBytes)`. Note the array-copy order puts the LBC
 /// address BEFORE the LP address (NOT the parameter order). The BTC-address
-/// bytes are `serializeBtcAddressWithVersion`; pre-RSKIP284 (iris) that
-/// round-trips the input `[version || hash160]` arg unchanged (a single version
-/// byte for every mainnet address version), so the raw 21-byte ABI args are
-/// used verbatim.
+/// bytes are `serializeBtcAddressWithVersion`'s, as [`flyover_btc_address`]
+/// returns them.
 fn flyover_derivation_hash(
     derivation_arguments_hash: &[u8; 32],
     user_refund_addr_bytes: &[u8],
@@ -1607,9 +1962,9 @@ fn flyover_redeem_script(flyover_derivation_hash: &[u8; 32], federation_redeem: 
 /// Flyover (RSKIP176, iris300) peg-in. Full port of rskj
 /// `BridgeSupport.registerFlyoverBtcTransaction`. Returns an int256:
 /// the locked amount in wei on success, or a negative `FlyoverTxResponseCodes`
-/// value on every rejection / unprocessable path. The method only ever fails
-/// the tx for a malformed BTC transaction or PMT (mirrors rskj's outer
-/// try/catch returning GENERIC_ERROR for those).
+/// value on every rejection / unprocessable path. It never fails the
+/// transaction: rskj's `Bridge.registerFlyoverBtcTransaction` catches every
+/// exception and answers GENERIC_ERROR.
 #[allow(clippy::too_many_arguments)]
 pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
@@ -1631,52 +1986,61 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
 
     // rskj wraps the whole body in try/catch → GENERIC_ERROR. Any malformed
     // ABI / arg shape returns GENERIC_ERROR (NOT a failed tx).
-    let parse = (|| -> Option<(usize, u64, usize, [u8; 32], Vec<u8>, RskAddress, Vec<u8>, bool)> {
-        if args.len() < 256 {
-            return None;
-        }
-        let btc_tx_offset = U256::from_be_slice(args.get(0..32)?).to::<usize>();
-        let btc_block_height = U256::from_be_slice(args.get(32..64)?).to::<u64>();
-        let pmt_offset = U256::from_be_slice(args.get(64..96)?).to::<usize>();
-        let derivation_args_hash: [u8; 32] = args.get(96..128)?.try_into().ok()?;
-        let user_refund_offset = U256::from_be_slice(args.get(128..160)?).to::<usize>();
-        // arg5: address (right-aligned in 32 bytes → low 20 bytes).
-        let lbc_address = RskAddress::from_slice(args.get(172..192)?);
-        let lp_offset = U256::from_be_slice(args.get(192..224)?).to::<usize>();
-        let should_transfer_to_contract = U256::from_be_slice(args.get(224..256)?) != U256::ZERO;
-        let user_refund_addr = read_dynamic_bytes(args, user_refund_offset).ok()?;
-        let lp_btc_addr = read_dynamic_bytes(args, lp_offset).ok()?;
+    // The arguments as rskj's decoder reads them: the height is `intValue()`,
+    // the LBC address `new RskAddress((DataWord) args[5])` and the flag
+    // `BoolType`'s `intValue() != 0`.
+    type Parsed = (
+        Vec<u8>,
+        i32,
+        Vec<u8>,
+        [u8; 32],
+        Vec<u8>,
+        RskAddress,
+        Vec<u8>,
+        bool,
+    );
+    let parse = (|| -> Option<Parsed> {
+        let args = crate::abi::Args::new(args);
         Some((
-            btc_tx_offset, btc_block_height, pmt_offset, derivation_args_hash,
-            user_refund_addr, lbc_address, lp_btc_addr, should_transfer_to_contract,
+            args.bytes(0)?.to_vec(),
+            args.int(1)?.int_value(),
+            args.bytes(2)?.to_vec(),
+            args.bytes32(3)?,
+            args.bytes(4)?.to_vec(),
+            args.address(5)?,
+            args.bytes(6)?.to_vec(),
+            args.bool(7)?,
         ))
     })();
     let Some((
-        btc_tx_offset, btc_block_height, pmt_offset, derivation_args_hash,
-        user_refund_addr, lbc_address, lp_btc_addr, should_transfer_to_contract,
+        btc_tx_data,
+        btc_block_height,
+        pmt_data,
+        derivation_args_hash,
+        user_refund_addr,
+        lbc_address,
+        lp_btc_addr,
+        should_transfer_to_contract,
     )) = parse
     else {
         return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
     };
 
     // rskj parses BOTH BTC addresses in the ABI layer (`Bridge.registerFlyover-
-    // BtcTransaction`) via `BridgeUtils.deserializeBtcAddressWithVersion`, wrapped
-    // in a try/catch that returns GENERIC_ERROR on ANY exception — and this runs
-    // BEFORE `bridgeSupport.registerFlyoverBtcTransaction`'s isContractTx/sender
-    // checks. Post-RSKIP284 (hop400) the deserializer REQUIRES exactly 21 bytes
-    // (`[version || 20-byte hash160]`), throwing `BridgeIllegalArgumentException`
-    // otherwise; pre-RSKIP284 the legacy path only needs ≥21 bytes (a shorter
-    // array throws `ArrayIndexOutOfBoundsException` in its `arraycopy`). Either
-    // way a bad-length address yields GENERIC_ERROR. The userRefund address is
-    // parsed first, the LP address second (mainnet #5,967,453: a 33-byte
-    // userRefund address makes rskj return GENERIC_ERROR, not a validations code).
+    // BtcTransaction`) via `BridgeUtils.deserializeBtcAddressWithVersion`, the
+    // userRefund address first, wrapped in a try/catch that returns
+    // GENERIC_ERROR on ANY exception -- and this runs BEFORE
+    // `bridgeSupport.registerFlyoverBtcTransaction`'s isContractTx/sender
+    // checks. [`flyover_btc_address`] says what it refuses: mainnet #5,967,453
+    // has a 33-byte userRefund address, refused from RSKIP284, and testnet
+    // #2,122,593 a testnet P2SH address, refused before it.
     let rskip284 = hardfork_cfg.has_rskip284(rsk_height_of(ctx));
-    let address_len_ok = |bytes: &[u8]| -> bool {
-        if rskip284 { bytes.len() == 21 } else { bytes.len() >= 21 }
-    };
-    if !address_len_ok(&user_refund_addr) || !address_len_ok(&lp_btc_addr) {
+    let (Some(user_refund_addr), Some(lp_btc_addr)) = (
+        flyover_btc_address(&user_refund_addr, config, rskip284),
+        flyover_btc_address(&lp_btc_addr, config, rskip284),
+    ) else {
         return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
-    }
+    };
 
     // rskj `isContractTx`: the rskTx must be an InternalTransaction (the Bridge
     // was reached via a contract CALL), i.e. call depth > 1.
@@ -1688,16 +2052,14 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_INVALID_SENDER));
     }
 
-    let btc_tx_data = read_dynamic_bytes(args, btc_tx_offset)?;
-    let pmt_data = read_dynamic_bytes(args, pmt_offset)?;
-
     // wtxid (calculateBtcTxHash over the raw bytes) — the first already-used key.
     let btc_tx_hash = calculate_btc_tx_hash(&btc_tx_data);
 
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let use_v2 = hardfork_cfg.has_stored_block_v2(block_number);
-    let rskip199 = hardfork_cfg.has_rskip199(block_number);
-    super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
+    // A store that can't be seeded throws, which rskj answers as any throw.
+    if super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg).is_err() {
+        return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
+    }
 
     // getFlyoverDerivationHash (over the raw 21-byte address args; see helper).
     let flyover_hash = flyover_derivation_hash(
@@ -1712,51 +2074,35 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_ALREADY_PROCESSED));
     }
 
-    // validationsForRegisterBtcTransaction: PMT + merkle root + confirmations.
-    let validations = (|| -> bool {
-        if !PartialMerkleTree::has_expected_size(&pmt_data) {
-            return false;
+    // validationsForRegisterBtcTransaction: a false is the validations code,
+    // and a throw reaches `Bridge.registerFlyoverBtcTransaction`'s catch, which
+    // answers GENERIC_ERROR.
+    match validations_for_register_btc_transaction(
+        ctx,
+        config,
+        hardfork_cfg,
+        &btc_tx_hash,
+        btc_block_height,
+        &pmt_data,
+        &btc_tx_data,
+    ) {
+        Ok(()) => {}
+        Err(Invalid::Swallowed(_)) => {
+            return ok(flyover_code_output(
+                flyover_codes::UNPROCESSABLE_VALIDATIONS,
+            ))
         }
-        let Some(pmt) = PartialMerkleTree::parse(&pmt_data) else { return false };
-        let Some(pmt_result) = pmt.extract_matches() else { return false };
-        if !pmt_result.matched_hashes.contains(&btc_tx_hash) {
-            return false;
+        Err(Invalid::Thrown(_) | Invalid::IllegalArgument(_)) => {
+            return ok(flyover_code_output(flyover_codes::GENERIC_ERROR))
         }
-        let Some(stored_block) =
-            super::btc_chain::stored_block_at_main_chain_height(ctx, btc_block_height as u32, rskip199)
-        else {
-            return false;
-        };
-        let block_hash = stored_block.header.block_hash();
-        let block_merkle_root = *stored_block.header.merkle_root.to_raw_hash().as_byte_array();
-        let root_valid = pmt_result.merkle_root == block_merkle_root || {
-            let block_hash_bytes = {
-                let mut raw = *block_hash.to_raw_hash().as_byte_array();
-                raw.reverse();
-                raw
-            };
-            match get_coinbase_information(ctx, &block_hash_bytes) {
-                Some(mut wr) => {
-                    wr.reverse();
-                    pmt_result.merkle_root == wr
-                }
-                None => false,
-            }
-        };
-        if !root_valid {
-            return false;
-        }
-        let best_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
-        let confirmations = best_height as i64 - btc_block_height as i64 + 1;
-        confirmations >= config.btc2rsk_minimum_acceptable_confirmations as i64
-    })();
-    if !validations {
-        return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_VALIDATIONS));
     }
 
-    // Parse the BTC tx and compute the witness-stripped txid (getHash(false)).
-    let btc_tx: BtcTransaction = deserialize(&btc_tx_data)
-        .map_err(|_| PrecompileError::other("registerFastBridgeBtcTransaction: invalid BTC transaction"))?;
+    // Parse the BTC tx as bitcoinj does, hold it to `verify()` (BridgeSupport
+    // l.2771-2772), and compute the witness-stripped txid (getHash(false)). A
+    // throw from either is answered by the same catch.
+    let Ok(btc_tx) = read_btc_transaction(&btc_tx_data) else {
+        return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
+    };
     let btc_tx_hash_no_witness = legacy_btc_txid(&btc_tx);
 
     // Second already-used check, keyed by the legacy txid (only when it differs
@@ -1790,8 +2136,8 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     // one has activated; its redeem follows the OLD federation's STORED format
     // version (`federation.getRedeemScript()`), so an ERP retiring federation
     // gets its ERP flyover redeem. The flyover output script is a plain P2SH for
-    // every federation format except P2SH-P2WSH-ERP (`getFlyoverFederationOutputScript`),
-    // which rustock does not yet support — feds at hop400 are P2SH-ERP.
+    // every federation format except P2SH-P2WSH-ERP, whose is the P2SH of the
+    // flyover script's witness program (`getFlyoverFederationOutputScript`).
     let retiring_format =
         federation_format_version(ctx, super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY);
     let retiring_flyover = if hardfork_cfg.has_rskip293(block_number) {
@@ -1813,6 +2159,21 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     } else {
         None
     };
+
+    // Before RSKIP293 `getAmountSentToAddresses` is
+    // `BridgeUtilsLegacy.getAmountSentToAddress`, which reads every output as an
+    // address with bitcoinj's `Script.getToAddress`. That throws for one that is
+    // neither P2PKH nor P2SH -- a native segwit output, an OP_RETURN, a script it
+    // can't parse -- and `Bridge.registerFlyoverBtcTransaction` answers the throw
+    // with GENERIC_ERROR, nothing transferred or registered.
+    if !hardfork_cfg.has_rskip293(block_number)
+        && btc_tx
+            .output
+            .iter()
+            .any(|o| !bitcoinj_reads_as_address(o.script_pubkey.as_bytes()))
+    {
+        return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
+    }
 
     // validateFlyoverPeginValue: the amount sent to the flyover address(es) must
     // be non-zero (getAmountSentToAddresses sums outputs paying any flyover
@@ -1890,9 +2251,17 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         // flyover UTXOs of BOTH the active and (RSKIP293) retiring feds, resolving
         // each input's redeem from its flyover P2SH (FlyoverCompatibleBtcWallet-
         // WithMultipleScripts).
-        let mut flyover_redeems: Vec<Vec<u8>> = vec![flyover_redeem.clone()];
+        let mut flyover_feds = vec![(
+            flyover_redeem.clone(),
+            flyover_script.clone(),
+            active_format,
+        )];
         if let Some(r) = &retiring_flyover {
-            flyover_redeems.push(r.flyover_redeem.clone());
+            flyover_feds.push((
+                r.flyover_redeem.clone(),
+                r.flyover_script.clone(),
+                retiring_format,
+            ));
         }
         let mut extra = refund_fields(&refund_hash160, refund_is_p2sh, config);
         extra.push(("peginPath", FieldValue::Text("flyover".into())));
@@ -1910,8 +2279,8 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         );
         emit_flyover_rejection_release(
             ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_satoshis,
-            &flyover_redeems, rsk_height, config, hardfork_cfg, tx_ctx,
-        );
+            &flyover_feds, rsk_height, config, hardfork_cfg, tx_ctx,
+        )?;
         return ok(flyover_code_output(if is_lp {
             flyover_codes::REFUNDED_LP
         } else {
@@ -1947,8 +2316,9 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     // transferTo(lbcAddress, amount): credit the LBC contract.
     let rbtc_amount = btc_satoshi_to_rbtc_wei(total_satoshis);
     if !rbtc_amount.is_zero() {
-        let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, lbc_address, rbtc_amount);
+        let _ = bridge_transfer(ctx, lbc_address, rbtc_amount);
     }
+    crate::tracer::record_precompile_transfer(ctx, BRIDGE_ADDR, lbc_address, rbtc_amount);
 
     // saveFlyoverActiveFederationDataInStorage:
     //   - mark the flyover hash used (keyed by the legacy txid)
@@ -1981,6 +2351,25 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
 
     // Returns the locked amount in wei (co.rsk.core.Coin.fromBitcoin.asBigInteger).
     ok(Bytes::copy_from_slice(&rbtc_amount.to_be_bytes::<32>()))
+}
+
+/// Whether bitcoinj's `Script.getToAddress` reads `script` as an address rather
+/// than throwing: the script parses, and is P2PKH by its chunks
+/// (`isSentToAddress`, a push of 20 bytes between `OP_DUP OP_HASH160` and
+/// `OP_EQUALVERIFY OP_CHECKSIG`, however the push is written) or P2SH by its
+/// bytes (`isPayToScriptHash`, the 23-byte template).
+fn bitcoinj_reads_as_address(script: &[u8]) -> bool {
+    use super::release_tx::{parse_chunks, Chunk};
+    let Some(chunks) = parse_chunks(script) else {
+        return false;
+    };
+    let p2pkh = matches!(
+        chunks.as_slice(),
+        [Chunk::Op(0x76), Chunk::Op(0xa9), Chunk::Data(hash), Chunk::Op(0x88), Chunk::Op(0xac)]
+            if hash.len() == 20
+    );
+    let p2sh = script.len() == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87;
+    p2pkh || p2sh
 }
 
 /// Flyover federation information for one federation (active or retiring): the
@@ -2024,17 +2413,49 @@ fn mark_flyover_derivation_hash_used<CTX: crate::RskContextTr>(
     super::storage::bridge_store_raw(ctx, key, Some(vec![1]));
 }
 
+/// rskj `BridgeStorageIndexKey.PEGOUT_TX_SIG_HASH` for one sighash. The key's
+/// identifier is the sighash's `Sha256Hash.toString()`, which for a
+/// `hashForSignature` result is bitcoinj `Sha256Hash.twiceOf` = INTERNAL byte
+/// order — NOT reversed, unlike a txid's `getHash().toString()`
+/// (`wrapReversed`). So the hex is taken directly, not via
+/// `btc_hash_hex_display`.
+fn pegout_tx_sig_hash_key(sig_hash: &[u8; 32]) -> U256 {
+    compound_key(
+        super::storage::PEGOUT_TX_SIG_HASH_KEY,
+        "-",
+        &to_hex(sig_hash),
+    )
+}
+
 /// rskj `BridgeStorageProvider.setPegoutTxSigHash`/`savePegoutTxSigHashes`
 /// (RSKIP379): index a created pegout by the legacy SIGHASH_ALL of its first
 /// input (`BitcoinUtils.getSigHashForPegoutIndex` → `hashForSignature(0,
-/// redeemScript, ALL, false)`). The key identifier is the sigHash's
-/// `Sha256Hash.toString()`, which for a `hashForSignature` result is bitcoinj
-/// `Sha256Hash.twiceOf` = INTERNAL byte order — NOT reversed, unlike a txid's
-/// `getHash().toString()` (`wrapReversed`). So the hex is taken directly, not
-/// via `btc_hash_hex_display`. Value is a single TRUE byte (`new byte[]{1}`).
+/// redeemScript, ALL, false)`). Value is a single TRUE byte (`new byte[]{1}`).
 fn save_pegout_tx_sig_hash<CTX: crate::RskContextTr>(ctx: &mut CTX, sig_hash: &[u8; 32]) {
-    let key = compound_key(super::storage::PEGOUT_TX_SIG_HASH_KEY, "-", &to_hex(sig_hash));
-    super::storage::bridge_store_raw(ctx, key, Some(vec![1]));
+    super::storage::bridge_store_raw(ctx, pegout_tx_sig_hash_key(sig_hash), Some(vec![1]));
+}
+
+/// rskj `BridgeStorageProvider.hasPegoutTxSigHash`: the index holds a sighash
+/// when its key holds the single TRUE byte. Read only from RSKIP379, where
+/// `pegout_tx_index_enabled` sends the classification.
+fn has_pegout_tx_sig_hash<CTX: crate::RskContextTr>(ctx: &mut CTX, sig_hash: &[u8; 32]) -> bool {
+    super::storage::bridge_load_raw(ctx, pegout_tx_sig_hash_key(sig_hash))
+        .is_some_and(|data| data.len() == 1 && data[0] == 1)
+}
+
+/// rskj `PegUtils.isPegoutTxIndexEnabled`: from RSKIP379, a transaction in a
+/// Bitcoin block at least `btc_height_when_pegout_tx_index_activates` plus
+/// `pegout_tx_index_grace_period_in_btc_blocks` high is classified by the
+/// pegout index, and one below it by the legacy rules.
+fn pegout_tx_index_enabled(
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    rsk_height: u64,
+    btc_height: i32,
+) -> bool {
+    let start = i64::from(config.btc_height_when_pegout_tx_index_activates)
+        + i64::from(config.pegout_tx_index_grace_period_in_btc_blocks);
+    hardfork_cfg.has_rskip379(rsk_height) && i64::from(btc_height) >= start
 }
 
 /// rskj `BitcoinUtils.getSigHashForPegoutIndex`: index a created pegout by the
@@ -2093,21 +2514,45 @@ fn save_release_outpoints_values<CTX: crate::RskContextTr>(
     super::storage::bridge_store_raw(ctx, key, Some(serialized));
 }
 
+/// rskj `processReleaseTransactionInfo`, which ends the settling of every
+/// release the Bridge builds: a pegout's, a migration's, and the refund of a
+/// peg-in it turns down (`settleReleaseRejection`). From RSKIP428 it logs
+/// `pegout_transaction_created` with the value of each output the release
+/// spends, in the order of its inputs, and from RSKIP305 it stores those
+/// values under the release's hash.
+fn process_release_transaction_info<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    built: &super::release_tx::BuiltPegout,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) {
+    if !hardfork_cfg.has_rskip428(block_number) {
+        return;
+    }
+    let outpoint_values: Vec<u64> = built
+        .used_utxos
+        .iter()
+        .map(|utxo| utxo.value_satoshis)
+        .collect();
+    let txid = btc_txid_event_bytes(&built.tx);
+    super::events::log_pegout_transaction_created(ctx, &txid, &outpoint_values);
+    save_release_outpoints_values(ctx, &txid, &outpoint_values, hardfork_cfg, block_number);
+}
+
 /// rskj `BridgeStorageProvider.getReleaseOutpointsValues`: the per-input spent
 /// values stored when a release tx is created, keyed by its witness-stripped
-/// hash. Decodes the bitcoinj `VarInt` concatenation (`UtxoUtils`).
+/// hash, or none where nothing is kept under it. Decodes the bitcoinj `VarInt`
+/// concatenation (`UtxoUtils`).
 fn load_release_outpoints_values<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     btc_tx_hash_display: &[u8; 32],
-) -> Vec<u64> {
+) -> Option<Vec<u64>> {
     let key = compound_key(
         super::storage::RELEASES_OUTPOINTS_VALUES_KEY,
         "-",
         &to_hex(btc_tx_hash_display),
     );
-    let Some(bytes) = super::storage::bridge_load_raw(ctx, key) else {
-        return Vec::new();
-    };
+    let bytes = super::storage::bridge_load_raw(ctx, key)?;
     let mut values = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
@@ -2129,7 +2574,7 @@ fn load_release_outpoints_values<CTX: crate::RskContextTr>(
         values.push(v);
         i += consumed;
     }
-    values
+    Some(values)
 }
 
 /// rskj `getStorageKeyForFlyoverHash`:
@@ -2237,10 +2682,11 @@ fn resolve_flyover_input_redeems<CTX: crate::RskContextTr>(
 /// empty-wallet refund of the flyover-federation outputs to `refund_hash160`
 /// using the FLYOVER redeem script(s), enqueue it, and log release_requested.
 ///
-/// `flyover_redeems` is the list of candidate flyover redeem scripts (the active
-/// fed's, plus the retiring fed's under RSKIP293). The refund spends every output
-/// paying any of their flyover P2SH addresses; each input is resolved to its own
-/// redeem (rskj `FlyoverCompatibleBtcWalletWithMultipleScripts`).
+/// `flyover_feds` holds, for the active federation and then (under RSKIP293) the
+/// retiring one, its flyover redeem script, the output script that pays it,
+/// and the federation's format. The refund spends every output paying one of
+/// them; each input is resolved to its own redeem (rskj
+/// `FlyoverCompatibleBtcWalletWithMultipleScripts`).
 #[allow(clippy::too_many_arguments)]
 fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
@@ -2248,22 +2694,21 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
     refund_hash160: &[u8; 20],
     refund_is_p2sh: bool,
     total_satoshis: u64,
-    flyover_redeems: &[Vec<u8>],
+    flyover_feds: &[(Vec<u8>, bitcoin::ScriptBuf, u64)],
     rsk_height: u64,
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
     tx_ctx: &BridgeTxContext,
-) {
-    // Map each flyover P2SH output script → its redeem, then gather the spending
-    // UTXOs in output order with their resolved redeem.
-    let scripts: Vec<(bitcoin::ScriptBuf, &[u8])> = flyover_redeems
-        .iter()
-        .map(|r| (p2sh_output_script(&redeem_script_hash160(r)), r.as_slice()))
-        .collect();
+) -> Result<(), PrecompileError> {
+    // Gather the spending UTXOs in output order, each with the redeem of the
+    // flyover address it pays.
     let mut utxos: Vec<BridgeUtxo> = Vec::new();
     let mut input_redeems: Vec<&[u8]> = Vec::new();
     for (index, o) in btc_tx.output.iter().enumerate() {
-        if let Some((_, redeem)) = scripts.iter().find(|(s, _)| *s == o.script_pubkey) {
+        if let Some((redeem, _, _)) = flyover_feds
+            .iter()
+            .find(|(_, script, _)| *script == o.script_pubkey)
+        {
             utxos.push(BridgeUtxo {
                 tx_hash: btc_txid_event_bytes(btc_tx),
                 vout: index as u32,
@@ -2275,6 +2720,15 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
             input_redeems.push(redeem);
         }
     }
+    // rskj `getFlyoverFederationFromTxOutputs`: the refund is built for the
+    // active federation where the payment pays its flyover address, and for
+    // the retiring one where it pays that one's alone, and in that federation's
+    // format: with the witness for a P2SH-P2WSH one
+    // (`ReleaseTransactionBuilder.setSrConfiguration`).
+    let is_segwit = flyover_feds
+        .iter()
+        .find(|(_, script, _)| btc_tx.output.iter().any(|o| o.script_pubkey == *script))
+        .is_some_and(|(_, _, format)| *format >= 4000);
     let fee_per_kb = get_effective_fee_per_kb(ctx, config);
     let tx_version = if hardfork_cfg.has_rskip201(rsk_height) { 2 } else { 1 };
     let refund_script = if refund_is_p2sh {
@@ -2289,30 +2743,40 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
     let built = if input_redeems.iter().all(|r| *r == input_redeems.first().copied().unwrap_or(&[])) {
         let single = input_redeems.first().copied().unwrap_or(&[]);
         super::release_tx::build_empty_wallet_to(
-            &utxos, &refund_script, single, fee_per_kb, tx_version,
-        )
+            &utxos, &refund_script, single, fee_per_kb, tx_version, is_segwit,
+        )?
     } else {
         build_flyover_empty_wallet_multi(
-            &utxos, &input_redeems, &refund_script, fee_per_kb, tx_version,
-        )
+            &utxos,
+            &input_redeems,
+            &refund_script,
+            fee_per_kb,
+            tx_version,
+            is_segwit,
+        )?
     };
     if let Some(built) = built {
+        // rskj names a flyover refund by `internalTx.getOriginHash()`, the
+        // hash of the transaction in the block, where every other release is
+        // named by `rskTx.getHash()`.
         let use_tx_hash = hardfork_cfg.has_rskip146(rsk_height);
         let mut waiting = load_pegout_confirmation_set(ctx, use_tx_hash);
         waiting.push(PegoutWaitingForConfirmations {
             btc_tx_raw: btc_serialize(&built.tx),
             rsk_block_height: rsk_height,
-            rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
+            rsk_tx_hash: use_tx_hash.then_some(tx_ctx.origin_tx_hash),
         });
         release_requested_or_record(
             ctx,
             use_tx_hash,
-            &tx_ctx.rsk_tx_hash,
+            &tx_ctx.origin_tx_hash,
             &btc_txid_event_bytes(&built.tx),
             total_satoshis,
         );
+        process_release_transaction_info(ctx, &built, hardfork_cfg, rsk_height);
         store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
     }
+    Ok(())
 }
 
 /// rskj `ReleaseTransactionBuilder.buildEmptyWalletTo` over a multi-script
@@ -2322,34 +2786,35 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
 /// single flyover tx funds BOTH the active and retiring flyover feds.
 ///
 /// The fee sizing mirrors bitcoinj exactly: a single downward fee adjustment of
-/// `feePerKb * size / 1000`, where `size` is the empty-scriptSig serialized
-/// length plus, per input, `threshold * SIG_SIZE + redeemScript.len()`. The
-/// final placeholder-filled tx must not exceed MAX_STANDARD_TX_SIZE.
+/// `feePerKb * size / 1000`, no less than the reference minimum, where `size`
+/// is the empty-scriptSig serialized length plus, per input, `threshold *
+/// SIG_SIZE + redeemScript.len()`, segwit-weighted for a P2SH-P2WSH federation
+/// (`is_segwit`), whose inputs carry their witnesses. The size limit is
+/// `release_tx::fill_inputs`'s. It refuses, and throws, where
+/// `release_tx::build_empty_wallet_to` does.
 fn build_flyover_empty_wallet_multi(
     utxos: &[BridgeUtxo],
     input_redeems: &[&[u8]],
     refund_script: &bitcoin::ScriptBuf,
     fee_per_kb: u64,
     version: i32,
-) -> Option<super::release_tx::BuiltPegout> {
+    is_segwit: bool,
+) -> Result<Option<super::release_tx::BuiltPegout>, super::release_tx::UncountableSignatures> {
     use bitcoin::{
         absolute::LockTime, transaction::Version, Amount, OutPoint, Sequence, TxIn, TxOut, Witness,
     };
-    // bitcoinj constants (see release_tx.rs): SIG_SIZE=75, min fee 5000 sat/kB,
-    // MAX_STANDARD_TX_SIZE=100k.
-    const SIG_SIZE: usize = 75;
+    // bitcoinj's minimum fee (see release_tx.rs): 5000 sat/kB.
     const REFERENCE_DEFAULT_MIN_TX_FEE: u64 = 5000;
-    const MAX_STANDARD_TX_SIZE: usize = 100_000;
 
     if utxos.is_empty() {
-        return None;
+        return Ok(None);
     }
     let thresholds: Vec<usize> = input_redeems
         .iter()
         .map(|r| super::release_tx::redeem_script_threshold(r))
         .collect();
     if thresholds.contains(&0) {
-        return None;
+        return Ok(None);
     }
     let gathered: u64 = utxos.iter().map(|u| u.value_satoshis).sum();
 
@@ -2383,32 +2848,30 @@ fn build_flyover_empty_wallet_multi(
         }],
     };
 
-    let base_size = bitcoin::consensus::serialize(&tx).len();
-    let sig_estimate: usize = input_redeems
-        .iter()
-        .zip(&thresholds)
-        .map(|(r, t)| t * SIG_SIZE + r.len())
-        .sum();
-    let size = base_size + sig_estimate;
-    let fee_rate = fee_per_kb.max(REFERENCE_DEFAULT_MIN_TX_FEE);
-    let fee = fee_rate * size as u64 / 1000;
+    // As `release_tx::build_empty_wallet_to` sizes and fills its inputs, with
+    // each input's own redeem script.
+    let base_size =
+        bitcoin::consensus::serialize(&tx).len() + if is_segwit { utxos.len() * 36 } else { 0 };
+    let sig_estimate = super::release_tx::signing_bytes(input_redeems.iter().copied())?;
+    let size = if is_segwit {
+        (base_size + sig_estimate + 3 * base_size) / 4
+    } else {
+        base_size + sig_estimate
+    };
+    let fee = (fee_per_kb * size as u64 / 1000).max(REFERENCE_DEFAULT_MIN_TX_FEE);
     if fee >= gathered {
-        return None;
+        return Ok(None);
     }
     let value = gathered - fee;
     if value < super::release_tx::min_non_dust_value(refund_script) {
-        return None;
+        return Ok(None);
     }
     tx.output[0].value = Amount::from_sat(value);
 
-    for (input, (redeem, threshold)) in tx.input.iter_mut().zip(input_redeems.iter().zip(&thresholds)) {
-        input.script_sig =
-            bitcoin::ScriptBuf::from_bytes(super::release_tx::placeholder_scriptsig(redeem, *threshold));
+    if !super::release_tx::fill_inputs(&mut tx, input_redeems.iter().copied(), is_segwit) {
+        return Ok(None);
     }
-    if bitcoin::consensus::serialize(&tx).len() > MAX_STANDARD_TX_SIZE {
-        return None;
-    }
-    Some(super::release_tx::BuiltPegout { tx, used_utxos: utxos.to_vec() })
+    Ok(Some(super::release_tx::BuiltPegout { tx, used_utxos: utxos.to_vec() }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2454,7 +2917,15 @@ pub fn release_btc<CTX: crate::RskContextTr>(
     // Convert Wei to satoshis: 1 satoshi = 10^10 wei
     let satoshis_per_wei = U256::from(10_000_000_000u64);
     let amount_satoshis_u256 = call_value_wei / satoshis_per_wei;
-    let amount_satoshis = amount_satoshis_u256.to::<u64>();
+    // rskj `co.rsk.core.Coin.toBitcoin()` takes the satoshis' `longValue()`,
+    // their low 64 bits as a signed long, and the minimum, the events and the
+    // refund before RSKIP427 all use that long. No mainnet or testnet balance
+    // comes near 2^63 satoshis, but regtest's genesis funds accounts with
+    // 10^30 wei, which wrap, and wrap negative past 2^63: a negative long is
+    // below every minimum, and rskj logs and refunds it as it is.
+    let satoshis = amount_satoshis_u256.as_limbs()[0] as i64;
+    // The amount the events carry before RSKIP427.
+    let satoshis_word = long_word(satoshis);
 
     // rskj `BridgeSupport.releaseBtc` (BridgeSupport.java:891) rejects a peg-out
     // requested by a CONTRACT before any min-value check, because a BTC address
@@ -2472,7 +2943,7 @@ pub fn release_btc<CTX: crate::RskContextTr>(
             let event_amount = if hardfork_cfg.has_rskip427(block_number) {
                 call_value_wei
             } else {
-                U256::from(amount_satoshis)
+                satoshis_word
             };
             super::events::log_release_request_rejected(
                 ctx,
@@ -2482,8 +2953,15 @@ pub fn release_btc<CTX: crate::RskContextTr>(
             );
             return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
         }
-        // Pre-RSKIP185: rskj throws Program.OutOfGasException (no event, no refund).
-        return Err(PrecompileError::OutOfGas);
+        // Before RSKIP185 rskj throws `Program.OutOfGasException`: no event, no
+        // refund. `Bridge.releaseBtc` lets it through and `Bridge.execute`
+        // wraps it in a `VMException`, as it wraps any other throw, so the
+        // call fails as a throw does: before RSKIP197, which comes with
+        // RSKIP185 on every network, the contract that made the call fails
+        // with all its gas.
+        return Err(PrecompileError::other(
+            "releaseBtc: a contract asked for a peg-out",
+        ));
     }
 
     // rskj BridgeSupport.requestRelease: post-RSKIP219 the minimum is INCLUSIVE
@@ -2499,22 +2977,24 @@ pub fn release_btc<CTX: crate::RskContextTr>(
         let (active_keys, active_redeem) =
             active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
         let num_sigs_required = (active_keys.len() / 2 + 1) as u64;
+        let segwit = active_federation_format(ctx, config, hardfork_cfg, block_number) >= 4000;
         let require_funds_for_fee = require_funds_for_fee(
             &active_redeem,
             num_sigs_required,
             fee_per_kb,
             hardfork_cfg.has_rskip271(block_number),
+            segwit,
             config,
         );
         let min_value = config.minimum_pegout_tx_value.max(require_funds_for_fee);
-        if amount_satoshis < min_value {
+        if i128::from(satoshis) < i128::from(min_value) {
             // rskj: FEE_ABOVE_VALUE when minValue == requireFundsForFee, else
             // LOW_AMOUNT. RejectedPegoutReason: LOW_AMOUNT=1, FEE_ABOVE_VALUE=3.
             Some(if min_value == require_funds_for_fee { 3 } else { 1 })
         } else {
             None
         }
-    } else if amount_satoshis_u256 <= U256::from(config.legacy_minimum_pegout_tx_value) {
+    } else if i128::from(satoshis) <= i128::from(config.legacy_minimum_pegout_tx_value) {
         Some(1) // legacy: always LOW_AMOUNT
     } else {
         None
@@ -2530,21 +3010,28 @@ pub fn release_btc<CTX: crate::RskContextTr>(
             // `Coin.fromBitcoin(weis.toBitcoin())` — the wei truncated to satoshi
             // granularity, which silently kept the sub-satoshi remainder in the
             // Bridge (mainnet #8,010,127: a 340,353-sat pegout below the 400,000
-            // minimum, 4,349,191,903 wei of sub-satoshi remainder).
-            let refund_wei = if hardfork_cfg.has_rskip427(block_number) {
-                call_value_wei
+            // minimum, 4,349,191,903 wei of sub-satoshi remainder). That is the
+            // long's satoshis back in wei, negative where the long is, and
+            // rskj's `Repository.transfer` moves a negative amount the other way:
+            // from the sender to the Bridge. A sender holding less would go
+            // below zero in rskj, which no balance here can; then nothing moves.
+            let (from, to, refund_wei) = if hardfork_cfg.has_rskip427(block_number) {
+                (BRIDGE_ADDR, tx_ctx.rsk_sender, call_value_wei)
             } else {
-                amount_satoshis_u256 * U256::from(10_000_000_000u64)
+                let refund = U256::from(satoshis.unsigned_abs()) * satoshis_per_wei;
+                if satoshis < 0 {
+                    (tx_ctx.rsk_sender, BRIDGE_ADDR, refund)
+                } else {
+                    (BRIDGE_ADDR, tx_ctx.rsk_sender, refund)
+                }
             };
-            let _ = ctx
-                .journal_mut()
-                .transfer(BRIDGE_ADDR, tx_ctx.rsk_sender, refund_wei);
+            let _ = ctx.journal_mut().transfer(from, to, refund_wei);
             // Pre-RSKIP427 the event amount is in satoshis; post-427 it is the
             // full wei call value (rskj logs `releaseRequestedValueInWeis`).
             let event_amount = if hardfork_cfg.has_rskip427(block_number) {
                 call_value_wei
             } else {
-                U256::from(amount_satoshis)
+                satoshis_word
             };
             super::events::log_release_request_rejected(
                 ctx,
@@ -2556,6 +3043,9 @@ pub fn release_btc<CTX: crate::RskContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
+    // Accepted: the long is at least the minimum, so not negative.
+    let amount_satoshis = satoshis.unsigned_abs();
+
     // BTC destination: RIPEMD160(SHA256(compressed_pubkey)) derived from tx sender.
     // tx_ctx.btc_sender_hash160 was computed by the executor from the RSK tx signature,
     // matching rskj's BridgeUtils.recoverBtcAddressFromEthTransaction.
@@ -2564,17 +3054,17 @@ pub fn release_btc<CTX: crate::RskContextTr>(
     let use_tx_hash_format = hardfork_cfg.has_rskip146(block_number);
 
     if use_tx_hash_format {
-        // Post-RSKIP146: store in releaseRequestQueueWithTxHash (triple format)
-        let key = bridge_storage_key(RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY);
-        let existing = bridge_load_bytes(ctx, key);
-        let mut queue = deserialize_release_queue_with_hash(&existing);
+        // Post-RSKIP146: rskj's `getReleaseRequestQueue` reads both cells,
+        // `releaseRequestQueue` and `releaseRequestQueueWithTxHash`, the
+        // request goes in with its hash, and `saveReleaseRequestQueue` writes
+        // both back, the legacy one as the empty list where it held nothing.
+        let mut queue = load_release_request_queue(ctx, true);
         queue.push(ReleaseRequest {
             btc_dest_hash160: btc_dest,
             amount_satoshis,
             rsk_tx_hash: Some(tx_ctx.rsk_tx_hash),
         });
-        let updated = serialize_release_queue_with_hash(&queue);
-        bridge_store_bytes(ctx, key, &updated);
+        save_release_request_queue(ctx, &queue, true);
     } else {
         // Pre-RSKIP146: store in releaseRequestQueue (pair format)
         let key = bridge_storage_key(RELEASE_REQUEST_QUEUE_KEY);
@@ -2599,7 +3089,7 @@ pub fn release_btc<CTX: crate::RskContextTr>(
         let event_amount = if hardfork_cfg.has_rskip427(block_number) {
             call_value_wei
         } else {
-            U256::from(amount_satoshis)
+            satoshis_word
         };
         super::events::log_release_request_received(
             ctx,
@@ -2612,6 +3102,18 @@ pub fn release_btc<CTX: crate::RskContextTr>(
     }
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// A Java `long` as rskj writes it into an event's word
+/// (`SolidityType.IntType.encodeInt`): sign-extended to 32 bytes, in a
+/// `uint256` field as in an `int256` one.
+fn long_word(long: i64) -> U256 {
+    let magnitude = U256::from(long.unsigned_abs());
+    if long < 0 {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2687,34 +3189,39 @@ pub fn update_collections<CTX: crate::RskContextTr>(
     // `newFederationFormatVersion` (mainnet #1,591,009).
     super::federation::save_new_federation_multikey(ctx, hardfork_cfg, block_number);
 
+    // rskj reads the peg-outs waiting for confirmations once in the call,
+    // before the call adds any; how many it read sizes the set
+    // `processConfirmedPegouts` walks (`next_pegout_with_enough_confirmations`).
+    let loaded_pegouts = load_pegout_confirmation_set(ctx, use_tx_hash).len();
+
     // -----------------------------------------------------------------------
     // Step 0: Funds migration (rskj processFundsMigration) — while the new
     // federation is in its migration window, each updateCollections call
     // moves the retiring federation's balance into the active federation
     // with a migration transaction queued like a peg-out.
     // -----------------------------------------------------------------------
-    process_funds_migration(ctx, config, hardfork_cfg, block_number, tx_ctx);
+    process_funds_migration(ctx, config, hardfork_cfg, block_number, tx_ctx)?;
 
     // -----------------------------------------------------------------------
     // Step 1: Process peg-out requests (rskj processPegoutRequests)
     // -----------------------------------------------------------------------
-    let should_process_requests = if use_rskip271 {
-        // RSKIP271: batching — only process when nextPegoutHeight ≤ current block
-        let next_height =
-            super::storage::bridge_load_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY).to::<u64>();
-        block_number >= next_height
-    } else {
-        true // Pre-RSKIP271: process every block
-    };
+    // RSKIP271: rskj's `processPegoutsInBatch` first reads the next peg-out
+    // height (`BridgeStorageProvider.getNextPegoutHeight`, 0 where the cell
+    // holds nothing), and `saveNextPegoutHeight` writes back what it read
+    // unless a new height was set.
+    let read_next_height = use_rskip271
+        .then(|| super::storage::bridge_load_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY).to::<u64>());
+    // RSKIP271: batching -- only process when nextPegoutHeight <= current
+    // block. Pre-RSKIP271: process every block.
+    let should_process_requests =
+        read_next_height.is_none_or(|next_height| block_number >= next_height);
+    let mut next_height_set = false;
 
     if should_process_requests {
         // rskj `getReleaseRequestQueue` concatenates the legacy queue with the
-        // with-txhash one; it does not pick whichever is populated. Reading
-        // only one was correct on mainnet by circumstance -- the legacy queue
-        // was drained before RSKIP146 activated at iris300 (#3,614,800) and
-        // every request since carries a tx hash -- but it is not correct by
-        // construction, and an entry that ever landed in the legacy queue
-        // afterwards would have been silently stranded there forever.
+        // with-txhash one, from RSKIP146 (papyrus200, mainnet #2,392,700); it
+        // does not pick whichever is populated, so a request queued before
+        // RSKIP146 and still waiting is read with those queued since.
         let pending = load_release_request_queue(ctx, use_tx_hash);
 
         // RSKIP271: rskj processPegoutsInBatch sets nextPegoutHeight whenever
@@ -2801,23 +3308,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                     // RSKIP428 (lovell700): processReleaseTransactionInfo emits
                     // pegout_transaction_created right after release_requested,
                     // listing each spent input's value (in input order).
-                    if hardfork_cfg.has_rskip428(block_number) {
-                        let outpoint_values: Vec<u64> =
-                            built.used_utxos.iter().map(|u| u.value_satoshis).collect();
-                        let txid = btc_txid_event_bytes(&built.tx);
-                        super::events::log_pegout_transaction_created(
-                            ctx,
-                            &txid,
-                            &outpoint_values,
-                        );
-                        save_release_outpoints_values(
-                            ctx,
-                            &txid,
-                            &outpoint_values,
-                            hardfork_cfg,
-                            block_number,
-                        );
-                    }
+                    process_release_transaction_info(ctx, &built, hardfork_cfg, block_number);
                     // rskj BridgeSupport.adjustBalancesIfChangeOutputWasDust
                     // (unconditional since genesis): when a dusty change
                     // output was raised to the non-dust minimum (paid by the
@@ -2840,7 +3331,13 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         let spent_by_federation = sum_inputs.saturating_sub(change);
                         if spent_by_federation < amount {
                             let to_burn = amount - spent_by_federation;
-                            let _ = ctx.journal_mut().transfer(
+                            let _ = bridge_transfer(
+                                ctx,
+                                BURN_ADDR,
+                                btc_satoshi_to_rbtc_wei(to_burn),
+                            );
+                            crate::tracer::record_precompile_transfer(
+                                ctx,
                                 BRIDGE_ADDR,
                                 BURN_ADDR,
                                 btc_satoshi_to_rbtc_wei(to_burn),
@@ -2865,6 +3362,9 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                             script: p2pkh_output_script(&request.btc_dest_hash160),
                             amount_satoshis: request.amount_satoshis,
                         }];
+                        // A build bitcoinj cannot size throws, and so does
+                        // this call, with no request processed (testnet
+                        // #2,237,507).
                         match super::release_tx::complete_pegout_tx(
                             &available,
                             &outputs,
@@ -2873,7 +3373,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                             fee_per_kb,
                             tx_version,
                             is_segwit,
-                        ) {
+                        )? {
                             Some(built) => {
                                 settle(
                                     ctx,
@@ -2891,34 +3391,49 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                     kept.extend(to_retry);
                     save_release_request_queue(ctx, &kept, use_tx_hash);
                 } else {
-                    // RSKIP271+ (processPegoutsInBatch): one batched BTC tx
-                    // for the whole queue, keyed by this updateCollections
-                    // call's tx hash.
-                    let outputs: Vec<super::release_tx::PegoutOutput> = pending
-                        .iter()
-                        .map(|r| super::release_tx::PegoutOutput {
-                            script: p2pkh_output_script(&r.btc_dest_hash160),
-                            amount_satoshis: r.amount_satoshis,
-                        })
-                        .collect();
-                    if let Some(built) = super::release_tx::complete_pegout_tx(
-                        &available,
-                        &outputs,
-                        &change_script,
-                        redeem_for,
-                        fee_per_kb,
-                        tx_version,
-                        is_segwit,
-                    ) {
-                        let total: u64 = pending.iter().map(|r| r.amount_satoshis).sum();
-                        // rskj logBatchPegoutCreated needs the batch BTC tx hash
-                        // and the per-request creation RSK tx hashes; capture
-                        // them before `settle` consumes `built`.
-                        let batch_btc_tx_hash = btc_txid_event_bytes(&built.tx);
-                        let batch_rsk_tx_hashes: Vec<[u8; 32]> = pending
+                    // RSKIP271+ (processPegoutsInBatch): one batched BTC tx,
+                    // keyed by this updateCollections call's tx hash. While
+                    // bitcoinj finds the transaction over its size and there
+                    // is more than one request, rskj halves the batch, keeping
+                    // the first half of the queue (`subList(0, size / 2)`).
+                    let build = |batch: &[ReleaseRequest]| {
+                        let outputs: Vec<super::release_tx::PegoutOutput> = batch
                             .iter()
-                            .map(|r| r.rsk_tx_hash.unwrap_or(tx_ctx.rsk_tx_hash))
+                            .map(|r| super::release_tx::PegoutOutput {
+                                script: p2pkh_output_script(&r.btc_dest_hash160),
+                                amount_satoshis: r.amount_satoshis,
+                            })
                             .collect();
+                        super::release_tx::build_pegout_tx(
+                            &available,
+                            &outputs,
+                            &change_script,
+                            redeem_for,
+                            fee_per_kb,
+                            tx_version,
+                            is_segwit,
+                        )
+                    };
+                    let mut batched: &[ReleaseRequest] = &pending;
+                    let mut result = build(batched)?;
+                    while batched.len() > 1
+                        && matches!(
+                            result,
+                            Err(super::release_tx::BuildRefusal::ExceededMaxTransactionSize)
+                        )
+                    {
+                        batched = &batched[..batched.len() / 2];
+                        result = build(batched)?;
+                    }
+                    if let Ok(built) = result {
+                        // rskj settles the batch with what the whole queue asked
+                        // for (`totalPegoutValue`), batched or not: the amount
+                        // `release_requested` logs, and what
+                        // `adjustBalancesIfChangeOutputWasDust` burns against.
+                        let total: u64 = pending.iter().map(|r| r.amount_satoshis).sum();
+                        // rskj logBatchPegoutCreated needs the batch BTC tx hash;
+                        // capture it before `settle` consumes `built`.
+                        let batch_btc_tx_hash = btc_txid_event_bytes(&built.tx);
                         // RSKIP379: index this pegout by the legacy sighash of
                         // its first input (BridgeSupport.savePegoutTxSigHash,
                         // inside settleReleaseRequest). Compute before `settle`
@@ -2945,20 +3460,36 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         );
                         // rskj BridgeSupport.processPegoutsInBatch logs
                         // batch_pegout_created right after settleReleaseRequest
-                        // (which already logged release_requested), listing every
-                        // batched request's RSK creation tx hash.
+                        // (which already logged release_requested), listing each
+                        // batched request's RSK creation tx hash. A request
+                        // queued before RSKIP146 has none, and
+                        // `serializeRskTxHashes` throws on it: so does the call.
+                        let Some(batch_rsk_tx_hashes) = batched
+                            .iter()
+                            .map(|r| r.rsk_tx_hash)
+                            .collect::<Option<Vec<[u8; 32]>>>()
+                        else {
+                            return Err(PrecompileError::other(
+                                "updateCollections: a batched peg-out request has no creation hash",
+                            ));
+                        };
                         super::events::log_batch_pegout_created(
                             ctx,
                             &batch_btc_tx_hash,
                             &batch_rsk_tx_hashes,
                         );
                         created_any = true;
-                        // The whole queue was batched into one BTC tx, so it
-                        // is now empty (rskj removeEntries(pegoutEntries)).
-                        // rskj re-serializes the emptied queue, so the cell
-                        // holds RLP.encodeList([]) = [0xc0], NOT empty bytes.
-                        save_release_request_queue(ctx, &[], use_tx_hash);
-                        queue_emptied = true;
+                        // rskj `removeEntries` is `List.removeAll`: every queued
+                        // request equal to a batched one goes. The queue is
+                        // re-serialized, so an emptied cell holds
+                        // RLP.encodeList([]) = [0xc0], NOT empty bytes.
+                        let kept: Vec<ReleaseRequest> = pending
+                            .iter()
+                            .filter(|r| !batched.iter().any(|b| same_release_request(b, r)))
+                            .cloned()
+                            .collect();
+                        save_release_request_queue(ctx, &kept, use_tx_hash);
+                        queue_emptied = kept.is_empty();
                     }
                 }
 
@@ -2982,7 +3513,11 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                 NEXT_PEGOUT_HEIGHT_KEY,
                 U256::from(next_height),
             );
+            next_height_set = true;
         }
+    }
+    if let (Some(read), false) = (read_next_height, next_height_set) {
+        super::storage::bridge_store_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY, U256::from(read));
     }
 
     // -----------------------------------------------------------------------
@@ -2997,6 +3532,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
             &waiting,
             block_number,
             min_confirmations,
+            loaded_pegouts,
         );
 
         if let Some(pos) = confirmed_pos {
@@ -3025,9 +3561,16 @@ pub fn update_collections<CTX: crate::RskContextTr>(
             // - RSKIP375+: the pegout creation RSK tx hash
             // - RSKIP146..RSKIP176: creation hash, falling back to this tx
             // - otherwise (incl. pre-RSKIP146): this updateCollections tx hash
-            #[allow(clippy::if_same_then_else)] // distinct rskj rules that coincide today
-            let rsk_hash = if hardfork_cfg.has_rskip375(block_number) {
-                entry.rsk_tx_hash.unwrap_or(tx_ctx.rsk_tx_hash)
+            let rskip375 = hardfork_cfg.has_rskip375(block_number);
+            let rsk_hash = if rskip375 {
+                // A peg-out of no creation hash, made before RSKIP146, is
+                // looked up in rskj's `TreeMap` under null, which throws.
+                let Some(creation) = entry.rsk_tx_hash else {
+                    return Err(PrecompileError::other(
+                        "updateCollections: a confirmed peg-out has no creation hash",
+                    ));
+                };
+                creation
             } else if use_tx_hash && !hardfork_cfg.has_rskip176(block_number) {
                 entry.rsk_tx_hash.unwrap_or(tx_ctx.rsk_tx_hash)
             } else {
@@ -3037,6 +3580,14 @@ pub fn update_collections<CTX: crate::RskContextTr>(
             let wfs_key = bridge_storage_key(PEGOUTS_WAITING_FOR_SIGNATURES_KEY);
             let wfs_data = bridge_load_bytes(ctx, wfs_key);
             let mut wfs = deserialize_rsk_txs_waiting_for_signatures(&wfs_data);
+            // rskj `checkIfEntryExistsInPegoutsWaitingForSignatures`: from
+            // RSKIP375 a key the set already holds is not taken over; the call
+            // throws, and both sets stay as they were.
+            if rskip375 && wfs.contains_key(&rsk_hash) {
+                return Err(PrecompileError::other(
+                    "updateCollections: a peg-out already waits for signatures under this key",
+                ));
+            }
             wfs.insert(rsk_hash, entry.btc_tx_raw);
             let updated_wfs = serialize_rsk_txs_waiting_for_signatures(&wfs);
             bridge_store_bytes(ctx, wfs_key, &updated_wfs);
@@ -3062,7 +3613,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
     // Step 4: drive the RSKIP419 Sign Validation Protocol for a proposed
     // federation (rskj updateSvpState).
     // -----------------------------------------------------------------------
-    update_svp_state(ctx, config, hardfork_cfg, block_number, tx_ctx);
+    update_svp_state(ctx, config, hardfork_cfg, block_number, tx_ctx)?;
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
@@ -3078,19 +3629,19 @@ fn update_svp_state<CTX: crate::RskContextTr>(
     hardfork_cfg: &RskHardforkConfig,
     block_number: u64,
     tx_ctx: &BridgeTxContext,
-) {
+) -> Result<(), PrecompileError> {
     if !hardfork_cfg.has_rskip419(block_number) {
-        return;
+        return Ok(());
     }
     let Some(proposed) = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY)
     else {
-        return;
+        return Ok(());
     };
 
     // isSvpOngoing: the proposal is still within its validation window.
     if block_number >= proposed.creation_block + config.validation_period_duration_in_blocks {
         process_svp_failure(ctx, &proposed, config, hardfork_cfg, block_number);
-        return;
+        return Ok(());
     }
 
     // shouldCreateAndProcessSvpFundTransaction: every SVP value must be clear.
@@ -3106,7 +3657,7 @@ fn update_svp_state<CTX: crate::RskContextTr>(
             hardfork_cfg,
             block_number,
             tx_ctx,
-        );
+        )?;
     }
 
     // Once the fund tx change has been registered (svpFundTxSigned set), build
@@ -3123,6 +3674,7 @@ fn update_svp_state<CTX: crate::RskContextTr>(
             tx_ctx,
         );
     }
+    Ok(())
 }
 
 /// rskj `BridgeSupport.processSvpFailure`: the proposed federation did not pass
@@ -3173,12 +3725,12 @@ fn process_svp_fund_transaction_unsigned<CTX: crate::RskContextTr>(
     hardfork_cfg: &RskHardforkConfig,
     block_number: u64,
     tx_ctx: &BridgeTxContext,
-) {
+) -> Result<(), PrecompileError> {
     let svp_fund_tx_outputs_value = config.minimum_pegout_tx_value * 2;
     let Some(built) =
-        build_svp_fund_transaction(ctx, proposed, svp_fund_tx_outputs_value, config, hardfork_cfg, block_number)
+        build_svp_fund_transaction(ctx, proposed, svp_fund_tx_outputs_value, config, hardfork_cfg, block_number)?
     else {
-        return;
+        return Ok(());
     };
 
     // setSvpFundTxHashUnsigned(tx.getHash()) = RLP element of the display-order txid.
@@ -3250,6 +3802,7 @@ fn process_svp_fund_transaction_unsigned<CTX: crate::RskContextTr>(
         super::events::log_pegout_transaction_created(ctx, &fund_hash, &outpoint_values);
         save_release_outpoints_values(ctx, &fund_hash, &outpoint_values, hardfork_cfg, block_number);
     }
+    Ok(())
 }
 
 /// rskj `BridgeSupport.processSvpSpendTransactionUnsigned`: once the SVP fund
@@ -3516,32 +4069,107 @@ fn svp_is_ongoing<CTX: crate::RskContextTr>(
         .is_some_and(|p| block_number < p.creation_block + config.validation_period_duration_in_blocks)
 }
 
-/// rskj `BitcoinUtils.getMultiSigTransactionHashWithoutSignatures`: the txid a
-/// signed multisig tx would have with its signatures stripped (each input's
-/// scriptSig rebuilt as the redeem placeholder). Returns the display-order hash,
-/// or `None` if any input is not a standard P2SH multisig (rskj throws → not an
-/// SVP tx). Witness txs use the plain txid.
-fn multisig_txid_without_signatures(tx: &BtcTransaction) -> Option<[u8; 32]> {
-    // Witness txs use the plain txid (rskj getMultiSigTransactionHashWithoutSignatures).
-    if tx.input.iter().any(|i| !i.witness.is_empty()) {
-        return Some(btc_txid_event_bytes(tx));
-    }
+/// The most signatures a federation's input can ask for: `OP_CHECKMULTISIG`
+/// takes at most 20 keys. Only the federation's own pegouts are in the index,
+/// and only its own SVP transactions are stored unsigned, so an input asking
+/// for more can't belong to any of them, and its stripped transaction isn't
+/// built.
+const MAX_FEDERATION_SIGNATURES: i64 = 20;
+
+/// rskj `BitcoinUtils.removeSignaturesFromMultiSigTransaction`, run on a copy
+/// (`getMultiSigTransactionWithoutSignatures`), or before RSKIP305 its
+/// `BitcoinUtilsLegacy` form, which skips the multisig check. Every input's
+/// redeem script is extracted and its scriptSig, or its witness and
+/// scriptSig, rebuilt with empty signatures, input by input.
+///
+/// `Ok(None)` is the `IllegalArgumentException` the callers catch: an input
+/// with no redeem script, from RSKIP305 one that isn't a multisig, a scriptSig
+/// asking for more than 16 signatures (`createMultiSigInputScriptBytes`), or a
+/// witness sized past Java's `int` (`createBaseWitnessThatSpendsFromErpRedeemScript`).
+/// It is also the answer when an input asks for more signatures than a
+/// federation can, whose stripped transaction couldn't match. `Err` is an
+/// exception nothing between it and `Bridge.execute` catches.
+pub(crate) fn without_multisig_signatures(
+    tx: &BtcTransaction,
+    before_rskip305: bool,
+) -> Result<Option<BtcTransaction>, &'static str> {
+    use super::rskj_sender_compat::{self as bitcoinj, Verdict};
     let mut copy = tx.clone();
+    let mut matchable = true;
     for input in &mut copy.input {
-        // Each input must be a P2SH multisig (standard or ERP): extract its
-        // redeem and rebuild the placeholder scriptSig. `placeholder_scriptsig`
-        // adds the extra OP_0 for the ERP OP_NOTIF branch, matching bitcoinj
-        // `createEmptyInputScript`. A non-multisig input (no redeem push, or
-        // threshold 0) is not an SVP tx (rskj throws → caught → false).
-        let redeem = super::release_tx::extract_redeem_script(input.script_sig.as_bytes())?;
-        let threshold = super::release_tx::redeem_script_threshold(&redeem);
-        if threshold == 0 {
-            return None;
+        let Some(redeem) =
+            bitcoinj::redeem_script_of_input(input.script_sig.as_bytes(), input.witness.last())?
+        else {
+            return Ok(None);
+        };
+        if !before_rskip305 {
+            match bitcoinj::is_sent_to_multisig(&redeem) {
+                Verdict::Multisig => {}
+                Verdict::NotMultisig => return Ok(None),
+                Verdict::RskjThrows(why) => return Err(why),
+            }
         }
-        input.script_sig =
-            bitcoin::ScriptBuf::from_bytes(super::release_tx::placeholder_scriptsig(&redeem, threshold));
+        let signatures = bitcoinj::signatures_required_to_spend(&redeem)?;
+        if input.witness.is_empty() {
+            if signatures > 16 {
+                return Ok(None);
+            }
+            input.script_sig = bitcoin::ScriptBuf::from_bytes(
+                super::release_tx::placeholder_scriptsig(&redeem, signatures as usize),
+            );
+        } else {
+            // Its pushes: the CHECKMULTISIG dummy, the signatures, the OP_NOTIF
+            // flag and the redeem script, counted in Java's int.
+            if signatures + 3 > i64::from(i32::MAX) {
+                return Ok(None);
+            }
+            if signatures > MAX_FEDERATION_SIGNATURES {
+                matchable = false;
+                continue;
+            }
+            let (script_sig, witness) =
+                super::release_tx::segwit_base_input(&redeem, signatures as usize);
+            input.script_sig = script_sig;
+            input.witness = witness;
+        }
     }
-    Some(btc_txid_event_bytes(&copy))
+    Ok(matchable.then_some(copy))
+}
+
+/// rskj `BitcoinUtils.getMultiSigTransactionHashWithoutSignatures`, or before
+/// RSKIP305 `BitcoinUtilsLegacy.getMultiSigTransactionHashWithoutSignaturesBeforeRSKIP305`:
+/// a segwit transaction's own txid, else the txid of its copy with every
+/// input's signatures stripped (display order, as the SVP hashes are stored).
+/// `Ok(None)` and `Err` are `without_multisig_signatures`'s.
+pub(crate) fn multisig_tx_hash_without_signatures(
+    tx: &BtcTransaction,
+    rskip305: bool,
+) -> Result<Option<[u8; 32]>, &'static str> {
+    if tx.input.iter().any(|i| !i.witness.is_empty()) {
+        return Ok(Some(btc_txid_event_bytes(tx)));
+    }
+    Ok(without_multisig_signatures(tx, !rskip305)?.map(|stripped| btc_txid_event_bytes(&stripped)))
+}
+
+/// rskj `BitcoinUtils.getSigHashForPegoutIndex` for a registered transaction:
+/// the sighash of its first input over its copy with every input's signatures
+/// stripped, which is the sighash the pegout's unsigned transaction was
+/// indexed by when it was created. `Ok(None)` where rskj answers empty, and
+/// `Err` where it throws past its `catch (IllegalArgumentException)`.
+fn sig_hash_for_pegout_index(tx: &BtcTransaction) -> Result<Option<[u8; 32]>, &'static str> {
+    use super::rskj_sender_compat as bitcoinj;
+    let Some(first) = tx.input.first() else {
+        return Ok(None);
+    };
+    let Some(redeem0) =
+        bitcoinj::redeem_script_of_input(first.script_sig.as_bytes(), first.witness.last())?
+    else {
+        return Ok(None);
+    };
+    let Some(stripped) = without_multisig_signatures(tx, false)? else {
+        return Ok(None);
+    };
+    Ok(Some(first_input_sig_hash(&stripped, &redeem0, 0)))
 }
 
 /// rskj `ReleaseTransactionBuilder.buildSvpFundTransaction`: two fixed outputs
@@ -3555,7 +4183,7 @@ fn build_svp_fund_transaction<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
     block_number: u64,
-) -> Option<super::release_tx::BuiltPegout> {
+) -> Result<Option<super::release_tx::BuiltPegout>, super::release_tx::UncountableSignatures> {
     // Proposed federation redeem + P2SH (its TYPE is keyed on its creation block).
     let proposed_keys = proposed.btc_keys();
     let proposed_redeem = build_committed_federation_redeem_script(
@@ -3648,23 +4276,28 @@ fn build_svp_fund_transaction<CTX: crate::RskContextTr>(
 /// `new PegoutsWaitingForConfirmations(entries)` →
 /// `this.entries = new HashSet<>(entries)` (constructor, NOT incremental). The
 /// `HashSet(Collection)` constructor pre-sizes the table to
-/// `tableSizeFor(max((int)(n / 0.75f) + 1, 16))`, so for `n` final entries the
-/// capacity is the next power of two `>= max((int)(n / 0.75) + 1, 16)`. This
-/// differs from an incremental default-16 fill exactly at the resize boundaries
-/// (e.g. `n = 12` -> cap 32 here, but an incremental fill would stay at 16;
-/// `n = 24` -> 64 vs 32), and getting it wrong reshuffles the bucket walk and
-/// forks the pegout selection (mainnet #3,344,303). Returns the index into
-/// `entries`.
-fn next_pegout_with_enough_confirmations(
+/// `tableSizeFor(max((int)(n / 0.75f) + 1, 16))`, so for the `loaded` entries
+/// the call read the capacity is the next power of two
+/// `>= max((int)(n / 0.75) + 1, 16)`. This differs from an incremental
+/// default-16 fill exactly at the resize boundaries (e.g. `n = 12` -> cap 32
+/// here, but an incremental fill would stay at 16; `n = 24` -> 64 vs 32), and
+/// getting it wrong reshuffles the bucket walk and forks the pegout selection
+/// (mainnet #3,344,303). The migration and the peg-outs the same call built
+/// went into that same set one at a time (`PegoutsWaitingForConfirmations.add`),
+/// and `HashMap.putVal` doubled its table whenever one left it more than
+/// three quarters full (`walked_hashset_capacity`); `entries` holds them too.
+/// Returns the index into `entries`.
+pub(crate) fn next_pegout_with_enough_confirmations(
     entries: &[PegoutWaitingForConfirmations],
     current_block: u64,
     min_confirmations: u64,
+    loaded: usize,
 ) -> Option<usize> {
     if entries.is_empty() {
         return None;
     }
 
-    let cap = java_hashset_capacity(entries.len());
+    let cap = walked_hashset_capacity(loaded, entries.len());
 
     // Bucket each entry; within a bucket preserve insertion (storage) order.
     let mut buckets: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
@@ -3696,6 +4329,20 @@ fn java_hashset_capacity(n: usize) -> u32 {
     init_cap.next_power_of_two()
 }
 
+/// The capacity of a set built from `loaded` entries (`java_hashset_capacity`)
+/// once it holds `now`, the rest added one at a time: `HashMap.putVal` doubles
+/// the table whenever an insertion leaves more than three quarters of it
+/// taken (`++size > threshold`, the threshold `0.75` of the capacity).
+fn walked_hashset_capacity(loaded: usize, now: usize) -> u32 {
+    let mut capacity = java_hashset_capacity(loaded);
+    for size in loaded + 1..=now {
+        if size as u64 > u64::from(capacity) * 3 / 4 {
+            capacity *= 2;
+        }
+    }
+    capacity
+}
+
 /// rskj `PegoutsWaitingForConfirmations.Entry.hashCode()`:
 /// `Objects.hash(btcTransaction, pegoutCreationRskBlockNumber)`
 /// `= 31 * (31 * 1 + btcTransaction.hashCode()) + Long.hashCode(height)`.
@@ -3718,22 +4365,22 @@ fn pegout_entry_hash(entry: &PegoutWaitingForConfirmations) -> u32 {
     31u32.wrapping_mul(r).wrapping_add(long_hash_code)
 }
 
-/// rskj `BridgeSupport.processFundsMigration` (pre-RSKIP294/376 era).
+/// rskj `BridgeSupport.processFundsMigration`.
 fn process_funds_migration<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
     block_number: u64,
     tx_ctx: &BridgeTxContext,
-) {
+) -> Result<(), PrecompileError> {
     let Some(retiring_keys) =
         retiring_federation_keys(ctx, config, hardfork_cfg, block_number)
     else {
-        return;
+        return Ok(());
     };
     let Some(new_fed) = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY)
     else {
-        return;
+        return Ok(());
     };
 
     let age = block_number.saturating_sub(new_fed.creation_block);
@@ -3755,7 +4402,7 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
     let in_migration_age = age > migration_start && age < migration_end;
     let past_migration_age = age >= migration_end;
     if !in_migration_age && !past_migration_age {
-        return;
+        return Ok(());
     }
 
     let mut old_utxos = super::storage::load_old_federation_utxos(ctx);
@@ -3793,25 +4440,25 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                     build_federation_redeem_script(&retiring_keys, retiring_keys.len() / 2 + 1)
                 });
         // rskj `migrateFunds` sends the migration to `getActiveFederationAddress()`
-        // = the NEW (active) federation's P2SH address (BridgeSupport.java:1308,
-        // FederationSupportImpl.getActiveFederationAddress -> getAddress()). The
-        // active federation here is the ERP federation committed at #4,652,781, so
-        // its address derives from the (RSKIP201-era non-standard) ERP redeem
-        // script, NOT a plain multisig. Use the committed-federation redeem builder
-        // so this matches whatever federation format was committed (standard pre-
-        // RSKIP201, non-standard ERP, P2SH-ERP, or P2SH-P2WSH-ERP).
+        // = the NEW (active) federation's address (BridgeSupport.java:1308,
+        // FederationSupportImpl.getActiveFederationAddress -> getAddress()), the
+        // federation as it is stored: rskj reads it back in its own format
+        // version (`deserializeFederationAccordingToVersion`), whatever format a
+        // federation committed in this block would take. The first ERP
+        // federation, committed at #4,652,781, is a non-standard ERP one.
         let new_btc_keys = new_fed.btc_keys();
-        let new_redeem = build_committed_federation_redeem_script(
-            &new_btc_keys,
-            config,
-            hardfork_cfg,
-            block_number,
-        );
         // getActiveFederationAddress is format-aware: a P2SH-P2WSH (format 4000,
         // RSKIP305) active federation receives the migration at its P2SH-P2WSH
         // address, not a plain P2SH of the redeem. First hit when the first
         // reed800 segwit federation activates (#8,147,324).
         let new_format = federation_format_version(ctx, super::storage::NEW_FEDERATION_FORMAT_VERSION_KEY);
+        let new_redeem = federation_redeem_for_format(
+            &new_btc_keys,
+            new_format,
+            config,
+            hardfork_cfg,
+            block_number,
+        );
         let active_script = p2sh_output_script(&federation_output_hash160(&new_redeem, new_format));
 
         // The migration spends the retiring (OLD) federation; a P2SH-P2WSH
@@ -3837,14 +4484,26 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                 .unwrap_or(retiring_redeem.as_slice())
         };
 
-        // createMigrationTransaction: target the full balance, halving on
-        // size overflow. rskj ReleaseTransactionBuilder sets version 2 once
-        // RSKIP201 is active (setDefaultTxConfig), but buildMigrationTransaction
-        // forces it back to version 1 until RSKIP376 — from RSKIP376 (arrowhead600)
-        // on, migration txs are version 2 like every other pegout.
+        // createMigrationTransaction: rskj ReleaseTransactionBuilder sets version
+        // 2 once RSKIP201 is active (setDefaultTxConfig), but
+        // buildMigrationTransaction forces it back to version 1 until RSKIP376 —
+        // from RSKIP376 (arrowhead600) on, migration txs are version 2 like every
+        // other pegout.
         let migration_tx_version = if hardfork_cfg.has_rskip376(block_number) { 2 } else { 1 };
+        // It asks for the whole balance and, each time bitcoinj can't build the
+        // transaction (INSUFFICIENT_MONEY, EXCEED_MAX_TRANSACTION_SIZE,
+        // COULD_NOT_ADJUST_DOWNWARDS), for half of it, with no floor. An amount
+        // under the destination's dust limit is DUSTY_SEND_REQUESTED, and
+        // createMigrationTransaction throws ("Retiring federation wallet cannot
+        // be emptied"), as it throws where bitcoinj can't size an input.
+        let dust = super::release_tx::min_non_dust_value(&active_script);
         let mut target = balance;
-        let built = loop {
+        let built: Result<super::release_tx::BuiltPegout, PrecompileError> = loop {
+            if target < dust {
+                break Err(PrecompileError::other(
+                    "createMigrationTransaction: the retiring federation's wallet cannot be emptied",
+                ));
+            }
             let outputs = [super::release_tx::PegoutOutput {
                 script: active_script.clone(),
                 amount_satoshis: target,
@@ -3858,14 +4517,18 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                 migration_tx_version,
                 retiring_is_segwit,
             ) {
-                Some(b) => break Some(b),
-                None => {
-                    target /= 2;
-                    if target < 10_000 {
-                        break None;
-                    }
-                }
+                Ok(Some(b)) => break Ok(b),
+                Ok(None) => target /= 2,
+                Err(e) => break Err(PrecompileError::from(e)),
             }
+        };
+        // processFundsMigration lets what migrateFunds throws fail the call while
+        // the active federation is in its migration age; past it, it catches the
+        // throw, migrates nothing, and retires the federation all the same.
+        let built = match built {
+            Ok(built) => Some(built),
+            Err(_) if past_migration_age => None,
+            Err(e) => return Err(e),
         };
 
         if let Some(built) = built {
@@ -3902,19 +4565,7 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
             }
             // RSKIP428 (lovell700): pegout_transaction_created for the migration
             // tx too (settleReleaseRequest -> processReleaseTransactionInfo).
-            if hardfork_cfg.has_rskip428(block_number) {
-                let outpoint_values: Vec<u64> =
-                    built.used_utxos.iter().map(|u| u.value_satoshis).collect();
-                let txid = btc_txid_event_bytes(&built.tx);
-                super::events::log_pegout_transaction_created(ctx, &txid, &outpoint_values);
-                save_release_outpoints_values(
-                    ctx,
-                    &txid,
-                    &outpoint_values,
-                    hardfork_cfg,
-                    block_number,
-                );
-            }
+            process_release_transaction_info(ctx, &built, hardfork_cfg, block_number);
             store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
 
             old_utxos.retain(|u| {
@@ -3946,6 +4597,7 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
         }
         bridge_store_bytes_named(ctx, OLD_FEDERATION_KEY, &[]);
     }
+    Ok(())
 }
 
 /// Active federation member keys (rskj FederationSupport.getActiveFederation):
@@ -4045,6 +4697,14 @@ fn store_utxos_at<CTX: crate::RskContextTr>(ctx: &mut CTX, key: &str, utxos: &[B
     bridge_store_bytes_named(ctx, key, &super::storage::serialize_utxo_list(utxos));
 }
 
+/// rskj `FederationStorageProviderImpl.saveNewFederationBtcUTXOs` and
+/// `saveOldFederationBtcUTXOs`: a call that read a federation's UTXOs writes
+/// them back as it returns, the empty list where the cell held nothing.
+fn write_back_utxos<CTX: crate::RskContextTr>(ctx: &mut CTX, key: &str) {
+    let utxos = load_utxos_at(ctx, key);
+    store_utxos_at(ctx, key, &utxos);
+}
+
 /// Active federation keys together with the redeem script built from the
 /// federation's STORED format version (rskj `getActiveFederation().getRedeemScript()`).
 /// During the activation window the active federation is still the OLD one, so its
@@ -4109,14 +4769,22 @@ pub(crate) fn active_federation_keys_and_redeem<CTX: crate::RskContextTr>(
             }
         }
         (Some(n), None) => (n.btc_keys(), super::storage::NEW_FEDERATION_FORMAT_VERSION_KEY),
+        // rskj `FederationSupportImpl.getGenesisFederation`: the genesis
+        // federation is built in the format its constants name.
         (None, _) => return {
             let keys = genesis_federation_keys(config);
-            let redeem = build_federation_redeem_script(&keys, keys.len() / 2 + 1);
+            let redeem = federation_redeem_for_format(
+                &keys,
+                config.genesis_federation_format,
+                config,
+                hardfork_cfg,
+                block_number,
+            );
             (keys, redeem)
         },
     };
     let version = federation_format_version(ctx, format_key);
-    let redeem = federation_redeem_for_format(&keys, version, config);
+    let redeem = federation_redeem_for_format(&keys, version, config, hardfork_cfg, block_number);
     (keys, redeem)
 }
 
@@ -4141,7 +4809,7 @@ pub(crate) fn active_federation_format<CTX: crate::RskContextTr>(
             }
         }
         (Some(_), None) => super::storage::NEW_FEDERATION_FORMAT_VERSION_KEY,
-        (None, _) => return 1000, // genesis federation: plain multisig
+        (None, _) => return config.genesis_federation_format,
     };
     federation_format_version(ctx, format_key)
 }
@@ -4165,7 +4833,7 @@ pub(crate) fn retiring_federation_keys_and_redeem<CTX: crate::RskContextTr>(
 ) -> Option<(Vec<[u8; 33]>, Vec<u8>)> {
     let keys = retiring_federation_keys(ctx, config, hardfork_cfg, block_number)?;
     let version = federation_format_version(ctx, super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY);
-    let redeem = federation_redeem_for_format(&keys, version, config);
+    let redeem = federation_redeem_for_format(&keys, version, config, hardfork_cfg, block_number);
     Some((keys, redeem))
 }
 
@@ -4209,17 +4877,20 @@ pub(crate) fn federation_redeem_for_format_pub(
     keys: &[[u8; 33]],
     format_version: u64,
     config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
 ) -> Vec<u8> {
-    federation_redeem_for_format(keys, format_version, config)
+    federation_redeem_for_format(keys, format_version, config, hardfork_cfg, block_number)
 }
 
 /// rskj `BridgeUtils.isFromFederateMember(rskTx, federation)`: true when the
 /// call's sender RSK address matches the RSK public-key address of any member
 /// of the ACTIVE or RETIRING federation. This is the authorization enforced by
-/// `Bridge.activeAndRetiringFederationOnly` for `updateCollections` (always)
-/// and `receiveHeaders` (post-RSKIP200). `sender` is the immediate caller of
-/// the Bridge precompile (= rskj's internalTx sender = `getOwnerRskAddress`),
-/// so a relay contract forwarding the call is checked, not the original EOA.
+/// `Bridge.activeAndRetiringFederationOnly` for `updateCollections` (always),
+/// `receiveHeaders` (post-RSKIP200) and `registerBtcTransaction` (until
+/// RSKIP199). `sender` is the immediate caller of the Bridge precompile (=
+/// rskj's internalTx sender = `getOwnerRskAddress`), so a relay contract
+/// forwarding the call is checked, not the original EOA.
 pub(crate) fn is_sender_active_or_retiring_fed_member<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
@@ -4227,7 +4898,7 @@ pub(crate) fn is_sender_active_or_retiring_fed_member<CTX: crate::RskContextTr>(
     block_number: u64,
     sender: alloy_primitives::Address,
 ) -> bool {
-    use super::federation::{rsk_address_from_public_key, StoredFederation};
+    use super::federation::{member_rsk_address, rsk_address_from_public_key, StoredFederation};
 
     let new = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
     let old = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY);
@@ -4250,9 +4921,9 @@ pub(crate) fn is_sender_active_or_retiring_fed_member<CTX: crate::RskContextTr>(
         };
 
     let member_match = |fed: &StoredFederation| {
-        fed.members.iter().any(|m| {
-            rsk_address_from_public_key(&m.rsk) == Some(sender)
-        })
+        fed.members
+            .iter()
+            .any(|m| member_rsk_address(&m.rsk) == Some(sender))
     };
 
     if active.as_ref().map(member_match).unwrap_or(false) {
@@ -4270,6 +4941,28 @@ pub(crate) fn is_sender_active_or_retiring_fed_member<CTX: crate::RskContextTr>(
             .any(|k| rsk_address_from_public_key(k) == Some(sender));
     }
     false
+}
+
+/// Whether `sender` is a member of the proposed federation, whom
+/// `Bridge.activeRetiringAndProposedFederationOnly` admits to `addSignature`
+/// beside the active and retiring federations' members. Before RSKIP419
+/// `getProposedFederation` answers that there is none.
+pub(crate) fn is_sender_proposed_fed_member<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+    sender: alloy_primitives::Address,
+) -> bool {
+    use super::federation::member_rsk_address;
+    hardfork_cfg.has_rskip419(block_number)
+        && super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY).is_some_and(
+            |proposed| {
+                proposed
+                    .members
+                    .iter()
+                    .any(|m| member_rsk_address(&m.rsk) == Some(sender))
+            },
+        )
 }
 
 pub(crate) fn genesis_federation_keys(config: &BridgeConstants) -> Vec<[u8; 33]> {
@@ -4309,35 +5002,20 @@ pub(crate) fn genesis_federation_keys(config: &BridgeConstants) -> Vec<[u8; 33]>
 /// bitcoinj reads one ASN.1 object and casts it to a sequence, then casts the
 /// first two elements to integers; anything else throws. It does *not* check
 /// for trailing data, and it reads r and s with `getPositiveValue()`, so a
-/// negative encoding is tolerated rather than rejected. This mirrors that: a
-/// DER SEQUENCE whose first two elements are INTEGERs, with lengths that stay
-/// inside the buffer. Stricter checks would reject signatures rskj accepts.
+/// negative encoding is tolerated rather than rejected. Bouncy Castle reads
+/// a length's long form as well as its short one, and refuses an integer
+/// whose first byte only repeats the sign of the next
+/// (`der_signature::der_signature_integers`).
 fn is_der_signature(sig: &[u8]) -> bool {
-    // SEQUENCE tag plus a definite-length byte.
-    if sig.len() < 2 || sig[0] != 0x30 {
-        return false;
-    }
-    let (seq_len, mut i) = match sig[1] {
-        n if n < 0x80 => (n as usize, 2usize),
-        0x81 if sig.len() >= 3 => (sig[2] as usize, 3usize),
-        _ => return false, // longer forms never appear in a 32-byte-scalar signature
-    };
-    if seq_len > sig.len() - i {
-        return false;
-    }
-    let end = i + seq_len;
-    // Two INTEGERs.
-    for _ in 0..2 {
-        if i + 2 > end || sig[i] != 0x02 {
-            return false;
-        }
-        let len = sig[i + 1] as usize;
-        if len == 0 || len >= 0x80 || i + 2 + len > end {
-            return false;
-        }
-        i += 2 + len;
-    }
-    true
+    super::der_signature::der_signature_integers(sig).is_some()
+}
+
+/// Does `key` parse the way rskj's `BtcECKey.fromPublicOnly` requires?
+/// That is BouncyCastle's `decodePoint`: a compressed, uncompressed or hybrid
+/// encoding of a point on the curve, as libsecp256k1 parses them, and also
+/// the single byte 0x00, the point at infinity, which libsecp256k1 refuses.
+fn is_btc_public_key(key: &[u8]) -> bool {
+    key == [0x00] || bitcoin::secp256k1::PublicKey::from_slice(key).is_ok()
 }
 
 pub fn add_signature<CTX: crate::RskContextTr>(
@@ -4347,51 +5025,14 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 96 {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    }
-
-    // ABI layout: bytes federatorPublicKey, bytes[] signatures, bytes rskTxHash.
-    // An out-of-range (oversized) ABI offset cannot index this calldata; treat
-    // it as a parse failure (empty output) rather than panicking — rskj's
-    // Solidity decoder likewise rejects such inputs. Mainnet #6,223,783 tx[3]
-    // forwards malformed calldata whose `signatures` offset points into the
-    // middle of the federator key, yielding an absurd array count.
-    let (Ok(fed_key_offset), Ok(sigs_offset), Ok(rsk_hash_offset)) = (
-        usize::try_from(U256::from_be_slice(&args[0..32])),
-        usize::try_from(U256::from_be_slice(&args[32..64])),
-        usize::try_from(U256::from_be_slice(&args[64..96])),
-    ) else {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    };
-
-    // Parse federator public key
-    let fed_key = match read_dynamic_bytes(args, fed_key_offset) {
-        Ok(k) => k,
-        Err(_) => return Ok(PrecompileOutput::new(gas_cost, Bytes::new())),
-    };
-    if fed_key.len() != 33 && fed_key.len() != 65 {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    }
-
-    // Parse RSK tx hash (32 bytes)
-    let rsk_tx_hash_bytes = match read_dynamic_bytes(args, rsk_hash_offset) {
-        Ok(h) if h.len() == 32 => h,
-        _ => return Ok(PrecompileOutput::new(gas_cost, Bytes::new())),
-    };
-    let mut rsk_tx_hash = [0u8; 32];
-    rsk_tx_hash.copy_from_slice(&rsk_tx_hash_bytes);
-
-    // Parse signatures array
-    let sigs = parse_bytes_array(args, sigs_offset);
-    if sigs.is_empty() {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    }
-
-    // rskj `Bridge.addSignature` (Bridge.java:632) runs every signature through
-    // `BtcECKey.ECDSASignature.decodeFromDER` before `bridgeSupport` sees it,
-    // and a parse failure throws `BridgeIllegalArgumentException`. `Bridge.execute`
-    // wraps that in a `VMException`, which `TransactionExecutor` records as
+    // rskj `Bridge.addSignature` (Bridge.java:617) parses the federator key
+    // (`BtcECKey.fromPublicOnly`), refuses an empty signature list, runs every
+    // signature through `BtcECKey.ECDSASignature.decodeFromDER` and wraps the
+    // RSK transaction hash in a `Keccak256`, all before `bridgeSupport` sees
+    // them, and each failure is a `BridgeIllegalArgumentException`. Before
+    // RSKIP88 `Bridge.execute` answers that with null, a success with no
+    // output. From RSKIP88 it throws, and `Bridge.execute` wraps it in a
+    // `VMException`, which `TransactionExecutor` records as
     // `result.setException` -- marking the execution summary failed, so the
     // sender is charged the FULL gas limit with no leftover refund, while the
     // receipt still reports SUCCESS because its status comes from
@@ -4400,16 +5041,38 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     // it into exactly those semantics.
     //
     // Mainnet #9,217,796 tx[1] submits a 71-byte signature beginning 0x9f
-    // rather than a DER SEQUENCE. Without this check rustock reached the
+    // rather than a DER SEQUENCE. Without the DER check rustock reached the
     // pegouts-waiting-for-signatures lookup, missed, returned quietly and
     // refunded 104,512 gas the chain had charged -- diverging the state root.
-    for sig in &sigs {
-        if !is_der_signature(sig) {
-            return Err(PrecompileError::other(
-                "addSignature: signature could not be parsed as DER",
-            ));
+    let rskip88 =
+        hardfork_cfg.has_rskip88(revm::context_interface::Block::number(ctx.block()).to::<u64>());
+    let refuse = |why: &'static str| -> Result<PrecompileOutput, PrecompileError> {
+        if rskip88 {
+            Err(PrecompileError::other(why))
+        } else {
+            Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
         }
+    };
+    let decoded = crate::abi::Args::new(args);
+    let (Some(fed_key), Some(sigs), Some(rsk_tx_hash)) =
+        (decoded.bytes(0), decoded.bytes_array(1), decoded.bytes(2))
+    else {
+        return refuse("addSignature: malformed arguments");
+    };
+    if !is_btc_public_key(fed_key) {
+        return refuse("addSignature: public key could not be parsed");
     }
+    if sigs.is_empty() {
+        return refuse("addSignature: signatures array is empty");
+    }
+    if !sigs.iter().all(|sig| is_der_signature(sig)) {
+        return refuse("addSignature: signature could not be parsed as DER");
+    }
+    let Ok(rsk_tx_hash) = <[u8; 32]>::try_from(rsk_tx_hash) else {
+        return refuse("addSignature: invalid rsk tx hash");
+    };
+    let fed_key = fed_key.to_vec();
+    let sigs: Vec<Vec<u8>> = sigs.into_iter().map(<[u8]>::to_vec).collect();
 
     // RSKIP419: if the SVP is ongoing and this RSK tx hash is the one that
     // created the SVP spend transaction, sign that (with the PROPOSED
@@ -4426,7 +5089,7 @@ pub fn add_signature<CTX: crate::RskContextTr>(
                     &sigs,
                     &rsk_tx_hash,
                     &items[1],
-                    block_number,
+                    hardfork_cfg.has_rskip305(block_number),
                     gas_cost,
                 );
             }
@@ -4437,6 +5100,16 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     let wfs_key = bridge_storage_key(PEGOUTS_WAITING_FOR_SIGNATURES_KEY);
     let wfs_data = bridge_load_bytes(ctx, wfs_key);
     let mut wfs = deserialize_rsk_txs_waiting_for_signatures(&wfs_data);
+    // rskj `BridgeStorageProvider.savePegoutsWaitingForSignatures`: `save()`
+    // writes back the set the call read, whatever the call does next, so a
+    // cell never written takes the empty list.
+    if wfs_data.is_empty() {
+        bridge_store_bytes(
+            ctx,
+            wfs_key,
+            &serialize_rsk_txs_waiting_for_signatures(&wfs),
+        );
+    }
 
     // Find the BTC tx by RSK tx hash
     let btc_tx_raw = match wfs.get(&rsk_tx_hash) {
@@ -4497,17 +5170,18 @@ pub fn add_signature<CTX: crate::RskContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // Membership check against the active federation (genesis fallback).
-    // TODO(rustock): rskj also accepts retiring-federation members.
+    // Membership check against the active federation (genesis fallback), then
+    // the retiring one.
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let federation_keys = federation_keys_or_genesis(ctx, config, hardfork_cfg, block_number, false);
     if federation_keys.is_empty() {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
-    let Some(compressed_key) = compress_pubkey(&fed_key) else {
+    // rskj getFederationFromPublicKey: active first, then retiring, each asked
+    // whether it holds the key as the call gave it (`hasBtcPublicKey`).
+    let Some(compressed_key) = member_key_as_given(&fed_key) else {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     };
-    // rskj getFederationFromPublicKey: active first, then retiring.
     let is_member = federation_keys.contains(&compressed_key)
         || retiring_federation_keys(ctx, config, hardfork_cfg, block_number)
             .is_some_and(|keys| keys.contains(&compressed_key));
@@ -4526,10 +5200,11 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     // rskj `BridgeEventLoggerImpl.getFederatorRskPublicKey`: the add_signature
     // event's federatorRskAddress topic derives from the member's BTC public
     // key before RSKIP415 (arrowhead600) and from its RSK public key after.
-    // For legacy single-key members the two keys are identical.
+    // For legacy single-key members the two keys are identical. A member's
+    // RSK key may be the point at infinity, whose address is that of `00`.
     let federator_addr_key: Vec<u8> = if hardfork_cfg.has_rskip415(block_number) {
         federator_rsk_key_for_btc(ctx, config, hardfork_cfg, block_number, &compressed_key)
-            .map(|k| k.to_vec())
+            .map(|k| super::federation::key_encoding(&k).to_vec())
             .unwrap_or_else(|| fed_key.clone())
     } else {
         fed_key.clone()
@@ -4544,8 +5219,10 @@ pub fn add_signature<CTX: crate::RskContextTr>(
                 &rsk_tx_hash,
             );
         } else if let Some(addr) = super::federation::rsk_address_from_public_key(&federator_addr_key) {
-            // Topic = federatorRskAddress; data = the BTC public key (always).
-            super::events::log_solidity_add_signature(ctx, &rsk_tx_hash, addr, &fed_key);
+            // Topic = federatorRskAddress; data = the member's BTC key as the
+            // federation keeps it, compressed, however the call gave it
+            // (`BridgeEventLoggerImpl.logAddSignature`).
+            super::events::log_solidity_add_signature(ctx, &rsk_tx_hash, addr, &compressed_key);
         }
     };
     if !log_only_when_applied {
@@ -4556,12 +5233,15 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     // input's sighash before applying any, then insert each at the position
     // determined by the key order in the redeem script. A segwit pegout signs
     // each input with its BIP-143 sighash, whose prevValue comes from the
-    // releasesOutpointsValues entry keyed by the tx's witness-stripped hash.
-    let prev_values = {
-        let txid = btc_txid_event_bytes(&btc_tx);
-        load_release_outpoints_values(ctx, &txid)
+    // releasesOutpointsValues entry keyed by the tx's witness-stripped hash,
+    // which rskj's `getReleaseOutpointsValues` refuses to read before RSKIP305.
+    let prev_values = if hardfork_cfg.has_rskip305(block_number) {
+        load_release_outpoints_values(ctx, &btc_txid_event_bytes(&btc_tx))
+    } else {
+        None
     };
-    let applied = apply_signatures_to_tx(&mut btc_tx, &sigs, &compressed_key, &prev_values);
+    let applied =
+        apply_signatures_to_tx(&mut btc_tx, &sigs, &compressed_key, prev_values.as_deref())?;
     if log_only_when_applied && applied {
         emit_add_signature(ctx, &btc_tx);
     }
@@ -4604,23 +5284,31 @@ fn add_svp_spend_tx_signatures<CTX: crate::RskContextTr>(
     sigs: &[Vec<u8>],
     rsk_tx_hash: &[u8; 32],
     spend_tx_bytes: &[u8],
-    _block_number: u64,
+    rskip305: bool,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let empty = || Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
 
+    // rskj throws where there is no proposed federation, and where the key is
+    // none of its members' (`getMemberByBtcPublicKey(..).orElseThrow`): the
+    // call fails. A member whose key is the point at infinity is found by its
+    // key, 00, as any other is by its own.
     let Some(proposed) = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY)
     else {
-        return empty();
+        return Err(PrecompileError::other(
+            "addSignature: no proposed federation signs the SVP spend transaction",
+        ));
     };
-    let Some(compressed_key) = compress_pubkey(fed_key) else {
-        return empty();
-    };
-    // The federator must belong to the proposed federation.
-    let Some(member_rsk) =
-        proposed.members.iter().find(|m| m.btc == compressed_key).map(|m| m.rsk)
-    else {
-        return empty();
+    let Some((compressed_key, member_rsk)) = member_key_of(fed_key).and_then(|key| {
+        proposed
+            .members
+            .iter()
+            .find(|m| m.btc == key)
+            .map(|m| (key, m.rsk))
+    }) else {
+        return Err(PrecompileError::other(
+            "addSignature: the key is no member's of the proposed federation",
+        ));
     };
     let mut spend_tx: BtcTransaction = match deserialize(spend_tx_bytes) {
         Ok(tx) => tx,
@@ -4633,15 +5321,21 @@ fn add_svp_spend_tx_signatures<CTX: crate::RskContextTr>(
 
     // generateInputSigHash (segwit): the per-input prevValue comes from the
     // releasesOutpointsValues entry keyed by the spend tx's witness-stripped
-    // hash, saved when the spend tx was created (processReleaseTransactionInfo).
+    // hash, saved when the spend tx was created (processReleaseTransactionInfo),
+    // and read only from RSKIP305.
     let spend_hash = btc_txid_event_bytes(&spend_tx);
-    let prev_values = load_release_outpoints_values(ctx, &spend_hash);
+    let prev_values = if rskip305 {
+        load_release_outpoints_values(ctx, &spend_hash)
+    } else {
+        None
+    };
 
     // processSigning: apply the signatures, then (RSKIP326) log add_signature.
-    let applied = apply_signatures_to_tx(&mut spend_tx, sigs, &compressed_key, &prev_values);
+    let applied =
+        apply_signatures_to_tx(&mut spend_tx, sigs, &compressed_key, prev_values.as_deref())?;
     if applied {
-        if let Some(addr) = super::federation::rsk_address_from_public_key(&member_rsk) {
-            super::events::log_solidity_add_signature(ctx, rsk_tx_hash, addr, fed_key);
+        if let Some(addr) = super::federation::member_rsk_address(&member_rsk) {
+            super::events::log_solidity_add_signature(ctx, rsk_tx_hash, addr, &compressed_key);
         }
     }
 
@@ -4669,12 +5363,29 @@ fn btc_txid_event_bytes(tx: &BtcTransaction) -> [u8; 32] {
     bytes
 }
 
-/// Compress a SEC1 public key (33- or 65-byte) to its 33-byte form.
-fn compress_pubkey(key: &[u8]) -> Option<[u8; 33]> {
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
-    let parsed = k256::PublicKey::from_sec1_bytes(key).ok()?;
-    let point = parsed.to_encoded_point(true);
-    point.as_bytes().try_into().ok()
+/// The member key a federator's key names where rskj compares points, as
+/// `Federation.getMemberByBtcPublicKey` does, reading the key again and
+/// comparing it with each member's by `BtcECKey.equals`: the point at
+/// infinity ([`super::federation::INFINITY_KEY`]) for the one byte 00 Bouncy
+/// Castle decodes as it, and the compressed form of a key in any other form
+/// it reads, compressed, uncompressed or hybrid.
+fn member_key_of(key: &[u8]) -> Option<[u8; 33]> {
+    if key == [0x00] {
+        return Some(super::federation::INFINITY_KEY);
+    }
+    bitcoin::secp256k1::PublicKey::from_slice(key)
+        .ok()
+        .map(|key| key.serialize())
+}
+
+/// The member key a federator's key names where rskj compares bytes, as
+/// `Federation.hasBtcPublicKey` does, by which `getFederationFromPublicKey`
+/// finds the federation a peg-out is signed for: the key's bytes as the call
+/// gave them against each member's compressed key. So a key given compressed,
+/// or the one byte 00, names its member, and one given uncompressed or hybrid
+/// names none.
+fn member_key_as_given(key: &[u8]) -> Option<[u8; 33]> {
+    member_key_of(key).filter(|member| super::federation::key_encoding(member) == key)
 }
 
 /// RIPEMD160(SHA256(pubkey)) — bitcoinj `ECKey.getPubKeyHash` over the key
@@ -4989,21 +5700,48 @@ fn p2pkh_output_script(hash160: &[u8; 20]) -> bitcoin::ScriptBuf {
 
 /// Build the federation P2SH redeem script from member public keys.
 ///
-/// m-of-n multisig: OP_m <key1> ... <keyn> OP_n OP_CHECKMULTISIG
-/// Keys are sorted (matching bitcoinj's createRedeemScript behavior).
+/// m-of-n multisig: <m> <key1> ... <keyn> <n> OP_CHECKMULTISIG, the counts
+/// written as bitcoinj-thin's `ScriptBuilder.number` writes them
+/// ([`script_number`]). Keys are sorted (matching bitcoinj's
+/// createRedeemScript behavior), and each is pushed as `ScriptBuilder.data`
+/// pushes its encoding: 33 compressed bytes, or for the point at infinity
+/// the one byte 00, which is a one-byte push (`01 00`), not OP_0.
 pub fn build_federation_redeem_script(keys: &[[u8; 33]], threshold: usize) -> Vec<u8> {
     let mut sorted_keys = keys.to_vec();
     sorted_keys.sort();
 
-    let mut script = Vec::new();
-    script.push(0x50 + threshold as u8); // OP_m
+    let mut script = script_number(threshold);
     for key in &sorted_keys {
-        script.push(33); // OP_PUSHBYTES_33
-        script.extend_from_slice(key);
+        let encoded = super::federation::key_encoding(key);
+        script.push(encoded.len() as u8); // OP_PUSHBYTES_33, or _1
+        script.extend_from_slice(encoded);
     }
-    script.push(0x50 + sorted_keys.len() as u8); // OP_n
+    script.extend_from_slice(&script_number(sorted_keys.len()));
     script.push(0xAE); // OP_CHECKMULTISIG
     script
+}
+
+/// bitcoinj-thin's `ScriptBuilder.number` as RSKj's release has it
+/// (`v0.14.4-rsk-18`): OP_0 to OP_15 for 0 to 15, and from 16 on the
+/// number's minimal little-endian bytes as a push (`bigNum`). So a
+/// federation of 16 to 20 members writes its size as `0x01 <n>`, not as
+/// OP_16 and the opcodes past it. `rsk-20` writes 16 as OP_16, but no
+/// release of RSKj runs it.
+fn script_number(n: usize) -> Vec<u8> {
+    if n < 16 {
+        // `Script.encodeToOpN`: OP_0, then OP_1 (0x51) to OP_15.
+        return vec![if n == 0 { 0x00 } else { 0x50 + n as u8 }];
+    }
+    let mut bytes = (n as u64).to_le_bytes().to_vec();
+    while bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    if bytes.last().is_some_and(|b| b & 0x80 != 0) {
+        bytes.push(0x00);
+    }
+    let mut push = vec![bytes.len() as u8];
+    push.extend_from_slice(&bytes);
+    push
 }
 
 /// rskj `Utils.signedLongToByteArrayLE`: `reverseBytes(BigInteger.valueOf(v)
@@ -5032,29 +5770,109 @@ fn signed_long_to_byte_array_le(value: i64) -> Vec<u8> {
     be
 }
 
-/// rskj `NonStandardErpRedeemScriptBuilder` (post-RSKIP284/293) and
+/// Which of rskj's ERP redeem script builders a federation's script comes
+/// from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ErpScript {
+    /// `NonStandardErpRedeemScriptBuilderHardcoded`: testnet's one script,
+    /// whatever the keys, before RSKIP284.
+    NonStandardHardcoded,
+    /// `NonStandardErpRedeemScriptBuilderWithCsvUnsignedBE`: before RSKIP293,
+    /// the CSV delay as two unsigned big-endian bytes.
+    NonStandardCsvUnsignedBe,
+    /// `NonStandardErpRedeemScriptBuilder`.
+    NonStandard,
+    /// `P2shErpRedeemScriptBuilder`.
+    P2sh,
+}
+
+/// rskj `NonStandardErpRedeemScriptBuilderHardcoded`'s
+/// `LEGACY_ERP_TESTNET_REDEEM_SCRIPT_BYTES`.
+const LEGACY_ERP_TESTNET_REDEEM_SCRIPT: &str = concat!(
+    "6453",
+    "210208f40073a9e43b3e9103acec79767a6de9b0409749884e989960fee578012fce",
+    "210225e892391625854128c5c4ea4340de0c2a70570f33db53426fc9c746597a03f4",
+    "2102afc230c2d355b1a577682b07bc2646041b5d0177af0f98395a46018da699b6da",
+    "210344a3c38cd59afcba3edcebe143e025574594b001700dec41e59409bdbd0f2a09",
+    "21039a060badbeb24bee49eb2063f616c0f0f0765d4ca646b20a88ce828f259fcdb9",
+    "55670300cd50b27552",
+    "210216c23b2ea8e4f11c3f9e22711addb1d16a93964796913830856b568cc3ea21d3",
+    "210275562901dd8faae20de0a4166362a4f82188db77dbed4ca887422ea1ec185f14",
+    "21034db69f2112f4fb1bb6141bf6e2bd6631f0484d0bd95b16767902c9fe219d4a6f",
+    "5368ae",
+);
+
+/// The hard-coded script's bytes. bitcoinj-thin's `RedeemScriptParserFactory`
+/// holds the same script, and an input spent with it cannot be sized
+/// (`release_tx::signatures_required`).
+pub(super) fn legacy_erp_testnet_redeem_script() -> &'static [u8] {
+    static SCRIPT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        alloy_primitives::hex::decode(LEGACY_ERP_TESTNET_REDEEM_SCRIPT)
+            .expect("the hard-coded script is hex")
+    })
+}
+
+/// rskj `NonStandardErpRedeemScriptBuilderFactory`: the builder of a
+/// non-standard ERP federation's redeem script, by network and by the block
+/// being run. rskj rebuilds a stored federation with that block's
+/// activations, so the same federation's script changes at RSKIP284 and at
+/// RSKIP293.
+fn non_standard_erp_script(
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> ErpScript {
+    if matches!(config.btc_network, super::constants::BtcNetwork::Testnet)
+        && !hardfork_cfg.has_rskip284(block_number)
+    {
+        ErpScript::NonStandardHardcoded
+    } else if !hardfork_cfg.has_rskip293(block_number) {
+        ErpScript::NonStandardCsvUnsignedBe
+    } else {
+        ErpScript::NonStandard
+    }
+}
+
+/// bitcoinj `Utils.unsignedLongToByteArrayBE`: `number` in exactly
+/// `num_bytes` big-endian bytes. bitcoinj refuses a number that doesn't fit,
+/// which a network's CSV delay never is.
+fn unsigned_long_to_byte_array_be(number: i64, num_bytes: usize) -> Vec<u8> {
+    (number as u64).to_be_bytes()[8 - num_bytes..].to_vec()
+}
+
+/// rskj's non-standard ERP redeem script builders (see [`ErpScript`]) and
 /// `P2shErpRedeemScriptBuilder` (post-RSKIP353) emergency-multisig template.
 ///
-/// Both wrap a default N-of-M multisig and an emergency K-of-J multisig in a
-/// CSV-gated `OP_NOTIF ... OP_ELSE <csv> OP_CHECKSEQUENCEVERIFY OP_DROP ...
-/// OP_ENDIF`. The non-standard form strips the trailing `OP_CHECKMULTISIG`
-/// from each inner script and appends a single `OP_CHECKMULTISIG` after
-/// `OP_ENDIF`; the P2SH-ERP form keeps each inner script intact (incl. its
-/// `OP_CHECKMULTISIG`) and emits nothing after `OP_ENDIF`. Inner scripts are
-/// standard multisig with keys sorted lexicographically (see
-/// [`build_federation_redeem_script`]). The CSV delay is pushed via
-/// [`signed_long_to_byte_array_le`].
+/// All but the hard-coded one wrap a default N-of-M multisig and an emergency
+/// K-of-J multisig in a CSV-gated `OP_NOTIF ... OP_ELSE <csv>
+/// OP_CHECKSEQUENCEVERIFY OP_DROP ... OP_ENDIF`. The non-standard form strips
+/// the trailing `OP_CHECKMULTISIG` from each inner script and appends a single
+/// `OP_CHECKMULTISIG` after `OP_ENDIF`; the P2SH-ERP form keeps each inner
+/// script intact (incl. its `OP_CHECKMULTISIG`) and emits nothing after
+/// `OP_ENDIF`. Inner scripts are standard multisig with keys sorted
+/// lexicographically (see [`build_federation_redeem_script`]). The CSV delay
+/// is pushed via [`signed_long_to_byte_array_le`], or before RSKIP293 as two
+/// unsigned big-endian bytes.
 fn build_erp_redeem_script(
     default_keys: &[[u8; 33]],
     default_threshold: usize,
     erp_keys: &[[u8; 33]],
     erp_threshold: usize,
     csv_delay: i64,
-    p2sh: bool,
+    script: ErpScript,
 ) -> Vec<u8> {
+    if script == ErpScript::NonStandardHardcoded {
+        return legacy_erp_testnet_redeem_script().to_vec();
+    }
+    let p2sh = script == ErpScript::P2sh;
     let default_redeem = build_federation_redeem_script(default_keys, default_threshold);
     let erp_redeem = build_federation_redeem_script(erp_keys, erp_threshold);
-    let csv = signed_long_to_byte_array_le(csv_delay);
+    let csv = if script == ErpScript::NonStandardCsvUnsignedBe {
+        unsigned_long_to_byte_array_be(csv_delay, 2)
+    } else {
+        signed_long_to_byte_array_le(csv_delay)
+    };
 
     // `removeOpCheckMultisig`: drop the trailing OP_CHECKMULTISIG (last byte).
     let default_inner: &[u8] = if p2sh { &default_redeem } else { &default_redeem[..default_redeem.len() - 1] };
@@ -5074,6 +5892,25 @@ fn build_erp_redeem_script(
         script.push(0xae); // OP_CHECKMULTISIG
     }
     script
+}
+
+/// rskj `FederationFactory.buildP2shErpFederation`'s redeem script: a P2SH
+/// ERP federation of `members`, with the emergency keys `emergency` after
+/// `delay` blocks, each threshold a majority.
+#[cfg(test)]
+pub(crate) fn p2sh_erp_redeem_script(
+    members: &[[u8; 33]],
+    emergency: &[[u8; 33]],
+    delay: i64,
+) -> Vec<u8> {
+    build_erp_redeem_script(
+        members,
+        members.len() / 2 + 1,
+        emergency,
+        emergency.len() / 2 + 1,
+        delay,
+        ErpScript::P2sh,
+    )
 }
 
 /// rskj `PendingFederation.buildFederation` redeem-script selection: a
@@ -5104,8 +5941,12 @@ pub fn build_committed_federation_redeem_script(
         .collect();
     let erp_threshold = erp_keys.len() / 2 + 1;
     let csv = config.erp_fed_activation_delay;
-    let p2sh = hardfork_cfg.has_rskip353(block_number);
-    build_erp_redeem_script(keys, threshold, &erp_keys, erp_threshold, csv, p2sh)
+    let script = if hardfork_cfg.has_rskip353(block_number) {
+        ErpScript::P2sh
+    } else {
+        non_standard_erp_script(config, hardfork_cfg, block_number)
+    };
+    build_erp_redeem_script(keys, threshold, &erp_keys, erp_threshold, csv, script)
 }
 
 /// Build a live federation's redeem script from its **stored format version**,
@@ -5118,11 +5959,16 @@ pub fn build_committed_federation_redeem_script(
 ///   2000 NON_STANDARD_ERP       → non-standard ERP (no trailing OP_CHECKMULTISIG per inner)
 ///   3000 P2SH_ERP / 4000 P2SH_P2WSH_ERP → P2SH-ERP template
 /// (The P2SH-P2WSH-ERP federation reuses the P2SH-ERP redeem template — see
-/// `FederationFactory.buildP2shP2wshErpFederation`.)
+/// `FederationFactory.buildP2shP2wshErpFederation`.) Within format 2000 the
+/// builder follows the block being run (`block_number`), as rskj rebuilds a
+/// stored federation with that block's activations: see
+/// [`non_standard_erp_script`].
 fn federation_redeem_for_format(
     keys: &[[u8; 33]],
     format_version: u64,
     config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
 ) -> Vec<u8> {
     let threshold = keys.len() / 2 + 1;
     if format_version <= 1000 {
@@ -5138,9 +5984,13 @@ fn federation_redeem_for_format(
         .collect();
     let erp_threshold = erp_keys.len() / 2 + 1;
     let csv = config.erp_fed_activation_delay;
-    // 2000 = non-standard ERP (p2sh=false); 3000/4000 = P2SH-ERP template (p2sh=true).
-    let p2sh = format_version >= 3000;
-    build_erp_redeem_script(keys, threshold, &erp_keys, erp_threshold, csv, p2sh)
+    // 2000 = non-standard ERP; 3000/4000 = the P2SH-ERP template.
+    let script = if format_version >= 3000 {
+        ErpScript::P2sh
+    } else {
+        non_standard_erp_script(config, hardfork_cfg, block_number)
+    };
+    build_erp_redeem_script(keys, threshold, &erp_keys, erp_threshold, csv, script)
 }
 
 /// Read a federation's stored format version (rskj
@@ -5235,12 +6085,18 @@ pub(crate) fn load_federation_member_keys<CTX: crate::RskContextTr>(ctx: &mut CT
 ///
 /// - Pre-RSKIP271: `BridgeUtilsLegacy.calculatePegoutTxSize` — an analytic
 ///   approximation parameterised by the script-sig chunk size.
-/// - Post-RSKIP271: `BridgeUtils.calculateLegacyTxSize` — the exact
+/// - Post-RSKIP271: `BridgeUtils.calculatePegoutTxSize`, by the federation's
+///   format: `calculateSegwitTxSize` for a P2SH-P2WSH ERP federation,
+///   `calculateLegacyTxSize` for any other -- the exact
 ///   `BtcTransaction.bitcoinSerialize()` length of a 2-in/2-out legacy tx whose
 ///   inputs carry the redeem script as their scriptSig, plus
-///   `numSigsRequired * inputsCount * 72`. (Mainnet federations are never
-///   segwit at the heights rustock handles, so only the legacy branch applies.)
-fn regular_pegout_tx_size(redeem: &[u8], num_sigs_required: u64, rskip271: bool) -> u64 {
+///   `numSigsRequired * inputsCount * 72`.
+fn regular_pegout_tx_size(
+    redeem: &[u8],
+    num_sigs_required: u64,
+    rskip271: bool,
+    segwit: bool,
+) -> u64 {
     const INPUTS: u64 = 2;
     const OUTPUTS: u64 = 2;
 
@@ -5258,29 +6114,20 @@ fn regular_pegout_tx_size(redeem: &[u8], num_sigs_required: u64, rskip271: bool)
             + (OUTPUT_SIZE + 1 + OUTPUT_ADDITIONAL_DATA_SIZE) * OUTPUTS;
     }
 
-    // Post-RSKIP271: exact bitcoinSerialize() length of the legacy tx that
-    // BridgeUtils.calculateLegacyTxSize builds (input scriptSig = redeem,
-    // output scriptPubKey = the 23-byte P2SH-to-federation script).
-    const P2SH_SCRIPT_LEN: u64 = 23;
-    let r = redeem.len() as u64;
-    let base_size = 4 // version
-        + varint_size(INPUTS)
-        + INPUTS * (36 + varint_size(r) + r + 4)
-        + varint_size(OUTPUTS)
-        + OUTPUTS * (8 + varint_size(P2SH_SCRIPT_LEN) + P2SH_SCRIPT_LEN)
-        + 4; // locktime
-    let signing_size = num_sigs_required * INPUTS * 72;
-    base_size + signing_size
-}
-
-/// bitcoinj `VarInt` serialized length.
-fn varint_size(n: u64) -> u64 {
-    match n {
-        0..=0xfc => 1,
-        0xfd..=0xffff => 3,
-        0x1_0000..=0xffff_ffff => 5,
-        _ => 9,
-    }
+    // The outputs pay the federation's address, a P2SH output script of 23
+    // bytes whatever the format; only its length counts.
+    let fed_script = p2sh_output_script(&[0; 20]);
+    let (threshold, inputs, outputs) = (
+        num_sigs_required as usize,
+        INPUTS as usize,
+        OUTPUTS as usize,
+    );
+    let size = if segwit {
+        pegout_tx_size_segwit(redeem, &fed_script, threshold, inputs, outputs)
+    } else {
+        pegout_tx_size_legacy(redeem, &fed_script, threshold, inputs, outputs)
+    };
+    size as u64
 }
 
 /// rskj `BridgeSupport.requestRelease` minimum-fee estimate (post-RSKIP219):
@@ -5290,9 +6137,10 @@ fn require_funds_for_fee(
     num_sigs_required: u64,
     fee_per_kb: u64,
     rskip271: bool,
+    segwit: bool,
     config: &BridgeConstants,
 ) -> u64 {
-    let pegout_size = regular_pegout_tx_size(redeem, num_sigs_required, rskip271);
+    let pegout_size = regular_pegout_tx_size(redeem, num_sigs_required, rskip271, segwit);
     let base = fee_per_kb * pegout_size / 1000;
     base + base * config.minimum_pegout_value_percentage_to_receive_after_fee / 100
 }
@@ -5315,16 +6163,30 @@ fn get_effective_fee_per_kb<CTX: crate::RskContextTr>(ctx: &mut CTX, config: &Br
 /// scriptSig) before any is applied; a single invalid signature aborts the
 /// call. Each valid signature is then inserted at the position dictated by
 /// the key order in the redeem script, consuming one OP_0 placeholder.
-/// Returns whether at least one signature was applied.
+/// Returns whether at least one signature was applied, and `Err` where rskj
+/// throws: at an input with a witness whose spent value `prev_values`, what
+/// `getReleaseOutpointsValues` read, doesn't hold, at an input whose
+/// redeem script it can't take, and where a signature is checked against the
+/// point at infinity.
+///
+/// The point at infinity verifies nothing in rskj: Bouncy Castle refuses it
+/// as a verifying key (`ECPublicKeyParameters` throws "point at infinity"),
+/// and `BtcECKey.verify` lets that `IllegalArgumentException` through.
+/// `getTransactionSignatures` doesn't catch it, so a call with that key fails
+/// at its first signature; nor does `BridgeSupport.sign`, which catches
+/// `IllegalStateException` alone, so once an input holds a signature, any
+/// member's call that signs it fails at `findSigInRedeem`, which tries the
+/// redeem script's keys in order and meets that key, sorted first, before
+/// any other.
 fn apply_signatures_to_tx(
     tx: &mut BtcTransaction,
     sigs: &[Vec<u8>],
     fed_key: &[u8; 33],
-    prev_values: &[u64],
-) -> bool {
+    prev_values: Option<&[u64]>,
+) -> Result<bool, PrecompileError> {
     use super::release_tx::{
         extract_redeem_script, input_signed_by, legacy_sighash_all, segwit_sighash_all,
-        sig_insertion_index, update_script_with_signature, verify_der_signature,
+        sig_insertion_index, signature_to_insert, update_script_with_signature,
         witness_input_signed_by, witness_sig_insertion_index, witness_update_with_signature,
     };
 
@@ -5337,16 +6199,33 @@ fn apply_signatures_to_tx(
     let mut sighashes = Vec::with_capacity(n);
     #[allow(clippy::needless_range_loop)] // indexes several parallel collections
     for i in 0..n {
+        // rskj reads a segwit input's value first, and throws where there is
+        // none: nothing kept under the transaction's hash (`orElseThrow`), or
+        // fewer values than inputs (`List.get`).
+        let prev_value = if is_witness[i] {
+            let Some(value) = prev_values.and_then(|values| values.get(i).copied()) else {
+                return Err(PrecompileError::other(
+                    "addSignature: no value kept for the output a segwit input spends",
+                ));
+            };
+            value
+        } else {
+            0
+        };
         let redeem = if is_witness[i] {
             tx.input[i].witness.last().map(|r| r.to_vec())
         } else {
             extract_redeem_script(tx.input[i].script_sig.as_bytes())
         };
+        // `BitcoinUtils.generateSigHashForLegacyTransactionInput` and its
+        // segwit twin throw where they can't take the input's redeem script.
         let Some(redeem) = redeem else {
-            return false;
+            return Err(PrecompileError::other(
+                "addSignature: an input has no redeem script to sign over",
+            ));
         };
         let sighash = if is_witness[i] {
-            segwit_sighash_all(tx, i, &redeem, prev_values.get(i).copied().unwrap_or(0))
+            segwit_sighash_all(tx, i, &redeem, prev_value)
         } else {
             legacy_sighash_all(tx, i, &redeem)
         };
@@ -5354,14 +6233,31 @@ fn apply_signatures_to_tx(
         redeems.push(redeem);
     }
 
-    // getTransactionSignatures: any malformed or non-verifying signature
-    // aborts without applying anything.
+    // getTransactionSignatures: the federator's key is the point at infinity,
+    // whose verification throws (see above): the call fails.
+    if *fed_key == super::federation::INFINITY_KEY {
+        return Err(PrecompileError::other(
+            "addSignature: a signature is verified with the point at infinity",
+        ));
+    }
+    // getTransactionSignatures: a signature bitcoinj cannot read, that does
+    // not verify, or whose s is in the upper half of the order aborts
+    // without applying anything; each is applied as bitcoinj writes it
+    // (`signature_to_insert`).
+    let mut encodings = Vec::with_capacity(n);
     for (sig, sighash) in sigs.iter().zip(&sighashes) {
-        if !verify_der_signature(sig, sighash, fed_key) {
-            return false;
-        }
+        let Some(encoded) = signature_to_insert(sig, sighash, fed_key) else {
+            return Ok(false);
+        };
+        encodings.push(encoded);
     }
 
+    // `findSigInRedeem` met the point at infinity (see above): the call fails.
+    let meets_infinity = || {
+        PrecompileError::other(
+            "addSignature: a signature is looked up against the point at infinity",
+        )
+    };
     // sign(): stop at the first input already signed by this federator.
     let mut signed = false;
     for i in 0..n {
@@ -5382,77 +6278,34 @@ fn apply_signatures_to_tx(
         // verified fine against the federator's own key, so without this
         // gate it would fill a placeholder it has no claim to (#2,448,984).
         if !super::release_tx::spending_redeem_keys(&redeems[i]).contains(fed_key) {
-            return signed;
+            return Ok(signed);
         }
-        let mut encoded = sigs[i].clone();
-        encoded.push(0x01); // SIGHASH_ALL
+        let encoded = encodings[i].clone();
         if is_witness[i] {
             let pushes: Vec<Vec<u8>> = tx.input[i].witness.iter().map(|p| p.to_vec()).collect();
-            let index =
-                witness_sig_insertion_index(&pushes, &sighashes[i], fed_key, &redeems[i]);
+            let Some(index) =
+                witness_sig_insertion_index(&pushes, &sighashes[i], fed_key, &redeems[i])
+            else {
+                return Err(meets_infinity());
+            };
             let Some(updated) = witness_update_with_signature(&pushes, &encoded, index) else {
-                return false; // no placeholder left (bitcoinj throws)
+                return Ok(false); // no placeholder left (bitcoinj throws)
             };
             tx.input[i].witness = bitcoin::Witness::from_slice(&updated);
         } else {
             let script_sig = tx.input[i].script_sig.as_bytes().to_vec();
-            let index = sig_insertion_index(&script_sig, &sighashes[i], fed_key, &redeems[i]);
+            let Some(index) = sig_insertion_index(&script_sig, &sighashes[i], fed_key, &redeems[i])
+            else {
+                return Err(meets_infinity());
+            };
             let Some(updated) = update_script_with_signature(&script_sig, &encoded, index) else {
-                return false; // no placeholder left (bitcoinj throws)
+                return Ok(false); // no placeholder left (bitcoinj throws)
             };
             tx.input[i].script_sig = bitcoin::ScriptBuf::from_bytes(updated);
         }
         signed = true;
     }
-    signed
-}
-
-/// Parse an array of dynamic bytes from ABI-encoded `bytes[]` argument.
-fn parse_bytes_array(args: &[u8], array_offset: usize) -> Vec<Vec<u8>> {
-    if array_offset + 32 > args.len() {
-        return Vec::new();
-    }
-    // Any ABI length/offset that does not fit in a usize is necessarily out of
-    // range for this calldata, so treat it as unparseable (an empty/short
-    // result) rather than panicking — rskj's Solidity decoder likewise rejects
-    // such inputs (the count guard runs after the read, so the conversion must
-    // never overflow). Mainnet #6,223,783 tx[3] feeds a count of ~uint256::MAX.
-    let Ok(count) = usize::try_from(U256::from_be_slice(&args[array_offset..array_offset + 32]))
-    else {
-        return Vec::new();
-    };
-    if count == 0 || count > 1000 {
-        return Vec::new();
-    }
-
-    let offsets_start = array_offset + 32;
-    let mut result = Vec::with_capacity(count);
-
-    for i in 0..count {
-        let off_pos = offsets_start + i * 32;
-        if off_pos + 32 > args.len() {
-            break;
-        }
-        let Ok(elem_rel_offset) =
-            usize::try_from(U256::from_be_slice(&args[off_pos..off_pos + 32]))
-        else {
-            break;
-        };
-        let elem_abs = offsets_start + elem_rel_offset;
-        if elem_abs + 32 > args.len() {
-            break;
-        }
-        let Ok(elem_len) = usize::try_from(U256::from_be_slice(&args[elem_abs..elem_abs + 32]))
-        else {
-            break;
-        };
-        let data_start = elem_abs + 32;
-        if data_start + elem_len > args.len() {
-            break;
-        }
-        result.push(args[data_start..data_start + elem_len].to_vec());
-    }
-    result
+    Ok(signed)
 }
 
 // ---------------------------------------------------------------------------
@@ -5465,32 +6318,22 @@ fn btc_satoshi_to_rbtc_wei(satoshis: u64) -> U256 {
     U256::from(satoshis) * U256::from(10_000_000_000u64) // 10^10
 }
 
-fn read_dynamic_bytes(args: &[u8], offset: usize) -> Result<Vec<u8>, PrecompileError> {
-    if offset + 32 > args.len() {
-        return Err(PrecompileError::other("ABI: offset out of bounds"));
-    }
-    // An oversized length can never fit this calldata: reject it (rskj's
-    // decoder does the same) instead of panicking on the usize conversion.
-    let Ok(len) = usize::try_from(U256::from_be_slice(&args[offset..offset + 32])) else {
-        return Err(PrecompileError::other("ABI: length out of bounds"));
-    };
-    let data_start = offset + 32;
-    if data_start + len > args.len() {
-        return Err(PrecompileError::other("ABI: data out of bounds"));
-    }
-    Ok(args[data_start..data_start + len].to_vec())
-}
-
 // ---------------------------------------------------------------------------
 // Read-only query methods
 // ---------------------------------------------------------------------------
 
 /// `getNextPegoutCreationBlockNumber()` → int256
+///
+/// The method exists from RSKIP271, where rskj's
+/// `BridgeStorageProvider.getNextPegoutHeight` reads the cell, 0 where it
+/// holds nothing, and the Bridge's `teardown` writes back what was read
+/// (`saveNextPegoutHeight`).
 pub fn get_next_pegout_creation_block_number<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let val = super::storage::bridge_load_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY);
+    super::storage::bridge_store_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY, val);
     let mut output = [0u8; 32];
     let bytes = val.to_be_bytes::<32>();
     output.copy_from_slice(&bytes);
@@ -5511,6 +6354,7 @@ pub fn get_queued_pegouts_count<CTX: crate::RskContextTr>(
     // only exists from RSKIP271 (hop400), which is well past RSKIP146, so the
     // with-txhash half is always in scope here.
     let entries = load_release_request_queue(ctx, true);
+    write_back_release_request_queue(ctx, true);
     let count = U256::from(entries.len());
     Ok(PrecompileOutput::new(gas_cost, count.to_be_bytes::<32>().to_vec().into()))
 }
@@ -5555,6 +6399,20 @@ fn save_release_request_queue<CTX: crate::RskContextTr>(
     }
 }
 
+/// rskj's `Bridge.execute` ends a method that returns with `teardown`, whose
+/// `BridgeStorageProvider.save` writes the release-request queue back if the
+/// method read it (`saveReleaseRequestQueue`): `releaseRequestQueue`, and
+/// from RSKIP146 `releaseRequestQueueWithTxHash`, each as rskj serializes
+/// what it read, the empty list where a cell held nothing. The getters that
+/// read the queue write it back so too.
+pub(crate) fn write_back_release_request_queue<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    rskip146: bool,
+) {
+    let queue = load_release_request_queue(ctx, rskip146);
+    save_release_request_queue(ctx, &queue, rskip146);
+}
+
 /// rskj `BridgeStorageProvider.getReleaseRequestQueue` (l.168-193): the legacy
 /// `releaseRequestQueue` entries FIRST, then — once RSKIP146 is active — the
 /// `releaseRequestQueueWithTxHash` entries appended. Both lists, concatenated,
@@ -5597,20 +6455,20 @@ fn estimated_fees_for_next_pegout<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
     block_number: u64,
-) -> u64 {
+) -> Result<u64, PrecompileError> {
     let queue = load_release_request_queue(ctx, hardfork_cfg.has_rskip146(block_number));
 
     // shouldReturnZeroEstimatedFees (l.2646-2651).
     if !hardfork_cfg.has_rskip385(block_number)
         && (!hardfork_cfg.has_rskip271(block_number) || queue.is_empty())
     {
-        return 0;
+        return Ok(0);
     }
 
     if !hardfork_cfg.has_rskip305(block_number) {
-        return estimated_fees_from_inputs_and_outputs_count(
+        return Ok(estimated_fees_from_inputs_and_outputs_count(
             ctx, config, hardfork_cfg, block_number, queue.len(),
-        );
+        ));
     }
 
     // getEstimatedFeesFromPegoutTransactionSimulation (l.2677-2692): the
@@ -5622,13 +6480,15 @@ fn estimated_fees_for_next_pegout<CTX: crate::RskContextTr>(
         100_000_000
     };
 
-    simulate_pegout_fee(ctx, config, hardfork_cfg, block_number, &queue, estimated_next_amount)
+    // A build bitcoinj cannot size throws past the fallback
+    // (`release_tx::signatures_required`).
+    Ok(simulate_pegout_fee(ctx, config, hardfork_cfg, block_number, &queue, estimated_next_amount)?
         .unwrap_or_else(|| {
             // BridgeIllegalArgumentException -> "fallback to old logic".
             estimated_fees_from_inputs_and_outputs_count(
                 ctx, config, hardfork_cfg, block_number, queue.len(),
             )
-        })
+        }))
 }
 
 /// rskj `BridgeSupport.getEstimatedFeesFromInputsAndOutputsCount`
@@ -5653,9 +6513,9 @@ fn estimated_fees_from_inputs_and_outputs_count<CTX: crate::RskContextTr>(
     let outputs_count = queued_pegouts + 2;
     let inputs_count = 2;
 
-    // rskj BridgeUtils.simulatePegoutTxSize: RSKIP378 (cardamom1000) is -1 on
-    // both mainnet and testnet, so the pre-cardamom branch is the live one —
-    // and it picks the sizer by federation format, not by activation.
+    // rskj BridgeUtils.calculatePegoutTxSize: from RSKIP271, which every
+    // network activates before anything reaches here, the sizer goes by the
+    // federation's format, segwit for a P2SH-P2WSH ERP federation.
     let size = if format >= 4000 {
         pegout_tx_size_segwit(&redeem_script, &fed_script, threshold, inputs_count, outputs_count)
     } else {
@@ -5672,7 +6532,8 @@ fn estimated_fees_from_inputs_and_outputs_count<CTX: crate::RskContextTr>(
 /// federation's real UTXO set, and report `inputSum - outputSum`.
 ///
 /// `None` mirrors the `BridgeIllegalArgumentException` rskj throws when the
-/// builder does not return SUCCESS; the caller then falls back.
+/// builder does not return SUCCESS; the caller then falls back. `Err` is a
+/// build bitcoinj cannot size, which throws past that fallback.
 fn simulate_pegout_fee<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
@@ -5680,11 +6541,11 @@ fn simulate_pegout_fee<CTX: crate::RskContextTr>(
     block_number: u64,
     queue: &[ReleaseRequest],
     estimated_next_amount: u64,
-) -> Option<u64> {
+) -> Result<Option<u64>, super::release_tx::UncountableSignatures> {
     let (keys, redeem_script) =
         active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
     if keys.is_empty() {
-        return None;
+        return Ok(None);
     }
     let format = active_federation_format(ctx, config, hardfork_cfg, block_number);
     let is_segwit = format >= 4000;
@@ -5694,6 +6555,10 @@ fn simulate_pegout_fee<CTX: crate::RskContextTr>(
 
     let utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, block_number);
     let available = load_utxos_at(ctx, utxo_key);
+    // rskj reads them with `getActiveFederationBtcUTXOs`, and `save()` writes
+    // them back as the call returns, the empty list where the cell held
+    // nothing.
+    store_utxos_at(ctx, utxo_key, &available);
 
     // Same FlyoverCompatibleBtcWallet resolution updateCollections uses.
     let mut candidate_fed_redeems = vec![redeem_script.clone()];
@@ -5722,7 +6587,7 @@ fn simulate_pegout_fee<CTX: crate::RskContextTr>(
         amount_satoshis: estimated_next_amount,
     });
 
-    let built = super::release_tx::complete_pegout_tx(
+    let Some(built) = super::release_tx::complete_pegout_tx(
         &available,
         &outputs,
         &change_script,
@@ -5730,11 +6595,14 @@ fn simulate_pegout_fee<CTX: crate::RskContextTr>(
         fee_per_kb,
         tx_version,
         is_segwit,
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
 
     let input_sum: u64 = built.used_utxos.iter().map(|u| u.value_satoshis).sum();
     let output_sum: u64 = built.tx.output.iter().map(|o| o.value.to_sat()).sum();
-    Some(input_sum.saturating_sub(output_sum))
+    Ok(Some(input_sum.saturating_sub(output_sum)))
 }
 
 /// `getEstimatedFeesForNextPegOutEvent()` → uint256 (satoshis)
@@ -5749,7 +6617,10 @@ pub fn get_estimated_fees_for_next_pegout<CTX: crate::RskContextTr>(
     hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let fee = estimated_fees_for_next_pegout(ctx, config, hardfork_cfg, block_number);
+    let fee = estimated_fees_for_next_pegout(ctx, config, hardfork_cfg, block_number)?;
+    // The method exists from RSKIP271, where `getQueuedPegoutsCount` reads
+    // the queue.
+    write_back_release_request_queue(ctx, hardfork_cfg.has_rskip146(block_number));
     let out = U256::from(fee).to_be_bytes::<32>();
     Ok(PrecompileOutput::new(gas_cost, out.to_vec().into()))
 }
@@ -5757,9 +6628,9 @@ pub fn get_estimated_fees_for_next_pegout<CTX: crate::RskContextTr>(
 /// `getEstimatedFeesForPegOutAmount(uint256 pegoutAmountInWeis)` → uint256
 ///
 /// Enabled by RSKIP540 (Vetiver900). Validates the amount against the
-/// minimum peg-out value like rskj BridgeSupport.getEstimatedFeesForPegOutAmount;
-/// the fee simulation itself shares getEstimatedFeesForNextPegOutEvent's
-/// (stub) fidelity.
+/// minimum peg-out value like rskj BridgeSupport.getEstimatedFeesForPegOutAmount,
+/// then runs getEstimatedFeesForNextPegOutEvent's peg-out simulation with the
+/// caller's amount.
 pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
@@ -5773,16 +6644,22 @@ pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
             "getEstimatedFeesForPegOutAmount: method not enabled",
         ));
     }
-    if args.len() < 32 {
-        return Err(PrecompileError::other(
-            "getEstimatedFeesForPegOutAmount: args too short",
-        ));
-    }
-
-    // co.rsk.core.Coin (wei) -> bitcoin Coin (satoshi): / 10^10
-    let wei = U256::from_be_slice(&args[0..32]);
-    let satoshis = wei / U256::from(10_000_000_000u64);
-    if satoshis < U256::from(config.minimum_pegout_tx_value) {
+    // rskj `new co.rsk.core.Coin((BigInteger) args[0]).toBitcoin()`: the wei
+    // as a signed number, divided by 10^10 toward zero, then `longValue()`,
+    // its low 64 bits. A negative amount is below the minimum like any other.
+    let wei = crate::abi::Args::new(args)
+        .int(0)
+        .ok_or_else(|| PrecompileError::other("getEstimatedFeesForPegOutAmount: no amount"))?;
+    let negative = wei.0[0] & 0x80 != 0;
+    let raw = U256::from_be_bytes(wei.0);
+    let magnitude = if negative {
+        (!raw).wrapping_add(U256::from(1))
+    } else {
+        raw
+    };
+    let low = (magnitude / U256::from(10_000_000_000u64)).as_limbs()[0] as i64;
+    let satoshis = if negative { low.wrapping_neg() } else { low };
+    if satoshis < config.minimum_pegout_tx_value as i64 {
         return Err(PrecompileError::other(
             "getEstimatedFeesForPegOutAmount: peg-out amount is below the minimum peg-out value",
         ));
@@ -5798,10 +6675,11 @@ pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
         PrecompileError::other("getEstimatedFeesForPegOutAmount: cannot simulate peg-out")
     })?;
     let queue = load_release_request_queue(ctx, hardfork_cfg.has_rskip146(block_number));
-    let fee = simulate_pegout_fee(ctx, config, hardfork_cfg, block_number, &queue, amount)
+    let fee = simulate_pegout_fee(ctx, config, hardfork_cfg, block_number, &queue, amount)?
         .ok_or_else(|| {
             PrecompileError::other("getEstimatedFeesForPegOutAmount: cannot simulate peg-out")
         })?;
+    write_back_release_request_queue(ctx, hardfork_cfg.has_rskip146(block_number));
     let out = U256::from(fee).to_be_bytes::<32>();
     Ok(PrecompileOutput::new(gas_cost, out.to_vec().into()))
 }
@@ -5998,6 +6876,9 @@ mod tests {
     fn an_unlimited_entry_survives_the_lock_it_authorises() {
         let mut ctx = queue_ctx();
         let user = [0x33u8; 20];
+        // Every save writes the one-off cell, so it is there beside the
+        // unlimited one on any chain.
+        store_one_off_whitelist(&mut ctx, &[], i32::MAX);
         store_unlimited_whitelist(&mut ctx, &[user]);
 
         assert!(whitelist_allows_and_consume(&mut ctx, &user, 1_000_000, 100, true));
@@ -6006,6 +6887,71 @@ mod tests {
         // And again: unlimited entries authorise repeatedly.
         assert!(whitelist_allows_and_consume(&mut ctx, &user, 1_000_000, 100, true));
         assert_eq!(load_unlimited_whitelist(&mut ctx), vec![user]);
+    }
+
+    /// rskj reads the unlimited cell only where the one-off cell exists
+    /// (`initializeLockWhitelist`), so without one an unlimited entry
+    /// authorises nothing, and the save writes the empty whitelist it read.
+    /// No chain holds that state, since every save writes the one-off cell.
+    #[test]
+    fn without_a_one_off_cell_the_unlimited_cell_is_not_read() {
+        let mut ctx = queue_ctx();
+        let user = [0x33u8; 20];
+        store_unlimited_whitelist(&mut ctx, &[user]);
+
+        assert!(!whitelist_allows_and_consume(
+            &mut ctx, &user, 1_000, 100, true
+        ));
+        assert_eq!(
+            to_hex(&bridge_load_bytes_named(&mut ctx, LOCK_WHITELIST_KEY)),
+            "c5847fffffff"
+        );
+        assert_eq!(
+            to_hex(&bridge_load_bytes_named(
+                &mut ctx,
+                UNLIMITED_LOCK_WHITELIST_KEY
+            )),
+            "c0"
+        );
+    }
+
+    /// Before RSKIP87 rskj reads the one-off cell alone, so an unlimited
+    /// entry authorises nothing there, and its cell is neither read nor
+    /// written.
+    #[test]
+    fn before_rskip87_the_unlimited_cell_is_not_read() {
+        let mut ctx = queue_ctx();
+        let user = [0x33u8; 20];
+        store_one_off_whitelist(&mut ctx, &[], i32::MAX);
+        store_unlimited_whitelist(&mut ctx, &[user]);
+
+        assert!(!whitelist_allows_and_consume(
+            &mut ctx, &user, 1_000, 100, false
+        ));
+        assert_eq!(load_unlimited_whitelist(&mut ctx), vec![user]);
+    }
+
+    /// The whitelist turns off only past its disable height (rskj
+    /// `height > disableBlockHeight`): at the height itself it still gates.
+    #[test]
+    fn at_its_disable_height_the_whitelist_still_gates() {
+        let mut ctx = queue_ctx();
+        store_one_off_whitelist(&mut ctx, &[], 50);
+
+        assert!(!whitelist_allows_and_consume(
+            &mut ctx,
+            &[0x99; 20],
+            1_000,
+            50,
+            true
+        ));
+        assert!(whitelist_allows_and_consume(
+            &mut ctx,
+            &[0x99; 20],
+            1_000,
+            51,
+            true
+        ));
     }
 
     /// Past the disable height the whitelist stops gating, but it is still
@@ -6276,8 +7222,64 @@ mod tests {
         sig.extend_from_slice(&[0x03, 0x20]);
         sig.extend_from_slice(&[0x22u8; 32]);
         assert!(!is_der_signature(&sig), "second element must be INTEGER");
-        // zero-length integer
-        assert!(!is_der_signature(&[0x30, 0x04, 0x02, 0x00, 0x02, 0x00]), "empty integer");
+        // an integer whose first byte only repeats the sign of the next
+        assert!(!is_der_signature(&[
+            0x30, 0x07, 0x02, 0x02, 0x00, 0x7f, 0x02, 0x01, 0x01
+        ]));
+        assert!(!is_der_signature(&[
+            0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x02, 0xff, 0x80
+        ]));
+        // an indefinite length, and a length of five bytes
+        assert!(!is_der_signature(&[
+            0x30, 0x80, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x00, 0x00
+        ]));
+        assert!(!is_der_signature(&[
+            0x30, 0x0b, 0x02, 0x85, 0, 0, 0, 0, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        // a length in four bytes, past what a Java int holds
+        assert!(!is_der_signature(&[
+            0x30, 0x84, 0x80, 0, 0, 0, 0x02, 0x01, 0x01
+        ]));
+        // a high tag number that is not the sequence's, or the integer's
+        assert!(!is_der_signature(&[
+            0x3f, 0x11, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        assert!(!is_der_signature(&[
+            0x30, 0x07, 0x1f, 0x03, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        // the integer's high tag cut off by the sequence's end
+        assert!(!is_der_signature(&[
+            0x30, 0x04, 0x02, 0x01, 0x01, 0x1f, 0x02, 0x01, 0x01
+        ]));
+    }
+
+    /// What Bouncy Castle 1.58's `ASN1InputStream` reads and bitcoinj's
+    /// `decodeFromDER` takes, though it is not DER.
+    #[test]
+    fn der_signature_accepts_what_bouncy_castle_reads() {
+        // integers with no bytes, read as 0
+        assert!(is_der_signature(&[0x30, 0x04, 0x02, 0x00, 0x02, 0x00]));
+        // lengths in the long form
+        assert!(is_der_signature(&[
+            0x30, 0x81, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        assert!(is_der_signature(&[
+            0x30, 0x0a, 0x02, 0x84, 0, 0, 0, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        // the high-tag-number forms of the sequence's and the integer's tags
+        assert!(is_der_signature(&[
+            0x3f, 0x10, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        assert!(is_der_signature(&[
+            0x30, 0x07, 0x1f, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        // a negative encoding, and bytes after the sequence
+        assert!(is_der_signature(&[
+            0x30, 0x06, 0x02, 0x01, 0x81, 0x02, 0x01, 0x01
+        ]));
+        assert!(is_der_signature(&[
+            0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0xde, 0xad
+        ]));
     }
 
     /// A federation member's signature over the **wrong sighash** is not
@@ -6333,15 +7335,55 @@ mod tests {
         // Well formed DER, right key, right federation -- wrong message.
         let before = tx.input[0].script_sig.clone();
         assert!(
-            !apply_signatures_to_tx(&mut tx, &[sig_over(&wrong)], pk, &[]),
+            !apply_signatures_to_tx(&mut tx, &[sig_over(&wrong)], pk, None).expect("no throw"),
             "a signature over the wrong sighash must not be applied"
         );
         assert_eq!(tx.input[0].script_sig, before, "nothing may be written");
 
         // The control: the same key over the right message does apply, so the
         // rejection above is about the message and not the setup.
-        assert!(apply_signatures_to_tx(&mut tx, &[sig_over(&correct)], pk, &[]));
+        assert!(
+            apply_signatures_to_tx(&mut tx, &[sig_over(&correct)], pk, None).expect("no throw")
+        );
         assert_ne!(tx.input[0].script_sig, before);
+    }
+
+    /// rskj takes every input's sighash before it reads a signature
+    /// (`BridgeSupport.processSigning`), and
+    /// `BitcoinUtils.generateSigHashForLegacyTransactionInput` throws where it
+    /// can't take an input's redeem script from its scriptSig: the call fails,
+    /// whatever the signatures.
+    #[test]
+    fn an_input_with_no_redeem_script_fails_the_call() {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        use k256::ecdsa::{Signature, SigningKey};
+
+        let sk = SigningKey::from_slice(&[1; 32]).unwrap();
+        let pk: [u8; 33] = sk
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        let mut tx = BtcTransaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![],
+        };
+        let sig: Signature = sk.sign_prehash(&[0x5a; 32]).unwrap();
+        let signed =
+            apply_signatures_to_tx(&mut tx, &[sig.to_der().as_bytes().to_vec()], &pk, None);
+        assert!(
+            signed.is_err(),
+            "rskj throws where an input has no redeem script"
+        );
+        assert!(tx.input[0].script_sig.is_empty(), "nothing may be written");
     }
 
     /// Regression for mainnet #2,448,984: a federator whose key is NOT in an
@@ -6391,11 +7433,13 @@ mod tests {
 
         // Outsider: verifies against its own key but is not in the redeem.
         let before = tx.input[0].script_sig.clone();
-        assert!(!apply_signatures_to_tx(&mut tx, &[sign(&outsider_sk)], &outsider_pk, &[]));
+        let outsider = apply_signatures_to_tx(&mut tx, &[sign(&outsider_sk)], &outsider_pk, None);
+        assert!(!outsider.expect("no throw"));
         assert_eq!(tx.input[0].script_sig, before, "script must be untouched");
 
         // Member: applied normally.
-        assert!(apply_signatures_to_tx(&mut tx, &[sign(&members[0].0)], &members[0].1, &[]));
+        let member = apply_signatures_to_tx(&mut tx, &[sign(&members[0].0)], &members[0].1, None);
+        assert!(member.expect("no throw"));
         assert_ne!(tx.input[0].script_sig, before);
     }
 
@@ -6655,6 +7699,44 @@ mod tests {
         assert_eq!(script.len(), 1 + 3 * 34 + 2);
     }
 
+    /// A federation of 16 to 20 members: RSKj's release builds its multisig
+    /// with bitcoinj-thin `v0.14.4-rsk-18`, whose `ScriptBuilder.number`
+    /// writes 16 and up as a push (`bigNum`), so the size goes in as
+    /// `0x01 <n>`. 15 is still OP_15, and so is every threshold up to 20
+    /// members' 11.
+    #[test]
+    fn a_federation_of_16_or_more_writes_its_size_as_a_push() {
+        let keys: Vec<[u8; 33]> = (0..20u8)
+            .map(|i| {
+                let mut key = [0x02; 33];
+                key[32] = i;
+                key
+            })
+            .collect();
+        for (n, size) in [
+            (15, vec![0x5f]),
+            (16, vec![0x01, 0x10]),
+            (20, vec![0x01, 0x14]),
+        ] {
+            let threshold = n / 2 + 1;
+            let script = build_federation_redeem_script(&keys[..n], threshold);
+            assert_eq!(
+                script[0],
+                0x50 + threshold as u8,
+                "{n} members: the threshold"
+            );
+            let mut tail = size.clone();
+            tail.push(0xae);
+            assert_eq!(&script[1 + n * 34..], &tail[..], "{n} members: the size");
+        }
+        assert_eq!(script_number(0), vec![0x00]);
+        assert_eq!(
+            script_number(128),
+            vec![0x02, 0x80, 0x00],
+            "a sign byte past 0x7f"
+        );
+    }
+
     /// Redeem script hash160.
     #[test]
     fn rskj_redeem_script_hash160_non_zero() {
@@ -6684,6 +7766,103 @@ mod tests {
         assert_eq!(signed_long_to_byte_array_le(1), vec![0x01]);
     }
 
+    /// bitcoinj `Utils.unsignedLongToByteArrayBE(csv, 2)`, which the
+    /// non-standard ERP builder pushes before RSKIP293: 52,560 -> `cd 50`.
+    #[test]
+    fn erp_csv_delay_unsigned_be_groundtruth() {
+        assert_eq!(unsigned_long_to_byte_array_be(52_560, 2), vec![0xcd, 0x50]);
+        assert_eq!(unsigned_long_to_byte_array_be(500, 2), vec![0x01, 0xf4]);
+        assert_eq!(unsigned_long_to_byte_array_be(20, 2), vec![0x00, 0x14]);
+    }
+
+    /// rskj `NonStandardErpFederationsTest`'s real values (its
+    /// `createdRedeemScriptProgramFrom...WithRealValues...` tests): five
+    /// federators, three emergency keys, CSV 52,560. The hard-coded builder
+    /// answers its one script whatever the keys; the builder with the unsigned
+    /// big-endian CSV, and today's builder, answer these programs.
+    #[test]
+    fn nonstandard_erp_redeem_scripts_match_rskjs_real_values() {
+        let emergency = [
+            "0216c23b2ea8e4f11c3f9e22711addb1d16a93964796913830856b568cc3ea21d3",
+            "0275562901dd8faae20de0a4166362a4f82188db77dbed4ca887422ea1ec185f14",
+            "034db69f2112f4fb1bb6141bf6e2bd6631f0484d0bd95b16767902c9fe219d4a6f",
+        ]
+        .map(key);
+        let script = |last: &str, kind: ErpScript| {
+            let federators = [
+                "0208f40073a9e43b3e9103acec79767a6de9b0409749884e989960fee578012fce",
+                "0225e892391625854128c5c4ea4340de0c2a70570f33db53426fc9c746597a03f4",
+                "025a2f522aea776fab5241ad72f7f05918e8606676461cb6ce38265a52d4ca9ed6",
+                "02afc230c2d355b1a577682b07bc2646041b5d0177af0f98395a46018da699b6da",
+                last,
+            ]
+            .map(key);
+            alloy_primitives::hex::encode(build_erp_redeem_script(
+                &federators,
+                3,
+                &emergency,
+                2,
+                52_560,
+                kind,
+            ))
+        };
+        assert_eq!(
+            script(
+                "039a060badbeb24bee49eb2063f616c0f0f0765d4ca646b20a88ce828f259fcdb9",
+                ErpScript::NonStandardHardcoded
+            ),
+            "6453210208f40073a9e43b3e9103acec79767a6de9b0409749884e989960fee578012fce210225e892391625854128c5c4ea4340de0c2a70570f33db53426fc9c746597a03f42102afc230c2d355b1a577682b07bc2646041b5d0177af0f98395a46018da699b6da210344a3c38cd59afcba3edcebe143e025574594b001700dec41e59409bdbd0f2a0921039a060badbeb24bee49eb2063f616c0f0f0765d4ca646b20a88ce828f259fcdb955670300cd50b27552210216c23b2ea8e4f11c3f9e22711addb1d16a93964796913830856b568cc3ea21d3210275562901dd8faae20de0a4166362a4f82188db77dbed4ca887422ea1ec185f1421034db69f2112f4fb1bb6141bf6e2bd6631f0484d0bd95b16767902c9fe219d4a6f5368ae"
+        );
+        assert_eq!(
+            script(
+                "0344a3c38cd59afcba3edcebe143e025574594b001700dec41e59409bdbd0f2a09",
+                ErpScript::NonStandardCsvUnsignedBe
+            ),
+            "6453210208f40073a9e43b3e9103acec79767a6de9b0409749884e989960fee578012fce210225e892391625854128c5c4ea4340de0c2a70570f33db53426fc9c746597a03f421025a2f522aea776fab5241ad72f7f05918e8606676461cb6ce38265a52d4ca9ed62102afc230c2d355b1a577682b07bc2646041b5d0177af0f98395a46018da699b6da210344a3c38cd59afcba3edcebe143e025574594b001700dec41e59409bdbd0f2a09556702cd50b27552210216c23b2ea8e4f11c3f9e22711addb1d16a93964796913830856b568cc3ea21d3210275562901dd8faae20de0a4166362a4f82188db77dbed4ca887422ea1ec185f1421034db69f2112f4fb1bb6141bf6e2bd6631f0484d0bd95b16767902c9fe219d4a6f5368ae"
+        );
+        assert_eq!(
+            script(
+                "03fb8e1d5d0392d35ca8c3656acb6193dbf392b3e89b9b7b86693f5c80f7ce8581",
+                ErpScript::NonStandard
+            ),
+            "6453210208f40073a9e43b3e9103acec79767a6de9b0409749884e989960fee578012fce210225e892391625854128c5c4ea4340de0c2a70570f33db53426fc9c746597a03f421025a2f522aea776fab5241ad72f7f05918e8606676461cb6ce38265a52d4ca9ed62102afc230c2d355b1a577682b07bc2646041b5d0177af0f98395a46018da699b6da2103fb8e1d5d0392d35ca8c3656acb6193dbf392b3e89b9b7b86693f5c80f7ce858155670350cd00b27552210216c23b2ea8e4f11c3f9e22711addb1d16a93964796913830856b568cc3ea21d3210275562901dd8faae20de0a4166362a4f82188db77dbed4ca887422ea1ec185f1421034db69f2112f4fb1bb6141bf6e2bd6631f0484d0bd95b16767902c9fe219d4a6f5368ae"
+        );
+    }
+
+    /// rskj `NonStandardErpRedeemScriptBuilderFactory`, by network and block:
+    /// on testnet the hard-coded script before RSKIP284, the unsigned
+    /// big-endian CSV before RSKIP293, today's builder after; elsewhere the
+    /// unsigned CSV before RSKIP293. A stored federation of format 2000 is
+    /// rebuilt by the block being run, not its creation block.
+    #[test]
+    fn the_nonstandard_erp_builder_is_picked_as_rskjs_factory_picks_it() {
+        let (testnet, testnet_cfg) = (BridgeConstants::testnet(), RskHardforkConfig::testnet());
+        let (mainnet, mainnet_cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        let on_testnet = |n| non_standard_erp_script(&testnet, &testnet_cfg, n);
+        let on_mainnet = |n| non_standard_erp_script(&mainnet, &mainnet_cfg, n);
+        assert_eq!(on_testnet(2_581_799), ErpScript::NonStandardHardcoded);
+        assert_eq!(on_testnet(2_581_800), ErpScript::NonStandardCsvUnsignedBe);
+        assert_eq!(on_testnet(3_102_999), ErpScript::NonStandardCsvUnsignedBe);
+        assert_eq!(on_testnet(3_103_000), ErpScript::NonStandard);
+        assert_eq!(on_mainnet(0), ErpScript::NonStandardCsvUnsignedBe);
+        assert_eq!(on_mainnet(4_598_499), ErpScript::NonStandardCsvUnsignedBe);
+        assert_eq!(on_mainnet(4_598_500), ErpScript::NonStandard);
+
+        let keys = test_keys(0x10);
+        let at = |n| federation_redeem_for_format(&keys, 2000, &testnet, &testnet_cfg, n);
+        assert_eq!(
+            at(2_581_799),
+            build_erp_redeem_script(&[], 0, &[], 0, 0, ErpScript::NonStandardHardcoded)
+        );
+        let (unsigned_csv, today) = (at(2_581_800), at(3_103_000));
+        assert_eq!(
+            unsigned_csv.len() + 1,
+            today.len(),
+            "two CSV bytes, not three"
+        );
+        assert_ne!(unsigned_csv, today);
+    }
+
     /// Ground truth: the first real RSK mainnet federation change committed at
     /// block #4,652,781 produced a NON-STANDARD ERP federation (RSKIP201 active,
     /// RSKIP353 not). Its base58 P2SH address appears in the block's
@@ -6710,7 +7889,8 @@ mod tests {
             .map(|h| key(h))
             .collect::<Vec<_>>();
         // NonStandard ERP (p2sh = false): default 5-of-9, emergency 3-of-4.
-        let redeem = build_erp_redeem_script(&new_keys, 5, &erp_keys, 3, 52560, false);
+        let redeem =
+            build_erp_redeem_script(&new_keys, 5, &erp_keys, 3, 52560, ErpScript::NonStandard);
         assert_eq!(p2sh_base58_mainnet(&redeem), "3DsneJha6CY6X9gU2M9uEc4nSdbYECB4Gh");
     }
 
@@ -6738,7 +7918,8 @@ mod tests {
             .iter()
             .map(|h| key(h))
             .collect::<Vec<_>>();
-        let redeem = build_erp_redeem_script(&default_keys, 5, &erp_keys, 3, 52560, true);
+        let redeem =
+            build_erp_redeem_script(&default_keys, 5, &erp_keys, 3, 52560, ErpScript::P2sh);
         assert_eq!(
             alloy_primitives::hex::encode(p2sh_output_script(&redeem_script_hash160(&redeem)).as_bytes()),
             "a9142c1bab6ea51fdaf85c8366bd2b1502eaa69b6ae687"
@@ -6770,9 +7951,13 @@ mod tests {
         ]
         .map(key);
         let config = BridgeConstants::mainnet();
+        // Where that federation was committed, past RSKIP293.
+        let (cfg, block) = (RskHardforkConfig::mainnet(), 4_652_781);
+        let for_format =
+            |format| federation_redeem_for_format(&active_keys, format, &config, &cfg, block);
 
         // format 2000 (NON_STANDARD_ERP) → the active fed's real mainnet P2SH.
-        let r2000 = federation_redeem_for_format(&active_keys, 2000, &config);
+        let r2000 = for_format(2000);
         assert_eq!(
             p2sh_base58_mainnet(&r2000),
             "3DsneJha6CY6X9gU2M9uEc4nSdbYECB4Gh",
@@ -6780,7 +7965,7 @@ mod tests {
         );
 
         // format 1000 (STANDARD_MULTISIG) → plain N-of-M, a DIFFERENT address.
-        let r1000 = federation_redeem_for_format(&active_keys, 1000, &config);
+        let r1000 = for_format(1000);
         assert_eq!(
             r1000,
             build_federation_redeem_script(&active_keys, active_keys.len() / 2 + 1),
@@ -6794,7 +7979,7 @@ mod tests {
 
         // format 3000 (P2SH_ERP) → the P2SH-ERP template (p2sh=true), distinct
         // from the non-standard ERP form.
-        let r3000 = federation_redeem_for_format(&active_keys, 3000, &config);
+        let r3000 = for_format(3000);
         assert_ne!(r3000, r2000, "P2SH-ERP and non-standard ERP differ");
     }
 
@@ -6882,7 +8067,7 @@ mod tests {
             entries.push(mk(&[1, 0, 0, 0, i], 3_345_000));
         }
 
-        let pos = next_pegout_with_enough_confirmations(&entries, 3_345_557, 4000)
+        let pos = next_pegout_with_enough_confirmations(&entries, 3_345_557, 4000, entries.len())
             .expect("one confirmed entry");
         assert_eq!(
             entries[pos].btc_tx_raw, selected_btc,
@@ -6919,6 +8104,24 @@ mod tests {
         assert_eq!(java_hashset_capacity(48), 128);
     }
 
+    /// rskj adds the peg-outs a call builds to the set it read
+    /// (`PegoutsWaitingForConfirmations.add`), one at a time, and
+    /// `HashMap.putVal` doubles the table once the set holds more than three
+    /// quarters of it: eleven read and one added stay at 16, where a set read
+    /// with twelve is 32, and a second added takes it to 32.
+    #[test]
+    fn a_set_grows_by_the_entries_added_after_it_was_read() {
+        assert_eq!(walked_hashset_capacity(11, 11), 16);
+        assert_eq!(walked_hashset_capacity(11, 12), 16);
+        assert_eq!(walked_hashset_capacity(11, 13), 32);
+        assert_eq!(walked_hashset_capacity(12, 12), 32);
+        assert_eq!(walked_hashset_capacity(0, 12), 16);
+        assert_eq!(walked_hashset_capacity(0, 13), 32);
+        assert_eq!(walked_hashset_capacity(23, 24), 32);
+        assert_eq!(walked_hashset_capacity(23, 25), 64);
+        assert_eq!(walked_hashset_capacity(24, 25), 64);
+    }
+
     /// Resize-boundary selection: with the two real h=3,341,556 entries plus
     /// fillers totalling exactly 13 entries the capacity is 32 (a7c69a46→bucket 9,
     /// 0260d432→bucket 20), so the a7c69a46 tx is selected — the #3,345,557
@@ -6945,7 +8148,7 @@ mod tests {
         }
         assert_eq!(entries.len(), 13);
         assert_eq!(java_hashset_capacity(entries.len()), 32);
-        let pos = next_pegout_with_enough_confirmations(&entries, 3_345_557, 4000)
+        let pos = next_pegout_with_enough_confirmations(&entries, 3_345_557, 4000, entries.len())
             .expect("one confirmed entry");
         assert_eq!(entries[pos].btc_tx_raw, selected_btc);
     }
@@ -6987,7 +8190,7 @@ mod tests {
         assert_eq!(entries.len(), 12);
         // n=12 → the HashSet(Collection) constructor pre-sizes to 32.
         assert_eq!(java_hashset_capacity(12), 32);
-        let pos = next_pegout_with_enough_confirmations(&entries, 3_344_303, 4000)
+        let pos = next_pegout_with_enough_confirmations(&entries, 3_344_303, 4000, entries.len())
             .expect("a confirmed entry");
         assert_eq!(
             entries[pos].btc_tx_raw, rskj_btc,
@@ -7081,7 +8284,13 @@ mod tests {
             output: vec![],
         };
         match classify_pegin_sender(&tx).unwrap() {
-            Some(PeginSender::P2pkh { pubkey: parsed }) => assert_eq!(parsed, pubkey),
+            Some(PeginSender::P2pkh {
+                btc_hash160,
+                rsk_address,
+            }) => {
+                assert_eq!(rsk_address, addr);
+                assert_eq!(btc_hash160, pubkey_hash160(&pubkey));
+            }
             other => panic!("expected P2PKH sender, got {}", other.is_some()),
         }
     }
@@ -7211,13 +8420,20 @@ mod tests {
     #[test]
     fn sender_refund_target_distinguishes_p2pkh_from_the_p2sh_shapes() {
         let pubkey = real_pubkey().to_vec();
-        let (hash, is_p2sh) = sender_refund_target(&PeginSender::P2pkh { pubkey: pubkey.clone() });
+        let rsk_address = crate::bridge::federation::rsk_address_from_public_key(&pubkey).unwrap();
+        let (hash, is_p2sh) = sender_refund_target(&PeginSender::P2pkh {
+            btc_hash160: pubkey_hash160(&pubkey),
+            rsk_address,
+        });
         assert_eq!(hash, pubkey_hash160(&pubkey), "P2PKH refunds to hash160(pubkey)");
         assert!(!is_p2sh, "P2PKH is not a P2SH address");
 
         let marker = [0xABu8; 20];
         for sender in [
-            PeginSender::P2shP2wpkh { pubkey, p2sh_hash: marker },
+            PeginSender::P2shP2wpkh {
+                p2sh_hash: marker,
+                rsk_address,
+            },
             PeginSender::P2shMultisig { p2sh_hash: marker },
             PeginSender::P2shP2wsh { p2sh_hash: marker },
         ] {
@@ -7281,9 +8497,9 @@ mod tests {
     fn the_switch_removes_exactly_the_two_multisig_shapes() {
         use super::super::rskj_sender_compat as compat;
 
-        // Guard: this flips process-wide state, so restore it.
-        let was = compat::enabled();
-        compat::set_enabled(false);
+        // On this test's thread alone: flipped for the whole process, the
+        // switch changed the answers of the tests running beside this one.
+        compat::set_enabled_on_this_thread(Some(false));
 
         assert!(
             matches!(classify_pegin_sender(&p2pkh_tx()).unwrap(), Some(PeginSender::P2pkh { .. })),
@@ -7302,7 +8518,7 @@ mod tests {
             "P2SH-P2WSH is no longer classified"
         );
 
-        compat::set_enabled(was);
+        compat::set_enabled_on_this_thread(None);
         assert!(
             matches!(classify_pegin_sender(&p2sh_multisig_tx()).unwrap(), Some(PeginSender::P2shMultisig { .. })),
             "and switching back restores it"
@@ -7363,36 +8579,427 @@ mod tests {
             "witness with a single push matches no shape"
         );
 
-        // Witness has two pushes but the second is not a valid compressed key.
+        // Witness has two pushes but the second is a key that isn't compressed.
+        // One that isn't a key at all throws: see
+        // `the_p2sh_p2wpkh_parser_throws_for_a_witness_key_it_cannot_decode`.
+        let mut uncompressed = vec![0x04];
+        uncompressed.extend_from_slice(&alloy_primitives::hex::decode(GX).unwrap());
+        uncompressed.extend_from_slice(&alloy_primitives::hex::decode(GY).unwrap());
         assert!(
-            classify_pegin_sender(&tx_with(vec![2, 0x00, 0x14],
-                vec![vec![0x30; 71], vec![0xFFu8; 33]])).unwrap().is_none(),
-            "P2SH-P2WPKH requires the witness key to be a curve point"
+            classify_pegin_sender(&tx_with(
+                vec![2, 0x00, 0x14],
+                vec![vec![0x30; 71], uncompressed]
+            ))
+            .unwrap()
+            .is_none(),
+            "P2SH-P2WPKH requires the witness key to be compressed"
         );
 
-        // Three witness items but the last is not a multisig redeem.
+        // Three witness items but the last is a script that isn't a multisig
+        // redeem. One bitcoinj can't parse throws: see
+        // `the_multisig_parsers_throw_for_a_redeem_script_they_cannot_build`.
         assert!(
-            classify_pegin_sender(&tx_with(vec![2, 0x00, 0x20],
-                vec![vec![], vec![0x30; 71], vec![0x01, 0x02, 0x03]])).unwrap().is_none(),
+            classify_pegin_sender(&tx_with(
+                vec![2, 0x00, 0x20],
+                vec![vec![], vec![0x30; 71], vec![0x51, 0x52, 0x53]]
+            ))
+            .unwrap()
+            .is_none(),
             "P2SH-P2WSH requires a multisig redeem as the last witness item"
         );
     }
 
-    /// The P2PKH branch accepts only a real curve point. rskj gets this from
-    /// BtcECKey.fromPublicOnly throwing; rustock from `compress_pubkey`
-    /// returning None. Without it a two-chunk scriptSig whose second push is
-    /// arbitrary bytes would be read as P2PKH and refunded to a hash160 of
-    /// data the sender never controlled.
+    /// **No Bitcoin transaction a peg-in can carry panics the Bridge.**
+    ///
+    /// Anyone can have a transaction of their own making mined into a Bitcoin
+    /// block and register it with a proof of inclusion, so every script,
+    /// witness push and output in it is theirs to choose: Bitcoin's consensus
+    /// asks for an input and leaves scripts free. A panic in reading one would
+    /// stop every node at the block that registers it. Each seed shape is varied
+    /// script by script and push by push, and each variation given to
+    /// everything that reads a peg-in or a federator's signature.
     #[test]
-    fn classify_pegin_sender_p2pkh_requires_a_valid_public_key() {
-        let mut script = vec![71];
-        script.extend_from_slice(&[0x30; 71]);
-        script.push(33);
-        script.extend_from_slice(&[0xFFu8; 33]); // not on the curve
-        assert!(
-            classify_pegin_sender(&tx_with(script, vec![])).unwrap().is_none(),
-            "a non-curve 33-byte push must not classify as P2PKH"
+    fn no_variation_on_a_pegin_panics_the_bridge() {
+        use super::super::release_tx;
+
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n.max(1) as u64) as usize
+            }
+        }
+
+        // Bytes that mean something to a script reader: pushes of each size
+        // and their limits, small numbers, and the opcodes multisig, ERP,
+        // flyover and OP_RETURN scripts are built from.
+        const OPCODES: [u8; 26] = [
+            0x00, 0x01, 0x02, 0x14, 0x20, 0x21, 0x41, 0x47, 0x48, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f,
+            0x51, 0x52, 0x60, 0x63, 0x67, 0x68, 0x6a, 0x75, 0x87, 0xa9, 0xae, 0xb2,
+        ];
+
+        fn vary(bytes: &mut Vec<u8>, rng: &mut Rng) {
+            for _ in 0..1 + rng.below(3) {
+                let at = rng.below(bytes.len() + 1);
+                match rng.below(7) {
+                    0 if at < bytes.len() => bytes[at] ^= 1 << rng.below(8),
+                    1 if at < bytes.len() => bytes[at] = OPCODES[rng.below(OPCODES.len())],
+                    2 => bytes.insert(at, OPCODES[rng.below(OPCODES.len())]),
+                    3 => bytes.insert(at, rng.next() as u8),
+                    4 if at < bytes.len() => {
+                        let n = 1 + rng.below(8.min(bytes.len() - at));
+                        bytes.drain(at..at + n);
+                    }
+                    5 => bytes.truncate(at),
+                    _ => {
+                        let n = rng.below(80);
+                        let fill = rng.next() as u8;
+                        bytes.splice(at..at, std::iter::repeat_n(fill, n));
+                    }
+                }
+            }
+        }
+
+        fn read_like_the_bridge(tx: &BtcTransaction) {
+            if let Ok(Some(sender)) = classify_pegin_sender(tx) {
+                let _ = sender_refund_target(&sender);
+                let _ = sender_type_name(Some(&sender));
+            }
+            let _ = undetermined_input_shape(tx);
+            let _ = super::super::pegin_instructions::build_pegin_instructions(tx);
+            let _ = btc_txid_event_bytes(tx);
+            let _ = multisig_tx_hash_without_signatures(tx, true);
+            let _ = multisig_tx_hash_without_signatures(tx, false);
+            let _ = sig_hash_for_pegout_index(tx);
+            let _ = release_tx::has_enough_signatures(tx);
+            let raw = bitcoin::consensus::serialize(tx);
+            let _ = has_inputs(&raw, true);
+            let _ = has_inputs(&raw, false);
+            let _ = super::super::tx::calculate_btc_tx_hash(&raw);
+            let mut scripts: Vec<&[u8]> = Vec::new();
+            for input in &tx.input {
+                scripts.push(input.script_sig.as_bytes());
+                scripts.extend(input.witness.iter());
+            }
+            scripts.extend(
+                tx.output
+                    .iter()
+                    .map(|output| output.script_pubkey.as_bytes()),
+            );
+            for script in scripts {
+                let _ = release_tx::parse_chunks(script);
+                let _ = p2sh_script_hash160(script);
+                let _ = is_der_signature(script);
+                let _ = is_btc_public_key(script);
+                let _ = member_key_as_given(script);
+                let _ = super::super::rskj_sender_compat::is_sent_to_multisig(script);
+                let _ = super::super::rskj_sender_compat::signatures_required_to_spend(script);
+                let _ = super::super::rskj_sender_compat::redeem_script_of_input(script, None);
+                if let Some(redeem) = release_tx::extract_redeem_script(script) {
+                    let _ = super::super::rskj_sender_compat::is_sent_to_multisig(&redeem);
+                    let _ = release_tx::is_erp_redeem(&redeem);
+                }
+            }
+        }
+
+        // A peg-in with outputs: an RSKT OP_RETURN carrying instructions with a
+        // refund address, a P2SH output and a P2PKH one.
+        let mut with_outputs = p2pkh_tx();
+        let mut payload = vec![0x52, 0x53, 0x4b, 0x54, 0x01];
+        payload.extend_from_slice(&[0x11; 20]);
+        payload.push(0x02);
+        payload.extend_from_slice(&[0x22; 20]);
+        let mut op_return = vec![0x6a, payload.len() as u8];
+        op_return.extend_from_slice(&payload);
+        for script in [
+            op_return,
+            p2sh_output_script_program(&[0x33; 20]),
+            p2pkh_output_script(&[0x44; 20]).to_bytes(),
+        ] {
+            with_outputs.output.push(bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000_000),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(script),
+            });
+        }
+        // A flyover peg-in: its redeem is the derivation hash, OP_DROP and
+        // the federation's multisig.
+        let flyover = {
+            let redeem = flyover_redeem_script(&[0x55; 32], &multisig_redeem());
+            let mut script = vec![0x00, 71];
+            script.extend_from_slice(&[0x30; 71]);
+            script.push(0x4c);
+            script.push(redeem.len() as u8);
+            script.extend_from_slice(&redeem);
+            tx_with(script, vec![])
+        };
+        let seeds = [
+            p2pkh_tx(),
+            p2sh_p2wpkh_tx(),
+            p2sh_multisig_tx(),
+            p2sh_p2wsh_tx(),
+            with_outputs,
+            flyover,
+        ];
+
+        let mut rng = Rng(0xA076_1D64_78BD_642F);
+        let mut varied = 0;
+        for seed in &seeds {
+            read_like_the_bridge(seed);
+            for _ in 0..1_500 {
+                let mut tx = seed.clone();
+                for _ in 0..1 + rng.below(3) {
+                    match rng.below(6) {
+                        0 => {
+                            let i = rng.below(tx.input.len());
+                            let mut script = tx.input[i].script_sig.to_bytes();
+                            vary(&mut script, &mut rng);
+                            tx.input[i].script_sig = bitcoin::ScriptBuf::from_bytes(script);
+                        }
+                        1 => {
+                            let i = rng.below(tx.input.len());
+                            let mut pushes: Vec<Vec<u8>> =
+                                tx.input[i].witness.iter().map(<[u8]>::to_vec).collect();
+                            match rng.below(3) {
+                                0 if !pushes.is_empty() => {
+                                    let p = rng.below(pushes.len());
+                                    vary(&mut pushes[p], &mut rng);
+                                }
+                                1 if !pushes.is_empty() => {
+                                    pushes.remove(rng.below(pushes.len()));
+                                }
+                                _ => {
+                                    let mut push = multisig_redeem();
+                                    vary(&mut push, &mut rng);
+                                    let at = rng.below(pushes.len() + 1);
+                                    pushes.insert(at, push);
+                                }
+                            }
+                            tx.input[i].witness = bitcoin::Witness::from_slice(&pushes);
+                        }
+                        2 if !tx.output.is_empty() => {
+                            let o = rng.below(tx.output.len());
+                            let mut script = tx.output[o].script_pubkey.to_bytes();
+                            vary(&mut script, &mut rng);
+                            tx.output[o].script_pubkey = bitcoin::ScriptBuf::from_bytes(script);
+                        }
+                        3 => {
+                            let copy = tx.input[rng.below(tx.input.len())].clone();
+                            tx.input.push(copy);
+                        }
+                        4 if tx.input.len() > 1 => {
+                            tx.input.remove(rng.below(tx.input.len()));
+                        }
+                        _ => {
+                            let mut script = vec![0x6a];
+                            let mut data = payload.clone();
+                            vary(&mut data, &mut rng);
+                            script.push(data.len().min(75) as u8);
+                            script.extend_from_slice(&data);
+                            tx.output.push(bitcoin::TxOut {
+                                value: bitcoin::Amount::ZERO,
+                                script_pubkey: bitcoin::ScriptBuf::from_bytes(script),
+                            });
+                        }
+                    }
+                }
+                read_like_the_bridge(&tx);
+                varied += 1;
+            }
+        }
+        assert_eq!(varied, seeds.len() * 1_500);
+    }
+
+    // --- the four sender parsers, case by case -----------------------------
+    //
+    // Every key below was decoded by the release's own libraries, bitcoinj-thin
+    // `0.14.4-rsk-18` for `BtcECKey.fromPublicOnly` and Bouncy Castle for
+    // `org.ethereum.crypto.ECKey.fromPublicOnly`, and the hashes and addresses
+    // are the ones they answered.
+
+    /// The generator's coordinates.
+    const GX: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    const GY: &str = "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+    /// `ECKey.getAddress()` of the generator, however it is encoded.
+    const G_RSK_ADDRESS: &str = "7e5f4552091a69125d5dfcb7b8c2659029395bdf";
+    /// `BtcECKey.getPubKeyHash()` of the generator compressed, and uncompressed.
+    const G_COMPRESSED_HASH160: &str = "751e76e8199196d454941c45d1b3a323f1433bd6";
+    const G_UNCOMPRESSED_HASH160: &str = "91b24bf9f5288532960ac687abb035127b1d28a5";
+
+    fn sec1(prefix: &str, rest: &[&str]) -> Vec<u8> {
+        alloy_primitives::hex::decode(format!("{prefix}{}", rest.concat())).unwrap()
+    }
+
+    /// A scriptSig of `first` and then `second` pushed.
+    fn then_push(first: &[u8], second: &[u8]) -> Vec<u8> {
+        let mut script = first.to_vec();
+        script.push(second.len() as u8);
+        script.extend_from_slice(second);
+        script
+    }
+
+    /// The sender rskj reads off a first input: its type, its Bitcoin address's
+    /// hash and its RSK address, in hex.
+    fn sender_read_off(
+        script_sig: Vec<u8>,
+        witness: Vec<Vec<u8>>,
+    ) -> Result<Option<(&'static str, String, Option<String>)>, &'static str> {
+        Ok(
+            classify_pegin_sender(&tx_with(script_sig, witness))?.map(|sender| {
+                (
+                    sender_type_name(Some(&sender)),
+                    alloy_primitives::hex::encode(sender_refund_target(&sender).0),
+                    rsk_address_of(&sender).map(alloy_primitives::hex::encode),
+                )
+            }),
+        )
+    }
+
+    fn rsk_address_of(sender: &PeginSender) -> Option<alloy_primitives::Address> {
+        match sender {
+            PeginSender::P2pkh { rsk_address, .. }
+            | PeginSender::P2shP2wpkh { rsk_address, .. } => Some(*rsk_address),
+            _ => None,
+        }
+    }
+
+    fn p2pkh(hash160: &str, rsk_address: &str) -> Option<(&'static str, String, Option<String>)> {
+        Some(("P2PKH", hash160.into(), Some(rsk_address.into())))
+    }
+
+    /// `P2pkhBtcLockSender` counts the scriptSig's chunks and reads the second.
+    /// It never looks at the first, which need not be a signature or a push.
+    #[test]
+    fn the_p2pkh_parser_reads_the_second_chunk_alone() {
+        let compressed = sec1("02", &[GX]);
+        let signature = then_push(&[], &[0x30; 71]);
+        // OP_0, OP_1 and OP_DUP in the signature's place.
+        for first in [&signature[..], &[0x00], &[0x51], &[0x76]] {
+            assert_eq!(
+                sender_read_off(then_push(first, &compressed), vec![]),
+                Ok(p2pkh(G_COMPRESSED_HASH160, G_RSK_ADDRESS)),
+                "{first:02x?}"
+            );
+        }
+    }
+
+    /// Bouncy Castle's `decodePoint` takes a hybrid key and the point at
+    /// infinity besides the two usual encodings. bitcoinj encodes a point
+    /// again before it hashes it, so a hybrid key has its uncompressed form's
+    /// address, and rskj's address of the point at infinity is the hash of
+    /// nothing.
+    #[test]
+    fn the_p2pkh_parser_takes_every_key_bouncy_castle_decodes() {
+        let sender_with = |key: &[u8]| sender_read_off(then_push(&[0x00], key), vec![]);
+        assert_eq!(
+            sender_with(&sec1("02", &[GX])),
+            Ok(p2pkh(G_COMPRESSED_HASH160, G_RSK_ADDRESS))
         );
+        assert_eq!(
+            sender_with(&sec1("04", &[GX, GY])),
+            Ok(p2pkh(G_UNCOMPRESSED_HASH160, G_RSK_ADDRESS))
+        );
+        // The generator's y is even: 0x06 says so, 0x07 contradicts it.
+        assert_eq!(
+            sender_with(&sec1("06", &[GX, GY])),
+            Ok(p2pkh(G_UNCOMPRESSED_HASH160, G_RSK_ADDRESS))
+        );
+        assert_eq!(
+            sender_with(&[0x00]),
+            Ok(p2pkh(
+                "9f7fd096d37ed2c0e3f7f0cfc924beef4ffceb68",
+                "dcc703c0e500b653ca82273b7bfad8045d85a470"
+            ))
+        );
+
+        // What it throws for is caught there: the parser answers false, and
+        // with no witness no other parser takes the input.
+        let not_keys = [
+            sec1("07", &[GX, GY]),
+            sec1("02", &[&"ff".repeat(32)]),
+            sec1("00", &[&"00".repeat(32)]),
+            sec1("04", &[GX]),
+            sec1("05", &[GX]),
+            vec![],
+        ];
+        for not_a_key in &not_keys {
+            assert_eq!(sender_with(not_a_key), Ok(None), "{not_a_key:02x?}");
+        }
+        // An opcode in the key's place has no data at all.
+        assert_eq!(sender_read_off(vec![0x00, 0x51], vec![]), Ok(None));
+    }
+
+    /// `P2pkhBtcLockSender.tryParse`, the first parser tried, opens with
+    /// `getScriptSig()`, which parses the script outside every `try`.
+    #[test]
+    fn a_script_sig_bitcoinj_cannot_parse_makes_rskj_throw() {
+        // OP_PUSHDATA1 with nothing after it, and a push longer than the script.
+        assert!(sender_read_off(vec![0x4c], vec![]).is_err());
+        assert!(sender_read_off(vec![0x05, 0x01], vec![]).is_err());
+    }
+
+    /// `P2shP2wpkhBtcLockSender` decodes the witness's second push with
+    /// `BtcECKey.fromPublicOnly` before its `try`: what isn't a key throws. A
+    /// key that isn't compressed is none of this parser's.
+    #[test]
+    fn the_p2sh_p2wpkh_parser_throws_for_a_witness_key_it_cannot_decode() {
+        let one_chunk = vec![2, 0x00, 0x14];
+        let with_key = |key: Vec<u8>| sender_read_off(one_chunk.clone(), vec![vec![0x30; 71], key]);
+
+        assert!(with_key(vec![0xff; 33]).is_err());
+        assert!(with_key(vec![]).is_err());
+        assert!(with_key(sec1("07", &[GX, GY])).is_err());
+
+        assert_eq!(with_key(sec1("04", &[GX, GY])), Ok(None));
+        assert_eq!(with_key(sec1("06", &[GX, GY])), Ok(None));
+        assert_eq!(with_key(vec![0x00]), Ok(None));
+
+        // hash160(0x0014 || hash160(key)), and the key's RSK address.
+        let mut program = vec![0x00, 0x14];
+        program.extend_from_slice(&alloy_primitives::hex::decode(G_COMPRESSED_HASH160).unwrap());
+        assert_eq!(
+            with_key(sec1("02", &[GX])),
+            Ok(Some((
+                "P2SH-P2WPKH",
+                alloy_primitives::hex::encode(pubkey_hash160(&program)),
+                Some(G_RSK_ADDRESS.into())
+            )))
+        );
+    }
+
+    /// Both multisig parsers build `new Script(redeemScript)` before their
+    /// `try`. A scriptSig that ends in an opcode has no data to build it from,
+    /// a `NullPointerException`, and a redeem script bitcoinj can't parse is a
+    /// `ScriptException`. One it parses that isn't a multisig is just not this
+    /// parser's.
+    #[test]
+    fn the_multisig_parsers_throw_for_a_redeem_script_they_cannot_build() {
+        let three_chunks = |last: &[u8]| {
+            let mut script = vec![0x00, 0x01, 0x30];
+            script.extend_from_slice(last);
+            script
+        };
+        // OP_1 as the last chunk, then OP_PUSHDATA1 alone pushed as the redeem.
+        assert!(sender_read_off(three_chunks(&[0x51]), vec![]).is_err());
+        assert!(sender_read_off(three_chunks(&[0x01, 0x4c]), vec![]).is_err());
+        // OP_1 pushed, and nothing pushed: scripts, not multisigs.
+        assert_eq!(
+            sender_read_off(three_chunks(&[0x01, 0x51]), vec![]),
+            Ok(None)
+        );
+        assert_eq!(sender_read_off(three_chunks(&[0x00]), vec![]), Ok(None));
+
+        let one_chunk = vec![2, 0x00, 0x20];
+        let witness_ending =
+            |last: Vec<u8>| sender_read_off(one_chunk.clone(), vec![vec![], vec![0x30; 71], last]);
+        assert!(witness_ending(vec![0x4c]).is_err());
+        assert!(witness_ending(vec![0x01, 0x02, 0x03]).is_err());
+        assert_eq!(witness_ending(vec![0x51]), Ok(None));
+        assert_eq!(witness_ending(vec![]), Ok(None));
     }
 
     /// sender address = P2SH(hash160(redeem)) — processable post-RSKIP143
@@ -7514,10 +9121,13 @@ mod tests {
         let redeem = build_federation_redeem_script(&keys, threshold);
 
         // Post-RSKIP271: exact match against rskj's 2058.
-        assert_eq!(regular_pegout_tx_size(&redeem, threshold as u64, true), 2058);
+        assert_eq!(
+            regular_pegout_tx_size(&redeem, threshold as u64, true, false),
+            2058
+        );
 
         // Pre-RSKIP271: within 2% of the real-world 2076-byte tx.
-        let legacy = regular_pegout_tx_size(&redeem, threshold as u64, false) as i64;
+        let legacy = regular_pegout_tx_size(&redeem, threshold as u64, false, false) as i64;
         let orig = 2076i64;
         assert!(
             (orig - legacy).abs() as f64 <= orig as f64 * 0.02,
@@ -7535,7 +9145,7 @@ mod tests {
         let keys = genesis_federation_keys(&config);
         let threshold = keys.len() / 2 + 1;
         let redeem = build_federation_redeem_script(&keys, threshold);
-        let fee = require_funds_for_fee(&redeem, threshold as u64, 30_000, true, &config);
+        let fee = require_funds_for_fee(&redeem, threshold as u64, 30_000, true, false, &config);
         assert!(
             fee < config.minimum_pegout_tx_value,
             "require_funds_for_fee {fee} should be below {} so reason is LOW_AMOUNT",
@@ -7782,11 +9392,15 @@ mod tests {
         // Uniform case: both inputs use fly_a → must equal the single-redeem build.
         let utxos = [mk_utxo(1, 5_000_000), mk_utxo(2, 6_000_000)];
         let redeems_uniform: Vec<&[u8]> = vec![fly_a.as_slice(), fly_a.as_slice()];
-        let multi = build_flyover_empty_wallet_multi(&utxos, &redeems_uniform, &refund, 1000, 2)
-            .expect("multi build");
-        let single =
-            crate::bridge::release_tx::build_empty_wallet_to(&utxos, &refund, &fly_a, 1000, 2)
-                .expect("single build");
+        let multi =
+            build_flyover_empty_wallet_multi(&utxos, &redeems_uniform, &refund, 1000, 2, false)
+                .unwrap()
+                .expect("multi build");
+        let single = crate::bridge::release_tx::build_empty_wallet_to(
+            &utxos, &refund, &fly_a, 1000, 2, false,
+        )
+        .unwrap()
+        .expect("single build");
         assert_eq!(
             bitcoin::consensus::serialize(&multi.tx),
             bitcoin::consensus::serialize(&single.tx),
@@ -7798,8 +9412,10 @@ mod tests {
         // only if the redeems differ in length; here they are equal length but
         // distinct content).
         let redeems_mixed: Vec<&[u8]> = vec![fly_a.as_slice(), fly_b.as_slice()];
-        let mixed = build_flyover_empty_wallet_multi(&utxos, &redeems_mixed, &refund, 1000, 2)
-            .expect("mixed build");
+        let mixed =
+            build_flyover_empty_wallet_multi(&utxos, &redeems_mixed, &refund, 1000, 2, false)
+                .unwrap()
+                .expect("mixed build");
         assert_eq!(mixed.tx.input.len(), 2);
         assert_eq!(mixed.used_utxos.len(), 2);
         // Each input's scriptSig is the placeholder built from its own redeem.
@@ -7886,7 +9502,13 @@ mod tests {
         .map(key);
         let config = BridgeConstants::mainnet();
         let plain = build_federation_redeem_script(&keys, keys.len() / 2 + 1);
-        let erp = federation_redeem_for_format(&keys, 2000, &config);
+        let erp = federation_redeem_for_format(
+            &keys,
+            2000,
+            &config,
+            &RskHardforkConfig::mainnet(),
+            4_652_781,
+        );
         assert_ne!(
             plain, erp,
             "an ERP retiring federation must not migrate with the plain multisig redeem"
@@ -7906,28 +9528,1653 @@ mod tests {
         );
     }
 
-    /// Regression: an ABI `bytes[]` whose declared count does not fit in a
-    /// usize must be rejected (empty result), never panic on the U256->usize
-    /// conversion. Mainnet #6,223,783 tx[3] forwarded malformed addSignature
-    /// calldata whose `signatures` offset landed mid-key, yielding an absurd
-    /// (~uint256::MAX) array count.
-    #[test]
-    fn parse_bytes_array_rejects_oversized_count_without_panic() {
-        // 32-byte count word = uint256::MAX (left of any plausible calldata).
-        let args = vec![0xFFu8; 32];
-        assert!(parse_bytes_array(&args, 0).is_empty());
+    use crate::abi::encode::{self, Arg};
 
-        // A within-range but too-large count (> 1000 guard) is also rejected.
-        let mut over = [0u8; 32];
-        over[30] = 0x10; // 0x1000 = 4096 > 1000
-        assert!(parse_bytes_array(&over, 0).is_empty());
+    /// A tree of one transaction, the one given, matched. Its root is the
+    /// transaction's hash, so it proves any bytes at all.
+    fn one_leaf_tree(tx: &[u8]) -> Vec<u8> {
+        let mut pmt = 1u32.to_le_bytes().to_vec();
+        pmt.push(1);
+        pmt.extend_from_slice(&calculate_btc_tx_hash(tx));
+        pmt.extend_from_slice(&[1, 0x01]);
+        pmt
     }
 
-    /// Regression: `read_dynamic_bytes` must reject an oversized ABI length
-    /// rather than panic converting it to usize (same malformed-calldata path).
+    /// What a crafted transaction needs for `validateInputsCount`: the version,
+    /// then an input count of one, or from RSKIP143 a segwit marker and flag
+    /// with a count of zero.
+    const ONE_INPUT: [u8; 5] = [1, 0, 0, 0, 1];
+    const NO_INPUTS: [u8; 7] = [1, 0, 0, 0, 0, 1, 0];
+
+    /// rskj `validateInputsCount`: what counts as no inputs, before and after
+    /// RSKIP143, and the transactions too short for bitcoinj to read.
     #[test]
-    fn read_dynamic_bytes_rejects_oversized_length() {
-        let args = vec![0xFFu8; 64]; // offset 0 -> length word = uint256::MAX
-        assert!(read_dynamic_bytes(&args, 0).is_err());
+    fn a_transaction_without_inputs_is_what_rskj_counts() {
+        assert!(has_inputs(&ONE_INPUT, false));
+        // Zero, also when bitcoinj reads it from a longer encoding.
+        assert!(!has_inputs(&[1, 0, 0, 0, 0], false));
+        assert!(!has_inputs(&[1, 0, 0, 0, 0xFD, 0, 0], false));
+        // From RSKIP143 a zero may be a segwit marker: with flag 1 the count
+        // after it decides, and any other flag is not refused.
+        assert!(!has_inputs(&NO_INPUTS, true));
+        assert!(has_inputs(&[1, 0, 0, 0, 0, 1, 2], true));
+        assert!(has_inputs(&[1, 0, 0, 0, 0, 2], true));
+        // Too short to read throws too.
+        assert!(!has_inputs(&[1, 0, 0, 0], false));
+        assert!(!has_inputs(&[1, 0, 0, 0, 0], true));
+        assert!(!has_inputs(&[1, 0, 0, 0, 0, 1], true));
+        assert!(!has_inputs(&[1, 0, 0, 0, 0xFD, 0], false));
+    }
+
+    /// rskj's `validationsForRegisterBtcTransaction`, check by check, in its
+    /// order. Regtest needs one confirmation, so height 0 passes with no chain
+    /// head stored, and with none stored the block store refuses the lookup.
+    #[test]
+    fn pegin_validations_answer_as_rskj_in_its_order() {
+        let config = BridgeConstants::regtest();
+        let cfg = RskHardforkConfig::regtest();
+        let run = |height: i32, pmt: &[u8], tx: &[u8]| {
+            let mut ctx = queue_ctx();
+            let hash = calculate_btc_tx_hash(tx);
+            match validations_for_register_btc_transaction(
+                &mut ctx, &config, &cfg, &hash, height, pmt, tx,
+            ) {
+                Ok(()) => ("valid", ""),
+                Err(Invalid::Swallowed(why)) => ("false", why),
+                Err(Invalid::Thrown(why)) => ("throws", why),
+                Err(Invalid::IllegalArgument(why)) => ("illegal argument", why),
+            }
+        };
+        let garbage = [0xFF; 3];
+        // Too few confirmations comes first, even with a tree that would throw.
+        assert_eq!(
+            run(5, &garbage, &ONE_INPUT),
+            ("false", "insufficient confirmations")
+        );
+        assert_eq!(run(-1, &garbage, &ONE_INPUT), ("false", "negative height"));
+        // Then the tree: the wrong size throws BridgeIllegalArgumentException,
+        // and a tree without the transaction is false.
+        assert_eq!(run(0, &garbage, &ONE_INPUT).0, "illegal argument");
+        // So does a tree of the right size that bitcoinj will not walk, here
+        // one of a block with no transactions: rskj rethrows bitcoinj's
+        // VerificationException as one.
+        let mut no_transactions = one_leaf_tree(&ONE_INPUT);
+        no_transactions[..4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            run(0, &no_transactions, &ONE_INPUT),
+            ("illegal argument", "PMT verification failed")
+        );
+        assert_eq!(
+            run(0, &one_leaf_tree(&NO_INPUTS), &ONE_INPUT),
+            ("false", "tx not in PMT")
+        );
+        // A transaction without inputs throws before any block is looked at.
+        assert_eq!(
+            run(0, &one_leaf_tree(&NO_INPUTS), &NO_INPUTS),
+            ("throws", "the transaction has no inputs")
+        );
+        // With inputs it reaches the store, which throws.
+        assert_eq!(
+            run(0, &one_leaf_tree(&ONE_INPUT), &ONE_INPUT),
+            ("throws", "the block store refused the height")
+        );
+    }
+
+    /// The divergence the validations fix closes: since RSKIP199 anyone may
+    /// call registerBtcTransaction, and a crafted transaction without inputs,
+    /// proved by a one-leaf tree, makes rskj throw and fail the transaction.
+    /// Answered with a quiet success instead, the sender would pay a
+    /// different fee and the block's state root would differ.
+    #[test]
+    fn a_crafted_pegin_without_inputs_fails_the_transaction() {
+        let tree = one_leaf_tree(&NO_INPUTS);
+        let args = encode::args(&[
+            Arg::Bytes(&NO_INPUTS),
+            Arg::Word(encode::int(0)),
+            Arg::Bytes(&tree),
+        ]);
+        let mut ctx = queue_ctx();
+        let result = register_btc_transaction(
+            &mut ctx,
+            &args,
+            0,
+            &BridgeConstants::regtest(),
+            &RskHardforkConfig::regtest(),
+            &BridgeTxContext::default(),
+        );
+        assert!(result.is_err());
+    }
+
+    /// rskj's `Bridge.registerFlyoverBtcTransaction` catches whatever its
+    /// validations throw and answers GENERIC_ERROR, and answers their false
+    /// with the validations code, the checks running in rskj's order.
+    #[test]
+    fn a_flyover_throw_is_a_generic_error_and_a_false_the_validations_code() {
+        let config = BridgeConstants::regtest();
+        let cfg = RskHardforkConfig::regtest();
+        let lbc = RskAddress::repeat_byte(0x42);
+        let mut lbc_word = [0u8; 32];
+        lbc_word[12..].copy_from_slice(lbc.as_slice());
+        let code = |tx: &[u8], height: i64, pmt: &[u8]| {
+            let args = encode::args(&[
+                Arg::Bytes(tx),
+                Arg::Word(encode::int(height)),
+                Arg::Bytes(pmt),
+                Arg::Word([0x11; 32]),
+                Arg::Bytes(&[0x6F; 21]),
+                Arg::Word(lbc_word),
+                Arg::Bytes(&[0x6F; 21]),
+                Arg::Word([0; 32]),
+            ]);
+            let mut ctx = queue_ctx();
+            let ctx_tx = BridgeTxContext::default();
+            register_fast_bridge_btc_transaction(&mut ctx, &args, 0, &config, &cfg, &ctx_tx, lbc, 2)
+                .unwrap()
+                .bytes
+        };
+        let generic = flyover_code_output(flyover_codes::GENERIC_ERROR);
+        let validations = flyover_code_output(flyover_codes::UNPROCESSABLE_VALIDATIONS);
+        assert_eq!(
+            code(&NO_INPUTS, 0, &one_leaf_tree(&NO_INPUTS)),
+            generic,
+            "no inputs"
+        );
+        assert_eq!(
+            code(&ONE_INPUT, 0, &[0xFF; 3]),
+            generic,
+            "a tree of the wrong size"
+        );
+        assert_eq!(
+            code(&ONE_INPUT, i64::from(i32::MAX), &[0xFF; 3]),
+            validations,
+            "confirmations first"
+        );
+        assert_eq!(
+            code(&ONE_INPUT, -1, &[0xFF; 3]),
+            validations,
+            "a negative height"
+        );
+    }
+
+    /// A Flyover call with the given BTC addresses at `height`, as the LBC
+    /// 0x4242..42 makes it, for a transaction whose confirmations rskj's
+    /// validations refuse: what the method answers, by name.
+    fn flyover_answer(
+        config: &BridgeConstants,
+        cfg: &RskHardforkConfig,
+        height: u64,
+        user: &[u8],
+        lp: &[u8],
+        registered: Option<[u8; 32]>,
+    ) -> &'static str {
+        use revm::MainContext;
+        let lbc = RskAddress::repeat_byte(0x42);
+        let mut lbc_word = [0u8; 32];
+        lbc_word[12..].copy_from_slice(lbc.as_slice());
+        let args = encode::args(&[
+            Arg::Bytes(&ONE_INPUT),
+            Arg::Word(encode::int(i64::from(i32::MAX))),
+            Arg::Bytes(&[0xFF; 3]),
+            Arg::Word([0x11; 32]),
+            Arg::Bytes(user),
+            Arg::Word(lbc_word),
+            Arg::Bytes(lp),
+            Arg::Word([0; 32]),
+        ]);
+        let mut ctx = revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        ctx.block.number = U256::from(height);
+        if let Some(hash) = registered {
+            mark_flyover_derivation_hash_used(&mut ctx, &calculate_btc_tx_hash(&ONE_INPUT), &hash);
+        }
+        let out = register_fast_bridge_btc_transaction(
+            &mut ctx,
+            &args,
+            0,
+            config,
+            cfg,
+            &BridgeTxContext::default(),
+            lbc,
+            2,
+        )
+        .unwrap()
+        .bytes;
+        [
+            (flyover_codes::GENERIC_ERROR, "generic"),
+            (flyover_codes::UNPROCESSABLE_VALIDATIONS, "validations"),
+            (flyover_codes::UNPROCESSABLE_ALREADY_PROCESSED, "already processed"),
+        ]
+        .into_iter()
+        .find(|(code, _)| flyover_code_output(*code) == out)
+        .map_or("other", |(_, name)| name)
+    }
+
+    /// rskj reads both Flyover BTC addresses with bitcoinj before anything
+    /// else (`BridgeUtils.deserializeBtcAddressWithVersion`) and answers
+    /// GENERIC_ERROR where that throws: in both eras for a version the network
+    /// doesn't accept, and before RSKIP284 for a version that is negative as a
+    /// signed byte, which testnet's P2SH version 196 (`0xc4`) is. Testnet
+    /// #2,122,593 makes such a call: rskj answers GENERIC_ERROR and the LBC
+    /// carries on, where rustock answered UNPROCESSABLE_VALUE_ZERO and the LBC
+    /// reverted.
+    #[test]
+    fn a_flyover_address_bitcoinj_refuses_is_a_generic_error() {
+        let with = |version: u8| [&[version][..], &[0x51; 20][..]].concat();
+        let (p2pkh, p2sh) = (with(0x6F), with(0xC4));
+        let longer = [&p2pkh[..], &[0xEE]].concat();
+
+        // Testnet past iris300, before its RSKIP284 (#2,581,800).
+        let (testnet, testnet_cfg) = (BridgeConstants::testnet(), RskHardforkConfig::testnet());
+        let before = |user: &[u8], lp: &[u8]| flyover_answer(&testnet, &testnet_cfg, 2_122_593, user, lp, None);
+        assert_eq!(before(&p2pkh, &p2pkh), "validations");
+        assert_eq!(before(&p2sh, &p2pkh), "generic", "a P2SH address, -60 as a signed byte");
+        assert_eq!(before(&p2pkh, &p2sh), "generic", "the liquidity provider's");
+        assert_eq!(before(&with(0x00), &p2pkh), "generic", "a mainnet version");
+        assert_eq!(before(&longer, &p2pkh), "validations", "a 22nd byte, ignored");
+
+        // From testnet's RSKIP284 the version is read unsigned, and the
+        // address is 21 bytes exactly.
+        let from = |user: &[u8], lp: &[u8]| flyover_answer(&testnet, &testnet_cfg, 2_581_800, user, lp, None);
+        assert_eq!(from(&p2sh, &p2sh), "validations");
+        assert_eq!(from(&with(0x00), &p2pkh), "generic", "a mainnet version");
+        assert_eq!(from(&longer, &p2pkh), "generic", "a 22nd byte");
+
+        // Mainnet before its RSKIP284 (hop400, #4,598,500): both its versions,
+        // 0 and 5, are positive bytes.
+        let (mainnet, mainnet_cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        let on_mainnet = |user: &[u8], lp: &[u8]| flyover_answer(&mainnet, &mainnet_cfg, 4_000_000, user, lp, None);
+        assert_eq!(on_mainnet(&with(0x05), &with(0x00)), "validations");
+        assert_eq!(on_mainnet(&p2pkh, &with(0x00)), "generic", "a testnet version");
+    }
+
+    /// The derivation hash is built from the address bitcoinj read and wrote
+    /// back (`serializeBtcAddressWithVersion`), not from the argument: before
+    /// RSKIP284 a 22nd byte is dropped, so a payment registered under the 21
+    /// bytes is found registered when the argument has 22.
+    #[test]
+    fn a_flyover_derivation_hash_reads_the_address_bitcoinj_read() {
+        let (config, cfg) = (BridgeConstants::testnet(), RskHardforkConfig::testnet());
+        let address = [0x6F; 21];
+        let longer = [&address[..], &[0xEE]].concat();
+        let lbc = RskAddress::repeat_byte(0x42);
+        let hash = flyover_derivation_hash(&[0x11; 32], &address, &lbc, &address);
+        assert_eq!(
+            flyover_answer(&config, &cfg, 2_122_593, &longer, &address, Some(hash)),
+            "already processed"
+        );
+    }
+
+    /// rskj's `Bridge.addSignature` turns down a key bitcoinj cannot parse, an
+    /// empty list of signatures, a signature that is not DER and a hash that is
+    /// not 32 bytes, each with a `BridgeIllegalArgumentException`: before
+    /// RSKIP88 a success with no output, from it a throw. The single byte 0,
+    /// the point at infinity, is a key bitcoinj parses.
+    #[test]
+    fn add_signature_refuses_what_rskj_cannot_parse() {
+        let der: &[u8] = &[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+        let not_der: &[u8] = &[0x9f, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+        let key = real_pubkey();
+        let run = |cfg: &RskHardforkConfig, key: &[u8], sigs: &[&[u8]], hash: &[u8]| {
+            let args = encode::args(&[Arg::Bytes(key), Arg::BytesArray(sigs), Arg::Bytes(hash)]);
+            let mut ctx = queue_ctx();
+            add_signature(&mut ctx, &args, 0, &BridgeConstants::regtest(), cfg).map(|out| out.bytes)
+        };
+        let rskip88 = RskHardforkConfig::regtest();
+        assert!(
+            run(&rskip88, &[0x05; 33], &[der], &[0x11; 32]).is_err(),
+            "not a key"
+        );
+        assert!(
+            run(&rskip88, &key, &[], &[0x11; 32]).is_err(),
+            "no signatures"
+        );
+        assert!(
+            run(&rskip88, &key, &[der, not_der], &[0x11; 32]).is_err(),
+            "not DER"
+        );
+        assert!(
+            run(&rskip88, &key, &[der], &[0x11; 31]).is_err(),
+            "not a hash"
+        );
+        assert_eq!(
+            run(&rskip88, &key, &[der], &[0x11; 32]).unwrap(),
+            Bytes::new(),
+            "not a member"
+        );
+        assert_eq!(
+            run(&rskip88, &[0x00], &[der], &[0x11; 32]).unwrap(),
+            Bytes::new(),
+            "infinity"
+        );
+        // Mainnet's block 0 is before RSKIP88.
+        let before = RskHardforkConfig::mainnet();
+        assert_eq!(
+            run(&before, &[0x05; 33], &[der], &[0x11; 32]).unwrap(),
+            Bytes::new()
+        );
+        assert_eq!(
+            run(&before, &key, &[not_der], &[0x11; 32]).unwrap(),
+            Bytes::new()
+        );
+    }
+
+    // --- the pegout index (RSKIP379) ---------------------------------------
+
+    /// A script pushing each item in turn.
+    fn pushes(items: &[&[u8]]) -> bitcoin::ScriptBuf {
+        let mut builder = bitcoin::script::Builder::new();
+        for item in items {
+            builder = builder.push_slice(<&bitcoin::script::PushBytes>::try_from(*item).unwrap());
+        }
+        builder.into_script()
+    }
+
+    /// Three keys, sorted as given.
+    fn test_keys(first: u8) -> Vec<[u8; 33]> {
+        (0..3u8)
+            .map(|i| {
+                let mut key = [first + i; 33];
+                key[0] = 0x02;
+                key
+            })
+            .collect()
+    }
+
+    /// A transaction spending one outpoint per input to `outputs`.
+    fn spend(
+        inputs: Vec<(bitcoin::ScriptBuf, bitcoin::Witness)>,
+        outputs: &[(u64, bitcoin::ScriptBuf)],
+    ) -> BtcTransaction {
+        BtcTransaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: inputs
+                .into_iter()
+                .zip(0u32..)
+                .map(|((script_sig, witness), vout)| bitcoin::TxIn {
+                    previous_output: bitcoin::OutPoint {
+                        txid: bitcoin::Txid::from_byte_array([0x5a; 32]),
+                        vout,
+                    },
+                    script_sig,
+                    sequence: bitcoin::Sequence::MAX,
+                    witness,
+                })
+                .collect(),
+            output: outputs
+                .iter()
+                .map(|(value, script_pubkey)| bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(*value),
+                    script_pubkey: script_pubkey.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// An input with `script_sig` and no witness.
+    fn legacy(script_sig: Vec<u8>) -> (bitcoin::ScriptBuf, bitcoin::Witness) {
+        (
+            bitcoin::ScriptBuf::from_bytes(script_sig),
+            bitcoin::Witness::new(),
+        )
+    }
+
+    /// An input spending `redeem`, a 2-of-n multisig, signed in its scriptSig.
+    fn signed_multisig(redeem: &[u8]) -> (bitcoin::ScriptBuf, bitcoin::Witness) {
+        (
+            pushes(&[&[], &[0x30; 71], &[0x31; 72], redeem]),
+            bitcoin::Witness::new(),
+        )
+    }
+
+    /// A one-key multisig asking for the signatures `m` pushes, which bitcoinj
+    /// takes as a multisig whatever the count.
+    fn asking(m: &[u8]) -> Vec<u8> {
+        let mut script = vec![m.len() as u8];
+        script.extend_from_slice(m);
+        script.push(0x21);
+        script.extend_from_slice(&[0x02; 33]);
+        script.extend_from_slice(&[0x51, 0xae]);
+        script
+    }
+
+    /// RSKj indexes a pegout as it builds it, by its first input's sighash over
+    /// the unsigned transaction, and finds it when the signed one is registered,
+    /// by stripping the signatures again. The two meet for a standard, a
+    /// P2SH-ERP and a P2SH-P2WSH federation.
+    #[test]
+    fn a_signed_pegout_strips_to_the_sighash_it_was_indexed_by() {
+        use super::super::release_tx::{is_erp_redeem, placeholder_scriptsig, segwit_base_input};
+        let keys = test_keys(0x10);
+        let standard = build_federation_redeem_script(&keys, 2);
+        let erp = build_erp_redeem_script(&keys, 2, &test_keys(0x40), 2, 52_560, ErpScript::P2sh);
+        let outputs = [(40_000, p2sh_output_script(&[0x77; 20]))];
+        for redeem in [&standard, &erp] {
+            let unsigned = spend(vec![legacy(placeholder_scriptsig(redeem, 2)); 2], &outputs);
+            let indexed = first_input_sig_hash(&unsigned, redeem, 0);
+            // OP_0, the signatures, and for an ERP script its default branch's OP_0.
+            let mut items: Vec<&[u8]> = vec![&[], &[0x30; 71], &[0x31; 72]];
+            if is_erp_redeem(redeem) {
+                items.push(&[]);
+            }
+            items.push(redeem);
+            let signed = spend(vec![(pushes(&items), bitcoin::Witness::new()); 2], &outputs);
+            assert_eq!(sig_hash_for_pegout_index(&signed), Ok(Some(indexed)));
+        }
+        let (script_sig, base) = segwit_base_input(&erp, 2);
+        let unsigned = spend(vec![(script_sig.clone(), base); 2], &outputs);
+        let indexed = first_input_sig_hash(&unsigned, &erp, 0);
+        let witness = bitcoin::Witness::from_slice(&[
+            vec![],
+            vec![0x30; 71],
+            vec![0x31; 72],
+            vec![],
+            erp.clone(),
+        ]);
+        let signed = spend(vec![(script_sig, witness); 2], &outputs);
+        // The witnesses are in what this sighash covers, so only stripping finds it.
+        assert_ne!(first_input_sig_hash(&signed, &erp, 0), indexed);
+        assert_eq!(sig_hash_for_pegout_index(&signed), Ok(Some(indexed)));
+    }
+
+    /// Where RSKj can't strip a registered transaction's signatures: what its
+    /// `catch (IllegalArgumentException)` takes is no sighash, and anything else
+    /// fails the call. The inputs are read in order, and the first throw ends
+    /// the reading.
+    #[test]
+    fn the_pegout_index_reads_a_transaction_it_cannot_strip_as_rskj_does() {
+        let redeem = build_federation_redeem_script(&test_keys(0x10), 2);
+        let outputs = [(40_000, p2sh_output_script(&[0x77; 20]))];
+        let index = |inputs| sig_hash_for_pegout_index(&spend(inputs, &outputs));
+        let pushing = |items: &[&[u8]]| legacy(pushes(items).into_bytes());
+        let witness = |m: &[u8]| {
+            (
+                bitcoin::ScriptBuf::new(),
+                bitcoin::Witness::from_slice(&[vec![], asking(m)]),
+            )
+        };
+        let not_a_script = || legacy(vec![0x4c]);
+        // Nothing to read in the first input: no inputs, an empty scriptSig, one
+        // ending in an opcode, or one ending in a push that isn't a script.
+        assert_eq!(index(vec![]), Ok(None));
+        assert_eq!(index(vec![legacy(vec![])]), Ok(None));
+        assert_eq!(index(vec![legacy(vec![0x51])]), Ok(None));
+        assert_eq!(index(vec![legacy(vec![0x01, 0x4c])]), Ok(None));
+        // A first scriptSig that isn't a script throws before RSKj's catch.
+        assert!(index(vec![not_a_script()]).is_err());
+        // A later input with no redeem script, or one that isn't a multisig,
+        // is caught. One that isn't a script, or has OP_0 for its M, throws
+        // something else.
+        let multisig = || signed_multisig(&redeem);
+        assert_eq!(index(vec![multisig(), legacy(vec![])]), Ok(None));
+        assert_eq!(
+            index(vec![multisig(), pushing(&[&[0x30; 71], &[0x02; 33]])]),
+            Ok(None)
+        );
+        assert!(index(vec![multisig(), not_a_script()]).is_err());
+        assert!(index(vec![
+            multisig(),
+            pushing(&[&[0x00, 0x01, 0xaa, 0x01, 0xbb, 0xae]])
+        ])
+        .is_err());
+        // A scriptSig takes at most 16 empty signatures, checked once they're
+        // made, and that throw is caught and ends the reading.
+        assert!(matches!(
+            index(vec![multisig(), pushing(&[&asking(&[16])])]),
+            Ok(Some(_))
+        ));
+        assert_eq!(
+            index(vec![multisig(), pushing(&[&asking(&[17])]), not_a_script()]),
+            Ok(None)
+        );
+        assert!(index(vec![multisig(), pushing(&[&asking(&[16])]), not_a_script()]).is_err());
+        // A witness's pushes are counted in Java's int: past it the list can't
+        // be made, which is caught; below it the inputs after are still read.
+        assert!(matches!(
+            index(vec![multisig(), witness(&[20])]),
+            Ok(Some(_))
+        ));
+        assert_eq!(index(vec![multisig(), witness(&[21])]), Ok(None));
+        assert_eq!(
+            index(vec![
+                multisig(),
+                witness(&[0xfd, 0xff, 0xff, 0x7f]),
+                not_a_script()
+            ]),
+            Ok(None)
+        );
+        assert!(index(vec![
+            multisig(),
+            witness(&[0xfc, 0xff, 0xff, 0x7f]),
+            not_a_script()
+        ])
+        .is_err());
+    }
+
+    /// The SVP checks strip as RSKj's `getMultiSigTransactionHashWithoutSignatures`,
+    /// and before RSKIP305 as its legacy form, which doesn't ask whether an
+    /// input is a multisig. A segwit transaction is its own hash.
+    #[test]
+    fn svp_hashes_strip_as_rskj_before_and_after_rskip305() {
+        use super::super::release_tx::{placeholder_scriptsig, segwit_base_input};
+        let redeem = build_federation_redeem_script(&test_keys(0x10), 2);
+        let outputs = [(40_000, p2sh_output_script(&[0x77; 20]))];
+        let to_address = [&[0x76, 0xa9, 0x14][..], &[0x33; 20][..], &[0x88, 0xac][..]].concat();
+        let tx = spend(
+            vec![
+                signed_multisig(&redeem),
+                legacy(pushes(&[&[0x30; 71], &to_address]).into_bytes()),
+            ],
+            &outputs,
+        );
+        assert_eq!(multisig_tx_hash_without_signatures(&tx, true), Ok(None));
+        // Before RSKIP305 a pay-to-address script asks for one signature.
+        let stripped = spend(
+            vec![
+                legacy(placeholder_scriptsig(&redeem, 2)),
+                legacy(placeholder_scriptsig(&to_address, 1)),
+            ],
+            &outputs,
+        );
+        assert_eq!(
+            multisig_tx_hash_without_signatures(&tx, false),
+            Ok(Some(btc_txid_event_bytes(&stripped)))
+        );
+        // A pay-to-pubkey script asks for one too.
+        let to_key = [&[0x21][..], &[0x02; 33][..], &[0xac][..]].concat();
+        let tx = spend(
+            vec![
+                signed_multisig(&redeem),
+                legacy(pushes(&[&[0x30; 71], &to_key]).into_bytes()),
+            ],
+            &outputs,
+        );
+        let stripped = spend(
+            vec![
+                legacy(placeholder_scriptsig(&redeem, 2)),
+                legacy(placeholder_scriptsig(&to_key, 1)),
+            ],
+            &outputs,
+        );
+        assert_eq!(
+            multisig_tx_hash_without_signatures(&tx, false),
+            Ok(Some(btc_txid_event_bytes(&stripped)))
+        );
+        assert_eq!(multisig_tx_hash_without_signatures(&tx, true), Ok(None));
+        // A pay-to-script-hash script's count bitcoinj can't tell, and throws.
+        let to_script = p2sh_output_script(&[0x44; 20]).into_bytes();
+        let tx = spend(
+            vec![
+                signed_multisig(&redeem),
+                legacy(pushes(&[&to_script]).into_bytes()),
+            ],
+            &outputs,
+        );
+        assert!(multisig_tx_hash_without_signatures(&tx, false).is_err());
+        assert_eq!(multisig_tx_hash_without_signatures(&tx, true), Ok(None));
+        // Nothing in a segwit transaction is stripped.
+        let segwit = spend(
+            vec![segwit_base_input(&redeem, 2), legacy(vec![0x4c])],
+            &outputs,
+        );
+        assert_eq!(
+            multisig_tx_hash_without_signatures(&segwit, true),
+            Ok(Some(btc_txid_event_bytes(&segwit)))
+        );
+    }
+
+    /// RSKj reads the index from RSKIP379 on, for Bitcoin blocks from the index's
+    /// activation height plus its grace period.
+    #[test]
+    fn the_pegout_index_is_read_from_its_bitcoin_height_once_rskip379_is_active() {
+        let networks = [
+            (
+                BridgeConstants::rskj_regtest(),
+                RskHardforkConfig::rskj_regtest(),
+                350,
+            ),
+            (
+                BridgeConstants::mainnet(),
+                RskHardforkConfig::mainnet(),
+                841_909,
+            ),
+            (
+                BridgeConstants::testnet(),
+                RskHardforkConfig::testnet(),
+                2_590_993,
+            ),
+        ];
+        for (config, cfg, start) in &networks {
+            // Past every upgrade of the three.
+            let rsk_height = 10_000_000;
+            assert!(!pegout_tx_index_enabled(config, cfg, rsk_height, start - 1));
+            assert!(pegout_tx_index_enabled(config, cfg, rsk_height, *start));
+        }
+        // Before RSKIP379 the legacy rules read every height.
+        let (config, cfg, start) = &networks[1];
+        assert!(!pegout_tx_index_enabled(config, cfg, 0, *start));
+    }
+
+    /// RSK block 10 on RSKj's regtest, whose Bridge holds a Bitcoin chain to
+    /// height 352 with `tx` the only transaction of blocks 349 and 350: one
+    /// below the height RSKj's regtest reads the pegout index from, and one at
+    /// it.
+    fn regtest_bridge_with(tx: &BtcTransaction) -> impl crate::RskContextTr {
+        regtest_bridge_with_bytes(&btc_serialize(tx))
+    }
+
+    /// The same, with the transaction as the bytes its block's tree holds.
+    fn regtest_bridge_with_bytes(raw: &[u8]) -> impl crate::RskContextTr {
+        regtest_bridge_at(raw, 10, &RskHardforkConfig::rskj_regtest())
+    }
+
+    /// The same at RSK block `number`, with the headers taken under `cfg`.
+    fn regtest_bridge_at(raw: &[u8], number: u64, cfg: &RskHardforkConfig) -> impl crate::RskContextTr {
+        use revm::MainContext;
+        let block = revm::context::BlockEnv {
+            number: U256::from(number),
+            timestamp: U256::from(1_700_000_000u64),
+            ..revm::context::BlockEnv::default()
+        };
+        let mut ctx = revm::Context::mainnet()
+            .with_block(block)
+            .with_chain(crate::raw_storage::RskChainExt::default());
+        let root = calculate_btc_tx_hash(raw);
+        let mut prev = bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
+            .header
+            .block_hash();
+        let headers: Vec<Vec<u8>> = (1..=352u32)
+            .map(|height| {
+                let merkle = if height == 349 || height == 350 {
+                    root
+                } else {
+                    [0x11; 32]
+                };
+                let header = (0..)
+                    .map(|nonce| bitcoin::block::Header {
+                        version: bitcoin::block::Version::from_consensus(1),
+                        prev_blockhash: prev,
+                        merkle_root: bitcoin::TxMerkleNode::from_byte_array(merkle),
+                        time: 1_700_000_000,
+                        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+                        nonce,
+                    })
+                    .find(|header| {
+                        super::super::btc_rules::verify_header(
+                            header,
+                            super::super::constants::BtcNetwork::Regtest,
+                        )
+                    })
+                    .unwrap();
+                prev = header.block_hash();
+                btc_serialize(&header)
+            })
+            .collect();
+        let slices: Vec<&[u8]> = headers.iter().map(Vec::as_slice).collect();
+        let args = encode::args(&[Arg::BytesArray(&slices)]);
+        super::super::btc_chain::receive_headers(
+            &mut ctx,
+            &args,
+            0,
+            &BridgeConstants::rskj_regtest(),
+            true,
+            cfg,
+        )
+        .unwrap();
+        ctx
+    }
+
+    /// `registerBtcTransaction` of `tx` at Bitcoin `height` on RSKj's regtest,
+    /// with `pegout_sig_hash` in the pegout index and `svp_fund_hash` as the
+    /// unsigned SVP fund transaction's hash. Answers as [`outcome`].
+    fn registered(
+        tx: &BtcTransaction,
+        height: i64,
+        pegout_sig_hash: Option<[u8; 32]>,
+        svp_fund_hash: Option<[u8; 32]>,
+    ) -> (bool, bool, usize, usize) {
+        let mut ctx = regtest_bridge_with(tx);
+        if let Some(sig_hash) = pegout_sig_hash {
+            save_pegout_tx_sig_hash(&mut ctx, &sig_hash);
+        }
+        if let Some(hash) = svp_fund_hash {
+            bridge_store_bytes_named(
+                &mut ctx,
+                super::super::storage::SVP_FUND_TX_HASH_UNSIGNED_KEY,
+                &rlp_encode_element(&hash),
+            );
+        }
+        outcome(&mut ctx, tx, height, &RskHardforkConfig::rskj_regtest())
+    }
+
+    /// rskj's `validationsForRegisterBtcTransaction` throws
+    /// `BridgeIllegalArgumentException` for a partial merkle tree of the wrong
+    /// size, and for one bitcoinj will not walk, whose `VerificationException`
+    /// it rethrows as one. `Bridge.execute` answers that with null before
+    /// RSKIP88: the call succeeds with no output, charged its gas, and
+    /// registers nothing. From RSKIP88 it throws.
+    #[test]
+    fn before_rskip88_a_tree_rskj_refuses_is_a_success_with_no_output() {
+        use revm::MainContext;
+        let (config, cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        assert!(!cfg.has_rskip88(728_999) && cfg.has_rskip88(729_000));
+        let (_, checkpoint, _) = config.btc_checkpoint.unwrap();
+        let tx = tx_with(vec![], vec![]);
+        let raw = btc_serialize(&tx);
+        // Of the right size, and of a block with no transactions.
+        let mut no_transactions = one_leaf_tree(&raw);
+        no_transactions[..4].copy_from_slice(&0u32.to_le_bytes());
+        for tree in [&[0u8; 3][..], &no_transactions] {
+            // Confirmed well past the minimum, so the tree is the check that
+            // answers.
+            let args = encode::args(&[
+                Arg::Bytes(&raw),
+                Arg::Word(encode::int(i64::from(checkpoint) - 200)),
+                Arg::Bytes(tree),
+            ]);
+            let at = |number: u64| {
+                let mut ctx =
+                    revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+                ctx.block.number = U256::from(number);
+                let out = register_btc_transaction(
+                    &mut ctx,
+                    &args,
+                    7_000,
+                    &config,
+                    &cfg,
+                    &BridgeTxContext::default(),
+                );
+                (out, is_btc_tx_processed(&mut ctx, &legacy_btc_txid(&tx)))
+            };
+            let (out, processed) = at(728_999);
+            let out = out.expect("a success before RSKIP88");
+            assert!(out.bytes.is_empty() && !processed);
+            assert_eq!(out.gas_used, 7_000);
+            assert!(at(729_000).0.is_err(), "a throw from RSKIP88");
+        }
+    }
+
+    /// `registerBtcTransaction` of `tx` at Bitcoin `height` in `ctx`, with RSKj's
+    /// regtest constants and `cfg`. Answers whether the call succeeded, whether
+    /// it marked the transaction processed, how many events it logged, and how
+    /// many UTXOs the active federation then holds.
+    fn outcome<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        tx: &BtcTransaction,
+        height: i64,
+        cfg: &RskHardforkConfig,
+    ) -> (bool, bool, usize, usize) {
+        outcome_of_bytes(ctx, &btc_serialize(tx), tx, height, cfg)
+    }
+
+    /// The same, with `tx` given as `raw`.
+    fn outcome_of_bytes<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        raw: &[u8],
+        tx: &BtcTransaction,
+        height: i64,
+        cfg: &RskHardforkConfig,
+    ) -> (bool, bool, usize, usize) {
+        let tree = one_leaf_tree(raw);
+        let args = encode::args(&[
+            Arg::Bytes(raw),
+            Arg::Word(encode::int(height)),
+            Arg::Bytes(&tree),
+        ]);
+        let ok = register_btc_transaction(
+            ctx,
+            &args,
+            0,
+            &BridgeConstants::rskj_regtest(),
+            cfg,
+            &BridgeTxContext::default(),
+        )
+        .is_ok();
+        let logs = ctx.journal_mut().take_logs().len();
+        let processed = is_btc_tx_processed(ctx, &legacy_btc_txid(tx));
+        let utxos = super::super::storage::load_federation_utxos(ctx, cfg, 10).len();
+        (ok, processed, logs, utxos)
+    }
+
+    /// RSKj's regtest federation's output script.
+    fn regtest_federation_script() -> bitcoin::ScriptBuf {
+        regtest_federation_script_for(&RskHardforkConfig::rskj_regtest())
+    }
+
+    /// The same under `cfg`.
+    fn regtest_federation_script_for(cfg: &RskHardforkConfig) -> bitcoin::ScriptBuf {
+        let config = BridgeConstants::rskj_regtest();
+        let mut ctx = queue_ctx();
+        let (_, redeem) = active_federation_keys_and_redeem(&mut ctx, &config, cfg, 10);
+        let format = active_federation_format(&mut ctx, &config, cfg, 10);
+        p2sh_output_script(&federation_output_hash160(&redeem, format))
+    }
+
+    /// From the index's height, a transaction whose first input's sighash the
+    /// index holds is a pegout, whatever it spends; one the index doesn't hold
+    /// that pays a live federation is a peg-in. Below that height the legacy
+    /// rules take the same transaction for a peg-in too. Here the spent multisig
+    /// is no live federation's, as for a pegout registered after its federation
+    /// retired.
+    #[test]
+    fn the_pegout_index_finds_a_pegout_the_legacy_rules_take_for_a_peg_in() {
+        let redeem = build_federation_redeem_script(&test_keys(0x10), 2);
+        let tx = spend(
+            vec![signed_multisig(&redeem)],
+            &[
+                (40_000, p2sh_output_script(&[0x77; 20])),
+                (1_000_000_000, regtest_federation_script()),
+            ],
+        );
+        let sig_hash = sig_hash_for_pegout_index(&tx).unwrap();
+        // Its change is registered as the federation's, and nothing is logged.
+        assert_eq!(registered(&tx, 350, sig_hash, None), (true, true, 0, 1));
+        // As a peg-in it's turned down and refunded: marked processed, three
+        // events (the refusal, the refund's request and its creation), and
+        // nothing kept for the federation.
+        let peg_in = (true, true, 3, 0);
+        assert_eq!(registered(&tx, 350, None, None), peg_in);
+        assert_eq!(registered(&tx, 349, sig_hash, None), peg_in);
+    }
+
+    /// From the index's height, a transaction the index doesn't hold that pays
+    /// no live federation is left alone: not marked processed, nothing logged.
+    /// Below it the legacy rules take it for a peg-in.
+    #[test]
+    fn the_pegout_index_leaves_unregistered_what_it_does_not_know() {
+        let redeem = build_federation_redeem_script(&test_keys(0x10), 2);
+        let tx = spend(
+            vec![signed_multisig(&redeem)],
+            &[(40_000, p2sh_output_script(&[0x77; 20]))],
+        );
+        assert_eq!(registered(&tx, 350, None, None), (true, false, 0, 0));
+        // A peg-in of nothing: turned down with two events, not marked processed.
+        assert_eq!(registered(&tx, 349, None, None), (true, false, 2, 0));
+    }
+
+    /// A transaction of two inputs written in ways bitcoinj reads and
+    /// rust-bitcoin refuses: with a byte left over, with its count of inputs
+    /// in five bytes, and with segwit's marker and flag before inputs that
+    /// carry no witness.
+    fn written_otherwise(tx: &BtcTransaction) -> [Vec<u8>; 3] {
+        assert_eq!(tx.input.len(), 2);
+        let raw = btc_serialize(tx);
+        let (version, rest) = raw.split_at(4);
+        let (body, lock_time) = rest.split_at(rest.len() - 4);
+        let written = [
+            [&raw[..], &[0xFF]].concat(),
+            [version, &[0xFE, 2, 0, 0, 0], &body[1..], lock_time].concat(),
+            [version, &[0x00, 0x01], body, &[0x00, 0x00], lock_time].concat(),
+        ];
+        for bytes in &written {
+            assert!(deserialize::<BtcTransaction>(bytes).is_err());
+        }
+        written
+    }
+
+    /// rskj reads the transaction with bitcoinj (`tx::parse_btc_transaction`),
+    /// so one written in a way rust-bitcoin refuses is registered as the same
+    /// transaction is when written the standard way: the tree proves the bytes
+    /// given, and the transaction is marked processed by the hash of what was
+    /// read. And rskj holds what it has read to bitcoinj's `verify()`, whose
+    /// throw fails the call.
+    #[test]
+    fn a_peg_in_is_registered_however_bitcoinj_reads_its_bytes() {
+        let redeem = build_federation_redeem_script(&test_keys(0x10), 2);
+        let tx = spend(
+            vec![signed_multisig(&redeem), signed_multisig(&redeem)],
+            &[(1_000_000_000, regtest_federation_script())],
+        );
+        // Turned down and refunded, as a multisig's peg-in is: marked
+        // processed, with three events.
+        let standard = registered(&tx, 350, None, None);
+        assert_eq!(standard, (true, true, 3, 0));
+        let cfg = RskHardforkConfig::rskj_regtest();
+        for bytes in &written_otherwise(&tx) {
+            let mut ctx = regtest_bridge_with_bytes(bytes);
+            assert_eq!(outcome_of_bytes(&mut ctx, bytes, &tx, 350, &cfg), standard);
+        }
+
+        // The same outpoint spent twice: bitcoinj's `DuplicatedOutPoint`.
+        let mut twice = tx.clone();
+        twice.input[1].previous_output = twice.input[0].previous_output;
+        assert_eq!(registered(&twice, 350, None, None), (false, false, 0, 0));
+    }
+
+    /// RSKj's regtest with every network upgrade after `last` taken off its
+    /// ladder.
+    fn rskj_regtest_until(last: crate::hardfork::RskNetworkUpgrade) -> RskHardforkConfig {
+        use crate::hardfork::RskNetworkUpgrade::*;
+        [
+            Orchid, Wasabi100, TwoToThree, Papyrus200, Iris300, Hop400, Fingerroot500,
+            Arrowhead600, Arrowhead631, Lovell700, Reed800, Reed810, Vetiver900,
+        ]
+        .into_iter()
+        .filter(|upgrade| *upgrade > last)
+        .fold(RskHardforkConfig::rskj_regtest(), |cfg, upgrade| cfg.with_hardfork(upgrade, None))
+    }
+
+    /// A native P2WPKH input: nothing in its scriptSig, from which rskj can
+    /// name no sender.
+    fn native_segwit() -> (bitcoin::ScriptBuf, bitcoin::Witness) {
+        let mut witness = bitcoin::Witness::new();
+        witness.push([0x30u8; 71]);
+        witness.push(real_pubkey());
+        (bitcoin::ScriptBuf::new(), witness)
+    }
+
+    /// An OP_RETURN output's script pushing `data`.
+    fn op_return(data: &[u8]) -> bitcoin::ScriptBuf {
+        bitcoin::ScriptBuf::from_bytes([&[0x6a, data.len() as u8][..], data].concat())
+    }
+
+    /// An RSKT payload of `version` naming `destination`.
+    fn rskt(version: u8, destination: [u8; 20]) -> bitcoin::ScriptBuf {
+        op_return(&[&b"RSKT"[..], &[version], &destination].concat())
+    }
+
+    /// The events a registration logged, each as (topics, data).
+    type Logged = Vec<(Vec<alloy_primitives::B256>, Vec<u8>)>;
+
+    /// `registerBtcTransaction` of `tx` at Bitcoin height 350 in `ctx`, RSKj's
+    /// regtest Bridge at RSK block `block`, under `cfg`: whether the call
+    /// succeeded, whether it marked the transaction processed, the events it
+    /// logged, and how many UTXOs the active federation then holds.
+    fn registration_in<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        tx: &BtcTransaction,
+        block: u64,
+        cfg: &RskHardforkConfig,
+    ) -> (bool, bool, Logged, usize) {
+        let raw = btc_serialize(tx);
+        let tree = one_leaf_tree(&raw);
+        let args = encode::args(&[Arg::Bytes(&raw), Arg::Word(encode::int(350)), Arg::Bytes(&tree)]);
+        let ok = register_btc_transaction(
+            ctx,
+            &args,
+            0,
+            &BridgeConstants::rskj_regtest(),
+            cfg,
+            &BridgeTxContext::default(),
+        )
+        .is_ok();
+        let logs = ctx
+            .journal_mut()
+            .take_logs()
+            .into_iter()
+            .map(|log| (log.data.topics().to_vec(), log.data.data.to_vec()))
+            .collect();
+        let processed = is_btc_tx_processed(ctx, &legacy_btc_txid(tx));
+        let utxos = super::super::storage::load_federation_utxos(ctx, cfg, block).len();
+        (ok, processed, logs, utxos)
+    }
+
+    /// The same at RSK block 10, the Bridge holding nothing but the chain.
+    fn registration(tx: &BtcTransaction, cfg: &RskHardforkConfig) -> (bool, bool, Logged, usize) {
+        let mut ctx = regtest_bridge_at(&btc_serialize(tx), 10, cfg);
+        registration_in(&mut ctx, tx, 10, cfg)
+    }
+
+    fn rejected(tx: &BtcTransaction, reason: u64) -> (Vec<alloy_primitives::B256>, Vec<u8>) {
+        let event = super::super::legacy_events::rejected_pegin(&btc_txid_event_bytes(tx), reason);
+        (event.topics, event.data)
+    }
+
+    fn unrefundable(tx: &BtcTransaction, reason: u64) -> (Vec<alloy_primitives::B256>, Vec<u8>) {
+        let event = super::super::legacy_events::unrefundable_pegin(&btc_txid_event_bytes(tx), reason);
+        (event.topics, event.data)
+    }
+
+    fn pegin_btc(
+        to: RskAddress,
+        tx: &BtcTransaction,
+        amount: u64,
+        version: u64,
+    ) -> (Vec<alloy_primitives::B256>, Vec<u8>) {
+        let event = super::super::legacy_events::pegin_btc(to, &btc_txid_event_bytes(tx), amount, version);
+        (event.topics, event.data)
+    }
+
+    /// The peg-in of testnet #4,513,687: one native-segwit input, so no sender
+    /// rskj can name, and no OP_RETURN. Before RSKIP379
+    /// `PeginInformation.parse` throws for want of both, and from RSKIP170
+    /// `legacyRegisterPegin`'s catch logs rejected_pegin(PEGIN_V1_INVALID_PAYLOAD=4),
+    /// then, with nowhere to refund to and the version still 0,
+    /// unrefundable_pegin(LEGACY_PEGIN_UNDETERMINED_SENDER=1), and marks the
+    /// transaction processed. Before RSKIP170 it does none of that. From
+    /// RSKIP379 `evaluateLegacyPegin` turns it down as an undetermined
+    /// sender's, marking it processed only between RSKIP459 and RSKIP551.
+    #[test]
+    fn a_peg_in_with_no_sender_and_no_instructions_testnet_4513687() {
+        use crate::hardfork::RskNetworkUpgrade::*;
+        let paying = |cfg: &RskHardforkConfig| {
+            spend(vec![native_segwit()], &[(1_000_000_000, regtest_federation_script_for(cfg))])
+        };
+        let cfg = rskj_regtest_until(Fingerroot500);
+        let tx = paying(&cfg);
+        assert_eq!(
+            registration(&tx, &cfg),
+            (true, true, vec![rejected(&tx, 4), unrefundable(&tx, 1)], 0)
+        );
+        let cfg = rskj_regtest_until(Papyrus200);
+        let tx = paying(&cfg);
+        assert_eq!(registration(&tx, &cfg), (true, false, vec![], 0));
+        for (cfg, marked) in [
+            (rskj_regtest_until(Reed810), true),
+            (RskHardforkConfig::rskj_regtest(), false),
+        ] {
+            let tx = paying(&cfg);
+            assert_eq!(
+                registration(&tx, &cfg),
+                (true, marked, vec![rejected(&tx, 3), unrefundable(&tx, 1)], 0)
+            );
+        }
+    }
+
+    /// A peg-in whose RSKT payload doesn't parse, from no sender rskj can name:
+    /// `PeginInformation.parse` throws with the version still 0, so rskj logs
+    /// rejected_pegin(PEGIN_V1_INVALID_PAYLOAD=4) and, with nowhere to refund
+    /// to, unrefundable_pegin(LEGACY_PEGIN_UNDETERMINED_SENDER=1). Before
+    /// RSKIP379 (`legacyRegisterPegin`'s catch) it marks the transaction
+    /// processed; from it (`handleNonRefundablePegin`) only between RSKIP459
+    /// and RSKIP551.
+    #[test]
+    fn a_peg_in_whose_payload_does_not_parse_from_no_sender_is_not_refundable() {
+        use crate::hardfork::RskNetworkUpgrade::*;
+        for (cfg, marked) in [
+            (rskj_regtest_until(Fingerroot500), true),
+            (rskj_regtest_until(Reed810), true),
+            (RskHardforkConfig::rskj_regtest(), false),
+        ] {
+            // Version 2, which no rskj reads.
+            let tx = spend(
+                vec![native_segwit()],
+                &[(1_000_000_000, regtest_federation_script_for(&cfg)), (0, rskt(2, [0x42; 20]))],
+            );
+            assert_eq!(
+                registration(&tx, &cfg),
+                (true, marked, vec![rejected(&tx, 4), unrefundable(&tx, 1)], 0)
+            );
+        }
+    }
+
+    /// From RSKIP170 rskj looks for the RSKT payload in every output's script,
+    /// and one bitcoinj can't parse throws the `PeginInstructionsException` a
+    /// payload that doesn't parse throws. A P2PKH sender's peg-in is refunded,
+    /// logging rejected_pegin(PEGIN_V1_INVALID_PAYLOAD=4), where it would be
+    /// credited: before RSKIP379 in `legacyRegisterPegin`'s catch, from it in
+    /// `evaluatePegin`'s. From no sender it is turned down for its payload,
+    /// not for its sender. Before RSKIP170 nothing reads the outputs so.
+    #[test]
+    fn from_rskip170_an_output_bitcoinj_cannot_parse_is_an_invalid_payload() {
+        use crate::hardfork::RskNetworkUpgrade::*;
+        let key = real_pubkey();
+        let sender = (pushes(&[&[0x30; 71], &key]), bitcoin::Witness::new());
+        let to = super::super::federation::rsk_address_from_public_key(&key).unwrap();
+        let amount = 1_000_000_000;
+        // OP_PUSHDATA1 with no length after it.
+        let unparseable = bitcoin::ScriptBuf::from_bytes(vec![0x4c]);
+        let paying = |input: &(bitcoin::ScriptBuf, bitcoin::Witness), cfg: &RskHardforkConfig| {
+            spend(
+                vec![input.clone()],
+                &[
+                    (amount, regtest_federation_script_for(cfg)),
+                    (0, unparseable.clone()),
+                ],
+            )
+        };
+
+        for cfg in [
+            rskj_regtest_until(Fingerroot500),
+            RskHardforkConfig::rskj_regtest(),
+        ] {
+            let tx = paying(&sender, &cfg);
+            let (ok, processed, logs, utxos) = registration(&tx, &cfg);
+            assert_eq!((ok, processed, utxos), (true, true, 0), "refunded");
+            assert_eq!(logs.first(), Some(&rejected(&tx, 4)));
+            let credited = pegin_btc(to, &tx, amount, 0);
+            assert!(logs.iter().all(|(topics, _)| topics[0] != credited.0[0]));
+        }
+
+        let cfg = RskHardforkConfig::rskj_regtest();
+        let tx = paying(&native_segwit(), &cfg);
+        assert_eq!(
+            registration(&tx, &cfg),
+            (true, false, vec![rejected(&tx, 4), unrefundable(&tx, 1)], 0)
+        );
+
+        let cfg = rskj_regtest_until(Papyrus200);
+        let tx = paying(&native_segwit(), &cfg);
+        assert_eq!(registration(&tx, &cfg), (true, false, vec![], 0));
+    }
+
+    /// bitcoinj's `Script.getToAddress` reads P2PKH by its chunks, so a 20-byte
+    /// hash pushed with OP_PUSHDATA1 is still an address, and P2SH by its exact
+    /// bytes, so the same hash pushed that way is not.
+    #[test]
+    fn bitcoinj_reads_only_p2pkh_and_p2sh_as_addresses() {
+        let hash = [0x11u8; 20];
+        let p2pkh = [&[0x76, 0xa9, 0x14][..], &hash, &[0x88, 0xac]].concat();
+        let p2pkh_pushdata1 = [&[0x76, 0xa9, 0x4c, 0x14][..], &hash, &[0x88, 0xac]].concat();
+        let p2sh = [&[0xa9, 0x14][..], &hash, &[0x87]].concat();
+        let p2sh_pushdata1 = [&[0xa9, 0x4c, 0x14][..], &hash, &[0x87]].concat();
+        let p2wpkh = [&[0x00, 0x14][..], &hash].concat();
+        let short_hash = [&[0x76, 0xa9, 0x13][..], &hash[..19], &[0x88, 0xac]].concat();
+        for (script, address) in [
+            (p2pkh, true),
+            (p2pkh_pushdata1, true),
+            (p2sh, true),
+            (p2sh_pushdata1, false),
+            (p2wpkh, false),
+            (short_hash, false),
+            (vec![0x6a, 0x01, 0x01], false),
+            // An opcode where the hash goes.
+            (vec![0x76, 0xa9, 0x61, 0x88, 0xac], false),
+            (vec![0x4c], false),
+            (vec![], false),
+        ] {
+            assert_eq!(bitcoinj_reads_as_address(&script), address, "{script:02x?}");
+        }
+    }
+
+    /// A v1 peg-in over the locking cap, from no sender, with no refund
+    /// address in its payload: before RSKIP379 `processPegInVersion1` logs
+    /// rejected_pegin(PEGIN_CAP_SURPASSED=1), then `refundTxSender`, with
+    /// nowhere to refund to and the version 1,
+    /// unrefundable_pegin(PEGIN_V1_REFUND_ADDRESS_NOT_SET=2), and marks the
+    /// transaction processed. From RSKIP379 `evaluatePegin` registers a v1
+    /// peg-in with `executePegIn`, which doesn't ask the cap.
+    #[test]
+    fn a_v1_peg_in_over_the_locking_cap() {
+        use crate::hardfork::RskNetworkUpgrade::*;
+        let destination = [0x42u8; 20];
+        // Twice regtest's locking cap of 1,000 BTC.
+        let amount = 200_000_000_000;
+        let paying = |cfg: &RskHardforkConfig| {
+            spend(
+                vec![native_segwit()],
+                &[(amount, regtest_federation_script_for(cfg)), (0, rskt(1, destination))],
+            )
+        };
+        let cfg = rskj_regtest_until(Fingerroot500);
+        let tx = paying(&cfg);
+        assert_eq!(
+            registration(&tx, &cfg),
+            (true, true, vec![rejected(&tx, 1), unrefundable(&tx, 2)], 0)
+        );
+        let cfg = RskHardforkConfig::rskj_regtest();
+        let tx = paying(&cfg);
+        assert_eq!(
+            registration(&tx, &cfg),
+            (true, true, vec![pegin_btc(RskAddress::from(destination), &tx, amount, 1)], 1)
+        );
+    }
+
+    /// From RSKIP379 a P2PKH sender's peg-in is registered as
+    /// `evaluateLegacyPegin` decides, asking neither the lock whitelist nor
+    /// the locking cap: on regtest, whose whitelist is empty and never
+    /// disabled, rskj credits one over the cap that the rules before RSKIP379
+    /// refund.
+    #[test]
+    fn from_rskip379_a_legacy_peg_in_asks_neither_the_whitelist_nor_the_cap() {
+        use crate::hardfork::RskNetworkUpgrade::*;
+        let key = real_pubkey();
+        let sender = (pushes(&[&[0x30; 71], &key]), bitcoin::Witness::new());
+        // Twice regtest's locking cap of 1,000 BTC.
+        let amount = 200_000_000_000;
+        let cfg = RskHardforkConfig::rskj_regtest();
+        let tx = spend(vec![sender.clone()], &[(amount, regtest_federation_script_for(&cfg))]);
+        let to = super::super::federation::rsk_address_from_public_key(&key).unwrap();
+        assert_eq!(registration(&tx, &cfg), (true, true, vec![pegin_btc(to, &tx, amount, 0)], 1));
+
+        let cfg = rskj_regtest_until(Fingerroot500);
+        let tx = spend(vec![sender], &[(amount, regtest_federation_script_for(&cfg))]);
+        let (ok, processed, logs, utxos) = registration(&tx, &cfg);
+        assert_eq!((ok, processed, utxos), (true, true, 0), "refunded");
+        let credited = pegin_btc(to, &tx, amount, 0);
+        assert!(logs.iter().all(|(topics, _)| topics[0] != credited.0[0]));
+    }
+
+    /// From RSKIP379 a multisig or P2SH-P2WSH sender's peg-in has its outputs
+    /// read by bitcoinj's `getPubKeyHash` (`hasOutputsToDifferentTypesOfFeds`),
+    /// which throws for one that is neither P2PKH nor P2SH; rskj doesn't catch
+    /// that, so the call fails. With outputs it can read, the peg-in is
+    /// refunded as before.
+    #[test]
+    fn from_rskip379_a_multisig_peg_in_fails_on_an_output_bitcoinj_cannot_hash() {
+        let redeem = build_federation_redeem_script(&test_keys(0x10), 2);
+        let cfg = RskHardforkConfig::rskj_regtest();
+        let federation = (1_000_000_000, regtest_federation_script());
+        let p2wpkh = bitcoin::ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0x77; 20]].concat());
+        for other in [p2wpkh, op_return(&[0xbe, 0xef])] {
+            let tx = spend(vec![signed_multisig(&redeem)], &[federation.clone(), (40_000, other)]);
+            assert!(!registration(&tx, &cfg).0, "the call fails");
+        }
+        for other in [p2pkh_output_script(&[0x77; 20]), p2sh_output_script(&[0x77; 20])] {
+            let tx = spend(vec![signed_multisig(&redeem)], &[federation.clone(), (40_000, other)]);
+            let (ok, processed, logs, _) = registration(&tx, &cfg);
+            assert!(ok && processed);
+            assert_eq!((logs.len(), &logs[0]), (3, &rejected(&tx, 2)), "refunded");
+        }
+    }
+
+    /// `test_keys(0x30)` in `active_format` as the new federation and
+    /// `test_keys(0x20)` in `retiring_format` as the old one, the new one
+    /// created at block 0: from regtest's activation age of 150 blocks the new
+    /// one is active and the old one retiring.
+    fn with_retiring_federation<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        active_format: u64,
+        retiring_format: u64,
+    ) {
+        use super::super::federation::{serialize_federation_multikey, StoredMember};
+        use super::super::serialization::rlp_encode_u64;
+        use super::super::storage::{
+            NEW_FEDERATION_FORMAT_VERSION_KEY, NEW_FEDERATION_KEY, OLD_FEDERATION_FORMAT_VERSION_KEY,
+            OLD_FEDERATION_KEY,
+        };
+        let federation = |first: u8| {
+            let members: Vec<StoredMember> =
+                test_keys(first).into_iter().map(StoredMember::from_btc).collect();
+            serialize_federation_multikey(&members, 0, 0)
+        };
+        bridge_store_bytes_named(ctx, OLD_FEDERATION_KEY, &federation(0x20));
+        bridge_store_bytes_named(ctx, OLD_FEDERATION_FORMAT_VERSION_KEY, &rlp_encode_u64(retiring_format));
+        bridge_store_bytes_named(ctx, NEW_FEDERATION_KEY, &federation(0x30));
+        bridge_store_bytes_named(ctx, NEW_FEDERATION_FORMAT_VERSION_KEY, &rlp_encode_u64(active_format));
+    }
+
+    /// The output scripts of the active and the retiring federation in `ctx`
+    /// at block `block`.
+    fn live_federation_scripts<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        cfg: &RskHardforkConfig,
+        block: u64,
+    ) -> (bitcoin::ScriptBuf, bitcoin::ScriptBuf) {
+        let config = BridgeConstants::rskj_regtest();
+        let (_, active) = active_federation_keys_and_redeem(ctx, &config, cfg, block);
+        let active_format = active_federation_format(ctx, &config, cfg, block);
+        let (_, retiring) = retiring_federation_keys_and_redeem(ctx, &config, cfg, block)
+            .expect("a retiring federation");
+        let retiring_format =
+            federation_format_version(ctx, super::super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY);
+        (
+            p2sh_output_script(&federation_output_hash160(&active, active_format)),
+            p2sh_output_script(&federation_output_hash160(&retiring, retiring_format)),
+        )
+    }
+
+    /// From RSKIP379 a multisig sender's peg-in that pays both live
+    /// federations, of different format versions, is turned down with no
+    /// refund (`evaluateLegacyPegin`, `hasOutputsToDifferentTypesOfFeds`):
+    /// rejected_pegin(LEGACY_PEGIN_MULTISIG_SENDER=2) and
+    /// unrefundable_pegin(OUTPUTS_SENT_TO_DIFFERENT_TYPES_OF_FEDS=4), and not
+    /// marked processed after RSKIP551. Paying two of one format, it's
+    /// refunded as before.
+    #[test]
+    fn from_rskip379_a_multisig_peg_in_to_two_kinds_of_federation_is_not_refunded() {
+        let redeem = build_federation_redeem_script(&test_keys(0x10), 2);
+        let cfg = RskHardforkConfig::rskj_regtest();
+        for (active_format, retiring_format, refunded) in [(4000, 3000, false), (4000, 4000, true)] {
+            let (active, retiring) = {
+                let mut ctx = queue_ctx();
+                with_retiring_federation(&mut ctx, active_format, retiring_format);
+                live_federation_scripts(&mut ctx, &cfg, 200)
+            };
+            let tx = spend(
+                vec![signed_multisig(&redeem)],
+                &[(1_000_000_000, active), (1_000_000_000, retiring)],
+            );
+            let mut ctx = regtest_bridge_at(&btc_serialize(&tx), 200, &cfg);
+            with_retiring_federation(&mut ctx, active_format, retiring_format);
+            let (ok, processed, logs, _) = registration_in(&mut ctx, &tx, 200, &cfg);
+            assert!(ok);
+            if refunded {
+                assert!(processed);
+                assert_eq!(logs[0], rejected(&tx, 2));
+                assert!(!logs.contains(&unrefundable(&tx, 4)));
+            } else {
+                assert_eq!((processed, logs), (false, vec![rejected(&tx, 2), unrefundable(&tx, 4)]));
+            }
+        }
+    }
+
+    /// bitcoinj reads a P2PKH output's hash where it reads a P2SH output's, so
+    /// a P2PKH output to a federation's script hash counts as paying that
+    /// federation; and a set of outputs paying no live federation is the
+    /// empty set's `NoSuchElementException`.
+    #[test]
+    fn outputs_to_different_types_of_feds_reads_outputs_as_bitcoinj_does() {
+        let (active, retiring) = (p2sh_output_script(&[0x11; 20]), p2sh_output_script(&[0x22; 20]));
+        let ask = |outputs: &[bitcoin::ScriptBuf], active_format: u64, retiring_format: u64| {
+            let paid: Vec<(u64, bitcoin::ScriptBuf)> = outputs.iter().map(|s| (1_000, s.clone())).collect();
+            outputs_to_different_types_of_feds(
+                &spend(vec![native_segwit()], &paid),
+                (&active, active_format),
+                Some((&retiring, retiring_format)),
+            )
+        };
+        assert_eq!(ask(&[active.clone(), retiring.clone()], 4000, 3000), Ok(true));
+        assert_eq!(ask(&[active.clone(), p2pkh_output_script(&[0x22; 20])], 4000, 3000), Ok(true));
+        assert_eq!(ask(&[active.clone(), retiring.clone()], 3000, 3000), Ok(false));
+        assert_eq!(ask(&[active.clone(), active.clone()], 4000, 3000), Ok(false));
+        assert_eq!(ask(std::slice::from_ref(&retiring), 4000, 3000), Ok(false));
+        assert!(ask(&[p2pkh_output_script(&[0x33; 20])], 4000, 3000).is_err());
+        assert!(ask(&[active.clone(), op_return(&[0x01])], 4000, 4000).is_err());
+    }
+
+    /// The flyover method reads its transaction the same way
+    /// (`BridgeSupport.registerFlyoverBtcTransaction` l.2771-2772): whatever
+    /// it does with the transaction written the standard way, it does with
+    /// the others. A throw from bitcoinj it answers with its generic error.
+    #[test]
+    fn a_flyover_payment_is_registered_however_bitcoinj_reads_its_bytes() {
+        let (config, cfg) = (
+            BridgeConstants::rskj_regtest(),
+            RskHardforkConfig::rskj_regtest(),
+        );
+        let lbc = RskAddress::repeat_byte(0x42);
+        let mut lbc_word = [0u8; 32];
+        lbc_word[12..].copy_from_slice(lbc.as_slice());
+        let (derivation_arguments, address) = ([0x11; 32], [0x6F; 21]);
+        // The federation's flyover address for those arguments.
+        let flyover_address = {
+            let mut ctx = queue_ctx();
+            let (_, redeem) = active_federation_keys_and_redeem(&mut ctx, &config, &cfg, 10);
+            let format = active_federation_format(&mut ctx, &config, &cfg, 10);
+            let hash = flyover_derivation_hash(&derivation_arguments, &address, &lbc, &address);
+            let script = flyover_redeem_script(&hash, &redeem);
+            p2sh_output_script(&federation_output_hash160(&script, format))
+        };
+        let payer = build_federation_redeem_script(&test_keys(0x10), 2);
+        let tx = spend(
+            vec![signed_multisig(&payer), signed_multisig(&payer)],
+            &[(1_000_000_000, flyover_address)],
+        );
+        let answer = |bytes: &[u8]| {
+            let tree = one_leaf_tree(bytes);
+            let args = encode::args(&[
+                Arg::Bytes(bytes),
+                Arg::Word(encode::int(350)),
+                Arg::Bytes(&tree),
+                Arg::Word(derivation_arguments),
+                Arg::Bytes(&address),
+                Arg::Word(lbc_word),
+                Arg::Bytes(&address),
+                Arg::Word([0; 32]),
+            ]);
+            let mut ctx = regtest_bridge_with_bytes(bytes);
+            let ctx_tx = BridgeTxContext::default();
+            register_fast_bridge_btc_transaction(&mut ctx, &args, 0, &config, &cfg, &ctx_tx, lbc, 2)
+                .unwrap()
+                .bytes
+        };
+        // This Bridge holds no balance, so every bitcoin counts as locked and
+        // the payment is over the cap: read, and refunded to its user.
+        let standard = answer(&btc_serialize(&tx));
+        assert_eq!(standard, flyover_code_output(flyover_codes::REFUNDED_USER));
+        for bytes in &written_otherwise(&tx) {
+            assert_eq!(answer(bytes), standard);
+        }
+
+        let mut twice = tx.clone();
+        twice.input[1].previous_output = twice.input[0].previous_output;
+        assert_eq!(
+            answer(&btc_serialize(&twice)),
+            flyover_code_output(flyover_codes::GENERIC_ERROR)
+        );
+    }
+
+    /// RSKj looks for its SVP transactions only where it reads the pegout
+    /// index: there a transaction whose stripped hash is the stored fund
+    /// transaction's is registered as it, and below it the legacy rules
+    /// classify the same transaction. It strips as RSKIP305 has it, so a
+    /// transaction that only the earlier stripping would match isn't the fund
+    /// transaction.
+    #[test]
+    fn svp_transactions_are_found_only_where_the_pegout_index_is_read() {
+        let redeem = build_federation_redeem_script(&test_keys(0x10), 2);
+        let outputs = [(40_000, p2sh_output_script(&[0x77; 20]))];
+        let tx = spend(vec![signed_multisig(&redeem)], &outputs);
+        let fund_hash = multisig_tx_hash_without_signatures(&tx, true).unwrap();
+        assert_eq!(registered(&tx, 350, None, fund_hash), (true, true, 0, 0));
+        assert_eq!(registered(&tx, 350, None, None), (true, false, 0, 0));
+        assert_eq!(registered(&tx, 349, None, fund_hash), (true, false, 2, 0));
+        let to_address = [&[0x76, 0xa9, 0x14][..], &[0x33; 20][..], &[0x88, 0xac][..]].concat();
+        let tx = spend(
+            vec![
+                signed_multisig(&redeem),
+                legacy(pushes(&[&[0x30; 71], &to_address]).into_bytes()),
+            ],
+            &outputs,
+        );
+        let before_rskip305 = multisig_tx_hash_without_signatures(&tx, false).unwrap();
+        assert!(before_rskip305.is_some());
+        assert_eq!(
+            registered(&tx, 350, None, before_rskip305),
+            (true, false, 0, 0)
+        );
+    }
+
+    /// Signed pegouts RSKj released on mainnet and testnet, with legacy and
+    /// with segwit inputs: each strips to the sighash whose key RSKj's Bridge
+    /// storage holds, as read from RSKj's public nodes.
+    #[test]
+    fn real_pegouts_strip_to_the_sighashes_rskj_indexed() {
+        let vectors = include_str!("testdata/pegout_index_sighashes.txt");
+        let (mut read, mut segwit) = (0, 0);
+        for line in vectors
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            let [network, block, sig_hash, key, raw] = line.split(' ').collect::<Vec<_>>()[..]
+            else {
+                panic!("a line of five columns: {line}");
+            };
+            let tx: BtcTransaction = deserialize(&hex::decode(raw).unwrap()).unwrap();
+            let stripped = sig_hash_for_pegout_index(&tx).unwrap().unwrap();
+            assert_eq!(to_hex(&stripped), sig_hash, "{network} {block}");
+            assert_eq!(
+                format!("{:#066x}", pegout_tx_sig_hash_key(&stripped)),
+                key,
+                "{network} {block}"
+            );
+            read += 1;
+            segwit += usize::from(tx.input.iter().any(|input| !input.witness.is_empty()));
+        }
+        assert_eq!((read, segwit), (8, 4));
+    }
+
+    /// Below the index's height, `isValidPegInTx` refuses its members' spend of
+    /// the last retired federation as it refuses a live one's, and
+    /// `isMigrationTx`, asked next, knows the retired federation by its
+    /// standard redeem script. Stored by its whole ERP redeem script, as before
+    /// RSKIP377, the retired federation's spend is neither, and is left alone.
+    /// Stored by its standard redeem script, the spend is a migration, from
+    /// RSKIP293 even when it pays the active federation nothing. A segwit one,
+    /// stored by the P2SH-P2WSH script of its standard redeem script, isn't
+    /// refused, so its spend is a peg-in; stored by its whole redeem script's,
+    /// it's refused, as bitcoinj matches the scriptSig's witness program to it,
+    /// and its spend is left alone.
+    #[test]
+    fn below_the_index_a_spend_of_the_last_retired_federation_is_no_peg_in() {
+        use k256::ecdsa::signature::hazmat::PrehashSigner as _;
+        use k256::ecdsa::{Signature, SigningKey};
+        let members: Vec<SigningKey> = (0x10..0x13u8)
+            .map(|seed| SigningKey::from_slice(&[seed; 32]).unwrap())
+            .collect();
+        let key_of = |member: &SigningKey| -> [u8; 33] {
+            member
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .try_into()
+                .unwrap()
+        };
+        let mut keys: Vec<[u8; 33]> = members.iter().map(key_of).collect();
+        keys.sort();
+        let standard = build_federation_redeem_script(&keys, 2);
+        let erp = build_erp_redeem_script(&keys, 2, &test_keys(0x40), 2, 52_560, ErpScript::P2sh);
+        let with_retired = |retired: &[u8; 20], tx: &BtcTransaction| {
+            let mut ctx = regtest_bridge_with(tx);
+            let script = p2sh_output_script(retired).into_bytes();
+            bridge_store_bytes_named(
+                &mut ctx,
+                super::super::storage::LAST_RETIRED_FEDERATION_P2SH_SCRIPT_KEY,
+                &rlp_encode_list(&[rlp_encode_element(&script)]),
+            );
+            outcome(&mut ctx, tx, 349, &RskHardforkConfig::rskj_regtest())
+        };
+        // A spend two members sign: OP_0, their signatures in their keys'
+        // order, OP_0 for the ERP script's default branch, and the ERP script.
+        let signed_spend = |outputs: &[(u64, bitcoin::ScriptBuf)]| {
+            let mut tx = spend(vec![legacy(vec![])], outputs);
+            let hash = bitcoin::sighash::SighashCache::new(&tx)
+                .legacy_signature_hash(0, bitcoin::Script::from_bytes(&erp), 1)
+                .unwrap()
+                .to_byte_array();
+            let mut signers: Vec<&SigningKey> = members.iter().collect();
+            signers.sort_by_key(|member| key_of(member));
+            let signatures: Vec<Vec<u8>> = signers[..2]
+                .iter()
+                .map(|member| {
+                    let signature: Signature = member.sign_prehash(&hash).unwrap();
+                    [signature.to_der().as_bytes(), &[0x01]].concat()
+                })
+                .collect();
+            tx.input[0].script_sig = pushes(&[&[], &signatures[0], &signatures[1], &[], &erp]);
+            tx
+        };
+        let to_federation = (1_000_000_000, regtest_federation_script());
+        let paying_nothing = signed_spend(&[(40_000, p2sh_output_script(&[0x77; 20]))]);
+        let migrating = signed_spend(std::slice::from_ref(&to_federation));
+        // With no federation retired, both are peg-ins, and the one that pays
+        // the federation is refunded, which leaves a third event.
+        assert_eq!(
+            registered(&paying_nothing, 349, None, None),
+            (true, false, 2, 0)
+        );
+        assert_eq!(registered(&migrating, 349, None, None), (true, true, 3, 0));
+        let whole = redeem_script_hash160(&erp);
+        assert_eq!(with_retired(&whole, &paying_nothing), (true, false, 0, 0));
+        assert_eq!(with_retired(&whole, &migrating), (true, false, 0, 0));
+        let members = redeem_script_hash160(&standard);
+        assert_eq!(with_retired(&members, &paying_nothing), (true, true, 0, 0));
+        assert_eq!(with_retired(&members, &migrating), (true, true, 0, 1));
+        let (script_sig, _) = super::super::release_tx::segwit_base_input(&erp, 2);
+        let witness = bitcoin::Witness::from_slice(&[
+            vec![],
+            vec![0x30; 71],
+            vec![0x31; 72],
+            vec![],
+            erp.clone(),
+        ]);
+        let segwit = spend(vec![(script_sig, witness)], &[to_federation]);
+        let peg_in = registered(&segwit, 349, None, None);
+        assert!(peg_in.0);
+        assert_eq!(
+            with_retired(&federation_output_hash160(&erp, 4000), &segwit),
+            (true, false, 0, 0)
+        );
+        assert_eq!(
+            with_retired(&federation_output_hash160(&standard, 4000), &segwit),
+            peg_in
+        );
+    }
+
+    /// rskj reads an ERP federation's standard redeem script out of its redeem
+    /// script with bitcoinj's parser, which has none for testnet's hard-coded
+    /// ERP script, a non-standard ERP federation's there before RSKIP284, and
+    /// throws a `ScriptException`. Below the index's height `isValidPegInTx`
+    /// catches it, and a transaction paying such a federation enough is a
+    /// peg-in; `isPegOutTx` of the live federations doesn't, and one it
+    /// refuses that is no migration fails the call. Another ERP federation's
+    /// is read, and the transaction is left alone.
+    #[test]
+    fn testnets_hard_coded_erp_script_has_no_standard_redeem_script() {
+        use super::super::peg_legacy::{LegacyRules, LiveFederation, PegType};
+        /// The rules with `redeem` the active federation's, at its P2SH
+        /// script `p2sh`, and an old federation `old` no input spends.
+        fn rules<'a>(
+            old: &'a [u8],
+            (redeem, p2sh): (&'a [u8], &'a [u8]),
+            format: u64,
+            below_minimum: bool,
+        ) -> LegacyRules<'a> {
+            LegacyRules {
+                rskip199: true,
+                rskip201: true,
+                rskip305: false,
+                old_federation_p2sh: old,
+                active: LiveFederation {
+                    p2sh,
+                    redeem,
+                    format,
+                },
+                retiring: None,
+                retired_p2sh: None,
+                live_below_minimum: below_minimum,
+                active_below_minimum: below_minimum,
+            }
+        }
+        let old = p2sh_output_script(&[0x0d; 20]).into_bytes();
+        let p2sh_of =
+            |redeem: &[u8]| p2sh_output_script(&redeem_script_hash160(redeem)).into_bytes();
+        let hard_coded = legacy_erp_testnet_redeem_script();
+        let hard_coded_p2sh = p2sh_of(hard_coded);
+        let p2sh_erp = build_erp_redeem_script(
+            &test_keys(0x10),
+            2,
+            &test_keys(0x40),
+            2,
+            500,
+            ErpScript::P2sh,
+        );
+        let p2sh_erp_p2sh = p2sh_of(&p2sh_erp);
+        // A multisig spend, whose standard redeem script is read and compared.
+        let tx = spend(
+            vec![signed_multisig(&build_federation_redeem_script(
+                &test_keys(0x20),
+                2,
+            ))],
+            &[(40_000, p2sh_output_script(&[0x77; 20]))],
+        );
+        let hard_coded = (hard_coded, hard_coded_p2sh.as_slice());
+        assert_eq!(
+            rules(&old, hard_coded, 2000, false).transaction_type(&tx),
+            Ok(PegType::PegIn)
+        );
+        assert!(rules(&old, hard_coded, 2000, true)
+            .transaction_type(&tx)
+            .is_err());
+        assert_eq!(
+            rules(&old, (&p2sh_erp, &p2sh_erp_p2sh), 3000, true).transaction_type(&tx),
+            Ok(PegType::Unknown {
+                refused_for_an_input: false
+            })
+        );
+    }
+
+    /// Below the index's height `isValidPegInTx`'s own minimum decides whether a
+    /// transaction is a peg-in: from RSKIP293 one UTXO to a live federation
+    /// below it makes it none, and it's left alone. From the index's height
+    /// every transaction paying a live federation is a peg-in, and
+    /// `evaluatePegin` turns a small one down with its two events. Where rskj
+    /// marks a rejected peg-in processed (RSKIP459 without RSKIP551), it marks
+    /// only that one.
+    #[test]
+    fn below_the_index_a_small_utxo_makes_no_peg_in() {
+        let redeem = build_federation_redeem_script(&test_keys(0x10), 2);
+        let tx = spend(
+            vec![signed_multisig(&redeem)],
+            &[(1, regtest_federation_script())],
+        );
+        assert_eq!(registered(&tx, 349, None, None), (true, false, 0, 0));
+        assert_eq!(registered(&tx, 350, None, None), (true, false, 2, 0));
+        let marking = RskHardforkConfig::rskj_regtest()
+            .with_hardfork(crate::hardfork::RskNetworkUpgrade::Vetiver900, None);
+        assert!(should_mark_rejected_pegin_as_processed(&marking, 10));
+        let marked = |height| outcome(&mut regtest_bridge_with(&tx), &tx, height, &marking);
+        assert_eq!(marked(349), (true, false, 0, 0));
+        assert_eq!(marked(350), (true, true, 2, 0));
     }
 }

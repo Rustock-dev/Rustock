@@ -108,6 +108,11 @@ pub struct ProcessedBlock {
     pub state_root_hash: B256,
     pub receipts_root: B256,
     pub logs_bloom: Bloom,
+    /// The Bridge's decisions this block made that it logs no event for
+    /// (`crate::silent`), which [`BlockProcessor::commit_receipts`] stores
+    /// with it. Empty unless the processor records them
+    /// ([`BlockProcessor::with_legacy_event_store`]).
+    pub unlogged_peg_events: Vec<crate::silent::SilentRecord>,
 }
 
 /// The running gas total for the receipt at `index`.
@@ -138,6 +143,10 @@ pub struct BlockProcessor {
     /// recovered most of this block's transactions when it admitted them.
     /// `None` disables the cache entirely and every sender is recomputed.
     sender_cache: Option<Arc<crate::sender_cache::SenderCache>>,
+    /// The chain's consensus constants, for the rules each uncle must pass:
+    /// proof of work, timestamps, difficulty and gas limit against its own
+    /// parent.
+    chain_config: Arc<rustock_core::config::ChainConfig>,
     /// Where to record the peg events the Bridge does not emit.
     ///
     /// `None` disables recording entirely, and the cost of that is one
@@ -189,35 +198,48 @@ impl BlockProcessor {
         block_store: Arc<BlockStore>,
     ) -> Self {
         let executor = RskExecutor::new(hardfork_cfg.clone(), block_store.clone());
+        let chain_config = Arc::new(match hardfork_cfg.chain_id {
+            crate::hardfork::RSK_MAINNET_CHAIN_ID => rustock_core::config::ChainConfig::mainnet(),
+            crate::hardfork::RSK_TESTNET_CHAIN_ID => rustock_core::config::ChainConfig::testnet(),
+            _ => rustock_core::config::ChainConfig::regtest(),
+        });
         Self {
             executor,
             hardfork_cfg,
             block_store,
             validate_fork_detection_data: false,
             sender_cache: None,
+            chain_config,
             legacy_events: None,
         }
+    }
+
+    /// The chain's consensus constants, for a node whose chain is not exactly
+    /// the one its chain id names: the configuration the rest of the node
+    /// validates headers with, and whose sequential-sublist minimum sets the
+    /// gas limit of every sublist the executor holds transactions to.
+    pub fn with_chain_config(mut self, config: Arc<rustock_core::config::ChainConfig>) -> Self {
+        self.executor = self
+            .executor
+            .with_min_sequential_set_gas_limit(config.min_sequential_set_gas_limit);
+        self.chain_config = config;
+        self
+    }
+
+    /// Records peg events the Bridge does not emit, into `store`: each block
+    /// this processor runs records its own (see `finish_execute`).
+    pub fn with_legacy_event_store(
+        mut self,
+        store: Arc<rustock_storage::legacy_event_store::LegacyEventStore>,
+    ) -> Self {
+        self.legacy_events = Some(store);
+        self
     }
 
     /// Share a sender cache with whoever else recovers senders -- the pool,
     /// above all. Handing the same `Arc` to both is the point: a transaction
     /// the pool admitted should not be recovered a second time when the
     /// block carrying it executes.
-    /// Records peg events the Bridge does not emit, into `store`.
-    ///
-    /// Opens the thread-local sink here, because recording is a property of
-    /// the thread that executes and this is the thread that will. Sublists
-    /// running in parallel open their own and the coordinator absorbs them
-    /// (`silent::absorb`), so a parallel block is captured whole.
-    pub fn with_legacy_event_store(
-        mut self,
-        store: Arc<rustock_storage::legacy_event_store::LegacyEventStore>,
-    ) -> Self {
-        crate::silent::start();
-        self.legacy_events = Some(store);
-        self
-    }
-
     pub fn with_sender_cache(
         mut self,
         cache: Arc<crate::sender_cache::SenderCache>,
@@ -295,6 +317,11 @@ impl BlockProcessor {
         self
     }
 
+    /// Whether the RSKIP110 fork-detection check runs.
+    pub fn validates_fork_detection(&self) -> bool {
+        self.validate_fork_detection_data
+    }
+
     /// Execute all transactions in a block without validating results against the header.
     ///
     /// Returns the processed block with receipts and new state root.
@@ -316,16 +343,27 @@ impl BlockProcessor {
         trie_store: Arc<dyn TrieStore>,
         save_out: Option<&mut std::time::Duration>,
     ) -> Result<ProcessedBlock, ProcessError> {
-        // Recording is thread-local, and the thread that built this processor
-        // need not be the one executing. Opening the sink lazily here makes
-        // that irrelevant: whichever thread arrives, it records. Without it a
-        // node whose import loop runs off the main thread would record
-        // nothing and look exactly like a chain with no Flyover peg-ins.
-        if self.legacy_events.is_some() && !crate::silent::is_recording() {
+        // The Bridge's unlogged decisions are recorded on the thread that
+        // executes (`crate::silent`), so recording is opened here, fresh, and
+        // closed again when the block is done, and what was recorded goes
+        // with the block, to be stored where it is committed, on any thread.
+        // Nothing else the thread runs is recorded -- a local call, a trace,
+        // the miner's trial run of its candidates -- and a block that fails
+        // leaves nothing behind for the next to store. A template the miner
+        // builds runs here too, and what it records goes with it unstored:
+        // only the block a solution completes is committed.
+        let recording = self.legacy_events.is_some();
+        if recording {
             crate::silent::start();
         }
         let started = std::time::Instant::now();
-        let out = self.execute_block_inner(block, state_root, trie_store, save_out);
+        let mut out = self.execute_block_inner(block, state_root, trie_store, save_out);
+        if recording {
+            let decisions = crate::silent::finish();
+            if let Ok(processed) = &mut out {
+                processed.unlogged_peg_events = decisions;
+            }
+        }
         // Timed whether or not it succeeded: a block that fails still spent
         // the time, and a measurement that only counts successes reads as a
         // faster node the worse things get.
@@ -367,23 +405,30 @@ impl BlockProcessor {
         // receipts root alone, which is how testnet #7,690,876 showed up.
         // Every earlier block verified because none of them actually split:
         // the edges field is present and empty from reed810 until here.
-        let sublist_starts: &[i16] = header
-            .version_fields
-            .as_ref()
-            .and_then(|v| v.edges.as_deref())
-            .unwrap_or(&[]);
+        //
+        // The edges count only where the block runs as its sublists
+        // (`runs_sublists`): rskj executes any other block as one list and
+        // never reads them.
+        let sublist_starts: &[i16] = if self.hardfork_cfg.runs_sublists(header.number) {
+            header
+                .version_fields
+                .as_ref()
+                .and_then(|v| v.edges.as_deref())
+                .unwrap_or(&[])
+        } else {
+            &[]
+        };
 
         // The sublists also have to be *independent*, and that is a rule the
         // validator applies rather than a property it may assume. Recording
         // is started only for a block that actually splits, so every block
         // mainnet has produced -- reed810 is unscheduled there, and the field
         // is absent or empty throughout -- pays nothing for it.
-        let check_collisions =
-            self.hardfork_cfg.has_rskip144(header.number) && !sublist_starts.is_empty();
+        let check_collisions = !sublist_starts.is_empty();
         if check_collisions {
             // No address is excluded on account of fees any more. The fees
-            // are postponed whenever RSKIP-144 is active -- which is whenever
-            // this check runs -- and settled once at the REMASC transaction,
+            // are postponed whenever the block runs as its sublists -- which
+            // is whenever this check runs -- and settled once at the REMASC transaction,
             // which is in the sequential set. So no parallel sublist writes
             // REMASC's account cell on their account, and excluding it would
             // only hide a genuine transfer to the Bridge's counterpart that
@@ -423,7 +468,7 @@ impl BlockProcessor {
         // whatever the call returned. Checked for every block that declares a
         // partition, not only one this node ran in parallel: it is a property
         // of the block, and running it on one thread does not make it true.
-        if !sublist_starts.is_empty() && self.hardfork_cfg.has_rskip144(header.number) {
+        if !sublist_starts.is_empty() {
             for (index, tx_result) in exec_result.tx_results.iter().enumerate() {
                 if !tx_result.reached_sequential_only {
                     continue;
@@ -484,6 +529,7 @@ impl BlockProcessor {
                 trie_store.as_ref(),
                 &exec_result.state_changes,
             )
+            .with_null_account(exec_result.markers.null_account)
         } else {
             crate::supply::SupplyReport::default()
         };
@@ -549,6 +595,7 @@ impl BlockProcessor {
             state_root_hash,
             receipts_root,
             logs_bloom: block_bloom,
+            unlogged_peg_events: Vec::new(),
         })
     }
 
@@ -573,11 +620,14 @@ impl BlockProcessor {
     ///
     /// # Why the receipt index is the right witness
     ///
-    /// `put_receipts` is called from exactly one place in this crate -- the end
-    /// of `process_and_commit` -- so a receipt entry keyed by a block hash is a
-    /// record that *this* node executed *that* block. It is persisted, so it
-    /// survives a restart, and the pruner deletes it in the same batch as the
-    /// block and its state, so it cannot outlive what it vouches for.
+    /// `put_receipts` is called in this crate only right after a block has
+    /// run -- by `commit_by_hash`, which `process_and_commit` and
+    /// `process_beside` reach once execution has succeeded, and by
+    /// `execute_and_commit` -- so a receipt entry keyed by a block hash is a
+    /// record that *this* node executed *that* block, on the chain or beside
+    /// it. It is persisted, so it survives a restart, and the pruner deletes
+    /// it in the same batch as the block and its state, so it cannot outlive
+    /// what it vouches for.
     /// `executed_locally_is_only_written_by_execution` pins that invariant.
     ///
     /// # Why it does not have to be trusted
@@ -609,7 +659,7 @@ impl BlockProcessor {
             return false;
         };
         // An empty list is not evidence. Every RSK block carries the REMASC
-        // synthetic transaction (see `is_remasc_tx`), so a real block always
+        // synthetic transaction (see `Transaction::is_remasc`), so a real block always
         // has at least one receipt; an empty entry means something other than
         // a normal execution put it there. Refusing to skip can only cost a
         // re-execution, so the conservative answer is the right one.
@@ -620,7 +670,7 @@ impl BlockProcessor {
             &receipts,
             self.hardfork_cfg.has_unitrie_state_root(header.number),
         );
-        root == header.receipts_root
+        header.has_receipts_root(root)
     }
 
     /// Trace one transaction of a block, by re-executing the block.
@@ -713,8 +763,6 @@ impl BlockProcessor {
         block: &Block,
         parent: Option<&rustock_core::Header>,
     ) -> Result<(), ValidationError> {
-        use rustock_core::validation::{HeaderValidator, ParentHeaderValidator};
-
         let number = block.header.number;
 
         // rskj `BlockValidatorImpl.isValid` refuses genesis outright: it is
@@ -726,20 +774,7 @@ impl BlockProcessor {
         }
 
         self.validate_block_body_rules(block, parent)?;
-
-        // rskj BlockUnclesValidationRule. The ommers HASH is checked in
-        // process_block; this decides whether the uncles are admissible.
-        let ancestry = self.ancestry();
-        let header_rules: Vec<Box<dyn HeaderValidator>> = Vec::new();
-        let parent_rules: Vec<Box<dyn ParentHeaderValidator>> = Vec::new();
-        rustock_core::validation::uncles::UnclesValidationRule {
-            store: &ancestry,
-            uncle_list_limit: rustock_core::validation::uncles::UNCLE_LIST_LIMIT,
-            uncle_generation_limit: rustock_core::validation::uncles::UNCLE_GENERATION_LIMIT,
-            header_rules: &header_rules,
-            parent_rules: &parent_rules,
-        }
-        .validate(block)?;
+        self.validate_uncles(block)?;
 
         // rskj ForkDetectionDataRule -- RSKIP110 (wasabi100).
         if self.validate_fork_detection_data {
@@ -748,18 +783,54 @@ impl BlockProcessor {
             rustock_core::validation::fork_detection::validate(
                 &block.header,
                 actual,
-                &ancestry,
+                &self.ancestry(),
                 self.rskip110_height(),
             )?;
         }
-        let _ = number;
         Ok(())
+    }
+
+    /// rskj `BlockUnclesValidationRule`, as a block is held to it on import.
+    /// The ommers HASH is checked in `process_block`; this decides whether
+    /// the uncles are admissible, each put through the rules rskj gives the
+    /// rule: its own proof of work, timestamps and gas used, and against its
+    /// own parent the minimum gas price, number, timestamp, difficulty and gas
+    /// limit. An uncle's difficulty counts toward the chain's work, so one
+    /// checked less hard than a trunk block is work credited that nobody did.
+    ///
+    /// Reads only the block's number, its parent's hash and its uncles, so
+    /// the miner holds the uncles it picked to it before building on them.
+    pub fn validate_uncles(&self, block: &Block) -> Result<(), ValidationError> {
+        use rustock_core::validation::uncles::{
+            rsk_header_rules, rsk_parent_rules, UncleForkDetection, UnclesValidationRule,
+            UNCLE_GENERATION_LIMIT, UNCLE_LIST_LIMIT,
+        };
+
+        let ancestry = self.ancestry();
+        let header_rules = rsk_header_rules(self.chain_config.clone());
+        let parent_rules = rsk_parent_rules(self.chain_config.clone());
+        UnclesValidationRule {
+            store: &ancestry,
+            uncle_list_limit: UNCLE_LIST_LIMIT,
+            uncle_generation_limit: UNCLE_GENERATION_LIMIT,
+            header_rules: &header_rules,
+            parent_rules: &parent_rules,
+            // Under the same switch as the block's own fork-detection check,
+            // and for the same cost: 449 headers per uncle.
+            fork_detection: self
+                .validate_fork_detection_data
+                .then_some(UncleForkDetection {
+                    view: &ancestry,
+                    rskip110_height: self.rskip110_height(),
+                }),
+        }
+        .validate(block)
     }
 
     /// The rules of [`Self::validate_block_rules`] that read only the block
     /// and its parent: the transaction gas price rules, REMASC's presence,
-    /// the extra data size and the minimum gas price range. No ancestry, no
-    /// merged-mining fields.
+    /// the extra data size, the sublist edges and the minimum gas price
+    /// range. No ancestry, no merged-mining fields.
     ///
     /// Split out for the miner, which runs them on the block it assembled
     /// before handing out work: these are the rules a block could break
@@ -773,8 +844,8 @@ impl BlockProcessor {
         parent: Option<&rustock_core::Header>,
     ) -> Result<(), ValidationError> {
         use rustock_core::validation::block_rules::{
-            BlockTxsMaxGasPriceRule, ExtraDataRule, PrevMinGasPriceRule, RemascValidationRule,
-            TxsMinGasPriceRule,
+            validate_tx_execution_sublists_edges, BlockTxsMaxGasPriceRule, ExtraDataRule,
+            PrevMinGasPriceRule, RemascValidationRule, TxsMinGasPriceRule,
         };
         use rustock_core::validation::{BlockValidator, HeaderValidator, ParentHeaderValidator};
 
@@ -789,11 +860,52 @@ impl BlockProcessor {
         RemascValidationRule.validate_block(block)?;
         // rskj ExtraDataRule -- unconditional, 32 bytes.
         ExtraDataRule::default().validate(&block.header)?;
+        // rskj ValidTxExecutionSublistsEdgesRule -- where the block runs as
+        // its sublists. Without it a block could partition itself in a way
+        // rskj refuses: edges out of order, past the end, or more of them
+        // than there are execution threads.
+        validate_tx_execution_sublists_edges(
+            block
+                .header
+                .version_fields
+                .as_ref()
+                .and_then(|v| v.edges.as_deref()),
+            block.transactions.len(),
+            self.hardfork_cfg.runs_sublists(block.header.number),
+        )?;
 
         if let Some(parent) = parent {
             // rskj PrevMinGasPriceRule -- unconditional.
             PrevMinGasPriceRule.validate_with_parent(&block.header, parent)?;
         }
+        Ok(())
+    }
+
+    /// What rskj holds each block of a snapshot to, past the rules its header
+    /// meets alone and against its parent, and the body its header commits to
+    /// (`RskContext.getSnapBlockValidationRule` and
+    /// `getSnapBlockParentDependantValidationRule`): the rules of
+    /// [`Self::validate_block_body_rules`], and `BlockTxsFieldsValidationRule`,
+    /// a signature the network takes on every transaction but REMASC.
+    ///
+    /// A block that is executed meets that last rule where its senders are
+    /// recovered. A snapshot's blocks are kept without being run, so nothing
+    /// else holds them to it.
+    ///
+    /// Block 0 passes: rskj reads it from its genesis file and holds it to no
+    /// rule, and its snapshot client stops at the first block whose parent it
+    /// holds (`SnapshotProcessor.validateAndSaveBlocks`), which block 1 is at
+    /// the latest.
+    pub fn validate_snapshot_block(
+        &self,
+        block: &Block,
+        parent: Option<&rustock_core::Header>,
+    ) -> Result<(), ProcessError> {
+        if block.header.number == 0 {
+            return Ok(());
+        }
+        self.validate_block_body_rules(block, parent)?;
+        self.recover_senders(&block.transactions, self.hardfork_cfg.chain_id)?;
         Ok(())
     }
 
@@ -815,15 +927,12 @@ impl BlockProcessor {
     /// Shared with the miner, which applies the same cap when it selects
     /// transactions (rskj `MinerUtils.isHighGasPriced`).
     pub fn rskip252_height(&self) -> u64 {
-        rskip252_height_for(self.hardfork_cfg.chain_id)
+        self.hardfork_cfg.rskip252_height()
     }
 
     /// RSKIP110 (`wasabi100`) for this chain.
     fn rskip110_height(&self) -> u64 {
-        match self.hardfork_cfg.chain_id {
-            crate::hardfork::RSK_MAINNET_CHAIN_ID => 1_591_000,
-            _ => 0,
-        }
+        self.hardfork_cfg.rskip110_height()
     }
 
     /// Execute all transactions in a block and validate results against the header.
@@ -874,7 +983,7 @@ impl BlockProcessor {
             &block.transactions,
             self.hardfork_cfg.has_unitrie_state_root(header.number),
         );
-        if computed_tx_root != header.transactions_root {
+        if !header.has_transactions_root(computed_tx_root) {
             return Err(ProcessError::TransactionsRootMismatch {
                 header: header.transactions_root,
                 computed: computed_tx_root,
@@ -882,7 +991,7 @@ impl BlockProcessor {
         }
 
         let computed_ommers_hash = compute_ommers_hash(&block.ommers);
-        if computed_ommers_hash != header.ommers_hash {
+        if !header.has_ommers_hash(computed_ommers_hash) {
             return Err(ProcessError::OmmersHashMismatch {
                 header: header.ommers_hash,
                 computed: computed_ommers_hash,
@@ -922,7 +1031,7 @@ impl BlockProcessor {
         }
 
         if self.hardfork_cfg.has_unitrie_state_root(header.number) {
-            if result.state_root_hash != header.state_root {
+            if !header.has_state_root(result.state_root_hash) {
                 return Err(ProcessError::StateRootMismatch {
                     header: header.state_root,
                     computed: result.state_root_hash,
@@ -960,7 +1069,7 @@ impl BlockProcessor {
             }
         }
 
-        if result.receipts_root != header.receipts_root {
+        if !header.has_receipts_root(result.receipts_root) {
             // Dump computed receipts to help pinpoint the diverging transaction.
             for (i, r) in result.receipts.iter().enumerate() {
                 debug!(
@@ -984,7 +1093,7 @@ impl BlockProcessor {
             });
         }
 
-        if result.logs_bloom != header.logs_bloom {
+        if !header.has_logs_bloom(&result.logs_bloom) {
             return Err(ProcessError::LogsBloomMismatch);
         }
 
@@ -1029,10 +1138,27 @@ impl BlockProcessor {
         Ok(result)
     }
 
-    /// The commit half of [`BlockProcessor::process_and_commit`]: store the
-    /// receipts of a processed block and index its transactions and Bridge
-    /// events.
-    /// Records this block's peg events that the Bridge did not emit.
+    /// Validate and execute a block that is not on the chain, against its own
+    /// parent's state, and commit what it keys by hash: its receipts and its
+    /// transactions. What it keys by height waits for the chain to take it up
+    /// ([`Self::commit_by_height`]), since the chain gives that height to
+    /// another block meanwhile. rskj executes every block it connects so
+    /// (`BlockChainImpl.internalTryToConnect`), best or not, and a switch to
+    /// it later runs nothing again.
+    pub fn process_beside(
+        &self,
+        block: &Block,
+        parent_state: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+    ) -> Result<ProcessedBlock, ProcessError> {
+        let result = self.process_block(block, parent_state, trie_store)?;
+        self.commit_by_hash(block, &result.receipts)?;
+        Ok(result)
+    }
+
+    /// Records this block's peg events that the Bridge did not emit: the
+    /// decisions `decisions` holds, which are the block's own
+    /// ([`ProcessedBlock::unlogged_peg_events`]).
     ///
     /// Runs beside `index_bridge_events` deliberately: that keeps the index
     /// of what the Bridge *did* log current as blocks arrive, and this keeps
@@ -1050,15 +1176,18 @@ impl BlockProcessor {
     /// Public so it can be driven without `commit_receipts`, which also
     /// writes receipts and so cannot run against a read-only store. The node
     /// reaches it through `commit_receipts`; a test reaches it directly.
-    pub fn record_unlogged_peg_events(&self, block: &Block) -> Result<(), ProcessError> {
+    pub fn record_unlogged_peg_events(
+        &self,
+        block: &Block,
+        decisions: &[crate::silent::SilentRecord],
+    ) -> Result<(), ProcessError> {
         let Some(store) = &self.legacy_events else { return Ok(()) };
-        let decisions = crate::silent::drain();
         if decisions.is_empty() {
             return Ok(());
         }
         let mut rows = Vec::new();
         let mut log_index: u32 = 0;
-        for d in &decisions {
+        for d in decisions {
             // A record that does not say whether the Bridge logged it is
             // refused, not guessed at -- see `legacy_events::reconstructable`.
             if !matches!(crate::bridge::legacy_events::reconstructable(d), Ok(true)) {
@@ -1088,14 +1217,31 @@ impl BlockProcessor {
         Ok(())
     }
 
+    /// The commit half of [`BlockProcessor::process_and_commit`]: store the
+    /// receipts of a processed block, index its transactions and Bridge
+    /// events, and record the peg events it made that the Bridge did not log.
     pub fn commit_receipts(
         &self,
         block: &Block,
         result: &ProcessedBlock,
     ) -> Result<(), ProcessError> {
+        self.commit_by_hash(block, &result.receipts)?;
+        self.commit_by_height(block, &result.receipts, &result.unlogged_peg_events)
+    }
+
+    /// What a processed block commits under its own hash: its receipts, and
+    /// its transactions in the index that finds them. A block beside the
+    /// chain holds both as well as one on it, as rskj's receipt store holds
+    /// every block it connects, so a block executed as it arrived is ready
+    /// the moment the chain switches to it.
+    ///
+    /// Private, and reached only from right after a block has run: the receipts
+    /// it writes are this node's witness that it executed the block (see
+    /// [`Self::was_executed_locally`]).
+    fn commit_by_hash(&self, block: &Block, receipts: &[Receipt]) -> Result<(), ProcessError> {
         let hash = block.hash();
         self.block_store
-            .put_receipts(hash, &result.receipts)
+            .put_receipts(hash, receipts)
             .map_err(ProcessError::Storage)?;
         // Receipts are stored by block hash, so without this the only way to
         // reach one is to already know which block it is in:
@@ -1105,6 +1251,20 @@ impl BlockProcessor {
         self.block_store
             .index_block_transactions(hash, &block.transactions)
             .map_err(ProcessError::Storage)?;
+        Ok(())
+    }
+
+    /// What a processed block commits under its height: its Bridge events, and
+    /// the peg events it made that the Bridge did not log. Indexed by height,
+    /// so written once the block is on the chain, and not for a block beside
+    /// it, which would leave its events at a height the chain gives another
+    /// block.
+    pub fn commit_by_height(
+        &self,
+        block: &Block,
+        receipts: &[Receipt],
+        unlogged: &[crate::silent::SilentRecord],
+    ) -> Result<(), ProcessError> {
         // Keep the Bridge event index current as blocks arrive. Rebuilding it
         // from receipts is possible (--build-bridge-index) but an index that is
         // only ever rebuilt is stale the moment the node advances, which is
@@ -1114,12 +1274,26 @@ impl BlockProcessor {
         self.block_store
             .index_bridge_events(
                 block.header.number,
-                &result.receipts,
+                receipts,
                 &block.transactions,
                 crate::precompiles::BRIDGE_ADDR,
             )
             .map_err(ProcessError::Storage)?;
-        self.record_unlogged_peg_events(block)?;
+        self.record_unlogged_peg_events(block, unlogged)
+    }
+
+    /// Take a block the chain has left out of the Bridge event index: the
+    /// events [`Self::commit_by_height`] wrote at its height from these
+    /// receipts. The peg events the Bridge did not log stay, since nothing
+    /// says which of them a block made once it has run.
+    pub fn uncommit_by_height(
+        &self,
+        number: u64,
+        receipts: &[Receipt],
+    ) -> Result<(), ProcessError> {
+        self.block_store
+            .remove_bridge_events(number, receipts, crate::precompiles::BRIDGE_ADDR)
+            .map_err(ProcessError::Storage)?;
         Ok(())
     }
 
@@ -1168,8 +1342,9 @@ impl BlockProcessor {
         transactions: &[Transaction],
         chain_id: u64,
     ) -> Result<Vec<Address>, ProcessError> {
+        let count = transactions.len();
         let one = |i: usize, tx: &Transaction| -> Result<Address, ProcessError> {
-            if Self::is_remasc_tx(tx) {
+            if tx.is_remasc(i, count) {
                 // REMASC carries no signature. rskj gives it the zero
                 // address too.
                 return Ok(Address::ZERO);
@@ -1192,11 +1367,14 @@ impl BlockProcessor {
             None => vec![None; transactions.len()],
         };
 
-        // `one`, but answering from the lookup above where it can.
+        // `one`, but answering from the lookup above where it can. Only a
+        // signed transaction's sender is cached, since its hash decides it
+        // (`Transaction::recover_key`); one with no signature has a sender only
+        // as REMASC, which its place in the block decides.
         let one = |i: usize, tx: &Transaction| -> Result<Address, ProcessError> {
             match known.get(i).copied().flatten() {
-                Some(address) => Ok(address),
-                None => one(i, tx),
+                Some(address) if tx.v != 0 => Ok(address),
+                _ => one(i, tx),
             }
         };
 
@@ -1217,12 +1395,13 @@ impl BlockProcessor {
         // harmless but would churn the LRU for no gain.
         if let Some(cache) = &self.sender_cache {
             cache.put_many(crate::sender_cache::Origin::Block,
-                senders
+                transactions
                     .iter()
+                    .zip(&senders)
                     .zip(&hashes)
                     .zip(&known)
-                    .filter(|((_, _), was_known)| was_known.is_none())
-                    .map(|((address, hash), _)| (*hash, *address)),
+                    .filter(|(((tx, _), _), was_known)| tx.v != 0 && was_known.is_none())
+                    .map(|(((_, address), hash), _)| (*hash, *address)),
             );
         }
         Ok(senders)
@@ -1261,23 +1440,6 @@ impl BlockProcessor {
             }
         }
         Ok(senders)
-    }
-
-    /// Detect the REMASC synthetic transaction appended to every RSK block.
-    /// Pattern: `to == REMASC_ADDR && v == 0 && r == 0 && s == 0 && gas_limit == 0`.
-    ///
-    /// Public because the gas-price tracker has to exclude it for the same
-    /// reason rskj does: REMASC carries no gas price and would drag the
-    /// percentile to zero.
-    pub fn is_remasc_tx(tx: &Transaction) -> bool {
-        if tx.v != 0 || !tx.r.is_zero() || !tx.s.is_zero() {
-            return false;
-        }
-        if !tx.gas_limit.is_zero() {
-            return false;
-        }
-        let remasc_bytes = crate::precompiles::REMASC_ADDR.as_slice();
-        tx.to.len() == 20 && tx.to.as_ref() == remasc_bytes
     }
 }
 
@@ -1341,13 +1503,17 @@ mod tests {
             paid_fees: U256::ZERO,
             minimum_gas_price: U256::from(0),
             uncle_count: 0,
-            umm_root: None,
+            // A UMM root where a store's heights, this process's, read one.
+            umm_root: rustock_core::config::ActivationHeights::current()
+                .umm_active(number)
+                .then(Bytes::new),
             version_fields: None,
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         }
     }
 
@@ -1548,7 +1714,7 @@ mod tests {
     /// consensus, not a miner's preference.
     #[test]
     fn a_bridge_call_in_a_parallel_sublist_invalidates_the_block() {
-        let (block, root, store, block_store) = bridge_calling_block(Some(vec![1, 2]));
+        let (block, root, store, block_store) = bridge_calling_block(Some(vec![1, 2]), None);
         let processor = BlockProcessor::new(
             RskHardforkConfig::testnet(), // reed810 is scheduled there
             block_store,
@@ -1573,7 +1739,7 @@ mod tests {
         // too, so put the Bridge call where the sequential set starts by
         // declaring a single transaction's worth of parallel sublists above
         // it: with no edges at all there is no partition and no rule.
-        let (block, root, store, block_store) = bridge_calling_block(None);
+        let (block, root, store, block_store) = bridge_calling_block(None, None);
         let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store);
         let out = processor.execute_block(&block, &root, store);
         assert!(
@@ -1583,6 +1749,127 @@ mod tests {
             ),
             "a block with no partition cannot break the partition rule"
         );
+    }
+
+    /// rskj counts a call to the Bridge as it starts, before it checks the
+    /// caller's balance (`Program.callToPrecompiledAddress`): a contract's call
+    /// it refuses because the contract can't pay the value bars the
+    /// transaction from a parallel sublist all the same. The contract is
+    /// `calls-bridge-unpaid` of `testdata/rskj_precompiles_called.txt`.
+    #[test]
+    fn a_refused_bridge_call_in_a_parallel_sublist_invalidates_the_block() {
+        let (block, root, store, block_store) = bridge_calling_block(
+            Some(vec![1, 2]),
+            Some(
+                "7f6923fa8500000000000000000000000000000000000000000000000000000000\
+                 6000526000600060046000600163010000065af15000",
+            ),
+        );
+        let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store);
+        let err = processor
+            .execute_block(&block, &root, store)
+            .expect_err("a refused Bridge call in a parallel sublist is invalid");
+        assert!(
+            matches!(
+                err,
+                ProcessError::SequentialOnlyPrecompileInParallelSublist {
+                    index: 0,
+                    sublist: 0,
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+    }
+
+    /// What a constructor run by CREATE calls doesn't count for the
+    /// transaction in rskj (`Program.createContract` never hands it on), so a
+    /// transaction whose only Bridge call is a constructor's may sit in a
+    /// parallel sublist. The contract is `creates-child-calling-bridge` of
+    /// `testdata/rskj_precompiles_called.txt`.
+    #[test]
+    fn a_constructors_bridge_call_leaves_a_parallel_sublist_open() {
+        let (block, root, store, block_store) = bridge_calling_block(
+            Some(vec![1, 2]),
+            Some(
+                "60376010600039603760006000f050007f6923fa850000000000000000000000\
+                 0000000000000000000000000000000000600052600060006004600060006301\
+                 0000065af15000",
+            ),
+        );
+        let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store);
+        processor
+            .execute_block(&block, &root, store)
+            .expect("a constructor's Bridge call bars no sublist");
+    }
+
+    /// The Bridge's unlogged decisions are recorded fresh for each block and
+    /// go with it (`ProcessedBlock::unlogged_peg_events`). What the thread
+    /// held before the block -- here a decision as a local call made one on
+    /// a thread an earlier block had left recording -- does not go with it,
+    /// and the thread records nothing once the block is done, so nothing
+    /// else it runs is stored as the chain's.
+    #[test]
+    fn a_block_carries_only_its_own_peg_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(
+            rustock_storage::legacy_event_store::LegacyEventStore::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
+        );
+        let (block, root, store, block_store) = bridge_calling_block(None, None);
+        let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store)
+            .with_legacy_event_store(events);
+        crate::silent::start();
+        crate::silent::record(crate::silent::SilentKind::PeginAccepted, 1, 0, vec![]);
+        let processed = processor
+            .execute_block(&block, &root, store)
+            .expect("block");
+        assert!(
+            processed.unlogged_peg_events.is_empty(),
+            "{:?}",
+            processed.unlogged_peg_events
+        );
+        assert!(
+            !crate::silent::is_recording(),
+            "the thread records once the block is done"
+        );
+    }
+
+    /// What a block carries is what its commit stores, on whatever thread it
+    /// commits: a decision the Bridge logs no event for becomes that event,
+    /// filed under the block.
+    #[test]
+    fn a_commit_stores_the_peg_decisions_its_block_carries() {
+        use crate::silent::{FieldValue, SilentKind, SilentRecord};
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(
+            rustock_storage::legacy_event_store::LegacyEventStore::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
+        );
+        let (block, root, store, block_store) = bridge_calling_block(None, None);
+        let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store)
+            .with_legacy_event_store(events.clone());
+        let mut processed = processor
+            .execute_block(&block, &root, store)
+            .expect("block");
+        let number = block.header.number;
+        processed.unlogged_peg_events = vec![SilentRecord {
+            kind: SilentKind::PegoutRequested,
+            block: number,
+            tx_index: 0,
+            fields: vec![
+                ("rskTxHash", FieldValue::Bytes(vec![1; 32])),
+                ("btcTxHash", FieldValue::Bytes(vec![2; 32])),
+                ("amountSat", FieldValue::U64(5)),
+            ],
+        }];
+        processor.commit_receipts(&block, &processed).unwrap();
+        let topic = crate::bridge::legacy_events::release_requested(&[1; 32], &[2; 32], 5).topic0;
+        assert_eq!(events.topics().unwrap(), vec![(topic, 1, number, number)]);
     }
 
     /// A block whose transactions reach nothing of the sort is unaffected,
@@ -1618,6 +1905,8 @@ mod tests {
         sign_tx(&mut tx, &key, chain_id);
 
         let mut header = dummy_header(8_000_000);
+        // Testnet's gas limit, so the parallel sublist has gas to hold it.
+        header.gas_limit = U256::from(12_000_000);
         header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
             version: 1,
             edges: Some(vec![1, 2]),
@@ -1628,23 +1917,156 @@ mod tests {
         let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store);
         let out = processor.execute_block(&block, &root, store);
         assert!(
-            !matches!(
-                out,
-                Err(ProcessError::SequentialOnlyPrecompileInParallelSublist { .. })
-            ),
-            "a plain transfer reaches no precompile"
+            out.is_ok(),
+            "a plain transfer reaches no precompile: {:?}",
+            out.err()
         );
     }
 
-    /// A block whose first transaction calls the Bridge, with `edges` as
-    /// given. Returns everything `execute_block` needs.
-    #[allow(clippy::type_complexity)]
-    fn bridge_calling_block(
-        edges: Option<Vec<i16>>,
-    ) -> (Block, TrieNode, Arc<dyn TrieStore>, Arc<BlockStore>) {
+    /// rskj `ValidTxExecutionSublistsEdgesRule` runs with the block's other
+    /// body rules, where the block runs as its sublists. A REMASC transaction
+    /// alone cannot be given a parallel sublist: the last transaction must
+    /// stay sequential.
+    #[test]
+    fn the_sublist_edges_are_checked_with_the_body_rules() {
+        let block = |edges: Option<Vec<i16>>| {
+            let mut header = dummy_header(8_000_000);
+            header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+                version: 1,
+                edges,
+                base_event: None,
+            });
+            Block {
+                header,
+                transactions: vec![Transaction::remasc(8_000_000)],
+                ommers: vec![],
+            }
+        };
+        let processor = |cfg: RskHardforkConfig| {
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            BlockProcessor::new(cfg, block_store)
+        };
+
+        let testnet = processor(RskHardforkConfig::testnet());
+        assert!(matches!(
+            testnet.validate_block_body_rules(&block(Some(vec![1])), None),
+            Err(ValidationError::InvalidSublistEdges { .. })
+        ));
+        assert_eq!(
+            testnet.validate_block_body_rules(&block(Some(vec![])), None),
+            Ok(())
+        );
+        // A header whose extension came without edges: rskj's rule throws on
+        // the null, and the block is not imported.
+        assert!(matches!(
+            testnet.validate_block_body_rules(&block(None), None),
+            Err(ValidationError::InvalidSublistEdges { .. })
+        ));
+
+        // With rskip351 moved off reed810, rskj runs the block as one list and
+        // never reads its edges.
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[("rskip351".to_string(), None)])
+            .unwrap();
+        assert_eq!(
+            processor(moved).validate_block_body_rules(&block(Some(vec![1])), None),
+            Ok(())
+        );
+    }
+
+    /// `reference.conf` has RSKIP252, the cap on a transaction's gas price,
+    /// at fingerroot500, and RSKIP110, the fork detection data, at wasabi100.
+    /// Each is read at its upgrade's height, wherever the chain has it.
+    #[test]
+    fn the_price_cap_and_fork_detection_move_with_their_upgrades() {
+        let heights = |cfg: RskHardforkConfig| {
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let processor = BlockProcessor::new(cfg, block_store);
+            (processor.rskip252_height(), processor.rskip110_height())
+        };
+        assert_eq!(
+            heights(RskHardforkConfig::mainnet()),
+            (5_468_000, 1_591_000)
+        );
+        assert_eq!(heights(RskHardforkConfig::testnet()), (4_015_800, 0));
+        assert_eq!(heights(RskHardforkConfig::regtest()), (0, 0));
+        assert_eq!(heights(RskHardforkConfig::rskj_regtest()), (0, 0));
+
+        let at = |name: &str, height: u64| (name.to_string(), Some(height));
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[at("wasabi100", 100), at("fingerroot500", 4_500_000)], &[])
+            .unwrap();
+        assert_eq!(heights(moved), (4_500_000, 100));
+    }
+
+    /// What REMASC pays the null address reaches its account after the
+    /// transactions, outside their state changes, and the block's supply check
+    /// counts it there: the payment moves value and burns none.
+    #[test]
+    fn paying_the_null_address_burns_nothing() {
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let mut parent_hash = B256::ZERO;
+        for number in 0..15 {
+            let mut header = dummy_header(number);
+            header.parent_hash = parent_hash;
+            if number == 5 {
+                // An empty coinbase: rskj's null address.
+                header.beneficiary = Address::ZERO;
+                header.paid_fees = U256::from(21_000);
+                header.kept = Some(Box::new(rustock_core::types::header::KeptFields {
+                    null_coinbase: true,
+                    ..Default::default()
+                }));
+            }
+            let hash = header.hash();
+            block_store.put_header_with_hash(hash, &header).unwrap();
+            block_store.put_canonical_hash(number, hash).unwrap();
+            parent_hash = hash;
+        }
         let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
-        let chain_id = 31u64;
-        let key = SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let remasc = crate::precompiles::REMASC_ADDR;
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &remasc,
+            0,
+            U256::from(21_000),
+        );
+        let mut header = dummy_header(15);
+        header.parent_hash = parent_hash;
+        let block = Block {
+            header,
+            transactions: vec![Transaction::remasc(15)],
+            ommers: vec![],
+        };
+
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+        let (processed, imbalances) = crate::supply::imbalances_while(|| {
+            processor.execute_block(&block, &root, store.clone())
+        });
+        // `remasc_basic_distribution_no_siblings`: the coinbase is paid 3,327.
+        let null = rustock_trie::account_key_from_bytes(&[]);
+        let account = processed
+            .unwrap()
+            .new_state_root
+            .get(&TrieKeySlice::from_key(&null), store.as_ref())
+            .and_then(|data| AccountState::decode(&data).ok());
+        assert_eq!(
+            account.map(|account| account.balance),
+            Some(U256::from(3_327))
+        );
+        assert_eq!(imbalances, Vec::<String>::new());
+    }
+
+    /// The chain configuration's sequential minimum reaches the executor. On
+    /// regtest's 6,800,000, a 12,000,000-gas block's parallel sublists hold
+    /// 2,600,000 each; testnet's 10,000,000 leaves them 1,000,000.
+    #[test]
+    fn the_chain_configuration_sets_the_sublists_gas() {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let key = SigningKey::from_slice(&[5u8; 32]).unwrap();
         let sender = sender_address(&key);
         let root = put_account(
             &TrieNode::empty(),
@@ -1653,6 +2075,149 @@ mod tests {
             0,
             U256::from(10u64).pow(U256::from(18)),
         );
+        let mut tx = Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(2_600_000),
+            to: Bytes::copy_from_slice(Address::repeat_byte(0xBB).as_slice()),
+            value: U256::from(1),
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign_tx(&mut tx, &key, 31);
+        let mut header = dummy_header(8_000_000);
+        header.gas_limit = U256::from(12_000_000);
+        header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+            version: 1,
+            edges: Some(vec![1]),
+            base_event: None,
+        });
+        let block = Block {
+            header,
+            transactions: vec![tx],
+            ommers: vec![],
+        };
+        let processor = || {
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            BlockProcessor::new(RskHardforkConfig::testnet(), block_store)
+        };
+
+        let err = processor()
+            .execute_block(&block, &root, store.clone())
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Too much gas used in this block or sublist"),
+            "{err}"
+        );
+        let regtest_minimum = Arc::new(rustock_core::config::ChainConfig {
+            min_sequential_set_gas_limit: 6_800_000,
+            ..rustock_core::config::ChainConfig::testnet()
+        });
+        let out = processor()
+            .with_chain_config(regtest_minimum)
+            .execute_block(&block, &root, store);
+        assert!(out.is_ok(), "{:?}", out.err());
+    }
+
+    /// A receipt's cumulative gas restarts with each sublist where the block
+    /// runs as its sublists, and nowhere else: with rskip351 moved off
+    /// reed810, rskj runs the same block as one list and counts across it.
+    #[test]
+    fn receipts_restart_their_gas_only_where_the_block_runs_as_sublists() {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let mut root = TrieNode::empty();
+        let mut transactions = Vec::new();
+        for seed in [3u8, 4] {
+            let key = SigningKey::from_slice(&[seed; 32]).unwrap();
+            let sender = sender_address(&key);
+            let rbtc = U256::from(10u64).pow(U256::from(18));
+            root = put_account(&root, store.as_ref(), &sender, 0, rbtc);
+            let mut tx = Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(21_000),
+                to: Bytes::copy_from_slice(Address::repeat_byte(seed).as_slice()),
+                value: U256::from(1),
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            sign_tx(&mut tx, &key, 31);
+            transactions.push(tx);
+        }
+        let mut header = dummy_header(8_000_000);
+        header.gas_limit = U256::from(12_000_000);
+        header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+            version: 1,
+            edges: Some(vec![1]),
+            base_event: None,
+        });
+        let block = Block {
+            header,
+            transactions,
+            ommers: vec![],
+        };
+        let cumulative = |cfg: RskHardforkConfig| -> Vec<u64> {
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            BlockProcessor::new(cfg, block_store)
+                .execute_block(&block, &root, store.clone())
+                .unwrap()
+                .receipts
+                .iter()
+                .map(|r| r.cumulative_gas_used)
+                .collect()
+        };
+
+        assert_eq!(
+            cumulative(RskHardforkConfig::testnet()),
+            vec![21_000, 21_000]
+        );
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[("rskip351".to_string(), None)])
+            .unwrap();
+        assert_eq!(cumulative(moved), vec![21_000, 42_000]);
+    }
+
+    /// A block whose first transaction calls the Bridge, with `edges` as
+    /// given, or calls a contract whose code is `through` (hex). Returns
+    /// everything `execute_block` needs.
+    #[allow(clippy::type_complexity)]
+    fn bridge_calling_block(
+        edges: Option<Vec<i16>>,
+        through: Option<&str>,
+    ) -> (Block, TrieNode, Arc<dyn TrieStore>, Arc<BlockStore>) {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let chain_id = 31u64;
+        let key = SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let sender = sender_address(&key);
+        let mut root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+        let mut to = crate::precompiles::BRIDGE_ADDR;
+        let mut input = Bytes::from(vec![0x00, 0x00, 0x00, 0x00]);
+        if let Some(code) = through {
+            to = Address::repeat_byte(0xC1);
+            input = Bytes::new();
+            root = put_account(&root, store.as_ref(), &to, 0, U256::ZERO);
+            let code_key = rustock_trie::code_key(&to);
+            root = root.put(
+                &TrieKeySlice::from_key(&code_key),
+                &hex::decode(code).unwrap(),
+                store.as_ref(),
+            );
+        }
         let block_store =
             Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
 
@@ -1662,9 +2227,9 @@ mod tests {
             nonce: 0,
             gas_price: U256::from(0),
             gas_limit: U256::from(500_000),
-            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            to: Bytes::copy_from_slice(to.as_slice()),
             value: U256::ZERO,
-            input: Bytes::from(vec![0x00, 0x00, 0x00, 0x00]),
+            input,
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
@@ -1673,6 +2238,8 @@ mod tests {
         sign_tx(&mut tx, &key, chain_id);
 
         let mut header = dummy_header(8_000_000);
+        // Testnet's gas limit, so a parallel sublist has gas to hold the call.
+        header.gas_limit = U256::from(12_000_000);
         if let Some(edges) = edges {
             header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
                 version: 1,
@@ -2037,19 +2604,8 @@ mod tests {
         };
         sign_tx(&mut transfer, &key, 33);
 
-        let remasc = Transaction {
-            nonce: 0,
-            gas_price: U256::ZERO,
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(crate::precompiles::REMASC_ADDR.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::default(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
-        };
-        assert!(BlockProcessor::is_remasc_tx(&remasc), "the fixture must look like REMASC");
+        let remasc = Transaction::remasc(5);
+        assert!(remasc.is_remasc(1, 2), "the fixture must be REMASC");
 
         let block = Block {
             // Below REMASC's maturity, so the distribution has no processing
@@ -2255,9 +2811,16 @@ mod tests {
         assert_eq!(
             writes, 2,
             "put_receipts is called {writes} times in this crate's production code, not 2 \
-             (the unitrie and Orchid arms of process_and_commit). A new writer means the \
-             receipt index no longer proves this node executed the block -- see \
-             was_executed_locally."
+             (commit_by_hash and execute_and_commit). A new writer means the receipt index no \
+             longer proves this node executed the block -- see was_executed_locally."
+        );
+        // The receipts of a block executed beside the chain are written by
+        // `process_beside`, through `commit_by_hash`, which must not be
+        // reachable from outside without a block having run.
+        assert!(
+            !production.contains("pub fn commit_by_hash"),
+            "commit_by_hash writes the receipt index and must stay private: only \
+             process_and_commit and process_beside reach it, after the block has run"
         );
     }
 
@@ -2792,102 +3355,37 @@ mod tests {
         ));
     }
 
-    // -----------------------------------------------------------------------
-    // REMASC detection tests — ported from rskj TransactionIsRemascTest.java
-    // -----------------------------------------------------------------------
-
-    fn make_remasc_tx() -> Transaction {
-        let remasc_addr = crate::precompiles::REMASC_ADDR;
-        Transaction {
-            nonce: 0,
-            gas_price: U256::ZERO,
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(remasc_addr.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
-        }
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.validRemascTransactionNullData
-    #[test]
-    fn rskj_valid_remasc_transaction_null_data() {
-        let tx = make_remasc_tx();
-        assert!(BlockProcessor::is_remasc_tx(&tx));
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.validRemascTransactionEmptyData
-    #[test]
-    fn rskj_valid_remasc_transaction_empty_data() {
-        let mut tx = make_remasc_tx();
-        tx.input = Bytes::new();
-        assert!(BlockProcessor::is_remasc_tx(&tx));
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.notRemascTransactionNotNullSig
-    #[test]
-    fn rskj_not_remasc_when_signed() {
-        let mut tx = make_remasc_tx();
-        tx.v = 27;
-        tx.r = U256::from(1);
-        tx.s = U256::from(1);
-        assert!(!BlockProcessor::is_remasc_tx(&tx));
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.notRemascTransactionReceiverIsNotRemasc
-    #[test]
-    fn rskj_not_remasc_wrong_destination() {
-        let mut tx = make_remasc_tx();
-        tx.to = Bytes::copy_from_slice(Address::repeat_byte(0xAA).as_slice());
-        assert!(!BlockProcessor::is_remasc_tx(&tx));
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.notRemascTransactionGasLimitIsNotZero
-    #[test]
-    fn rskj_not_remasc_nonzero_gas_limit() {
-        let mut tx = make_remasc_tx();
-        tx.gas_limit = U256::from(10);
-        assert!(!BlockProcessor::is_remasc_tx(&tx));
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.notRemascTransactionGasPriceIsNotZero
-    #[test]
-    fn rskj_not_remasc_nonzero_gas_price() {
-        let mut tx = make_remasc_tx();
-        tx.gas_price = U256::from(10);
-        // gas_price alone doesn't disqualify — only v/r/s and gas_limit matter
-        // in our implementation (matching rskj's checkRemascTxZeroValues)
-        // rskj checks gas_price too, so this should NOT be remasc
-        // Let's verify our implementation matches: v=0, r=0, s=0, gas_limit=0
-        // but gas_price != 0. In rskj, checkRemascTxZeroValues checks gasPrice.
-        // Our is_remasc_tx doesn't check gas_price — this is a known difference.
-        // For compatibility, we note this but don't enforce it since REMASC
-        // txs on chain always have gas_price=0 along with gas_limit=0.
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.notRemascTransactionValueIsNotZero
-    #[test]
-    fn rskj_not_remasc_nonzero_value() {
-        let mut tx = make_remasc_tx();
-        tx.value = U256::from(10);
-        // Similar to gas_price: our is_remasc_tx checks v/r/s/gas_limit/to
-        // but not value. Real REMASC txs always have value=0.
-        // The signature check (v=0 r=0 s=0) + gas_limit=0 + to=REMASC is sufficient.
-    }
-
-    /// Verify REMASC sender recovery yields Address::ZERO
+    /// REMASC's sender is the zero address, as rskj's `RemascTransaction`
+    /// gives it, and only as the block's last transaction: anywhere else it
+    /// is a transaction with no signature, which no block carries. Which
+    /// transactions are REMASC is `Transaction::is_remasc`, held to rskj's
+    /// `TransactionIsRemascTest` in core.
     #[test]
     fn rskj_remasc_sender_is_zero() {
-        let tx = make_remasc_tx();
         let processor = BlockProcessor::new(
             test_hardfork_cfg(),
             Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap()),
         );
-        let senders = processor.recover_senders(&[tx], 33).unwrap();
+        let remasc = Transaction::remasc(5);
+        let senders = processor
+            .recover_senders(std::slice::from_ref(&remasc), 33)
+            .unwrap();
         assert_eq!(senders[0], Address::ZERO);
+
+        let key = SigningKey::from_slice(&[23u8; 32]).unwrap();
+        let mut transfer = Transaction {
+            gas_limit: U256::from(21_000u64),
+            to: Bytes::copy_from_slice(Address::repeat_byte(0xEE).as_slice()),
+            ..Default::default()
+        };
+        sign_tx(&mut transfer, &key, 33);
+        let error = processor
+            .recover_senders(&[remasc, transfer], 33)
+            .unwrap_err();
+        assert!(
+            matches!(error, ProcessError::SenderRecovery { index: 0, .. }),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2925,6 +3423,186 @@ mod tests {
         // Full validation should pass
         let validated = processor.process_block(&block, &root, store).unwrap();
         assert_eq!(validated.gas_used, 0);
+    }
+
+    /// Merge-mine `header` as a miner would, committing to `fork_data` after
+    /// its merged-mining hash, beside a Bitcoin header of its own time. Its
+    /// difficulty must be small: at 1, rskj's target is 2^256 / 3, which a
+    /// few nonces meet.
+    fn seal(header: &mut Header, fork_data: &[u8]) {
+        use crate::mining::{coinbase, fork_detection, merkle};
+        use bitcoin::hashes::Hash as _;
+        use rustock_core::validation::merged_mining::{compress_coinbase, difficulty_to_target};
+
+        let payload = fork_detection::apply_to_hash(header.hash_for_merged_mining(), fork_data);
+        let cb = coinbase::build_coinbase(&payload, 0);
+        let mut btc = coinbase::build_bitcoin_block(cb.clone(), 0);
+        btc.header.time = header.timestamp as u32;
+        let target = difficulty_to_target(header.difficulty);
+        while U256::from_le_slice(btc.header.block_hash().as_byte_array()) > target {
+            btc.header.nonce += 1;
+        }
+        let compressed = compress_coinbase(&coinbase::encode_transaction(&cb), true).unwrap();
+        let proof = merkle::proof_from_txids(&coinbase::txids_display_order(&btc)).unwrap();
+        header.bitcoin_merged_mining_header = Some(coinbase::encode_header(&btc.header).into());
+        header.bitcoin_merged_mining_coinbase_transaction = Some(compressed.into());
+        header.bitcoin_merged_mining_merkle_proof = Some(proof.into());
+        header.cached_hash = None;
+    }
+
+    /// Regtest's constants with rskj's timestamp rule on, so every rule an
+    /// uncle faces runs, and without RSKIPUMM, so these headers need no UMM
+    /// root.
+    fn uncle_config() -> Arc<rustock_core::config::ChainConfig> {
+        let mut config = rustock_core::config::ChainConfig::regtest();
+        config.max_future_block_time = 60;
+        config.activation_heights.rskip_umm = None;
+        Arc::new(config)
+    }
+
+    /// A header at `number` on `parent`, at `timestamp` and difficulty 1.
+    fn child_of(number: u64, parent: &Header, timestamp: u64) -> Header {
+        let mut header = dummy_header(number);
+        header.parent_hash = parent.hash();
+        header.timestamp = timestamp;
+        header.difficulty = U256::from(1);
+        header
+    }
+
+    /// `parent`'s child at `number` naming `uncle`, its REMASC transaction
+    /// in place, sealed with `fork_data`.
+    fn naming(number: u64, parent: &Header, uncle: &Header, fork_data: &[u8]) -> Block {
+        let mut header = child_of(number, parent, parent.timestamp + 10);
+        header.uncle_count = 1;
+        header.ommers_hash = compute_ommers_hash(std::slice::from_ref(uncle));
+        seal(&mut header, fork_data);
+        Block {
+            header,
+            transactions: vec![crate::mining::remasc_transaction(number)],
+            ommers: vec![uncle.clone()],
+        }
+    }
+
+    /// The import path's uncle rule holds each uncle to rskj's rules. It used
+    /// to check only an uncle's place in the chain, so a block could name one
+    /// that did no work and have its difficulty counted all the same.
+    #[test]
+    fn an_uncle_without_proof_of_work_fails_the_import_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let block_store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store.clone())
+            .with_chain_config(uncle_config());
+
+        let mut genesis = dummy_header(0);
+        genesis.difficulty = U256::from(1);
+        let b1 = child_of(1, &genesis, 1_700_000_010);
+        let b2 = child_of(2, &b1, 1_700_000_030);
+        for header in [&genesis, &b1, &b2] {
+            block_store.put_header(header).unwrap();
+        }
+
+        // b2's sibling: a child of b1, ten seconds on, at the difficulty b1
+        // calls for on regtest.
+        let mut uncle = child_of(2, &b1, 1_700_000_020);
+        uncle.beneficiary = Address::repeat_byte(0x0b);
+
+        assert_eq!(
+            processor.validate_block_rules(&naming(3, &b2, &uncle, &[]), Some(&b2)),
+            Err(ValidationError::BitcoinHeaderDecodeError),
+            "an uncle with no proof of work must not pass"
+        );
+
+        // Work done for another header is not its work either: this proof
+        // commits to the uncle as it was before its beneficiary changed.
+        let mut stolen = uncle.clone();
+        seal(&mut stolen, &[]);
+        stolen.beneficiary = Address::repeat_byte(0x0c);
+        assert_eq!(
+            processor.validate_block_rules(&naming(3, &b2, &stolen, &[]), Some(&b2)),
+            Err(ValidationError::BitcoinCoinbaseTagInvalid)
+        );
+
+        seal(&mut uncle, &[]);
+        assert_eq!(
+            processor.validate_block_rules(&naming(3, &b2, &uncle, &[]), Some(&b2)),
+            Ok(())
+        );
+
+        // Proof of work is not all: against its parent it must come later.
+        let mut early = child_of(2, &b1, b1.timestamp);
+        early.beneficiary = Address::repeat_byte(0x0b);
+        seal(&mut early, &[]);
+        assert!(matches!(
+            processor.validate_block_rules(&naming(3, &b2, &early, &[]), Some(&b2)),
+            Err(ValidationError::TimestampOlderThanParent { .. })
+        ));
+    }
+
+    /// With fork detection on, an uncle must carry the fork-detection data of
+    /// its own parent, read from the 449 headers below that parent as rskj's
+    /// `ForkDetectionDataRule` reads them. With it off, as for a bulk replay,
+    /// the data is not looked at.
+    #[test]
+    fn with_fork_detection_on_an_uncle_carries_its_own_parents_data() {
+        use rustock_core::validation::fork_detection::{calculate, REQUIRED_BLOCKS};
+
+        let dir = tempfile::tempdir().unwrap();
+        let block_store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let processor = |fork_detection: bool| {
+            BlockProcessor::new(test_hardfork_cfg(), block_store.clone())
+                .with_chain_config(uncle_config())
+                .with_fork_detection_validation(fork_detection)
+        };
+
+        // A trunk long enough to read fork-detection data from, each header
+        // merge-mined so the commit-to-parents bytes have hashes to come from.
+        let mut genesis = dummy_header(0);
+        genesis.difficulty = U256::from(1);
+        let mut chain = vec![genesis];
+        for number in 1..=REQUIRED_BLOCKS + 2 {
+            let parent = chain.last().unwrap();
+            let mut header = child_of(number, parent, parent.timestamp + 10);
+            seal(&mut header, &[]);
+            chain.push(header);
+        }
+        for header in &chain {
+            block_store.put_header(header).unwrap();
+        }
+        // Newest first, from `tip` down, as the rule reads them.
+        let data_from = |tip: usize| {
+            let view: Vec<Header> = chain[..=tip].iter().rev().cloned().collect();
+            calculate(&view).expect("449 headers to read")
+        };
+
+        let tip = chain.len() - 1;
+        let parent = &chain[tip];
+        let uncle_parent = &chain[tip - 2];
+        let mut uncle = child_of(
+            uncle_parent.number + 1,
+            uncle_parent,
+            uncle_parent.timestamp + 5,
+        );
+        uncle.beneficiary = Address::repeat_byte(0x0b);
+        let mut right = uncle.clone();
+        seal(&mut right, &data_from(tip - 2));
+        // The data its sibling carries: read from one block too high.
+        let mut wrong = uncle;
+        seal(&mut wrong, &data_from(tip - 1));
+
+        let number = parent.number + 1;
+        let block = |uncle: &Header| naming(number, parent, uncle, &data_from(tip));
+        assert_eq!(
+            processor(true).validate_block_rules(&block(&right), Some(parent)),
+            Ok(())
+        );
+        assert!(matches!(
+            processor(true).validate_block_rules(&block(&wrong), Some(parent)),
+            Err(ValidationError::ForkDetectionDataMismatch { .. })
+        ));
+        assert_eq!(
+            processor(false).validate_block_rules(&block(&wrong), Some(parent)),
+            Ok(())
+        );
     }
 }
 
@@ -3075,28 +3753,36 @@ mod sender_cache_integration {
     }
 
     /// REMASC carries no signature and is given the zero address. It must not
-    /// be cached as if it were a recovered sender -- every block has one, at
-    /// a different hash, and they would churn the LRU for nothing.
+    /// be cached as if it were a recovered sender: its place in the block,
+    /// not its hash, makes it REMASC, so the same bytes anywhere else are a
+    /// transaction with no signature, and refused. And every block has one, at
+    /// a different hash, which would churn the LRU for nothing.
     #[test]
     fn remasc_is_handled_without_consulting_the_signature() {
         let (mut txs, mut want) = block_of(3, 33);
-        txs.push(Transaction::remasc(100));
+        let remasc = Transaction::remasc(100);
+        txs.push(remasc.clone());
         want.push(Address::ZERO);
 
         let cache = Arc::new(SenderCache::new(1024, 1024));
         let p = processor(Some(cache.clone()));
         assert_eq!(p.recover_senders(&txs, 33).unwrap(), want);
-        assert_eq!(p.recover_senders(&txs, 33).unwrap(), want, "and again from the cache");
-    }
-}
+        assert_eq!(
+            p.recover_senders(&txs, 33).unwrap(),
+            want,
+            "and again from the cache"
+        );
+        assert_eq!(
+            cache.get_many(&[remasc.tx_hash()]),
+            vec![None],
+            "REMASC is never cached"
+        );
 
-/// RSKIP252 (`fingerroot500`) for a chain id: mainnet's and testnet's
-/// heights, genesis anywhere else. The block rule, the miner's selection
-/// and the pool's per-transaction cap all read it.
-pub fn rskip252_height_for(chain_id: u64) -> u64 {
-    match chain_id {
-        crate::hardfork::RSK_MAINNET_CHAIN_ID => 5_468_000,
-        crate::hardfork::RSK_TESTNET_CHAIN_ID => 4_015_800,
-        _ => 0,
+        txs.rotate_right(1);
+        let error = p.recover_senders(&txs, 33).unwrap_err();
+        assert!(
+            matches!(error, ProcessError::SenderRecovery { index: 0, .. }),
+            "{error}"
+        );
     }
 }

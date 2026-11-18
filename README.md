@@ -131,6 +131,25 @@ cargo test --workspace
 
 786 tests covering consensus validation, RLP encoding, P2P handshakes, sync state machines, storage, the Unitrie, EVM execution, every RSK precompile (including the full Bridge surface and REMASC), the transaction pool, RPC methods, transaction relay, and chain reorganizations.
 
+### Starting from Rootstock's published state
+
+Rootstock publishes signed copies of the mainnet and testnet state for rskj's
+`--import`, and `--import` here does what rskj's does: it reads each trusted
+signer's index, takes the newest copy that more than half of them sign, checks
+those signatures and the copy's SHA-256, loads its blocks and state, and starts
+the node from there.
+
+```bash
+rustock --import --data-dir ./data
+```
+
+The data directory must not hold a chain: where rskj deletes one, rustock
+refuses. Mainnet's copy at #9,405,000 downloaded in about two minutes and
+loaded in 18 seconds, and the node then caught up with the network in about one.
+`--import-url` and `--import-trusted-key` point it at another network's copies;
+[`crates/cli/src/bootstrap_import.rs`](crates/cli/src/bootstrap_import.rs) says
+what it checks.
+
 ### Importing from rskj
 
 A synced rskj database can be imported instead of syncing from peers — about an
@@ -150,15 +169,14 @@ independent cross-check.
 
 ### A regtest chain rskj runs
 
-rustock's regtest is its own chain: its own genesis, no Bridge federation, and
-gas limits of its own. To run the chain an rskj regtest node runs, so that
-blocks rskj mined connect here, start from rskj's genesis file and its rules:
+rustock's regtest is its own chain: its own genesis and no Bridge federation.
+To run the chain an rskj regtest node runs, so that blocks rskj mined connect
+here, start from rskj's genesis file and its rules:
 
 ```bash
 rustock --network-id 33 \
   --genesis genesis.json \
   --consensus-rule rskip97=0 \
-  --min-gas-limit 3000000 --max-gas-limit 18446744073709551615 \
   --skip-pow-validation
 ```
 
@@ -184,11 +202,10 @@ rustock --network-id 30 --allow-chain-overrides \
 
 The overrides reach everything that reads the schedule: header decoding and
 hashing, difficulty, execution, REMASC and the Bridge. Names the node reads at
-one fixed height per chain (`bahamas`, `afterBridgeSync`, `hop401`) are
-accepted at that height only; `orchid060` and `tbd1000` are accepted and
-change nothing, and the node says so (`tbd1000` only turns on RSKIP-559,
-pegout sorting in the Bridge, which it does not implement). A node started
-this way must not follow the real network.
+one fixed height per chain (`bahamas`, `orchid060`, `hop401`) are accepted at
+that height only; `tbd1000` is accepted and changes nothing, and the node says
+so (it only turns on RSKIP-559, pegout sorting in the Bridge, which the node
+does not implement). A node started this way must not follow the real network.
 
 Blocks rskj exported with its `ExportBlocks` tool (`number,hash,td,rlp` per
 line, plain or gzipped) can then be imported from an empty data directory:
@@ -275,6 +292,16 @@ The RPC server is compatible with rskj's JSON-RPC 2.0 interface. Supported metho
 **State queries** (served from the local Unitrie at any historical block):
 
 - `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`
+
+**For light clients** (rustock's own, not rskj's: what a relay answers a light client from, which checks every byte itself):
+
+- `rsk_getStorageNodes(address, [slots], block)`: for each slot, whether it's held, its value, and the unitrie nodes from
+  the slot's key, or from where the key leaves the trie, up to the block's state root
+- `rsk_getStateNodes(blockHash, [keys])`: for each raw unitrie key, the nodes from where its walk ends up to the state root
+  of that block, or null if the node doesn't hold that state
+- `rsk_getBlockNumberByHash(hash)`: the block's number on the chain the node follows, or null
+- `rsk_getRawBlocks(from, to)`: one run of that chain, at most 1,000 blocks, each its header compressed, as rskj sends a
+  chain's headers to its peers, and its uncles in full
 
 **Execution:**
 

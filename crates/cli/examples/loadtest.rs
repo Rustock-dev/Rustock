@@ -47,12 +47,9 @@
 //! **Proof of work costs the same at any difficulty**, which is what makes
 //! this affordable: verification decodes the Bitcoin header, hashes it and
 //! compares against the target, and none of those depend on how hard the
-//! target is. The blocks are sealed at difficulty 1, where the target is
-//! `U256::MAX` and the first nonce tried always clears it, so sealing
-//! costs nothing and verifying costs exactly what it costs on mainnet.
-//! Difficulty 0 would be cheaper still and is not allowed -- the rule
-//! rejects it with `DifficultyZero` before doing any work, which would
-//! measure nothing.
+//! target is. The blocks are sealed at difficulty 1, where rskj's target is
+//! 2^256 / 3: one hash in three meets it, so sealing takes a few nonces and
+//! verifying costs exactly what it costs on mainnet.
 //!
 //! Sealing is deliberately **outside** the timed region. A node receives
 //! blocks already mined; making one is not a cost it pays.
@@ -221,11 +218,7 @@ fn main() -> Result<()> {
     // Regtest's activation heights are all zero, so every rule -- orchid,
     // wasabi100, iris300 -- is live from block one. On mainnet's heights a
     // 40-block run would skip merged mining entirely and measure nothing.
-    // Regtest's bounds, with the gas limit raised to the one the
-    // benchmark's headers have always carried. Changing the header
-    // instead would move every figure already recorded, and the bound is
-    // not what is being measured.
-    let chain = Arc::new(ChainConfig { max_gas_limit: 100_000_000, ..ChainConfig::regtest() });
+    let chain = Arc::new(ChainConfig::regtest());
     let header_verifier = HeaderVerifier::default_rsk(chain.clone());
     let block_verifier = BlockVerifier::default_rsk(&chain);
 
@@ -774,12 +767,14 @@ fn remasc_tx() -> Transaction {
 ///
 /// Not a cost a node pays -- it receives blocks already mined -- so this
 /// runs outside the timed region. It is here because verification has
-/// nothing to verify without it, and because at `difficulty: 1` the
-/// target is `U256::MAX`, so the first nonce tried clears it and sealing
-/// is a handful of hashes rather than a search. Verification does the
-/// same work it would against a real mainnet target.
+/// nothing to verify without it, and because at `difficulty: 1` rskj's
+/// target is 2^256 / 3, which one hash in three meets, so sealing is a few
+/// nonces rather than a search. Verification does the same work it would
+/// against a real mainnet target.
 fn seal_merged_mining(header: &mut Header) -> Result<()> {
-    use rustock_core::validation::merged_mining::compress_coinbase;
+    use bitcoin::hashes::Hash as _;
+    use rustock_core::validation::fork_detection::REQUIRED_BLOCKS;
+    use rustock_core::validation::merged_mining::{compress_coinbase, difficulty_to_target};
     use rustock_execution::mining::{coinbase, fork_detection, merkle};
 
     // The coinbase commits to the header's merged-mining hash, which is
@@ -788,10 +783,23 @@ fn seal_merged_mining(header: &mut Header) -> Result<()> {
     // hash is the one from before the transaction root was set.
     header.cached_hash = None;
     header.cached_hash_for_merged_mining = None;
-    let payload = fork_detection::apply_to_hash(header.hash_for_merged_mining(), &[0u8; 12]);
+    // From block 449 the hash's last twelve bytes are fork-detection data,
+    // and any twelve do here: this measures proof of work, not fork
+    // detection. Below 449 rskj wants the whole hash.
+    let fork_data: &[u8] = if header.number >= REQUIRED_BLOCKS {
+        &[0u8; 12]
+    } else {
+        &[]
+    };
+    let payload = fork_detection::apply_to_hash(header.hash_for_merged_mining(), fork_data);
 
     let cb = coinbase::build_coinbase(&payload, 0);
-    let btc = coinbase::build_bitcoin_block(cb.clone(), 0);
+    // One hash in three meets rskj's target at difficulty 1, 2^256 / 3.
+    let target = difficulty_to_target(header.difficulty);
+    let btc = (0..=u32::MAX)
+        .map(|nonce| coinbase::build_bitcoin_block(cb.clone(), nonce))
+        .find(|block| U256::from_le_slice(block.header.block_hash().as_byte_array()) <= target)
+        .context("no nonce meets the target")?;
     let compressed = compress_coinbase(&coinbase::encode_transaction(&cb), true)
         .map_err(|e| anyhow::anyhow!("compressing the coinbase: {e}"))?;
     let proof = merkle::proof_from_txids(&coinbase::txids_display_order(&btc))
@@ -877,6 +885,7 @@ fn bench_header(number: u64, parent_hash: B256, state_root: B256, edges: Vec<i16
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     }
 }
 

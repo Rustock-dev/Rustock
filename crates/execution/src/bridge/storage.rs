@@ -220,15 +220,36 @@ pub fn bridge_load_bytes_named<CTX: crate::RskContextTr>(ctx: &mut CTX, key_name
     bridge_load_bytes(ctx, key)
 }
 
-/// Transfer amount from Bridge contract to recipient.
-pub fn bridge_transfer<CTX: crate::RskContextTr>(ctx: &mut CTX, recipient: Address, amount: U256) -> bool {
-    if amount.is_zero() {
-        return true;
+/// Moves `amount`, which is more than nothing, from the Bridge to
+/// `recipient`, as rskj's `BridgeSupport.transferTo` moves it: with
+/// `Repository.transfer`, which takes it off the Bridge whatever the Bridge
+/// holds. On a chain the Bridge holds what it pays. A local call can name
+/// the Bridge as its sender and have it send what it holds away first, or
+/// run over a state in which it holds too little; rskj's Bridge pays all the
+/// same, and is left below zero. No balance here can be, so the Bridge is
+/// lifted to the amount and owes what it was lifted by
+/// (`RskChainExt::debts`), as the sender of a local call is.
+///
+/// Nothing a Bridge method does after it has paid can fail, so what the
+/// Bridge owes is taken back with the frame its caller runs in and not
+/// otherwise (`RskHandler`'s `frames`).
+pub fn bridge_transfer<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    recipient: Address,
+    amount: U256,
+) -> Result<
+    Option<revm::context_interface::journaled_state::TransferError>,
+    <CTX::Db as revm::Database>::Error,
+> {
+    use revm::context_interface::journaled_state::account::JournaledAccountTr;
+    let held = *ctx.journal_mut().load_account_mut(BRIDGE_ADDR)?.balance();
+    if held < amount {
+        ctx.journal_mut()
+            .load_account_mut(BRIDGE_ADDR)?
+            .set_balance(amount);
+        ctx.chain_mut().debts.add(BRIDGE_ADDR, amount - held);
     }
-    matches!(
-        ctx.journal_mut().transfer(BRIDGE_ADDR, recipient, amount),
-        Ok(None)
-    )
+    ctx.journal_mut().transfer(BRIDGE_ADDR, recipient, amount)
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +425,75 @@ pub fn save_lock_whitelist<CTX: crate::RskContextTr>(
     }
 }
 
+/// rskj's `LockWhitelist` as a Bridge call holds it once it has read it
+/// (`WhitelistStorageProviderImpl.getLockWhitelist`): the one-off entries with
+/// the disable height, and the unlimited entries. rskj writes it back when the
+/// call returns, whatever the call answers and whether or not it changed it
+/// ([`save_lock_whitelist`]), so every path that reads it saves it.
+pub struct LockWhitelist {
+    pub one_off: Vec<([u8; 20], u64)>,
+    pub disable_height: i32,
+    pub unlimited: Vec<[u8; 20]>,
+    /// The activation it was read under, which `save` writes under too.
+    rskip87: bool,
+}
+
+impl LockWhitelist {
+    /// rskj `initializeLockWhitelist`. With no one-off cell the whitelist is
+    /// empty and the unlimited cell is never read; with one, the unlimited
+    /// cell is read from RSKIP87 on.
+    pub fn load<CTX: crate::RskContextTr>(ctx: &mut CTX, rskip87: bool) -> Self {
+        let data = bridge_load_bytes_named(ctx, LOCK_WHITELIST_KEY);
+        if data.is_empty() {
+            return Self {
+                one_off: Vec::new(),
+                disable_height: i32::MAX,
+                unlimited: Vec::new(),
+                rskip87,
+            };
+        }
+        let (one_off, disable_height) =
+            deserialize_one_off_whitelist(&data).unwrap_or((Vec::new(), i32::MAX));
+        let unlimited = if rskip87 {
+            load_unlimited_whitelist(ctx)
+        } else {
+            Vec::new()
+        };
+        Self {
+            one_off,
+            disable_height,
+            unlimited,
+            rskip87,
+        }
+    }
+
+    /// rskj `LockWhitelist.isWhitelisted`: in either list.
+    pub fn contains(&self, hash160: &[u8; 20]) -> bool {
+        self.one_off.iter().any(|(h, _)| h == hash160) || self.unlimited.contains(hash160)
+    }
+
+    /// rskj `LockWhitelist.remove`: out of whichever list holds it, and
+    /// whether one did.
+    pub fn remove(&mut self, hash160: &[u8; 20]) -> bool {
+        let held = self.one_off.len() + self.unlimited.len();
+        self.one_off.retain(|(h, _)| h != hash160);
+        self.unlimited.retain(|h| h != hash160);
+        self.one_off.len() + self.unlimited.len() < held
+    }
+
+    /// rskj `WhitelistStorageProviderImpl.save`, as the call returns: both
+    /// cells, the unlimited one from RSKIP87 on.
+    pub fn save<CTX: crate::RskContextTr>(&self, ctx: &mut CTX) {
+        save_lock_whitelist(
+            ctx,
+            &self.one_off,
+            self.disable_height,
+            &self.unlimited,
+            self.rskip87,
+        );
+    }
+}
+
 /// Load the unlimited lock whitelist from Bridge storage.
 pub fn load_unlimited_whitelist<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<[u8; 20]> {
     let data = bridge_load_bytes_named(ctx, UNLIMITED_LOCK_WHITELIST_KEY);
@@ -549,9 +639,9 @@ pub fn deserialize_utxo_list(data: &[u8]) -> Vec<BridgeUtxo> {
 /// ```
 ///
 /// and for testnet, the general key before RSKIP284, the pre-hop key between
-/// RSKIP284 and RSKIP293, the post-hop key after. Both activate at hop400
-/// (testnet #3,103,000), so the middle case is unreachable there -- it is
-/// modelled anyway because the rule is rskj's, not the schedule's.
+/// RSKIP284 and RSKIP293, the post-hop key after. `testnet.conf` moves
+/// RSKIP284 to #2,581,800 while RSKIP293 comes with hop400 at #3,103,000, so
+/// the pre-hop key held testnet's UTXOs for the 521,200 blocks between.
 ///
 /// Mainnet never moved: its UTXOs stayed under the general key throughout.
 ///
@@ -621,20 +711,33 @@ mod utxo_key_tests {
 
     /// Testnet moved the active federation's UTXOs twice; mainnet never did.
     ///
-    /// Ground truth: testnet #7,139,903 is a pegout batch where rskj spends
-    /// from `newFedBtcUTXOsForTestnetPostHop` and leaves
+    /// `testnet.conf` puts RSKIP284 at #2,581,800 and RSKIP293 comes with
+    /// hop400 at #3,103,000, so the pre-hop cell holds them in between. RSKj's
+    /// public testnet node shows it: `newFederationBtcUTXOsForTestnet` is
+    /// empty through #2,581,800 and an RLP list (`0xc0`) from #2,581,801. With
+    /// RSKIP284 read at hop400, the two moves coincided and that cell was
+    /// never reached.
+    ///
+    /// Ground truth for the second move: testnet #7,139,903 is a pegout batch
+    /// where rskj spends from `newFedBtcUTXOsForTestnetPostHop` and leaves
     /// `newFederationBtcUTXOs` untouched. Reading the general cell there
     /// selects different inputs, so the pegout transaction, its hash and its
     /// outpoint values all come out different.
     #[test]
-    fn testnet_moves_to_the_post_hop_cell_at_hop400() {
+    fn testnet_moves_through_the_pre_hop_cell_to_the_post_hop_cell() {
         let cfg = RskHardforkConfig::testnet();
-        // hop400 on testnet is #3,103,000; RSKIP284 and RSKIP293 both land there.
         assert_eq!(
-            new_federation_utxos_key(&cfg, 3_102_999),
+            new_federation_utxos_key(&cfg, 2_581_799),
             NEW_FEDERATION_BTC_UTXOS_KEY,
-            "before hop400 testnet used the general cell"
+            "before RSKIP284 testnet used the general cell"
         );
+        for h in [2_581_800, 3_000_000, 3_102_999] {
+            assert_eq!(
+                new_federation_utxos_key(&cfg, h),
+                NEW_FEDERATION_BTC_UTXOS_TESTNET_PRE_HOP_KEY,
+                "between RSKIP284 and hop400, at #{h}"
+            );
+        }
         assert_eq!(
             new_federation_utxos_key(&cfg, 3_103_000),
             NEW_FEDERATION_BTC_UTXOS_TESTNET_POST_HOP_KEY
@@ -1127,5 +1230,47 @@ mod tests {
         let data = serialize_utxo_list(&[]);
         let decoded = deserialize_utxo_list(&data);
         assert!(decoded.is_empty());
+    }
+
+    /// The Bridge pays whatever it holds, as rskj's `Repository.transfer`
+    /// moves a balance: one that doesn't cover the payment is left below
+    /// zero, which here is what the Bridge owes. rskj's release answered a
+    /// Bridge that holds too little through `eth_call` (the rpc crate's
+    /// `testdata/rskj_local_calls.txt`, the scenarios `bridgepays` and
+    /// `bridgepoor`).
+    #[test]
+    fn the_bridge_pays_whatever_it_holds() {
+        use revm::context_interface::journaled_state::account::JournaledAccountTr;
+        use revm::context_interface::ContextTr;
+        use revm::MainContext;
+
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        let to = Address::repeat_byte(0x77);
+        ctx.journal_mut()
+            .load_account_mut(BRIDGE_ADDR)
+            .unwrap()
+            .set_balance(U256::from(7));
+        // What the Bridge holds and owes after it has paid 5, and what the
+        // account it paid holds.
+        let mut pay = || {
+            assert!(matches!(
+                bridge_transfer(&mut ctx, to, U256::from(5)),
+                Ok(None)
+            ));
+            let mut held = |who| ctx.journal_mut().load_account(who).unwrap().info.balance;
+            let (bridge, paid) = (held(BRIDGE_ADDR), held(to));
+            (
+                bridge.to::<u64>(),
+                ctx.chain().debts.of(BRIDGE_ADDR).to::<u64>(),
+                paid.to::<u64>(),
+            )
+        };
+        // It holds 7: 2 are left, and it owes nothing.
+        assert_eq!(pay(), (2, 0, 5));
+        // It holds 2: it is left 3 below zero.
+        assert_eq!(pay(), (0, 3, 10));
+        // And nothing: 8 below.
+        assert_eq!(pay(), (0, 8, 15));
     }
 }

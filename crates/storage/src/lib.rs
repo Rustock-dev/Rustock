@@ -6,7 +6,7 @@ pub mod flat_migrate;
 pub mod counting_trie_store;
 pub mod rskj_import;
 pub use position::{
-    BlockRef, Cursor, LineageBreak, Transition, Validated, verify_local_coherence,
+    BlockRef, Cursor, ExecutionSwitch, LineageBreak, Transition, Validated, verify_local_coherence,
 };
 pub use trie_store::RocksDbTrieStore;
 pub mod trie_tool;
@@ -24,7 +24,9 @@ pub use flat_trie_store::FlatTrieStore;
 pub use epoch_backend::TrieEngine;
 
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};
+use rustock_core::config::ActivationHeights;
 use rustock_core::{Block, Header, Receipt, Transaction};
+use rustock_core::selection_rule::{should_we_add_this_block, Contender};
 use alloy_primitives::{B256, U256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
 use anyhow::{Result, Context, anyhow, bail};
@@ -146,6 +148,18 @@ fn height_index_key(number: u64, hash: B256) -> [u8; 40] {
     key
 }
 
+/// `topic0 (32) || block (8 BE) || tx_index (4 BE) || log_index (4 BE)`: a
+/// Bridge event's key in `CF_BRIDGE_EVENTS`, so that one event type's
+/// occurrences sort by block and scanning them is a prefix walk.
+fn bridge_event_key(topic0: B256, block: u64, tx_index: u32, log_index: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(48);
+    key.extend_from_slice(topic0.as_slice());
+    key.extend_from_slice(&block.to_be_bytes());
+    key.extend_from_slice(&tx_index.to_be_bytes());
+    key.extend_from_slice(&log_index.to_be_bytes());
+    key
+}
+
 /// Safety limit: refuse to reorg deeper than this many blocks.
 const MAX_REORG_DEPTH: u64 = 1000;
 
@@ -165,6 +179,45 @@ pub struct BlockStore {
     /// the freezer holds is also in `CF_HEADERS`, so this only ever changes how
     /// fast a header is found, never whether it is found.
     freezer: std::sync::RwLock<Option<Arc<crate::freezer::Freezer>>>,
+    /// The heights headers are read under: see [`BlockStore::with_activations`].
+    activations: Option<ActivationHeights>,
+    /// Whether this node executed a block and still holds the state it
+    /// produced: installed by whatever executes blocks, absent on a node
+    /// that executes nothing. See [`BlockStore::set_executed_check`].
+    executed_check: std::sync::RwLock<Option<ExecutedCheck>>,
+    /// The tip of a heavier branch that is not adopted yet, because this
+    /// node has not executed it past its executed head. See
+    /// [`BlockStore::deferred_head`].
+    deferred_head: std::sync::Mutex<Option<B256>>,
+    /// Held while a [`Transition`] is applied, and while a move of the head
+    /// is weighed against the executed head before it: a batch records
+    /// execution on a thread of its own meanwhile. See [`BlockStore::apply`].
+    transitions: std::sync::Mutex<()>,
+    /// The switches of execution that changes of head made, for the calls
+    /// that made them to take up. See [`BlockStore::switch_mark`].
+    switches: std::sync::Mutex<position::Switches>,
+}
+
+/// Says whether this node executed the block `hash` (whose header is the
+/// second argument) and still holds the state it produced.
+///
+/// The store cannot answer that itself: the evidence is the block's receipts
+/// hashed against its header's `receiptsRoot`, which needs the execution
+/// crate's hardfork configuration, and its state root resolving in the trie
+/// store, which is another store. So whoever executes blocks installs it.
+pub type ExecutedCheck = Arc<dyn Fn(B256, &Header) -> bool + Send + Sync>;
+
+/// What [`BlockStore::retry_deferred_head`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredHead {
+    /// No branch was waiting.
+    None,
+    /// The branch is executed past the executed head and is now the chain.
+    Adopted,
+    /// The branch still waits for more of it to be executed.
+    Waiting,
+    /// The head has overtaken the branch, which is forgotten.
+    Dropped,
 }
 
 /// RocksDB settings for a bulk import.
@@ -193,15 +246,15 @@ impl Default for ImportTuning {
     }
 }
 
-/// RLP-encodes a header exactly as the headers column family stores it.
+/// RLP-encodes a header exactly as the headers column family stores it
+/// ([`Header::encode_stored`]).
 pub fn encode_header(header: &Header) -> Vec<u8> {
-    let mut buf = Vec::new();
-    header.encode(&mut buf);
-    buf
+    header.encode_stored()
 }
 
 /// RLP-encodes a block body exactly as the bodies column family stores it:
-/// `[[transactions], [ommers]]`.
+/// `[[transactions], [ommers]]`, each uncle in the store's form
+/// ([`Header::encode_stored`]).
 pub fn encode_body(transactions: &[Transaction], ommers: &[Header]) -> Vec<u8> {
     let mut txs_payload = Vec::new();
     for tx in transactions {
@@ -209,7 +262,7 @@ pub fn encode_body(transactions: &[Transaction], ommers: &[Header]) -> Vec<u8> {
     }
     let mut ommers_payload = Vec::new();
     for uncle in ommers {
-        uncle.encode(&mut ommers_payload);
+        ommers_payload.extend_from_slice(&uncle.encode_stored());
     }
 
     let body_len = RlpHeader { list: true, payload_length: txs_payload.len() }.length()
@@ -326,7 +379,15 @@ impl BlockStore {
             DB::open_cf_for_read_only(&opts, path.as_ref(), existing, false)
                 .context("Failed to open RocksDB read-only")?
         };
-        Ok(Self { db: Arc::new(db), freezer: std::sync::RwLock::new(None) })
+        Ok(Self {
+            db: Arc::new(db),
+            freezer: std::sync::RwLock::new(None),
+            activations: None,
+            executed_check: std::sync::RwLock::new(None),
+            deferred_head: std::sync::Mutex::new(None),
+            transitions: std::sync::Mutex::new(()),
+            switches: std::sync::Mutex::new(position::Switches::default()),
+        })
     }
 
     fn open_with<P: AsRef<Path>>(path: P, tuning: Option<ImportTuning>) -> Result<Self> {
@@ -366,7 +427,43 @@ impl BlockStore {
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs).context("Failed to open RocksDB")?;
-        Ok(Self { db: Arc::new(db), freezer: std::sync::RwLock::new(None) })
+        Ok(Self {
+            db: Arc::new(db),
+            freezer: std::sync::RwLock::new(None),
+            activations: None,
+            executed_check: std::sync::RwLock::new(None),
+            deferred_head: std::sync::Mutex::new(None),
+            transitions: std::sync::Mutex::new(()),
+            switches: std::sync::Mutex::new(position::Switches::default()),
+        })
+    }
+
+    /// This store reading its headers under `activations` rather than the
+    /// process-wide heights ([`ActivationHeights::install`]), as a node of the
+    /// chain they belong to does: for a test that holds another chain's
+    /// headers. Whether a header's slot 6 holds its logs bloom or the
+    /// commitment to its extension, for one, depends on them, as it does for
+    /// rskj's store, which reads through its `BlockFactory`.
+    pub fn with_activations(mut self, activations: ActivationHeights) -> Self {
+        self.activations = Some(activations);
+        self
+    }
+
+    /// The heights this store reads headers under.
+    fn activations(&self) -> &ActivationHeights {
+        match &self.activations {
+            Some(activations) => activations,
+            None => ActivationHeights::current(),
+        }
+    }
+
+    /// A stored header, read under this store's heights.
+    fn read_header(&self, buf: &mut &[u8]) -> alloy_rlp::Result<Header> {
+        Header::decode_in(
+            buf,
+            self.activations(),
+            rustock_core::types::header::HeaderForm::Stored,
+        )
     }
 
     /// Scans the headers column family for the highest block number.
@@ -386,7 +483,7 @@ impl BlockStore {
                 continue;
             }
             let mut slice: &[u8] = &v;
-            if let Ok(h) = Header::decode(&mut slice) {
+            if let Ok(h) = self.read_header(&mut slice) {
                 if best.is_none_or(|(n, _)| h.number > n) {
                     best = Some((h.number, B256::from_slice(&k)));
                 }
@@ -508,7 +605,7 @@ impl BlockStore {
             // The header is keyed by the hash the node computed for it, which
             // for genesis and for Java-encoded headers is not the hash of a
             // re-encoding. Index under the stored key, never a recomputed one.
-            let number = match Header::decode(&mut value.as_ref()) {
+            let number = match self.read_header(&mut value.as_ref()) {
                 Ok(h) => h.number,
                 Err(e) => {
                     warn!(
@@ -551,7 +648,7 @@ impl BlockStore {
         let bytes = self.db.get_cf(self.cf(CF_HEADERS)?, hash.as_slice())
             .context("Failed to read header")?;
         if let Some(b) = bytes {
-            return Ok(Some(Header::decode(&mut b.as_slice())?));
+            return Ok(Some(self.read_header(&mut b.as_slice())?));
         }
 
         // Not in the database. It may have been frozen and then deleted, in
@@ -606,7 +703,7 @@ impl BlockStore {
         let one = |h: &B256| -> Option<Header> {
             let cf = self.cf(CF_HEADERS).ok()?;
             let bytes = self.db.get_cf(cf, h.as_slice()).ok()??;
-            Header::decode(&mut bytes.as_slice()).ok()
+            self.read_header(&mut bytes.as_slice()).ok()
         };
 
         let threads = read_threads();
@@ -804,6 +901,17 @@ impl BlockStore {
         Ok(())
     }
 
+    /// `hash`, held with total difficulty `total_difficulty`, as rskj's
+    /// selection rule weighs it (`rustock_core::selection_rule`): with the
+    /// fees its header says it paid. `None` when its header isn't held.
+    pub fn contender(&self, hash: B256, total_difficulty: U256) -> Result<Option<Contender>> {
+        Ok(self.header(hash)?.map(|header| Contender {
+            total_difficulty,
+            paid_fees: header.paid_fees,
+            hash,
+        }))
+    }
+
     /// Atomically stores a batch of validated headers along with their total
     /// difficulties, then updates the canonical chain if the head changed.
     ///
@@ -811,6 +919,11 @@ impl BlockStore {
     /// Canonical `number → hash` mappings are only updated for blocks on the
     /// winning chain, preventing fork headers from corrupting the canonical
     /// pointers.
+    ///
+    /// A header takes the head as rskj's `BlockChainImpl.internalTryToConnect`
+    /// lets a block take it, by `SelectionRule.shouldWeAddThisBlock`: a greater
+    /// total difficulty wins, and a tie goes by the two blocks' fees and then
+    /// their hashes, not to whichever arrived first.
     ///
     /// Returns the hash of the new head (if it changed) or the existing head.
     pub fn store_headers_batch(
@@ -830,23 +943,46 @@ impl BlockStore {
 
         let mut batch = WriteBatch::default();
         let mut best_hash = current_head_hash;
-        let mut best_td = current_td;
+        // The block each header is weighed against: the head, by the hash it
+        // is held under, not one recomputed from its stored form.
+        let mut best = match current_head_hash {
+            Some(hash) => self.contender(hash, current_td)?,
+            None => None,
+        };
 
         for &(header, td) in entries {
             let hash = header.hash();
 
-            let mut header_buf = Vec::new();
-            header.encode(&mut header_buf);
-            batch.put_cf(cf_headers, hash.as_slice(), &header_buf);
+            // A header that came compressed, as rskj sends a chain's headers,
+            // holds only the commitment to its RSKIP-351 extension, and the one
+            // held may have been completed with the extension that came beside
+            // its body. Written over it, the copy lost the bloom and the
+            // execution edges, its body still held beside a header that can't
+            // be run: testnet's #8,295,561 and #8,295,940 were then refused
+            // beside the chain for want of their edges.
+            if header.extension_data.is_none() || !self.holds_completed_header(hash) {
+                batch.put_cf(cf_headers, hash.as_slice(), encode_header(header));
+            }
 
             batch.put_cf(cf_td, hash.as_slice(), encode_td(td));
             // Fork headers arrive through here too, and they are precisely the
             // ones uncle selection is looking for.
             batch.put_cf(cf_index, height_index_key(header.number, hash), []);
 
-            if td > best_td {
-                best_td = td;
+            let contender = Contender {
+                total_difficulty: td,
+                paid_fees: header.paid_fees,
+                hash,
+            };
+            let takes_head = match &best {
+                Some(best) => should_we_add_this_block(&contender, best),
+                // No head, or none held under its hash: nothing to weigh but
+                // the total difficulty.
+                None => td > current_td,
+            };
+            if takes_head {
                 best_hash = Some(hash);
+                best = Some(contender);
             }
         }
 
@@ -861,6 +997,13 @@ impl BlockStore {
         }
 
         Ok(best_hash)
+    }
+
+    /// Whether the header held for `hash` holds the fields of its RSKIP-351
+    /// extension, rather than only the commitment to them. `false` when none
+    /// is held, or the one held can't be read: it is written over, as before.
+    fn holds_completed_header(&self, hash: B256) -> bool {
+        matches!(self.header(hash), Ok(Some(held)) if held.extension_data.is_none())
     }
 
     /// Move the head to `new_head` through [`Transition`], so the canonical
@@ -900,6 +1043,31 @@ impl BlockStore {
             }
         };
 
+        // rskj makes a block its best only once it has connected it, which
+        // means executed it against its parent's state
+        // (`BlockChainImpl.internalTryToConnect`), so a heavier chain whose
+        // blocks it has not executed leaves its best block where it is. Taken
+        // on its headers alone, such a chain pulls execution back to the fork
+        // point and puts the miner and every query there until its blocks
+        // arrive and run, and for good if they never do: headers heavy with
+        // work and their bodies withheld would hold the node at the fork. So
+        // a move that would leave the executed head off the chain waits until
+        // this node has executed the new branch past it.
+        //
+        // Weighed and made under one lock: a batch recording execution in
+        // between would leave the weighing about an executed head that has
+        // moved on.
+        let held = self.transitions.lock().unwrap_or_else(|e| e.into_inner());
+        if self.adoption_waits_for_execution(&proved)? {
+            debug!(
+                target: "rustock::storage",
+                "head {new_head} is heavier, but its branch is not executed past the executed \
+                 head; holding it until it is"
+            );
+            *self.deferred_head.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_head);
+            return Ok(());
+        }
+
         // Identical work either way -- the distinction is what the logs say
         // happened, and a retreat is worth being able to see.
         let descending = previous
@@ -911,8 +1079,110 @@ impl BlockStore {
             Transition::Adopt { head: proved }
         };
 
-        self.apply(&transition)?;
+        self.apply_holding(&held, &transition)?;
+        drop(held);
+        let mut deferred = self.deferred_head.lock().unwrap_or_else(|e| e.into_inner());
+        if *deferred == Some(new_head) {
+            *deferred = None;
+        }
         Ok(())
+    }
+
+    /// Install the test for "this node executed that block and still holds
+    /// the state it produced": see [`ExecutedCheck`]. With one installed, a
+    /// reorg waits for its branch to be executed (see [`Self::deferred_head`])
+    /// and execution follows a reorg to the highest block of the new branch
+    /// executed already, rather than back to the fork point.
+    pub fn set_executed_check(&self, check: ExecutedCheck) {
+        *self
+            .executed_check
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(check);
+    }
+
+    /// Whether this node executes blocks: whether a check is installed.
+    fn executes(&self) -> bool {
+        self.executed_check
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Whether this node executed `hash`, whose header is `header`, and still
+    /// holds its state. `false` on a node that executes nothing.
+    pub fn executed_here(&self, hash: B256, header: &Header) -> bool {
+        let check = self
+            .executed_check
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        check.is_some_and(|check| check(hash, header))
+    }
+
+    /// The tip of a heavier branch whose adoption waits for this node to
+    /// execute it past the executed head, if there is one.
+    ///
+    /// The head, the canonical index and the executed head all stay on the
+    /// chain execution is on meanwhile, as rskj's best block stays on the
+    /// best chain it has connected. Whoever executes blocks executes this
+    /// branch's beside the chain and calls [`Self::retry_deferred_head`].
+    pub fn deferred_head(&self) -> Option<B256> {
+        *self.deferred_head.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Forget the deferred branch: one of its blocks failed to execute, so it
+    /// can never be adopted, as rskj never connects a block that fails.
+    pub fn clear_deferred_head(&self) {
+        *self.deferred_head.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Weigh the deferred branch again, after more of it was executed: adopt
+    /// it if its executed part now beats the executed head, and forget it if
+    /// the head has since overtaken it.
+    pub fn retry_deferred_head(&self) -> Result<DeferredHead> {
+        let Some(deferred) = self.deferred_head() else {
+            return Ok(DeferredHead::None);
+        };
+        let head = self.head()?;
+        if !self.takes_head_from(deferred, head)? {
+            self.clear_deferred_head();
+            return Ok(DeferredHead::Dropped);
+        }
+        self.move_head_to(deferred, head)?;
+        Ok(if self.head()? == Some(deferred) {
+            DeferredHead::Adopted
+        } else {
+            DeferredHead::Waiting
+        })
+    }
+
+    /// Weigh `hash` against the head again: for a block whose total
+    /// difficulty rose once its body showed its uncles, which its header
+    /// alone could not. Returns whether it took the head.
+    pub fn reconsider_head(&self, hash: B256) -> Result<bool> {
+        let head = self.head()?;
+        if head == Some(hash) || !self.takes_head_from(hash, head)? {
+            return Ok(false);
+        }
+        self.move_head_to(hash, head)?;
+        Ok(self.head()? == Some(hash))
+    }
+
+    /// Whether `hash` takes the head from `head` by rskj's selection rule,
+    /// each weighed with the total difficulty stored for it.
+    fn takes_head_from(&self, hash: B256, head: Option<B256>) -> Result<bool> {
+        let td = self.total_difficulty(hash)?.unwrap_or_default();
+        let Some(candidate) = self.contender(hash, td)? else {
+            return Ok(false);
+        };
+        let Some(head) = head else {
+            return Ok(true);
+        };
+        let head_td = self.total_difficulty(head)?.unwrap_or_default();
+        Ok(match self.contender(head, head_td)? {
+            Some(current) => should_we_add_this_block(&candidate, &current),
+            None => td > head_td,
+        })
     }
 
     /// Walks backward from `new_head` using `parent_hash` links, updating
@@ -1125,6 +1395,13 @@ impl BlockStore {
         self.db
             .put_cf(self.cf(CF_BODIES)?, hash.as_slice(), &buf)
             .context("Failed to write block body")
+    }
+
+    /// Removes a block's body, so that the sync asks for it again.
+    pub fn delete_body(&self, hash: B256) -> Result<()> {
+        self.db
+            .delete_cf(self.cf(CF_BODIES)?, hash.as_slice())
+            .context("Failed to delete block body")
     }
 
     /// Attaches a freezer, so header runs can be served from flat files.
@@ -1354,12 +1631,37 @@ impl BlockStore {
                 let mut ommers_buf = &body[..ommers_h.payload_length];
                 let mut ommers = Vec::new();
                 while !ommers_buf.is_empty() {
-                    ommers.push(Header::decode(&mut ommers_buf)?);
+                    ommers.push(self.read_header(&mut ommers_buf)?);
                 }
 
                 Ok(Some((transactions, ommers)))
             }
         }
+    }
+
+    /// The uncle headers of a stored block body, read without decoding its
+    /// transactions: all that the uncle rule and total difficulty need, for a
+    /// fraction of [`Self::body`]'s work on a busy block.
+    pub fn uncles(&self, hash: B256) -> Result<Option<Vec<Header>>> {
+        let Some(bytes) = self
+            .db
+            .get_cf(self.cf(CF_BODIES)?, hash.as_slice())
+            .context("Failed to read block body")?
+        else {
+            return Ok(None);
+        };
+        let mut buf = bytes.as_slice();
+        let outer = RlpHeader::decode(&mut buf)?;
+        let mut body = &buf[..outer.payload_length];
+        let transactions = RlpHeader::decode(&mut body)?;
+        body = &body[transactions.payload_length..];
+        let ommers_h = RlpHeader::decode(&mut body)?;
+        let mut ommers_buf = &body[..ommers_h.payload_length];
+        let mut ommers = Vec::new();
+        while !ommers_buf.is_empty() {
+            ommers.push(self.read_header(&mut ommers_buf)?);
+        }
+        Ok(Some(ommers))
     }
 
 
@@ -1417,45 +1719,94 @@ impl BlockStore {
 }
 
 impl BlockStore {
-    /// Stores a transaction index entry: tx_hash -> (block_hash, tx_index).
+    /// The bytes one block takes in a transaction's index entry: the block's
+    /// hash, then the transaction's position in it, big-endian.
+    const TX_INDEX_ENTRY: usize = 36;
+
+    /// Records that a block holds a transaction, at `tx_index`.
+    ///
+    /// A transaction keeps one entry per block it was committed in, oldest
+    /// first, as rskj's `ReceiptStoreImplV2.add` appends each block's hash to
+    /// the transaction's list. A reorg can put the same transaction in a block
+    /// of each branch, and which of them is canonical can change after both
+    /// were written; overwriting kept only the newest, which after a reorg
+    /// back is the one that lost. A block already listed isn't listed again.
     pub fn put_tx_index(&self, tx_hash: B256, block_hash: B256, tx_index: u32) -> Result<()> {
-        let mut val = [0u8; 36];
-        val[..32].copy_from_slice(block_hash.as_slice());
-        val[32..].copy_from_slice(&tx_index.to_be_bytes());
+        let mut entries = self.tx_index_bytes(tx_hash)?.unwrap_or_default();
+        if entries
+            .chunks_exact(Self::TX_INDEX_ENTRY)
+            .any(|entry| &entry[..32] == block_hash.as_slice())
+        {
+            return Ok(());
+        }
+        entries.extend_from_slice(block_hash.as_slice());
+        entries.extend_from_slice(&tx_index.to_be_bytes());
         self.db
-            .put_cf(self.cf(CF_TX_INDEX)?, tx_hash.as_slice(), val)
+            .put_cf(self.cf(CF_TX_INDEX)?, tx_hash.as_slice(), entries)
             .context("Failed to write tx index")
     }
 
-    /// Looks up which block contains a transaction and at what index.
-    pub fn tx_location(&self, tx_hash: B256) -> Result<Option<(B256, u32)>> {
+    /// A transaction's index entry as stored, refused if it isn't whole.
+    fn tx_index_bytes(&self, tx_hash: B256) -> Result<Option<Vec<u8>>> {
         let bytes = self.db
             .get_cf(self.cf(CF_TX_INDEX)?, tx_hash.as_slice())
             .context("Failed to read tx index")?;
         match bytes {
-            None => Ok(None),
-            Some(b) => {
-                if b.len() < 36 {
-                    return Err(anyhow!("corrupt tx index entry: {} bytes", b.len()));
-                }
-                let block_hash = B256::from_slice(&b[..32]);
-                let tx_index = u32::from_be_bytes([b[32], b[33], b[34], b[35]]);
-                Ok(Some((block_hash, tx_index)))
+            Some(b) if b.is_empty() || b.len() % Self::TX_INDEX_ENTRY != 0 => {
+                Err(anyhow!("corrupt tx index entry: {} bytes", b.len()))
+            }
+            bytes => Ok(bytes),
+        }
+    }
+
+    /// Every block a transaction was committed in, oldest first, with its
+    /// index in each.
+    pub fn tx_locations(&self, tx_hash: B256) -> Result<Vec<(B256, u32)>> {
+        let entries = self.tx_index_bytes(tx_hash)?.unwrap_or_default();
+        Ok(entries
+            .chunks_exact(Self::TX_INDEX_ENTRY)
+            .map(|entry| {
+                let block_hash = B256::from_slice(&entry[..32]);
+                let tx_index = u32::from_be_bytes([entry[32], entry[33], entry[34], entry[35]]);
+                (block_hash, tx_index)
+            })
+            .collect())
+    }
+
+    /// The block a transaction was last committed in, and its index there.
+    /// Not necessarily canonical: see [`Self::tx_location_in_main_chain`].
+    pub fn tx_location(&self, tx_hash: B256) -> Result<Option<(B256, u32)>> {
+        Ok(self.tx_locations(tx_hash)?.pop())
+    }
+
+    /// The canonical block holding a transaction, and its index there: rskj's
+    /// `ReceiptStore.getInMainChain`, which looks through every block the
+    /// transaction was committed in for the one the chain has at that block's
+    /// height. `None` when none of them is, as for a transaction whose only
+    /// block lost a reorg (upstream #343).
+    pub fn tx_location_in_main_chain(&self, tx_hash: B256) -> Result<Option<(B256, u32)>> {
+        for (block_hash, tx_index) in self.tx_locations(tx_hash)? {
+            let Some(header) = self.header(block_hash)? else {
+                continue;
+            };
+            if self.canonical_hash(header.number)? == Some(block_hash) {
+                return Ok(Some((block_hash, tx_index)));
             }
         }
+        Ok(None)
     }
 
     /// Indexes all transactions in a block body for fast lookup by tx hash.
     /// Computes each transaction's hash from its RLP encoding.
     pub fn index_block_transactions(&self, block_hash: B256, transactions: &[Transaction]) -> Result<()> {
         for (i, tx) in transactions.iter().enumerate() {
-            // `tx.tx_hash()` hashes `rlp_for_trie()`, which returns the ORIGINAL
-            // bytes when they were cached at decode time. Re-encoding here
-            // instead would key the index by a hash that differs from the
-            // canonical one for any transaction whose RLP does not round-trip
-            // byte-for-byte -- and reproducing rskj's non-canonical encodings is
-            // exactly why `cached_rlp` exists. The index must be keyed by the
-            // hash callers actually have.
+            // `tx.tx_hash()` hashes `rlp_for_trie()`, the encoding rskj hashes
+            // the transaction by, kept when it was read. Re-encoding here
+            // instead would key the index by a hash that differs from rskj's
+            // for any transaction whose rskj encoding is not canonical RLP --
+            // and reproducing rskj's encodings is exactly why `cached_rlp`
+            // exists. The index must be keyed by the hash callers actually
+            // have.
             self.put_tx_index(tx.tx_hash(), block_hash, i as u32)?;
         }
         Ok(())
@@ -1689,11 +2040,7 @@ impl BlockStore {
         topics: &[B256],
         data: &[u8],
     ) -> Result<()> {
-        let mut key = Vec::with_capacity(48);
-        key.extend_from_slice(topic0.as_slice());
-        key.extend_from_slice(&block.to_be_bytes());
-        key.extend_from_slice(&tx_index.to_be_bytes());
-        key.extend_from_slice(&log_index.to_be_bytes());
+        let key = bridge_event_key(topic0, block, tx_index, log_index);
 
         let mut val = Vec::with_capacity(64 + data.len());
         val.extend_from_slice(tx_hash.as_slice());
@@ -1742,6 +2089,40 @@ impl BlockStore {
             }
         }
         Ok(written)
+    }
+
+    /// Remove what [`Self::index_bridge_events`] wrote for a block at height
+    /// `block` with these receipts: for a block the chain has left, whose
+    /// events would otherwise stay indexed at a height the chain now gives
+    /// another block. Returns how many were removed.
+    pub fn remove_bridge_events(
+        &self,
+        block: u64,
+        receipts: &[Receipt],
+        bridge: alloy_primitives::Address,
+    ) -> Result<u64> {
+        let cf = self.cf(CF_BRIDGE_EVENTS)?;
+        let mut batch = WriteBatch::default();
+        let mut removed = 0u64;
+        for (tx_index, receipt) in receipts.iter().enumerate() {
+            for (log_index, log) in receipt.logs.iter().enumerate() {
+                if log.address != bridge {
+                    continue;
+                }
+                let Some(topic0) = log.topics.first().copied() else {
+                    continue;
+                };
+                batch.delete_cf(
+                    cf,
+                    bridge_event_key(topic0, block, tx_index as u32, log_index as u32),
+                );
+                removed += 1;
+            }
+        }
+        self.db
+            .write(batch)
+            .context("Failed to remove bridge events")?;
+        Ok(removed)
     }
 
     /// Every occurrence of one event type, in block order, optionally bounded.
@@ -2007,6 +2388,36 @@ impl BlockStore {
     pub fn db(&self) -> &Arc<DB> {
         &self.db
     }
+
+    /// Writes every column family's memtables out to its tables, so nothing
+    /// the database holds is left only in its write-ahead log, which RocksDB
+    /// then drops. For the end of a bulk load: `--import` otherwise leaves
+    /// the next start well over a gigabyte of log to replay.
+    pub fn flush_all(&self) -> Result<()> {
+        let names = [
+            CF_HEADERS,
+            CF_NUMBERS,
+            CF_TD,
+            CF_BODIES,
+            CF_RECEIPTS,
+            CF_TX_INDEX,
+            CF_BRIDGE_EVENTS,
+            CF_HEIGHT_INDEX,
+            CF_HEADER_NUMBERS,
+            CF_SNAP_CHUNKS,
+            CF_TRIE_NODES,
+        ];
+        for name in names {
+            if let Some(cf) = self.db.cf_handle(name) {
+                self.db
+                    .flush_cf(cf)
+                    .with_context(|| format!("flushing {name}"))?;
+            }
+        }
+        self.db
+            .flush()
+            .context("flushing the default column family")
+    }
 }
 
 #[cfg(test)]
@@ -2057,7 +2468,197 @@ mod tests {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         }
+    }
+
+    /// A store reads its headers under its chain's heights, the process's
+    /// unless set, as rskj's `BlockFactory` reads them, by height: a header
+    /// held compressed, as one is from RSKIP-351 on, reads back as held under
+    /// regtest's heights, and not at all under this process's, mainnet's,
+    /// which read no such header at #1. The freezer reads its own alike.
+    #[test]
+    fn a_store_reads_headers_under_its_chains_heights() {
+        use rustock_core::config::ActivationHeights;
+        let mut commitment = vec![0xe2, 0x01, 0xa0];
+        commitment.extend_from_slice(&[0x55; 32]);
+        let mut slot = Vec::new();
+        commitment.as_slice().encode(&mut slot);
+        // rskj's regtest has RSKIPUMM and RSKIP-351 from block 1, and its
+        // headers hash as its heights say.
+        let regtest = ActivationHeights::regtest();
+        let compressed = Header {
+            extension_data: Some(Bytes::from(slot)),
+            umm_root: Some(Bytes::new()),
+            ..dummy_header(1)
+        }
+        .with_activations(&regtest);
+        let hash = compressed.hash();
+
+        let dir = tempdir().unwrap();
+        {
+            let store = BlockStore::open(dir.path())
+                .unwrap()
+                .with_activations(regtest.clone());
+            store.put_header(&compressed).unwrap();
+            store
+                .put_body(hash, &[], std::slice::from_ref(&compressed))
+                .unwrap();
+            assert_eq!(store.header(hash).unwrap(), Some(compressed.clone()));
+            assert_eq!(store.uncles(hash).unwrap(), Some(vec![compressed.clone()]));
+        }
+        let store = BlockStore::open(dir.path()).unwrap();
+        assert!(store.header(hash).is_err());
+        assert!(store.uncles(hash).is_err());
+
+        let frozen = tempdir().unwrap();
+        let freezer = crate::freezer::Freezer::open(frozen.path())
+            .unwrap()
+            .with_activations(regtest);
+        freezer.put(1, &compressed).unwrap();
+        freezer
+            .put_uncles(1, std::slice::from_ref(&compressed))
+            .unwrap();
+        freezer.sync().unwrap();
+        assert_eq!(freezer.header(1).unwrap(), Some(compressed.clone()));
+        let uncle = freezer.uncles(1).unwrap().unwrap().remove(0);
+        assert_eq!(uncle.extension_data, compressed.extension_data);
+        assert_eq!(uncle.hash(), hash);
+        let unread = crate::freezer::Freezer::open(frozen.path()).unwrap();
+        assert_eq!(unread.header(1).unwrap(), None);
+        assert!(unread.uncles(1).is_err());
+    }
+
+    /// Every path that writes a header writes it in the store's own form
+    /// ([`encode_header`]), so it reads back as it was held: a header at a
+    /// time, a batch, as the header sync writes one, a body's uncles, and the
+    /// freezer's headers and uncles. In rskj's full encoding, a header of
+    /// version 0 from RSKIP-351 on, which writes no version, would read back
+    /// as nothing rskj reads there.
+    #[test]
+    fn every_path_that_writes_a_header_reads_it_back_as_held() {
+        use rustock_core::config::ActivationHeights;
+        use rustock_core::types::header::HeaderVersionFields;
+        let regtest = ActivationHeights::regtest();
+        let v0 = |number| {
+            Header {
+                umm_root: Some(Bytes::new()),
+                version_fields: Some(HeaderVersionFields {
+                    version: 0,
+                    edges: Some(vec![1]),
+                    base_event: Some(Bytes::new()),
+                }),
+                ..dummy_header(number)
+            }
+            .with_activations(&regtest)
+        };
+        let mut commitment = vec![0xe2, 0x02, 0xa0];
+        commitment.extend_from_slice(&[0x55; 32]);
+        let mut slot = Vec::new();
+        commitment.as_slice().encode(&mut slot);
+        let held = Header {
+            umm_root: Some(Bytes::new()),
+            extension_data: Some(Bytes::from(slot)),
+            ..dummy_header(6)
+        }
+        .with_activations(&regtest);
+        let (batched, single) = (v0(5), v0(7));
+        let uncles = vec![batched.clone(), held.clone()];
+
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path())
+            .unwrap()
+            .with_activations(regtest.clone());
+        // A total difficulty no entry passes, so the head stays where it is.
+        let entries = [(&batched, U256::from(1)), (&held, U256::from(2))];
+        store
+            .store_headers_batch(&entries, None, U256::MAX)
+            .unwrap();
+        store.put_header(&single).unwrap();
+        store.put_body(single.hash(), &[], &uncles).unwrap();
+        for header in [&batched, &held, &single] {
+            assert_eq!(store.header(header.hash()).unwrap().as_ref(), Some(header));
+        }
+        assert_eq!(store.uncles(single.hash()).unwrap(), Some(uncles.clone()));
+
+        let frozen = tempdir().unwrap();
+        let freezer = crate::freezer::Freezer::open(frozen.path())
+            .unwrap()
+            .with_activations(regtest);
+        freezer.put(7, &single).unwrap();
+        freezer.put_uncles(7, &uncles).unwrap();
+        freezer.sync().unwrap();
+        assert_eq!(freezer.header(7).unwrap(), Some(single));
+        // The freezer's uncles come with the hashes its reader caches.
+        let read: Vec<_> = freezer.uncles(7).unwrap().unwrap();
+        assert_eq!(read.len(), uncles.len());
+        for (read, uncle) in read.into_iter().zip(&uncles) {
+            let uncached = Header {
+                cached_hash: None,
+                cached_hash_for_merged_mining: None,
+                ..read
+            };
+            assert_eq!(&uncached, uncle);
+        }
+    }
+
+    /// A header held completed, with the RSKIP-351 extension that came beside
+    /// its body, is kept when it comes again compressed, as a peer's headers
+    /// response sends it, holding only the commitment to that extension. The
+    /// copy written over it lost the bloom and the execution edges while the
+    /// body stayed beside it: testnet's #8,295,561 and #8,295,940, blocks of
+    /// rskj's chain, were then refused beside the chain for want of their
+    /// edges, on 14 November 2026.
+    #[test]
+    fn a_completed_header_is_kept_when_it_comes_again_compressed() {
+        use rustock_core::config::ActivationHeights;
+        use rustock_core::types::header_extension::BlockHeaderExtension;
+        let regtest = ActivationHeights::regtest();
+        let extension = BlockHeaderExtension::V2 {
+            logs_bloom: vec![0x11; 256],
+            edges: Some(vec![1]),
+            base_event: Some(Vec::new()),
+        };
+        let mut slot = Vec::new();
+        extension
+            .create_extension_data()
+            .as_slice()
+            .encode(&mut slot);
+        let compressed = Header {
+            umm_root: Some(Bytes::new()),
+            extension_data: Some(Bytes::from(slot)),
+            ..dummy_header(6)
+        }
+        .with_activations(&regtest);
+        let completed = compressed
+            .with_extension(&extension)
+            .expect("the extension its commitment names");
+        let hash = compressed.hash();
+        assert_eq!(completed.hash(), hash);
+
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path())
+            .unwrap()
+            .with_activations(regtest);
+        // A total difficulty no entry passes, so the head stays where it is.
+        for header in [&compressed, &completed] {
+            store
+                .store_headers_batch(&[(header, U256::from(1))], None, U256::MAX)
+                .unwrap();
+        }
+        assert_eq!(
+            store.header(hash).unwrap().unwrap().extension(),
+            Some(extension.clone())
+        );
+
+        store
+            .store_headers_batch(&[(&compressed, U256::from(1))], None, U256::MAX)
+            .unwrap();
+        assert_eq!(
+            store.header(hash).unwrap().unwrap().extension(),
+            Some(extension),
+            "the compressed copy took the place of the header its body completed"
+        );
     }
 
     #[test]
@@ -2248,6 +2849,76 @@ mod tests {
         // But the header should still be stored
         assert!(store.header(h.hash()).unwrap().is_some());
         assert_eq!(store.total_difficulty(h.hash()).unwrap(), Some(U256::from(5)));
+    }
+
+    /// A sibling of the head with the same total difficulty takes the head as
+    /// rskj's `SelectionRule.shouldWeAddThisBlock` lets it, not by having
+    /// arrived second: with fees alike, the lower hash takes it; more than
+    /// twice the head's fees take it whatever the hashes; and a head that paid
+    /// twice the sibling's fees or more, or two blocks that paid nothing, stay.
+    #[test]
+    fn test_store_headers_batch_settles_a_tie_by_rskj_selection_rule() {
+        use rustock_core::selection_rule::is_this_block_hash_smaller;
+
+        // Whether a sibling paying `fees`, whose hash is below the head's if
+        // `lower`, takes the head from one at #2 paying `head_fees`.
+        fn takes(head_fees: u64, fees: u64, lower: bool) -> bool {
+            let dir = tempdir().unwrap();
+            let store = BlockStore::open(dir.path()).unwrap();
+            let chain = build_and_store_chain(&store, 2, 10, 0xAA);
+            let (parent, parent_td) = (chain[1].0.hash(), chain[1].1);
+            let td = parent_td + U256::from(10u64);
+            let sibling = |fees: u64, tag: u8| {
+                let mut h = make_chain_header(2, parent, 10, tag);
+                h.paid_fees = U256::from(fees);
+                h
+            };
+
+            let head = sibling(head_fees, 0);
+            store
+                .store_headers_batch(&[(&head, td)], Some(parent), parent_td)
+                .unwrap();
+            assert_eq!(store.head().unwrap(), Some(head.hash()));
+
+            let newcomer = (1..=u8::MAX)
+                .map(|tag| sibling(fees, tag))
+                .find(|h| is_this_block_hash_smaller(&h.hash(), &head.hash()) == lower)
+                .expect("a tag that hashes to the side wanted");
+            let new_head = store
+                .store_headers_batch(&[(&newcomer, td)], Some(head.hash()), td)
+                .unwrap();
+            assert_eq!(store.head().unwrap(), new_head);
+            let took = new_head == Some(newcomer.hash());
+            let canonical = if took { newcomer.hash() } else { head.hash() };
+            assert_eq!(store.canonical_hash(2).unwrap(), Some(canonical));
+            assert!(
+                store.header(newcomer.hash()).unwrap().is_some(),
+                "the loser is kept too"
+            );
+            took
+        }
+
+        assert!(
+            takes(100, 100, true),
+            "fees alike: the lower hash takes the head"
+        );
+        assert!(!takes(100, 100, false), "fees alike: a higher hash doesn't");
+        assert!(
+            takes(100, 201, false),
+            "more than twice the head's fees, whatever the hashes"
+        );
+        assert!(
+            !takes(100, 200, false),
+            "twice is not more than twice: the hashes decide"
+        );
+        assert!(
+            !takes(200, 100, true),
+            "a head that paid twice the newcomer's fees stays"
+        );
+        assert!(
+            !takes(0, 0, true),
+            "two blocks that paid nothing: the one held first stays"
+        );
     }
 
     // --- Reorg / canonical chain tests ---
@@ -2858,6 +3529,24 @@ mod tests {
     }
 
     #[test]
+    fn uncles_reads_the_uncles_of_a_body_past_its_transactions() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let hash = B256::repeat_byte(0xCC);
+        assert_eq!(store.uncles(hash).unwrap(), None, "no body, no answer");
+
+        let txs: Vec<Transaction> = (0..10).map(dummy_tx).collect();
+        let ommers: Vec<Header> = (100..103).map(dummy_header).collect();
+        store.put_body(hash, &txs, &ommers).unwrap();
+        let (_, from_body) = store.body(hash).unwrap().unwrap();
+        assert_eq!(store.uncles(hash).unwrap(), Some(from_body));
+
+        // A body that names none answers none, which is not the same as no body.
+        store.put_body(hash, &txs, &[]).unwrap();
+        assert_eq!(store.uncles(hash).unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
     fn test_put_body_overwrite() {
         let dir = tempdir().unwrap();
         let store = BlockStore::open(dir.path()).unwrap();
@@ -2945,21 +3634,22 @@ mod tests {
     /// callers pass to `eth_getTransactionReceipt` and the one
     /// `eth_getBlockByNumber` hands out.
     ///
-    /// `Transaction::tx_hash()` hashes `rlp_for_trie()`, which returns the
-    /// ORIGINAL bytes when they were cached at decode time. An earlier version
+    /// `Transaction::tx_hash()` hashes `rlp_for_trie()`, the encoding rskj
+    /// hashes the transaction by, kept when it was read. An earlier version
     /// of `index_block_transactions` re-encoded instead, so for any transaction
-    /// whose RLP does not round-trip byte-for-byte it stored a key nobody would
-    /// ever look up. Reproducing rskj's non-canonical encodings is precisely why
-    /// `cached_rlp` exists, so such transactions are expected, not hypothetical.
+    /// whose rskj encoding is not canonical RLP it stored a key nobody would
+    /// ever look up. rskj writes a zero gas price as the byte 0x00, as the
+    /// federators' free bridge transactions carry it, so such transactions are
+    /// expected, not hypothetical.
     #[test]
     fn index_block_transactions_keys_by_the_canonical_hash_not_a_reencode() {
         let dir = tempdir().unwrap();
         let store = BlockStore::open(dir.path()).unwrap();
         let block_hash = B256::repeat_byte(0xAB);
 
-        let mut tx = Transaction {
+        let tx = Transaction {
             nonce: 7,
-            gas_price: U256::from(1),
+            gas_price: U256::ZERO,
             gas_limit: U256::from(21_000),
             to: Bytes::copy_from_slice(Address::repeat_byte(0xCC).as_slice()),
             value: U256::from(5),
@@ -2969,14 +3659,16 @@ mod tests {
             s: U256::from(2),
             cached_rlp: None,
         };
-
-        // Bytes that deliberately differ from what re-encoding would produce,
-        // standing in for a transaction whose stored RLP is not reproducible.
         let mut reencoded = Vec::new();
         tx.encode(&mut reencoded);
+
+        // The same transaction as rskj writes it: its zero gas price, after
+        // the list's header and the nonce, the byte 0x00 rather than empty.
+        assert_eq!(reencoded[1..3], [0x07, 0x80]);
         let mut original = reencoded.clone();
-        original.push(0x00);
-        tx.cached_rlp = Some(original);
+        original[2] = 0x00;
+        let tx = <Transaction as alloy_rlp::Decodable>::decode(&mut original.as_slice()).unwrap();
+        assert_eq!(tx.rlp_for_trie(), original, "rskj keeps the byte");
 
         let canonical = tx.tx_hash();
         assert_ne!(
@@ -3114,6 +3806,58 @@ mod tests {
         assert_eq!(found[0].2, 1, "log index within the receipt is preserved");
     }
 
+    /// A block the chain left takes its Bridge events out of the index with
+    /// it, and only its own: the block that has its height now, and blocks at
+    /// other heights, keep theirs.
+    #[test]
+    fn remove_bridge_events_takes_out_only_the_block_left() {
+        use rustock_core::Log;
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let bridge = Address::repeat_byte(0x06);
+        let topic = B256::repeat_byte(0xA1);
+        let receipt = |data: &[u8]| Receipt {
+            post_tx_state: vec![1],
+            cumulative_gas_used: 0,
+            gas_used: 0,
+            logs_bloom: alloy_primitives::Bloom::ZERO,
+            status: true,
+            logs: vec![
+                Log {
+                    address: Address::repeat_byte(0x99),
+                    topics: vec![topic],
+                    data: vec![].into(),
+                },
+                Log {
+                    address: bridge,
+                    topics: vec![topic],
+                    data: data.to_vec().into(),
+                },
+            ],
+        };
+        let left = vec![receipt(b"left")];
+        store.index_bridge_events(7, &left, &[], bridge).unwrap();
+        store
+            .index_bridge_events(8, &[receipt(b"above")], &[], bridge)
+            .unwrap();
+
+        assert_eq!(store.remove_bridge_events(7, &left, bridge).unwrap(), 1);
+        let found = store.scan_bridge_events(topic, 0, u64::MAX).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].0, found[0].5.as_slice()),
+            (8, b"above".as_slice())
+        );
+
+        // The block taken up at #7 in its place indexes its own.
+        store
+            .index_bridge_events(7, &[receipt(b"taken up")], &[], bridge)
+            .unwrap();
+        let found = store.scan_bridge_events(topic, 7, 7).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].5, b"taken up");
+    }
+
     #[test]
     fn test_tx_index_put_and_get() {
         let dir = tempdir().unwrap();
@@ -3158,6 +3902,92 @@ mod tests {
             assert_eq!(found_block, block_hash);
             assert_eq!(found_idx, i as u32);
         }
+    }
+
+    /// A transaction a reorg put in a block of each branch is found in the
+    /// canonical one, whichever was written last, as rskj's
+    /// `ReceiptStoreImplV2.getInMainChain` finds it, and in none while no block
+    /// holding it is canonical (upstream #343). The index keeps both blocks,
+    /// each once.
+    #[test]
+    fn a_transaction_is_found_in_the_canonical_block_that_holds_it() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let tx = dummy_tx(0);
+        let hash = tx.tx_hash();
+        // Two blocks at #5, one on each branch; the second holds it second.
+        let first = dummy_header(5);
+        let second = Header {
+            timestamp: 1,
+            ..dummy_header(5)
+        };
+        store.put_header(&first).unwrap();
+        store.put_header(&second).unwrap();
+        store
+            .index_block_transactions(first.hash(), std::slice::from_ref(&tx))
+            .unwrap();
+        store
+            .index_block_transactions(second.hash(), &[dummy_tx(1), tx.clone()])
+            .unwrap();
+        store
+            .index_block_transactions(first.hash(), std::slice::from_ref(&tx))
+            .unwrap();
+        assert_eq!(
+            store.tx_locations(hash).unwrap(),
+            [(first.hash(), 0), (second.hash(), 1)]
+        );
+        assert_eq!(store.tx_location(hash).unwrap(), Some((second.hash(), 1)));
+
+        assert_eq!(store.tx_location_in_main_chain(hash).unwrap(), None);
+        store.put_canonical_hash(5, first.hash()).unwrap();
+        assert_eq!(
+            store.tx_location_in_main_chain(hash).unwrap(),
+            Some((first.hash(), 0))
+        );
+        store.put_canonical_hash(5, second.hash()).unwrap();
+        assert_eq!(
+            store.tx_location_in_main_chain(hash).unwrap(),
+            Some((second.hash(), 1))
+        );
+        store
+            .put_canonical_hash(5, B256::repeat_byte(0x99))
+            .unwrap();
+        assert_eq!(store.tx_location_in_main_chain(hash).unwrap(), None);
+
+        // A block the store holds no header of is passed over, as rskj's
+        // `getInMainChain` passes over a block it can't read.
+        let other = dummy_tx(2);
+        store
+            .index_block_transactions(B256::repeat_byte(0x77), std::slice::from_ref(&other))
+            .unwrap();
+        store
+            .index_block_transactions(first.hash(), std::slice::from_ref(&other))
+            .unwrap();
+        store.put_canonical_hash(5, first.hash()).unwrap();
+        assert_eq!(
+            store.tx_location_in_main_chain(other.tx_hash()).unwrap(),
+            Some((first.hash(), 0))
+        );
+
+        // An entry that isn't whole is refused.
+        let cf = store.cf(CF_TX_INDEX).unwrap();
+        store
+            .db
+            .put_cf(cf, B256::repeat_byte(0x55).as_slice(), [0u8; 35])
+            .unwrap();
+        assert!(store.tx_locations(B256::repeat_byte(0x55)).is_err());
+        store
+            .db
+            .put_cf(cf, B256::repeat_byte(0x55).as_slice(), [0u8; 73])
+            .unwrap();
+        assert!(store.tx_location(B256::repeat_byte(0x55)).is_err());
+        store
+            .db
+            .put_cf(cf, B256::repeat_byte(0x55).as_slice(), [0u8; 0])
+            .unwrap();
+        assert!(store
+            .tx_location_in_main_chain(B256::repeat_byte(0x55))
+            .is_err());
     }
 
     #[test]

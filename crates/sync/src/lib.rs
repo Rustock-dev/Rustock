@@ -1,3 +1,5 @@
+pub mod announce;
+mod block_nodes;
 pub mod execution_commit;
 pub mod import;
 pub mod sampler;
@@ -10,6 +12,7 @@ mod manager;
 mod progress;
 mod service;
 mod state;
+mod total_difficulty;
 mod tracker;
 pub mod chain_activity;
 pub mod gas_price;
@@ -23,8 +26,9 @@ pub mod txpool;
 pub mod watchdog;
 
 // Re-exports for external consumers
+pub use announce::{broadcast_block, on_mined};
 pub use events::SyncEvent;
-pub use handler::SyncHandler;
+pub use handler::{parse_banned_miners, SyncHandler};
 pub use manager::SyncManager;
 pub use service::{BestBlockListeners, ExternalBlockSource, SyncService};
 pub use state::{InFlightBody, SyncState};

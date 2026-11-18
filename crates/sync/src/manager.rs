@@ -8,7 +8,7 @@ use rustock_networking::protocol::{
 use alloy_primitives::{B256, B512, U256};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use tracing::{debug, trace, warn};
 
@@ -50,6 +50,10 @@ pub struct SyncManager {
     /// header difficulty. Bounded, because it is an optimisation and a peer
     /// could otherwise grow it without limit.
     proven: Mutex<HashMap<B256, U256>>,
+    /// The peers known to hold each block heard of lately, so that a block
+    /// is announced only to the peers that lack it. See
+    /// [`crate::block_nodes`].
+    block_nodes: Mutex<crate::block_nodes::BlockNodes>,
 }
 
 /// How many proved cumulative difficulties to keep. A skeleton chunk is 192
@@ -70,6 +74,7 @@ impl SyncManager {
             unlinked: Mutex::new(UnlinkedHeaders::new()),
             uncle_guard: Mutex::new(crate::uncle_guard::UncleGuard::new()),
             proven: Mutex::new(HashMap::new()),
+            block_nodes: Mutex::new(crate::block_nodes::BlockNodes::new()),
         }
     }
 
@@ -80,6 +85,20 @@ impl SyncManager {
         self.ingest_headers(headers, Some(peer))
     }
 
+    /// rskj's relay validator, past the rules every header meets
+    /// ([`HeaderVerifier::verify_for_relay`]), against the parent this node
+    /// holds. A header whose parent it lacks passes: rskj judges a block so
+    /// only once its ancestors are in hand.
+    pub fn verify_for_relay(
+        &self,
+        header: &Header,
+    ) -> std::result::Result<(), rustock_core::validation::ValidationError> {
+        match self.store.header(header.parent_hash) {
+            Ok(Some(parent)) => self.verifier.verify_for_relay(header, &parent),
+            _ => Ok(()),
+        }
+    }
+
     /// Record the cumulative difficulties proved by `entries`, and hand back
     /// the bare headers for the ordinary ingest path.
     ///
@@ -87,7 +106,7 @@ impl SyncManager {
     /// match the trunk header's `ommers_hash`, so these figures are as sound
     /// as the header's own proof of work.
     pub fn note_proven_difficulties(&self, entries: Vec<HeaderWithUncles>) -> Vec<Header> {
-        let mut proven = self.proven.lock().unwrap();
+        let mut proven = self.proven.lock().unwrap_or_else(PoisonError::into_inner);
         if proven.len() + entries.len() > MAX_PROVEN {
             // Everything in here is re-derivable from a later request, so
             // dropping the lot is cheaper than tracking an eviction order.
@@ -148,13 +167,13 @@ impl SyncManager {
         // several of its own blocks and have the work counted each time --
         // capped only by `uncleListLimit`, so up to eleven times the trunk
         // work actually performed.
-        let mut guard = self.uncle_guard.lock().unwrap();
-        if let Err(why) = guard.uncles_are_admissible(
-            &self.store,
-            &self.verifier,
-            &entry.header,
-            &entry.uncles,
-        ) {
+        let mut guard = self
+            .uncle_guard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Err(why) =
+            guard.uncles_are_admissible(&self.store, &self.verifier, &entry.header, &entry.uncles)
+        {
             warn!(
                 target: "rustock::sync",
                 "Block #{}: uncles not admissible ({why}); ignoring the \
@@ -165,6 +184,101 @@ impl SyncManager {
         }
         guard.record(&entry.header, entry.uncles.clone());
         true
+    }
+
+    /// What a block adds to the chain's work from what this node holds: with
+    /// its uncles in hand, its own difficulty and theirs once they pass the
+    /// whole uncle rule; without, its own difficulty alone, the lower bound a
+    /// bare header gives.
+    fn held_contribution(&self, hash: B256, header: &Header) -> U256 {
+        let Some(uncles) = crate::total_difficulty::held_uncles(&self.store, hash, header) else {
+            return header.difficulty;
+        };
+        match crate::total_difficulty::credited_uncles(&self.store, &self.verifier, header, &uncles)
+        {
+            Ok(credited) => header.difficulty.saturating_add(credited),
+            Err(why) => {
+                debug!(
+                    target: "rustock::sync",
+                    "Block #{}: its uncles are not credited with their difficulty: {why}",
+                    header.number
+                );
+                header.difficulty
+            }
+        }
+    }
+
+    /// Record what a block sent whole adds to the chain's work, from the
+    /// uncles that came with it: its own difficulty and theirs, once they
+    /// pass the whole uncle rule against the ancestry this node holds. The
+    /// header's ingest then gives the block the total rskj gives it on
+    /// connecting it (`Block.getCumulativeDifficulty`), and the head is
+    /// picked by that, where a bare header's lower bound would leave a block
+    /// whose uncles carry it past the head beside the chain.
+    ///
+    /// The caller has held the body to the header's commitments, so the list
+    /// is the one the block's miner chose. Uncles that can't be judged, or
+    /// that fail the rule, are left to the ordinary path, which counts the
+    /// header alone.
+    pub(crate) fn note_whole_block_difficulty(&self, header: &Header, uncles: &[Header]) {
+        if uncles.is_empty() {
+            return;
+        }
+        match crate::total_difficulty::credited_uncles(&self.store, &self.verifier, header, uncles)
+        {
+            Ok(credited) => {
+                let mut proven = self.proven.lock().unwrap_or_else(PoisonError::into_inner);
+                if proven.len() >= MAX_PROVEN {
+                    proven.clear();
+                }
+                proven.insert(header.hash(), header.difficulty.saturating_add(credited));
+            }
+            Err(why) => debug!(
+                target: "rustock::sync",
+                "Block #{}: its uncles are not credited with their difficulty: {why}",
+                header.number
+            ),
+        }
+    }
+
+    /// Settle the total difficulty of each of `blocks`, oldest first, now that
+    /// their bodies are held. See [`crate::total_difficulty`].
+    ///
+    /// Stops at the first it cannot settle, a block without its body or whose
+    /// parent has no total, because every total above it would start from a
+    /// bound. Returns how many it settled.
+    pub(crate) fn settle_total_difficulties(&self, blocks: &[(B256, Header)]) -> usize {
+        for (settled, (hash, header)) in blocks.iter().enumerate() {
+            let Ok(Some(uncles)) = self.store.uncles(*hash) else {
+                return settled;
+            };
+            if !self.settle_total_difficulty(*hash, header, &uncles) {
+                return settled;
+            }
+        }
+        blocks.len()
+    }
+
+    /// Settle one block's total difficulty from the uncles its body names.
+    /// `false` when it cannot be settled: its parent has no total, or the
+    /// store failed.
+    pub(crate) fn settle_total_difficulty(
+        &self,
+        hash: B256,
+        header: &Header,
+        uncles: &[Header],
+    ) -> bool {
+        match crate::total_difficulty::settle(&self.store, &self.verifier, hash, header, uncles) {
+            Ok(settled) => settled.is_some(),
+            Err(e) => {
+                warn!(
+                    target: "rustock::sync",
+                    "Could not settle the total difficulty of #{} ({:?}): {e}",
+                    header.number, hash
+                );
+                false
+            }
+        }
     }
 
     /// The body of [`Self::handle_headers_response`], with the peer optional so
@@ -233,6 +347,22 @@ impl SyncManager {
 
             let already_stored = self.store.header(hash)?.is_some();
 
+            // What this block adds to the chain's work: its own difficulty and
+            // its uncles', and uncle headers travel only in the body. In order
+            // of what can be proved: the uncles this peer sent with the header;
+            // then the uncles of a body this node holds, once they pass the
+            // whole uncle rule; otherwise -- plain header-first sync from an
+            // `rsk/62` peer, which is every rskj node -- the header difficulty
+            // alone. That is a lower bound, and `crate::total_difficulty`
+            // settles it once the body is in.
+            let proven = self
+                .proven
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&hash)
+                .copied();
+            let contribution = proven.unwrap_or_else(|| self.held_contribution(hash, header));
+
             // The parent is the block named by `parent_hash`, and nothing else.
             // Take it from the chunk when the previous entry *is* that block,
             // otherwise from the store.
@@ -258,13 +388,17 @@ impl SyncManager {
                         // Held already, so it was verified when it was first
                         // stored. Carry its committed total difficulty rather
                         // than recomputing one from a parent of zero, which
-                        // would rewrite a real chain's weight downward.
+                        // would rewrite a real chain's weight downward. What
+                        // the block adds is taken off here and added back
+                        // below, so the total stays as stored; taking off its
+                        // own difficulty alone would count its uncles twice
+                        // once its total holds them.
                         parent_ref = None;
                         parent_td = self
                             .store
                             .total_difficulty(hash)?
                             .unwrap_or_default()
-                            .saturating_sub(header.difficulty);
+                            .saturating_sub(contribution);
                     } else {
                         // The named parent is not held, so there is nothing to
                         // verify this header against. Storing it anyway is how
@@ -283,7 +417,10 @@ impl SyncManager {
                         // search is verified normally.
                         unlinked_here += 1;
                         if let Some(p) = peer {
-                            self.unlinked.lock().unwrap().record(p, hash, header.number, now);
+                            self.unlinked
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .record(p, hash, header.number, now);
                         }
                         // Deliberately leave `prev_in_chunk` alone. A refused
                         // header must not seed a total difficulty for the next
@@ -294,26 +431,6 @@ impl SyncManager {
                 }
             }
 
-            // Total difficulty counts the uncle difficulties too, and those
-            // live only in the body -- a header records `uncle_count` and
-            // nothing more. During header-first sync the body has usually not
-            // arrived, so this is the header difficulty alone: a lower bound,
-            // corrected once the body lands. A block that declares no uncles
-            // needs no body, and `cumulative_difficulty` says so without a read.
-            // Total difficulty counts uncle difficulty too, and uncle headers
-            // live only in the body. In order of what can actually be proved:
-            // the uncles this peer sent with the header, then a body this node
-            // already holds, then -- during plain header-first sync, where
-            // neither exists -- the header difficulty alone, which is a lower
-            // bound and the reason `rsk/63` carries the uncles at all.
-            let contribution = self
-                .proven
-                .lock()
-                .unwrap()
-                .get(&hash)
-                .copied()
-                .or_else(|| self.store.cumulative_difficulty(hash, header).ok().flatten())
-                .unwrap_or(header.difficulty);
             let new_td = parent_td + contribution;
 
             // For NEW headers with a known parent, run full verification.
@@ -381,14 +498,20 @@ impl SyncManager {
     ///
     /// Marks the search as taken, so the caller cannot forget to.
     pub fn consider_fork_search(&self, peer: &B512) -> Verdict {
-        self.unlinked.lock().unwrap().consider(peer, Instant::now())
+        self.unlinked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .consider(peer, Instant::now())
     }
 
     /// Whether this peer is still sending headers we cannot connect to after a
     /// search already resolved where its chain diverges — a peer not serving
     /// the chain it agreed on.
     pub fn unlinked_persisted_after_search(&self, peer: &B512) -> bool {
-        self.unlinked.lock().unwrap().persisted_after_search(peer)
+        self.unlinked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .persisted_after_search(peer)
     }
 
     /// See [`UnlinkedHeaders::backdate`].
@@ -399,7 +522,28 @@ impl SyncManager {
 
     /// Releases a disconnected peer's evidence.
     pub fn forget_peer(&self, peer: &B512) {
-        self.unlinked.lock().unwrap().clear_peer(peer);
+        self.unlinked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear_peer(peer);
+    }
+
+    /// Remembers that `peer` holds `block`: rskj
+    /// `BlockNodeInformation.addBlockToNode`.
+    pub(crate) fn note_block_holder(&self, block: B256, peer: B512) {
+        self.block_nodes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .add(block, peer);
+    }
+
+    /// The peers known to hold `block`: rskj
+    /// `BlockNodeInformation.getNodesByBlock`.
+    pub(crate) fn block_holders(&self, block: B256) -> std::collections::HashSet<B512> {
+        self.block_nodes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .nodes(block)
     }
 
     /// Helper to create a headers request message.

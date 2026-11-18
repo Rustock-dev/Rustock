@@ -73,6 +73,23 @@ a free denial of service. Now the peer is charged, the session is abandoned,
 and another starts against a different peer — up to `MAX_SNAP_ATTEMPTS` (5),
 carrying forward the list of peers already found unhelpful.
 
+### Nor can five failures
+
+When the attempts are spent, a node that has executed something hands over to
+ordinary sync, which can execute the blocks it is missing. A node that has
+executed nothing cannot: all it holds are the headers the sessions wrote, and
+nothing to execute them from. On mainnet on 6 November 2026 a light node handed
+over anyway, and ordinary sync tried three times to execute #9,372,260 on top
+of genesis, said "this node holds headers it has no way to execute", and
+stopped until someone restarted it.
+
+So such a node stays out of ordinary sync and tries snapshot sync again, after
+30 minutes, then after twice as long each time up to a day, one attempt per
+wait, and with every peer asked again: one set aside may have been set aside
+through no fault of its own (those five attempts failed on a bug in this
+client), and it may be the only one serving snapshots. A failure that keeps
+repeating costs one state download a day.
+
 ### The header walk runs in parallel
 
 For a node that starts with nothing, step 2 covers the whole mainnet chain:
@@ -588,10 +605,21 @@ Given the state root `R` the client trusts:
    in from the child the tree gave it, or from the stub hash the chunk supplied
    for a subtree it did not carry; embedded children re-prefixed with a
    one-byte length; a long value replaced by its keccak and a three-byte
-   length, the bytes kept aside to store separately. Its hash is the keccak of
-   that message.
+   length, the bytes kept aside to store separately -- an embedded child's
+   as well as the node's own. Its hash is the keccak of that message. A child
+   the tree hangs where the node's flags have none is refused: it would not
+   enter the message, so nothing would tie it to the root.
 
-5. **Compare the tree root's hash with `R`.** Everything stands or falls here.
+5. **Compare the tree root's hash with `R`.** The nodes and their shape stand
+   or fall here.
+
+6. **Place the chunk.** The rebuilt tree is the top of the real trie, and a
+   subtree it left out keeps its size: a parent's `children_size` commits to
+   both children together, so beside a carried child the other is the
+   difference. Descending from the root places every carried node at its
+   offset, by the arithmetic of the seek. The chunk's own nodes must then fill
+   the stretch from the first's start to the last's end -- their sizes, added
+   up, must equal it -- or the chunk is refused.
 
 ### Why the Cartesian tree is the right tree
 
@@ -612,15 +640,77 @@ what makes the Cartesian tree well defined. Had it been merely non-strict, ties
 would leave the shape ambiguous, and an ambiguous rebuild is a *wrong* answer
 rather than a slow one.
 
+### Where a chunk stops
+
+rskj's format states no offsets, so for a while the client advanced by the
+cell it had asked for. An rskj server does not serve that cell: it serves
+`from` to `from + 50 * 1024`, a constant on its side, whatever the request
+says. On rustock's 100,000-byte grid the last 48,800 bytes of every cell were
+marked done and never fetched. On mainnet at #9,381,160 that was 45.7% of the
+state, found only by the completeness check after an hour's download, on five
+attempts running; `crates/cli/examples/snap_holes.rs` maps such holes, and put
+every missing byte past the first 51,200 of its cell.
+
+So the client advances by what the chunk covers, and asks next for the offset
+just past where it stopped. rskj answers any offset, starting with the node
+that holds it, so the next chunk begins with the node that begins there,
+whatever size the server serves. A chunk that begins after the offset asked
+for is not an answer to it and is charged.
+
+What a chunk covers is its own nodes, placed by step 6, and the node rskj's
+walk stopped at when that one follows them. rskj keeps a node among a chunk's
+own only if it ends before `from + 50 * 1024`, and leaves the first that does
+not on its stack, which it hands back top-first: that node arrives whole,
+first among the nodes still owed their right subtree, and is rebuilt and
+checked with the rest. A node longer than that window -- an account with its
+contract's code embedded in it, or a long value of the Bridge's storage -- is
+never among a chunk's own, wherever it is asked for, and arrives only this
+way. Counted by its own nodes alone, a chunk asked where such a node began
+brought only the node before it, and one asked inside it nothing of its own;
+every answer was taken and none moved the cursor. On testnet at #8,261,160 the
+download stood at 94% for hours.
+
+Asking at the cursor itself, as the client did once it stopped advancing by
+the cell, stalls there too. rskj begins with the node that ends at the offset,
+and when that node has an embedded right child and no separate left one, its
+walk sets out from inside the child and counts the whole node from there. A
+long node is then never kept, and the walk stops at it at once, with the same
+answer every time. Just past the cursor, the walk begins with the node after
+it.
+
+An answer the client takes that moves nothing counts as one that added
+nothing. It did not before: each was taken, and taking one started the count
+again, so the stall never ended the session. Sixty-four such answers in a row
+end it, as sixty-four refusals do, and nobody is charged.
+
+Asking where the last chunk stopped also avoids a fault in rskj's own client,
+which steps by its cell and trusts the chunk for `k * cell` to begin where the
+one before ended. rskj's iterator breaks that: an offset that lands in a
+node's embedded right child puts the walk's position at the child rather than
+the node, everything after it in that chunk is counted too far along, and the
+chunk stops short of its cell. The nodes in the shortfall belong to no chunk at
+all. `asked_where_they_stopped_rskj_chunks_tile_the_trie` in
+`crates/trie/tests/rskj_vectors.rs` shows both: rskj's stepping losing nodes,
+and asking just past where the last chunk stopped losing none.
+`asked_just_past_where_they_stopped_rskj_chunks_tile_any_trie` shows it for
+tries with nodes longer than the window, and
+`a_node_longer_than_the_window_arrives_whole_where_the_walk_stops` where such
+a node comes.
+
+The root also commits to the trie's size, so a rebuilt chunk settles the total
+as a proved one does, and a peer's hint is never the last word on where the
+download ends.
+
 ### What this gives up
 
 Completeness is established *at the end* rather than by construction. If the
 rebuilt root matches, the nodes and their arrangement are the ones the trie
 commits to, since any other set or shape would have to collide with the root
-hash. Sound — but the property arrives as a conclusion rather than falling out
-of a comparison, and a conclusion is easier to get subtly wrong. It is why
-rustock asks for its own format whenever it can, and why this path exists only
-for peers that cannot speak it.
+hash; that the chunk left nothing out between its first node and its last
+comes from step 6. Sound -- but the property arrives as a conclusion rather
+than falling out of a comparison, and a conclusion is easier to get subtly
+wrong. It is why rustock asks for its own format whenever it can, and why this
+path exists only for peers that cannot speak it.
 
 ## Differences from rskj
 

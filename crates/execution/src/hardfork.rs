@@ -40,6 +40,8 @@ pub enum RskNetworkUpgrade {
 
 pub const RSK_MAINNET_CHAIN_ID: u64 = 30;
 pub const RSK_TESTNET_CHAIN_ID: u64 = 31;
+/// rskj `Constants.REGTEST_CHAIN_ID`: its regtest's, and rustock's own.
+pub const RSK_REGTEST_CHAIN_ID: u64 = 33;
 
 /// Mainnet activation heights.
 pub const MAINNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
@@ -62,8 +64,9 @@ pub const MAINNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
 /// Testnet activation heights.
 ///
 /// Ground truth is rskj `rskj-core/src/main/resources/config/testnet.conf`
-/// (rskj 9.1.0). Testnet starts already on wasabi100: bahamas, orchid,
-/// orchid060 and wasabi100 are all height 0 there, unlike mainnet.
+/// (rskj's release VETIVER-9.0.4). Testnet starts already on wasabi100:
+/// bahamas, orchid, orchid060 and wasabi100 are all height 0 there, unlike
+/// mainnet.
 pub const TESTNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
     (0, RskNetworkUpgrade::Genesis),
     (0, RskNetworkUpgrade::Orchid),
@@ -86,6 +89,9 @@ pub const TESTNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
 /// by name are here; every other rule follows its upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusRule {
+    Rskip103,
+    Rskip136,
+    Rskip144,
     Rskip351,
     Rskip535,
     Rskip536,
@@ -95,6 +101,9 @@ impl ConsensusRule {
     /// The rule rskj calls `name` in `consensusRules`.
     pub fn from_rskj_name(name: &str) -> Option<Self> {
         Some(match name {
+            "rskip103" => Self::Rskip103,
+            "rskip136" => Self::Rskip136,
+            "rskip144" => Self::Rskip144,
             "rskip351" => Self::Rskip351,
             "rskip535" => Self::Rskip535,
             "rskip536" => Self::Rskip536,
@@ -104,6 +113,24 @@ impl ConsensusRule {
 }
 
 impl RskNetworkUpgrade {
+    /// The upgrades of rskj's `hardforkActivationHeights` that are rungs of
+    /// this ladder, in their order.
+    const SCHEDULED: [Self; 13] = [
+        Self::Orchid,
+        Self::Wasabi100,
+        Self::TwoToThree,
+        Self::Papyrus200,
+        Self::Iris300,
+        Self::Hop400,
+        Self::Fingerroot500,
+        Self::Arrowhead600,
+        Self::Arrowhead631,
+        Self::Lovell700,
+        Self::Reed800,
+        Self::Reed810,
+        Self::Vetiver900,
+    ];
+
     /// The upgrade rskj calls `name` in `hardforkActivationHeights`, for the
     /// upgrades this ladder models. `bahamas`, `afterBridgeSync`, `orchid060`,
     /// `hop401` and `tbd1000` are rskj names too, but not rungs here; see
@@ -126,6 +153,35 @@ impl RskNetworkUpgrade {
             _ => return None,
         })
     }
+
+    /// rskj's name for the upgrade in `hardforkActivationHeights`.
+    pub fn rskj_name(self) -> &'static str {
+        match self {
+            Self::Genesis => "genesis",
+            Self::Orchid => "orchid",
+            Self::Wasabi100 => "wasabi100",
+            Self::TwoToThree => "twoToThree",
+            Self::Papyrus200 => "papyrus200",
+            Self::Iris300 => "iris300",
+            Self::Hop400 => "hop400",
+            Self::Fingerroot500 => "fingerroot500",
+            Self::Arrowhead600 => "arrowhead600",
+            Self::Arrowhead631 => "arrowhead631",
+            Self::Lovell700 => "lovell700",
+            Self::Reed800 => "reed800",
+            Self::Reed810 => "reed810",
+            Self::Vetiver900 => "vetiver900",
+        }
+    }
+
+    /// Whether the ladder reads this upgrade's rules at the upgrade's own
+    /// height, as rskj reads every rule, and not from the upgrade in force.
+    /// The two upgrades a network leaves out are read so: reed810, which
+    /// mainnet never schedules (RSKIP144, RSKIP351, RSKIP502, RSKIP529 and
+    /// RSKIP536), and arrowhead631, which testnet never does (RSKIP434).
+    fn is_read_at_its_own_height(self) -> bool {
+        matches!(self, Self::Arrowhead631 | Self::Reed810)
+    }
 }
 
 /// Configuration that determines which RSK features are active at a given block.
@@ -134,8 +190,15 @@ pub struct RskHardforkConfig {
     activations: Vec<(u64, RskNetworkUpgrade)>,
     pub chain_id: u64,
     /// Rules scheduled apart from their upgrade (`consensusRules`). `None`
-    /// is rskj's `-1`: never. Empty on every built-in chain.
+    /// is rskj's `-1`: never. Mainnet has RSKIP536 here, as `main.conf` has
+    /// it, and rskj's regtest the three `regtest.conf` moves; the ladders
+    /// without reed810 that have RSKIP536 all the same hold it here too.
     rule_overrides: Vec<(ConsensusRule, Option<u64>)>,
+    /// rskj's `afterBridgeSync`, where `areBridgeTxsPaid` activates: before
+    /// it, the federators' and authorizers' Bridge transactions cost nothing
+    /// (`BridgeUtils.isFreeBridgeTx`). `None` is rskj's `-1`, as on rskj's
+    /// regtest, where they stay free.
+    after_bridge_sync: Option<u64>,
 }
 
 impl RskHardforkConfig {
@@ -143,7 +206,10 @@ impl RskHardforkConfig {
         Self {
             activations: MAINNET_ACTIVATIONS.to_vec(),
             chain_id: RSK_MAINNET_CHAIN_ID,
-            rule_overrides: Vec::new(),
+            // main.conf's `consensusRules`: `rskip536 = 8804200`, a height of
+            // its own where `reference.conf` has reed810.
+            rule_overrides: vec![(ConsensusRule::Rskip536, Some(8_804_200))],
+            after_bridge_sync: Self::after_bridge_sync_for(RSK_MAINNET_CHAIN_ID),
         }
     }
 
@@ -152,14 +218,45 @@ impl RskHardforkConfig {
             activations: TESTNET_ACTIVATIONS.to_vec(),
             chain_id: RSK_TESTNET_CHAIN_ID,
             rule_overrides: Vec::new(),
+            after_bridge_sync: Self::after_bridge_sync_for(RSK_TESTNET_CHAIN_ID),
         }
     }
 
+    /// rustock's own regtest: every upgrade on the ladder from block 0, with
+    /// RSKIP535 from block 1 and every Bridge transaction paid from block 0.
+    /// It schedules neither reed810 nor arrowhead631, so its blocks run as
+    /// one list and the union Bridge's methods stay closed; RSKIP536, which
+    /// rskj has at reed810, it has from block 0 all the same. A chain started
+    /// from an rskj genesis file is rskj's regtest, [`Self::rskj_regtest`].
     pub fn regtest() -> Self {
         Self {
-            activations: vec![(0, RskNetworkUpgrade::Vetiver900)],
-            chain_id: 33,
-            rule_overrides: Vec::new(),
+            activations: Self::from_genesis_without(&[
+                RskNetworkUpgrade::Arrowhead631,
+                RskNetworkUpgrade::Reed810,
+            ]),
+            chain_id: RSK_REGTEST_CHAIN_ID,
+            rule_overrides: vec![(ConsensusRule::Rskip536, Some(0))],
+            after_bridge_sync: Self::after_bridge_sync_for(RSK_REGTEST_CHAIN_ID),
+        }
+    }
+
+    /// rskj's regtest, as its `regtest.conf` schedules it: every upgrade on
+    /// the ladder from block 0 but arrowhead631, which it never schedules;
+    /// RSKIP144, RSKIP351 and RSKIP535 from block 1, so blocks run as their
+    /// sublists from there; and `afterBridgeSync` never, so the federators'
+    /// and authorizers' Bridge transactions stay free. A chain started from
+    /// an rskj genesis file runs on it. `regtest.conf` leaves `tbd1000`, the
+    /// upgrade for RSKIP559, unscheduled, and this ladder doesn't model it.
+    pub fn rskj_regtest() -> Self {
+        Self {
+            activations: Self::from_genesis_without(&[RskNetworkUpgrade::Arrowhead631]),
+            chain_id: RSK_REGTEST_CHAIN_ID,
+            rule_overrides: vec![
+                (ConsensusRule::Rskip144, Some(1)),
+                (ConsensusRule::Rskip351, Some(1)),
+                (ConsensusRule::Rskip535, Some(1)),
+            ],
+            after_bridge_sync: None,
         }
     }
 
@@ -177,11 +274,19 @@ impl RskHardforkConfig {
     /// gated on `reed810` being *scheduled*, and naming Vetiver900 alone
     /// does not schedule it -- see `has_rskip144`. A test that wants
     /// parallel sublists wants [`RskHardforkConfig::all_active_parallel`].
+    ///
+    /// Arrowhead631 is named for the same reason: testnet never schedules
+    /// it, so RSKIP-434 asks whether it is scheduled, not whether a later
+    /// upgrade is active. RSKIP536 is on without reed810, as on mainnet.
     pub fn all_active(chain_id: u64) -> Self {
         Self {
-            activations: vec![(0, RskNetworkUpgrade::Vetiver900)],
+            activations: vec![
+                (0, RskNetworkUpgrade::Arrowhead631),
+                (0, RskNetworkUpgrade::Vetiver900),
+            ],
             chain_id,
-            rule_overrides: Vec::new(),
+            rule_overrides: vec![(ConsensusRule::Rskip536, Some(0))],
+            after_bridge_sync: Self::after_bridge_sync_for(chain_id),
         }
     }
 
@@ -198,6 +303,7 @@ impl RskHardforkConfig {
             ],
             chain_id,
             rule_overrides: Vec::new(),
+            after_bridge_sync: Self::after_bridge_sync_for(chain_id),
         }
     }
 
@@ -211,6 +317,54 @@ impl RskHardforkConfig {
     /// `has_rskip144`.
     pub fn activation_height(&self, upgrade: RskNetworkUpgrade) -> Option<u64> {
         self.activations.iter().find(|(_, u)| *u == upgrade).map(|(h, _)| *h)
+    }
+
+    /// Every upgrade at block 0 but `unscheduled`, which stay at rskj's `-1`.
+    fn from_genesis_without(unscheduled: &[RskNetworkUpgrade]) -> Vec<(u64, RskNetworkUpgrade)> {
+        RskNetworkUpgrade::SCHEDULED
+            .into_iter()
+            .filter(|upgrade| !unscheduled.contains(upgrade))
+            .map(|upgrade| (0, upgrade))
+            .collect()
+    }
+
+    /// The first block `active_upgrade` is at `upgrade` or past it: the
+    /// lowest height of that rung or a later one, or `None` where the
+    /// ladder has none of them.
+    fn in_force_from(&self, upgrade: RskNetworkUpgrade) -> Option<u64> {
+        self.activations
+            .iter()
+            .filter(|(_, rung)| *rung >= upgrade)
+            .map(|(height, _)| *height)
+            .min()
+    }
+
+    /// The first block this ladder has `upgrade`'s rules in force, or `None`
+    /// where it never has: the upgrade's own height for the two read that
+    /// way ([`RskNetworkUpgrade::is_read_at_its_own_height`]), and for every
+    /// other the lowest height of it or a later rung, as `active_upgrade`
+    /// reads it.
+    fn rules_in_force_from(&self, upgrade: RskNetworkUpgrade) -> Option<u64> {
+        if upgrade.is_read_at_its_own_height() {
+            self.activation_height(upgrade)
+        } else {
+            self.in_force_from(upgrade)
+        }
+    }
+
+    /// RSKIP252 (fingerroot500): the first block whose transactions' gas
+    /// prices are capped, or `u64::MAX` where none is. The block rule, the
+    /// miner's selection and the pool's cap all read it.
+    pub fn rskip252_height(&self) -> u64 {
+        self.in_force_from(RskNetworkUpgrade::Fingerroot500)
+            .unwrap_or(u64::MAX)
+    }
+
+    /// RSKIP110 (wasabi100): the first block whose fork detection data is
+    /// checked, or `u64::MAX` where none is.
+    pub fn rskip110_height(&self) -> u64 {
+        self.in_force_from(RskNetworkUpgrade::Wasabi100)
+            .unwrap_or(u64::MAX)
     }
 
     /// rskj `ActivationConfig.ForBlock.isActivating`: the upgrade activates
@@ -235,8 +389,14 @@ impl RskHardforkConfig {
             .unwrap_or(RskNetworkUpgrade::Genesis)
     }
 
-    /// Schedule `upgrade` at `height`, or take it off the ladder with `None`
-    /// (rskj's `-1`). Activations stay ordered by height.
+    /// Schedule `upgrade` at `height`, or take it off the ladder with `None`.
+    /// Activations stay ordered by height.
+    ///
+    /// Off the ladder is rskj's `-1` only for a rung with no later rung
+    /// scheduled, and for reed810 and arrowhead631: every other rung's rules
+    /// are read from the upgrade in force, so a later rung still turns them
+    /// on. [`Self::with_rskj_overrides`], which takes rskj's own schedule,
+    /// refuses what this would read otherwise than rskj.
     pub fn with_hardfork(mut self, upgrade: RskNetworkUpgrade, height: Option<u64>) -> Self {
         self.activations.retain(|(_, u)| *u != upgrade);
         if let Some(h) = height {
@@ -259,17 +419,29 @@ impl RskHardforkConfig {
     }
 
     /// A rung this ladder does not model as such but reads at one height
-    /// per chain: rskj's `bahamas`, `afterBridgeSync` and `hop401`.
+    /// per chain: rskj's `bahamas`, `orchid060` and `hop401`.
     fn fixed_rskj_height(&self, name: &str) -> Option<u64> {
         let (mainnet, testnet) = match name {
             "bahamas" => (3_397, 0),
-            "afterBridgeSync" => (370_000, 114_000),
+            "orchid060" => (1_052_700, 0),
             "hop401" => (4_976_300, 3_362_200),
             _ => return None,
         };
         Some(match self.chain_id {
             RSK_MAINNET_CHAIN_ID => mainnet,
             RSK_TESTNET_CHAIN_ID => testnet,
+            _ => 0,
+        })
+    }
+
+    /// rskj's `afterBridgeSync` on the chain `chain_id` names: `main.conf`'s
+    /// and `testnet.conf`'s heights, and block 0 elsewhere, as rustock's own
+    /// regtest has it. rskj's regtest never reaches it
+    /// ([`Self::rskj_regtest`]).
+    fn after_bridge_sync_for(chain_id: u64) -> Option<u64> {
+        Some(match chain_id {
+            RSK_MAINNET_CHAIN_ID => 370_000,
+            RSK_TESTNET_CHAIN_ID => 114_000,
             _ => 0,
         })
     }
@@ -281,16 +453,22 @@ impl RskHardforkConfig {
     /// What each name does here:
     ///
     /// - A rung of this ladder (`orchid` to `vetiver900`): scheduled at the
-    ///   height, or removed.
-    /// - `bahamas`, `afterBridgeSync`, `hop401`: read at one fixed height per
-    ///   chain, so they are accepted at that height and refused at any other.
-    /// - `orchid060` and `tbd1000`: nothing here reads them. `tbd1000` only
-    ///   turns on RSKIP-559 (deterministic pegout sorting in the Bridge),
-    ///   which this node does not implement. Accepted and reported as such.
-    /// - `rskip351`, `rskip535`, `rskip536`: scheduled apart from their
-    ///   upgrade.
-    /// - `rskipUMM`: follows papyrus200 here, so it is accepted at that height
-    ///   and refused at any other.
+    ///   height, or removed. Refused where the ladder would then read some
+    ///   upgrade's rules from another height than rskj does
+    ///   ([`Self::reads_as_rskj_does`]): with an upgrade left out below a
+    ///   scheduled one, or scheduled out of its order.
+    /// - `afterBridgeSync`: where the federators' and authorizers' Bridge
+    ///   transactions start to be paid, or never.
+    /// - `bahamas`, `orchid060`, `hop401`: read at one fixed height per chain,
+    ///   so they are accepted at that height and refused at any other.
+    /// - `tbd1000`: nothing here reads it. It is rskj's upgrade for RSKIP559,
+    ///   which no network schedules and this node doesn't implement. Accepted
+    ///   and reported as such. Any other name is refused, as rskj's
+    ///   `NetworkUpgrade.named` refuses it.
+    /// - `rskip103`, `rskip136`, `rskip144`, `rskip351`, `rskip535` and
+    ///   `rskip536`: scheduled apart from their upgrade.
+    /// - `rskipUMM`: accepted at any height. Only a header's layout reads it,
+    ///   from the chain's activation heights, which the caller moves.
     ///
     /// Returns the names that were accepted without effect, for the log.
     pub fn with_rskj_overrides(
@@ -299,9 +477,18 @@ impl RskHardforkConfig {
         rules: &[(String, Option<u64>)],
     ) -> Result<(Self, Vec<String>), String> {
         let mut unmodelled = Vec::new();
+        // Where rskj reads each upgrade's rules from: where this ladder has
+        // them in force, until an override names another height.
+        let mut rskj_heights = RskNetworkUpgrade::SCHEDULED
+            .map(|upgrade| (upgrade, self.rules_in_force_from(upgrade)));
         for (name, height) in hardforks {
             if let Some(upgrade) = RskNetworkUpgrade::from_rskj_name(name) {
                 self = self.with_hardfork(upgrade, *height);
+                for named in rskj_heights.iter_mut().filter(|(rung, _)| *rung == upgrade) {
+                    named.1 = *height;
+                }
+            } else if name == "afterBridgeSync" {
+                self.after_bridge_sync = *height;
             } else if let Some(fixed) = self.fixed_rskj_height(name) {
                 if *height != Some(fixed) {
                     return Err(format!(
@@ -309,31 +496,65 @@ impl RskHardforkConfig {
                          cannot move it"
                     ));
                 }
-            } else if matches!(name.as_str(), "orchid060" | "tbd1000") {
+            } else if name == "tbd1000" {
                 unmodelled.push(name.clone());
             } else {
                 return Err(format!("hardfork {name}: not an rskj upgrade name"));
             }
         }
+        self.reads_as_rskj_does(&rskj_heights)?;
         for (name, height) in rules {
             if let Some(rule) = ConsensusRule::from_rskj_name(name) {
                 self = self.with_consensus_rule(rule, *height);
             } else if name == "rskipUMM" {
-                let papyrus200 = self.activation_height(RskNetworkUpgrade::Papyrus200);
-                if *height != papyrus200 {
-                    return Err(format!(
-                        "consensus rule rskipUMM: this node reads it at papyrus200 \
-                         ({papyrus200:?}) and cannot move it"
-                    ));
-                }
+                // Nothing on the ladder reads it.
             } else {
                 return Err(format!(
                     "consensus rule {name}: not one this node schedules on its own \
-                     (rskip351, rskip535, rskip536, rskipUMM)"
+                     (rskip103, rskip136, rskip144, rskip351, rskip535, rskip536, rskipUMM)"
                 ));
             }
         }
         Ok((self, unmodelled))
+    }
+
+    /// Whether this ladder has every upgrade's rules in force from the height
+    /// rskj reads them at, which `rskj_heights` gives for each.
+    ///
+    /// rskj reads each rule at the height of its own upgrade
+    /// (`ActivationConfig.isActive`): an upgrade at `-1` has its rules off for
+    /// good, whatever is scheduled after it, and one scheduled above a later
+    /// upgrade has them off until its own height. This ladder reads a rule
+    /// from the upgrade in force (`active_upgrade() >= X`), and has it on from
+    /// the later upgrade's height in both cases; and an upgrade scheduled
+    /// below an earlier one brings the earlier one's rules down with it. The
+    /// networks leave out only reed810 and arrowhead631, whose rules are read
+    /// at their own heights here as well; rskj's own tests leave out others.
+    /// A schedule this ladder would read otherwise than rskj is refused, not
+    /// run.
+    fn reads_as_rskj_does(
+        &self,
+        rskj_heights: &[(RskNetworkUpgrade, Option<u64>)],
+    ) -> Result<(), String> {
+        let from = |height: Option<u64>| match height {
+            Some(height) => format!("from #{height}"),
+            None => "never".to_string(),
+        };
+        for (upgrade, rskj) in rskj_heights {
+            let here = self.rules_in_force_from(*upgrade);
+            if here != *rskj {
+                return Err(format!(
+                    "hardfork overrides: rskj reads {name}'s rules {rskj}, and this node would \
+                     read them {here}. It reads a rule from the upgrade in force, so no upgrade \
+                     but reed810 and arrowhead631 can be left out below a scheduled one, or \
+                     scheduled out of its order",
+                    name = upgrade.rskj_name(),
+                    rskj = from(*rskj),
+                    here = from(here),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Maps the RSK network upgrade to the closest revm SpecId.
@@ -424,6 +645,14 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Orchid
     }
 
+    /// RSKIP85 (orchid): REMASC holds back a reward, and a federator's share,
+    /// that comes to less than the executing block's minimum gas price times
+    /// its minimum payable gas. rskj reads it at the executing block
+    /// (`Remasc.activations`).
+    pub fn has_rskip85(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Orchid
+    }
+
     /// RSKIP123: multikey federation members; disables the single-key "add"
     /// federation-change function (Wasabi100).
     pub fn has_rskip123(&self, block_number: u64) -> bool {
@@ -498,6 +727,12 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
+    /// RSKIP191: DUPN, SWAPN and TXINDEX, RSK's own opcodes, are removed
+    /// (Iris300). Before it rskj's VM runs them (`VM.executeOpcode`).
+    pub fn has_rskip191(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
     /// RSKIP197: a failing precompile CALL is handled (push 0, refund the
     /// surplus, continue) instead of propagating an exception that aborts the
     /// calling frame and burns all its gas (Iris300). Post-197 a failed
@@ -506,8 +741,22 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
+    /// RSKIP417 (Arrowhead600): the Bridge refuses a method reached by a kind
+    /// of call it does not accept (`Bridge.validateCallMessageType`), and a
+    /// method with nothing to return answers an empty array where it
+    /// answered null (`Bridge.calculateVoidReturnValue`).
+    pub fn has_rskip417(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead600
+    }
+
     /// RSKIP219: updated minimum peg-in tx value (Iris300).
     pub fn has_rskip219(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
+    /// RSKIP218 (iris300): REMASC pays the Core Developers Fund at its new
+    /// address (`Remasc.getRskLabsAddress`), read at the executing block.
+    pub fn has_rskip218(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
@@ -523,7 +772,15 @@ impl RskHardforkConfig {
 
     /// RSKIP284: BTC address-with-version serialization uses a single version
     /// byte instead of `BigInteger.toByteArray()` (Hop400, mainnet 4_598_500).
+    ///
+    /// Testnet moves it: `testnet.conf` sets `rskip284 = 2581800`, 521,200
+    /// blocks before testnet's hop400. Among other things it switches
+    /// testnet's ERP redeem script off the hard-coded one
+    /// (`NonStandardErpRedeemScriptBuilderFactory`).
     pub fn has_rskip284(&self, block_number: u64) -> bool {
+        if self.chain_id == RSK_TESTNET_CHAIN_ID {
+            return block_number >= 2_581_800;
+        }
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
     }
 
@@ -580,15 +837,17 @@ impl RskHardforkConfig {
     }
 
     /// RSKIP305: committed federations become P2SH-P2WSH-ERP federations
-    /// instead of P2SH-ERP (mainnet reed800 = 8,052,200; testnet 6,835,700;
+    /// instead of P2SH-ERP (Reed800: mainnet 8,052,200; testnet 6,835,700;
     /// regtest 0).
     pub fn has_rskip305(&self, block_number: u64) -> bool {
-        let height = match self.chain_id {
-            RSK_MAINNET_CHAIN_ID => 8_052_200,
-            RSK_TESTNET_CHAIN_ID => 6_835_700,
-            _ => 0,
-        };
-        block_number >= height
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Reed800
+    }
+
+    /// RSKIP516 (Reed800): the secp256k1 addition and multiplication
+    /// contracts, and a contract's input to a precompile cut to what the
+    /// precompile reads (`Program.getInputLength`).
+    pub fn has_rskip516(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Reed800
     }
 
     /// RSKIP375: pegouts-waiting-for-signatures keyed by the pegout creation
@@ -605,8 +864,16 @@ impl RskHardforkConfig {
     }
 
     /// RSKIP434: lifts the BTC chainwork-overflow header block (Arrowhead631).
+    ///
+    /// Whether arrowhead631 is scheduled, not an ordinal comparison: testnet
+    /// never schedules it (`arrowhead631 = -1` in `testnet.conf`, and in
+    /// `regtest.conf`), and its lovell700 outranks it, so `>= Arrowhead631`
+    /// turned this on at testnet #6,110,487. Inert there so far, since the
+    /// guard it lifts only applies to Bitcoin mainnet, but it is the trap
+    /// `has_rskip144` describes.
     pub fn has_rskip434(&self, block_number: u64) -> bool {
-        self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead631
+        self.activation_height(RskNetworkUpgrade::Arrowhead631)
+            .is_some_and(|h| block_number >= h)
     }
 
     /// RSKIP415: the `add_signature` event's `federatorRskAddress` topic is
@@ -635,10 +902,19 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
-    /// RSKIP171: a CALL/CREATE that runs no new frame resets the caller's
+    /// RSKIP171: a CALL that opens no new frame resets the caller's
     /// returnDataBuffer (canonical EIP-211), instead of preserving the prior
-    /// call's output as pre-iris rskj did (Iris300).
+    /// call's output as pre-iris rskj did (Iris300). Only rskj's call paths
+    /// run that clean-up (`Program.cleanReturnDataBuffer`): a creation that
+    /// runs no init code leaves the buffer as it was at every height.
     pub fn has_rskip171(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
+    /// RSKIP169: EXTCODEHASH of a contract whose code key holds nothing
+    /// answers `keccak256("")` (rskj `getCodeHashStandard`), where before it
+    /// answered 0 (`getCodeHashNonStandard`) (Iris300).
+    pub fn has_rskip169(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
@@ -709,10 +985,30 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
     }
 
+    /// RSKIP460 (Lovell700): the Bridge reads a Bitcoin output's script bytes
+    /// as they are when it looks for a coinbase's witness commitment. Before
+    /// it, it parsed each script first, and one bitcoinj can't parse threw.
+    pub fn has_rskip460(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
+    }
+
     /// RSKIP459: mark rejected non-refundable peg-ins as processed (Lovell700).
     /// Disabled again by RSKIP551 at Vetiver900.
     pub fn has_rskip459(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
+    }
+
+    /// RSKIP103 (orchid060 — mainnet 1_052_700, testnet/regtest genesis):
+    /// STATICCALL takes no value. Before it rskj's `VM.calculateCallValue`
+    /// takes one off the stack for every call but DELEGATECALL
+    /// (`rsk_instructions::rsk_static_call_with_value`). orchid060 carries no
+    /// other rule, and isn't a rung of this ladder.
+    pub fn has_rskip103(&self, block_number: u64) -> bool {
+        if let Some(height) = self.rule_override(ConsensusRule::Rskip103) {
+            return height.is_some_and(|h| block_number >= h);
+        }
+        self.fixed_rskj_height("orchid060")
+            .is_some_and(|h| block_number >= h)
     }
 
     /// RSKIP136 (bahamas — mainnet 3_397, testnet/regtest genesis): correct
@@ -720,6 +1016,9 @@ impl RskHardforkConfig {
     /// the tx gas limit against the precompile cost alone and recorded
     /// gasUsed = precompileCost + intrinsicCost, which can EXCEED the limit.
     pub fn has_rskip136(&self, block_number: u64) -> bool {
+        if let Some(height) = self.rule_override(ConsensusRule::Rskip136) {
+            return height.is_some_and(|h| block_number >= h);
+        }
         let height = match self.chain_id {
             RSK_MAINNET_CHAIN_ID => 3_397,
             _ => 0,
@@ -758,17 +1057,12 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Wasabi100
     }
 
-    /// areBridgeTxsPaid (rskj reference.conf: afterBridgeSync — mainnet
-    /// 370_000, testnet 114_000). Before activation, federation/authorized
-    /// transactions to the Bridge execute for free with zero gas
-    /// (BridgeUtils.isFreeBridgeTx).
+    /// areBridgeTxsPaid (rskj `reference.conf`: `afterBridgeSync`; mainnet
+    /// 370,000, testnet 114,000, never on rskj's regtest). Before it, the
+    /// federators' and authorizers' transactions to the Bridge execute for
+    /// free with zero gas (`BridgeUtils.isFreeBridgeTx`).
     pub fn has_are_bridge_txs_paid(&self, block_number: u64) -> bool {
-        let height = match self.chain_id {
-            RSK_MAINNET_CHAIN_ID => 370_000,
-            RSK_TESTNET_CHAIN_ID => 114_000,
-            _ => 0,
-        };
-        block_number >= height
+        self.after_bridge_sync.is_some_and(|h| block_number >= h)
     }
 
     /// RSKIP144: parallel transaction execution, and the
@@ -787,7 +1081,13 @@ impl RskHardforkConfig {
     /// inert only because nothing read this predicate yet and mainnet headers
     /// carry no sublist edges. The first thing to depend on it would have
     /// forked the node.
+    ///
+    /// A `consensusRules` entry moves it off reed810, as rskj's
+    /// `regtest.conf` does (`rskip144 = 1`).
     pub fn has_rskip144(&self, block_number: u64) -> bool {
+        if let Some(height) = self.rule_override(ConsensusRule::Rskip144) {
+            return height.is_some_and(|h| block_number >= h);
+        }
         self.activation_height(RskNetworkUpgrade::Reed810)
             .is_some_and(|h| block_number >= h)
     }
@@ -807,31 +1107,74 @@ impl RskHardforkConfig {
             .is_some_and(|h| block_number >= h)
     }
 
+    /// Whether a block runs as its sublists: rskj's
+    /// `areActive(RSKIP351, RSKIP144)`, which picks
+    /// `BlockExecutor.executeParallel` over `executeInternal`.
+    ///
+    /// Everything the sublists bring turns on with this, not with RSKIP-144
+    /// alone: the fees postponed to the REMASC transaction, each sublist's
+    /// own gas limit, the edges rule, the collision check, and receipts
+    /// whose gas restarts at each sublist. The two predicates coincide on
+    /// every network rskj ships; they part only where a `consensusRules`
+    /// override moves rskip351 off reed810, and rskj then executes the
+    /// block as one list, edges or not.
+    pub fn runs_sublists(&self, block_number: u64) -> bool {
+        self.has_rskip144(block_number) && self.has_rskip351(block_number)
+    }
+
+    /// RSKIP502: the union bridge's seven Bridge methods (reed810).
+    ///
+    /// Not an ordinal comparison, for `has_rskip144`'s reason: mainnet
+    /// never schedules reed810, and nothing in `main.conf` moves this rule,
+    /// so rskj keeps the methods off there for good. `>= Reed810` had them
+    /// on from mainnet #8,804,200, where vetiver900 outranks reed810: a
+    /// call that rskj fails as an unknown method, rustock executed.
+    pub fn has_rskip502(&self, block_number: u64) -> bool {
+        self.activation_height(RskNetworkUpgrade::Reed810)
+            .is_some_and(|h| block_number >= h)
+    }
+
+    /// RSKIP529: the union bridge's super and base events, six more Bridge
+    /// methods on RSKIP502's schedule (reed810, never on mainnet).
+    pub fn has_rskip529(&self, block_number: u64) -> bool {
+        self.activation_height(RskNetworkUpgrade::Reed810)
+            .is_some_and(|h| block_number >= h)
+    }
+
     /// RSKIP535: the `baseEvent` header-extension field, which makes the
     /// header version 2.
     ///
-    /// `testnet.conf` sets `rskip535 = 7604200`, the vetiver900 height, with
-    /// the comment "To be activated in testnet only". Mainnet does not set it.
+    /// Each network schedules it on its own, apart from any upgrade:
+    /// `reference.conf` has `rskip535 = -1`, `testnet.conf` sets `7604200`
+    /// (the vetiver900 height, "To be activated in testnet only") and
+    /// `regtest.conf` sets `1`. Mainnet does not set it, so it never
+    /// activates there -- vetiver900 does not imply it.
     pub fn has_rskip535(&self, block_number: u64) -> bool {
         if let Some(height) = self.rule_override(ConsensusRule::Rskip535) {
             return height.is_some_and(|h| block_number >= h);
         }
-        self.active_upgrade(block_number) >= RskNetworkUpgrade::Vetiver900
+        match self.chain_id {
+            RSK_MAINNET_CHAIN_ID => false,
+            RSK_TESTNET_CHAIN_ID => block_number >= 7_604_200,
+            _ => block_number >= 1,
+        }
     }
 
     /// RSKIP536: additional BlockHeader precompile methods. Maps to reed810 in
-    /// reference.conf; mainnet overrides it to the vetiver900 height (8_804_200)
-    /// via main.conf consensusRules. `>= Reed810` is exact on both networks
-    /// because mainnet jumps Reed800 -> Vetiver900 at that height.
+    /// reference.conf; mainnet gives it a height of its own, vetiver900's
+    /// (8_804_200), in main.conf's consensusRules.
     ///
-    /// So this one *is* an ordinal comparison, deliberately, and differs from
-    /// `has_rskip144` right above it: both map to reed810 in reference.conf,
-    /// but mainnet overrides this one and not that one.
+    /// Not an ordinal comparison, for `has_rskip144`'s reason. `>= Reed810`
+    /// is right on both networks as they are, since mainnet jumps from
+    /// Reed800 to Vetiver900 at that height, and wrong once either upgrade
+    /// moves: rskj keeps mainnet's rule at its own height when vetiver900
+    /// moves, and testnet's at reed810 wherever that goes.
     pub fn has_rskip536(&self, block_number: u64) -> bool {
         if let Some(height) = self.rule_override(ConsensusRule::Rskip536) {
             return height.is_some_and(|h| block_number >= h);
         }
-        self.active_upgrade(block_number) >= RskNetworkUpgrade::Reed810
+        self.activation_height(RskNetworkUpgrade::Reed810)
+            .is_some_and(|h| block_number >= h)
     }
 
     /// RSKIP540: min pegout value as extra pegout in fee estimation;
@@ -896,7 +1239,7 @@ fn upgrade_to_spec_id(upgrade: RskNetworkUpgrade) -> SpecId {
 mod fee_settlement_tests {
     use super::*;
 
-    /// Postponing the gas fee to the REMASC transaction is gated on
+    /// Postponing the gas fee to the REMASC transaction needs
     /// RSKIP-144, and RSKIP-144 is unscheduled on mainnet. So every mainnet
     /// block credits the fee inside the transaction that paid it, as it
     /// always has, and this change cannot reach the chain this node follows.
@@ -979,7 +1322,7 @@ mod tests {
         assert!(testnet.has_rskip91(0));
     }
 
-    /// rskj `rskj-core/src/main/resources/config/testnet.conf` (rskj 9.1.0),
+    /// rskj `rskj-core/src/main/resources/config/testnet.conf` (VETIVER-9.0.4),
     /// transcribed as a block. rustock's testnet ladder had drifted: wasabi100
     /// was 863,000 (rskj: 0 — that number is rskj's *papyrus200*), papyrus200
     /// was 1,580,000 (a value that appears nowhere in rskj), twoToThree was
@@ -1283,7 +1626,7 @@ mod override_tests {
     #[test]
     fn the_seed_schedule_turns_reed810_on_above_vetiver900() {
         let (cfg, unmodelled) = seed_ladder();
-        assert_eq!(unmodelled, vec!["orchid060".to_string(), "tbd1000".to_string()]);
+        assert_eq!(unmodelled, vec!["tbd1000".to_string()]);
         assert_eq!(cfg.activation_height(RskNetworkUpgrade::Reed810), Some(9_002_504));
         assert!(!cfg.has_rskip144(9_002_503));
         assert!(cfg.has_rskip144(9_002_504));
@@ -1307,12 +1650,17 @@ mod override_tests {
     #[test]
     fn mainnet_without_overrides_is_unchanged() {
         let cfg = RskHardforkConfig::mainnet();
-        assert_eq!(cfg.rule_overrides, Vec::new());
+        // main.conf's one rule of its own.
+        assert_eq!(
+            cfg.rule_overrides,
+            vec![(ConsensusRule::Rskip536, Some(8_804_200))]
+        );
         assert_eq!(cfg.activation_height(RskNetworkUpgrade::Reed810), None);
         assert!(!cfg.has_rskip144(9_003_580));
         assert!(!cfg.has_rskip351(9_003_580));
-        assert!(cfg.has_rskip535(8_804_200));
-        assert!(!cfg.has_rskip535(8_804_199));
+        // main.conf never sets rskip535 and reference.conf has it at -1.
+        assert!(!cfg.has_rskip535(8_804_200));
+        assert!(!cfg.has_rskip535(9_003_580));
         assert!(cfg.has_rskip536(8_804_200));
         assert_eq!(cfg.active_upgrade(8_804_200), RskNetworkUpgrade::Vetiver900);
         assert_eq!(cfg.active_upgrade(8_804_199), RskNetworkUpgrade::Reed800);
@@ -1330,9 +1678,19 @@ mod override_tests {
         let moved = RskHardforkConfig::mainnet()
             .with_rskj_overrides(&[h("hop401", 5_000_000)], &[]);
         assert!(moved.is_err());
-        let umm = RskHardforkConfig::mainnet()
-            .with_rskj_overrides(&[], &[h("rskipUMM", 1)]);
-        assert!(umm.is_err());
+        // Only a header's layout reads RSKIPUMM, from the chain's heights:
+        // the ladder takes it at any height and changes nothing.
+        let (umm, unmodelled) = RskHardforkConfig::mainnet()
+            .with_rskj_overrides(&[], &[h("rskipUMM", 1)])
+            .unwrap();
+        assert_eq!(umm.activations, RskHardforkConfig::mainnet().activations);
+        assert_eq!(
+            (umm.rule_overrides, unmodelled),
+            (
+                RskHardforkConfig::mainnet().rule_overrides,
+                Vec::<String>::new()
+            )
+        );
         let unknown = RskHardforkConfig::mainnet()
             .with_rskj_overrides(&[h("quartz", 1)], &[]);
         assert!(unknown.is_err());
@@ -1350,5 +1708,419 @@ mod override_tests {
         assert!(!cfg.has_rskip144(8_000_000));
         assert!(!cfg.has_rskip535(8_000_000));
         assert_eq!(cfg.active_upgrade(7_604_200), RskNetworkUpgrade::Vetiver900);
+    }
+
+    /// rskj reads each rule at its own upgrade's height, so an upgrade at -1
+    /// has its rules off for good whatever comes after it; this ladder reads
+    /// a rule from the upgrade in force and would have them on. rskj's own
+    /// tests leave out lovell700, iris300 and arrowhead600 that way (RSKIP438,
+    /// RSKIP445 and RSKIP446; RSKIP174; RSKIP203). No network does, and the
+    /// schedule is refused.
+    #[test]
+    fn an_upgrade_left_out_below_a_scheduled_one_is_refused() {
+        for name in ["lovell700", "iris300", "arrowhead600", "orchid", "reed800"] {
+            for base in [
+                RskHardforkConfig::rskj_regtest(),
+                RskHardforkConfig::regtest(),
+                RskHardforkConfig::mainnet(),
+                RskHardforkConfig::testnet(),
+            ] {
+                let refused = base.with_rskj_overrides(&[h(name, -1)], &[]).unwrap_err();
+                let never = format!("rskj reads {name}'s rules never");
+                assert!(refused.contains(&never), "{refused}");
+            }
+        }
+        // With every later upgrade left out too, the ladder ends below it, and
+        // reads as rskj's does: lovell700's rules are off and arrowhead600's on.
+        let last_four =
+            [h("lovell700", -1), h("reed800", -1), h("reed810", -1), h("vetiver900", -1)];
+        let (ends, _) = RskHardforkConfig::rskj_regtest()
+            .with_rskj_overrides(&last_four, &[])
+            .unwrap();
+        assert_eq!(ends.active_upgrade(u64::MAX), RskNetworkUpgrade::Arrowhead600);
+        assert!(!ends.has_initcode_metering(u64::MAX) && !ends.has_rskip445(u64::MAX));
+        assert!(ends.has_push0(0));
+        // A later upgrade put back over the ones left out would turn theirs on,
+        // though no override names them.
+        let refused = ends.with_rskj_overrides(&[h("vetiver900", 0)], &[]).unwrap_err();
+        assert!(refused.contains("rskj reads lovell700's rules never"), "{refused}");
+        // reed810 and arrowhead631 are read at their own heights, as on the
+        // networks that leave them out, so each may be left out anywhere.
+        let (testnet, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[h("reed810", -1)], &[])
+            .unwrap();
+        assert!(!testnet.has_rskip144(u64::MAX) && testnet.has_rskip540(7_604_200));
+        let (mainnet, _) = RskHardforkConfig::mainnet()
+            .with_rskj_overrides(&[h("arrowhead631", -1)], &[])
+            .unwrap();
+        assert!(!mainnet.has_rskip434(u64::MAX) && mainnet.has_rskip445(7_338_024));
+    }
+
+    /// The same for an upgrade moved out of its order: above a later one its
+    /// rules would be read as in force from the later one's height, and below
+    /// an earlier one it would bring that one's rules down with it.
+    #[test]
+    fn an_upgrade_scheduled_out_of_its_order_is_refused() {
+        let mainnet = RskHardforkConfig::mainnet;
+        // lovell700 above reed800 (#8,052,200).
+        assert!(mainnet().with_rskj_overrides(&[h("lovell700", 8_500_000)], &[]).is_err());
+        // fingerroot500 below hop400 (#4,598,500).
+        assert!(mainnet().with_rskj_overrides(&[h("fingerroot500", 4_000_000)], &[]).is_err());
+        // reed810 below every upgrade mainnet has above #100.
+        assert!(mainnet().with_rskj_overrides(&[h("reed810", 100)], &[]).is_err());
+        // reed810 above vetiver900 is read at its own height, as rskj reads it.
+        assert!(mainnet().with_rskj_overrides(&[h("reed810", 9_002_504)], &[]).is_ok());
+        // An upgrade moved within its order, and two moved together, are taken.
+        assert!(mainnet().with_rskj_overrides(&[h("fingerroot500", 6_000_000)], &[]).is_ok());
+        assert!(mainnet()
+            .with_rskj_overrides(&[h("lovell700", 8_500_000), h("reed800", 8_600_000)], &[])
+            .is_ok());
+        // At one height with its neighbours, as on a regtest, nothing is out of order.
+        assert!(RskHardforkConfig::rskj_regtest()
+            .with_rskj_overrides(&[h("vetiver900", 0), h("orchid", 0)], &[])
+            .is_ok());
+    }
+
+    /// rskj's `regtest.conf` has every upgrade but arrowhead631 at block 0,
+    /// and rustock's own regtest every one but that and reed810. Moving the
+    /// last ones leaves the earlier ones' rules where they were.
+    #[test]
+    fn a_regtest_keeps_its_earlier_upgrades_when_its_last_ones_move() {
+        for regtest in [
+            RskHardforkConfig::rskj_regtest(),
+            RskHardforkConfig::regtest(),
+        ] {
+            let (moved, _) = regtest
+                .with_rskj_overrides(&[h("reed810", 10), h("vetiver900", 20)], &[])
+                .unwrap();
+            assert_eq!(moved.active_upgrade(0), RskNetworkUpgrade::Reed800);
+            assert!(moved.has_rskip88(0) && moved.has_rskip197(9) && moved.has_rskip516(0));
+            assert_eq!(moved.active_upgrade(10), RskNetworkUpgrade::Reed810);
+            assert!(!moved.has_rskip540(19) && moved.has_rskip540(20));
+        }
+    }
+
+    /// `reference.conf` has RSKIP305 at reed800, so it moves with reed800.
+    #[test]
+    fn rskip305_moves_with_reed800() {
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[h("reed800", 7_000_000)], &[])
+            .unwrap();
+        assert!(!moved.has_rskip305(6_999_999) && moved.has_rskip305(7_000_000));
+        assert!(!moved.has_rskip516(6_999_999) && moved.has_rskip516(7_000_000));
+    }
+
+    /// RSKIP536 is at reed810 (`reference.conf`) unless the chain gives it a
+    /// height of its own, as `main.conf` does: #8,804,200, which stays where
+    /// it is when vetiver900 moves.
+    #[test]
+    fn rskip536_follows_reed810_or_the_chains_own_height() {
+        let (mainnet, _) = RskHardforkConfig::mainnet()
+            .with_rskj_overrides(&[h("vetiver900", 9_000_000)], &[])
+            .unwrap();
+        assert!(!mainnet.has_rskip536(8_804_199) && mainnet.has_rskip536(8_804_200));
+        let (later, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[h("reed810", 8_000_000)], &[])
+            .unwrap();
+        assert!(!later.has_rskip536(7_999_999) && later.has_rskip536(8_000_000));
+        let (never, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[h("reed810", -1)], &[])
+            .unwrap();
+        assert!(!never.has_rskip536(u64::MAX));
+        // rustock's own regtest and the all-active ladders keep it from block 0.
+        assert!(RskHardforkConfig::regtest().has_rskip536(0));
+        assert!(RskHardforkConfig::all_active(30).has_rskip536(0));
+        assert!(RskHardforkConfig::all_active_parallel(33).has_rskip536(0));
+    }
+
+    /// rskj picks `executeParallel` by RSKIP-351 and RSKIP-144 together.
+    /// Moving rskip351 alone runs testnet's RSKIP-144 blocks as one list.
+    #[test]
+    fn a_block_runs_as_its_sublists_only_under_both_rules() {
+        let testnet = RskHardforkConfig::testnet();
+        assert!(!testnet.runs_sublists(7_139_599));
+        assert!(testnet.runs_sublists(7_139_600));
+        assert!(!RskHardforkConfig::mainnet().runs_sublists(9_003_580));
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[h("rskip351", -1)])
+            .unwrap();
+        assert!(moved.has_rskip144(8_000_000));
+        assert!(!moved.runs_sublists(8_000_000));
+        // rskip144 moves apart from reed810 too, as rskj's regtest has it.
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[h("rskip144", 7_500_000)])
+            .unwrap();
+        assert!(moved.has_rskip351(7_139_600) && !moved.has_rskip144(7_499_999));
+        assert!(!moved.runs_sublists(7_499_999));
+        assert!(moved.runs_sublists(7_500_000));
+        let (off, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[h("rskip144", -1)])
+            .unwrap();
+        assert!(!off.has_rskip144(8_000_000) && !off.runs_sublists(8_000_000));
+    }
+
+    /// `afterBridgeSync` is a height this ladder reads and moves, as rskj's
+    /// `hardforkActivationHeights` sets it; at `-1` the free senders' Bridge
+    /// calls stay free for good, as on rskj's regtest. `tbd1000` is taken
+    /// and changes nothing: it isn't a rung. `cardamom1000`, the name rskj
+    /// gave it after its latest release, is refused, as that release refuses
+    /// it.
+    #[test]
+    fn after_bridge_sync_moves_and_tbd1000_is_taken() {
+        let mainnet = RskHardforkConfig::mainnet();
+        assert!(!mainnet.has_are_bridge_txs_paid(369_999));
+        assert!(mainnet.has_are_bridge_txs_paid(370_000));
+        let (never, _) = RskHardforkConfig::mainnet()
+            .with_rskj_overrides(&[h("afterBridgeSync", -1)], &[])
+            .unwrap();
+        assert!(!never.has_are_bridge_txs_paid(u64::MAX));
+        let (paid, _) = RskHardforkConfig::rskj_regtest()
+            .with_rskj_overrides(&[h("afterBridgeSync", 5)], &[])
+            .unwrap();
+        assert!(!paid.has_are_bridge_txs_paid(4) && paid.has_are_bridge_txs_paid(5));
+
+        let (named, unmodelled) = RskHardforkConfig::rskj_regtest()
+            .with_rskj_overrides(&[h("tbd1000", 0)], &[])
+            .unwrap();
+        assert_eq!(unmodelled, ["tbd1000"]);
+        assert_eq!(
+            named.activations,
+            RskHardforkConfig::rskj_regtest().activations
+        );
+        assert!(RskHardforkConfig::rskj_regtest()
+            .with_rskj_overrides(&[h("cardamom1000", 0)], &[])
+            .is_err());
+    }
+}
+
+/// Every rule this config answers for by predicate, against the height rskj
+/// activates it at on each network: `reference.conf` maps a rule to an
+/// upgrade (or a number), and `config/main.conf` and `config/testnet.conf`
+/// give the upgrades' heights and the `consensusRules` that move a rule off
+/// its upgrade.
+///
+/// `activation_heights_match_rskj_config` pins the upgrades. This pins the
+/// rules, which is where the two part: a network can move a rule off its
+/// upgrade (testnet's rskip132, rskip284 and rskip535, mainnet's rskip536),
+/// and an upgrade a network never schedules (mainnet's reed810, testnet's
+/// arrowhead631) is outranked there by the ones after it, so an ordinal
+/// `active_upgrade() >= X` turns its rules on where rskj never does.
+#[cfg(test)]
+mod rskj_schedule_tests {
+    use super::*;
+
+    type Predicate = fn(&RskHardforkConfig, u64) -> bool;
+
+    /// (rule, predicate, mainnet, testnet), from the config files of rskj's
+    /// release VETIVER-9.0.4.
+    /// `None` is rskj's `-1`: never.
+    #[rustfmt::skip]
+    const SCHEDULE: &[(&str, Predicate, Option<u64>, Option<u64>)] = &[
+        ("areBridgeTxsPaid", RskHardforkConfig::has_are_bridge_txs_paid, Some(370_000), Some(114_000)),
+        ("rskip87", RskHardforkConfig::has_rskip87, Some(729_000), Some(0)),
+        ("rskip88", RskHardforkConfig::has_rskip88, Some(729_000), Some(0)),
+        ("rskip90", RskHardforkConfig::has_rskip90, Some(729_000), Some(0)),
+        ("rskip91", RskHardforkConfig::has_rskip91, Some(729_000), Some(0)),
+        ("rskip103", RskHardforkConfig::has_rskip103, Some(1_052_700), Some(0)),
+        ("rskip123", RskHardforkConfig::has_rskip123, Some(1_591_000), Some(0)),
+        ("rskip124", RskHardforkConfig::has_rskip124, Some(1_591_000), Some(0)),
+        ("rskip125", RskHardforkConfig::has_rskip125, Some(1_591_000), Some(0)),
+        ("rskip126", RskHardforkConfig::has_unitrie_state_root, Some(1_591_000), Some(0)),
+        ("rskip132", RskHardforkConfig::has_rskip132, Some(1_591_000), Some(43_550)),
+        ("rskip134", RskHardforkConfig::has_rskip134, Some(2_392_700), Some(863_000)),
+        ("rskip136", RskHardforkConfig::has_rskip136, Some(3_397), Some(0)),
+        ("rskip140", RskHardforkConfig::has_rskip140, Some(2_392_700), Some(863_000)),
+        ("rskip143", RskHardforkConfig::has_rskip143, Some(2_392_700), Some(863_000)),
+        ("rskip144", RskHardforkConfig::has_rskip144, None, Some(7_139_600)),
+        ("rskip146", RskHardforkConfig::has_rskip146, Some(2_392_700), Some(863_000)),
+        ("rskip150", RskHardforkConfig::has_rskip150, Some(2_018_000), Some(504_000)),
+        ("rskip152", RskHardforkConfig::has_chainid, Some(2_392_700), Some(863_000)),
+        ("rskip169", RskHardforkConfig::has_rskip169, Some(3_614_800), Some(2_060_500)),
+        ("rskip170", RskHardforkConfig::has_rskip170, Some(3_614_800), Some(2_060_500)),
+        ("rskip171", RskHardforkConfig::has_rskip171, Some(3_614_800), Some(2_060_500)),
+        ("rskip174", RskHardforkConfig::has_rskip174, Some(3_614_800), Some(2_060_500)),
+        ("rskip176", RskHardforkConfig::has_rskip176, Some(3_614_800), Some(2_060_500)),
+        ("rskip181", RskHardforkConfig::has_rskip181, Some(3_614_800), Some(2_060_500)),
+        ("rskip185", RskHardforkConfig::has_rskip185, Some(3_614_800), Some(2_060_500)),
+        ("rskip186", RskHardforkConfig::has_rskip186, Some(3_614_800), Some(2_060_500)),
+        ("rskip197", RskHardforkConfig::has_rskip197, Some(3_614_800), Some(2_060_500)),
+        ("rskip199", RskHardforkConfig::has_rskip199, Some(3_614_800), Some(2_060_500)),
+        ("rskip200", RskHardforkConfig::has_rskip200, Some(3_614_800), Some(2_060_500)),
+        ("rskip201", RskHardforkConfig::has_rskip201, Some(3_614_800), Some(2_060_500)),
+        ("rskip219", RskHardforkConfig::has_rskip219, Some(3_614_800), Some(2_060_500)),
+        ("rskip271", RskHardforkConfig::has_rskip271, Some(4_598_500), Some(3_103_000)),
+        ("rskip284", RskHardforkConfig::has_rskip284, Some(4_598_500), Some(2_581_800)),
+        ("rskip293", RskHardforkConfig::has_rskip293, Some(4_598_500), Some(3_103_000)),
+        ("rskip294", RskHardforkConfig::has_rskip294, Some(4_598_500), Some(3_103_000)),
+        ("rskip305", RskHardforkConfig::has_rskip305, Some(8_052_200), Some(6_835_700)),
+        ("rskip326", RskHardforkConfig::has_rskip326, Some(5_468_000), Some(4_015_800)),
+        ("rskip351", RskHardforkConfig::has_rskip351, None, Some(7_139_600)),
+        ("rskip353", RskHardforkConfig::has_rskip353, Some(4_976_300), Some(3_362_200)),
+        ("rskip357", RskHardforkConfig::has_rskip357, Some(4_976_300), Some(3_362_200)),
+        ("rskip374", RskHardforkConfig::has_rskip374, Some(5_468_000), Some(4_015_800)),
+        ("rskip375", RskHardforkConfig::has_rskip375, Some(5_468_000), Some(4_015_800)),
+        ("rskip376", RskHardforkConfig::has_rskip376, Some(6_223_700), Some(4_927_100)),
+        ("rskip377", RskHardforkConfig::has_rskip377, Some(5_468_000), Some(4_015_800)),
+        ("rskip379", RskHardforkConfig::has_rskip379, Some(6_223_700), Some(4_927_100)),
+        ("rskip383", RskHardforkConfig::has_rskip383, Some(5_468_000), Some(4_015_800)),
+        ("rskip385", RskHardforkConfig::has_rskip385, Some(5_468_000), Some(4_015_800)),
+        ("rskip398", RskHardforkConfig::has_push0, Some(6_223_700), Some(4_927_100)),
+        ("rskip400", RskHardforkConfig::has_reduced_calldata_cost, Some(6_223_700), Some(4_927_100)),
+        ("rskip412", RskHardforkConfig::has_basefee, Some(6_223_700), Some(4_927_100)),
+        ("rskip415", RskHardforkConfig::has_rskip415, Some(6_223_700), Some(4_927_100)),
+        ("rskip419", RskHardforkConfig::has_rskip419, Some(7_338_024), Some(6_110_487)),
+        ("rskip427", RskHardforkConfig::has_rskip427, Some(7_338_024), Some(6_110_487)),
+        ("rskip428", RskHardforkConfig::has_rskip428, Some(7_338_024), Some(6_110_487)),
+        ("rskip434", RskHardforkConfig::has_rskip434, Some(6_549_300), None),
+        ("rskip438", RskHardforkConfig::has_initcode_metering, Some(7_338_024), Some(6_110_487)),
+        ("rskip445", RskHardforkConfig::has_rskip445, Some(7_338_024), Some(6_110_487)),
+        ("rskip446", RskHardforkConfig::has_rskip446, Some(7_338_024), Some(6_110_487)),
+        ("rskip453", RskHardforkConfig::has_rskip453, Some(7_338_024), Some(6_110_487)),
+        ("rskip454", RskHardforkConfig::has_stored_block_v2, Some(7_338_024), Some(6_110_487)),
+        ("rskip459", RskHardforkConfig::has_rskip459, Some(7_338_024), Some(6_110_487)),
+        ("rskip502", RskHardforkConfig::has_rskip502, None, Some(7_139_600)),
+        ("rskip529", RskHardforkConfig::has_rskip529, None, Some(7_139_600)),
+        ("rskip535", RskHardforkConfig::has_rskip535, None, Some(7_604_200)),
+        ("rskip536", RskHardforkConfig::has_rskip536, Some(8_804_200), Some(7_139_600)),
+        ("rskip540", RskHardforkConfig::has_rskip540, Some(8_804_200), Some(7_604_200)),
+        ("rskip544", RskHardforkConfig::has_rskip544, Some(8_804_200), Some(7_604_200)),
+        ("rskip551", RskHardforkConfig::has_rskip551, Some(8_804_200), Some(7_604_200)),
+        ("rskip552", RskHardforkConfig::has_rskip552, Some(8_804_200), Some(7_604_200)),
+    ];
+
+    /// Far past every height either network schedules anything at.
+    const LATER: u64 = 50_000_000;
+
+    /// Where a rule rskj never turns on could wrongly be on: every height
+    /// either network schedules an upgrade or moves a rule to, and later.
+    fn probes() -> Vec<u64> {
+        let mut at: Vec<u64> = MAINNET_ACTIVATIONS
+            .iter()
+            .chain(TESTNET_ACTIVATIONS)
+            .map(|(h, _)| *h)
+            .collect();
+        at.extend([43_550, 2_581_800, 7_604_200, 8_804_200, LATER]);
+        at
+    }
+
+    fn check(cfg: &RskHardforkConfig, active: Predicate, rskj: Option<u64>) -> Result<(), String> {
+        match rskj {
+            Some(h) => {
+                if h > 0 && active(cfg, h - 1) {
+                    return Err(format!("already on at #{}", h - 1));
+                }
+                if !active(cfg, h) {
+                    return Err(format!("off at #{h}"));
+                }
+                if !active(cfg, LATER) {
+                    return Err(format!("off again by #{LATER}"));
+                }
+            }
+            None => {
+                if let Some(at) = probes().into_iter().find(|&n| active(cfg, n)) {
+                    return Err(format!("on at #{at}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_rule_activates_where_rskjs_config_puts_it() {
+        let mainnet = RskHardforkConfig::mainnet();
+        let testnet = RskHardforkConfig::testnet();
+        let mut wrong = Vec::new();
+        for &(rule, active, on_mainnet, on_testnet) in SCHEDULE {
+            for (network, cfg, rskj) in [
+                ("mainnet", &mainnet, on_mainnet),
+                ("testnet", &testnet, on_testnet),
+            ] {
+                if let Err(e) = check(cfg, active, rskj) {
+                    wrong.push(format!("{network} {rule}: {e}; rskj: {rskj:?}"));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "rules off rskj's schedule:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// Where rskj's `regtest.conf` puts each rule: every upgrade at block 0
+    /// but `afterBridgeSync` and arrowhead631, which it leaves at `-1`, and
+    /// its `consensusRules` put RSKIP144, RSKIP351 and RSKIP535 at block 1.
+    /// `reference.conf` maps every rule here to an upgrade, but RSKIP535,
+    /// which regtest moves.
+    fn on_rskj_regtest(rule: &str) -> Option<u64> {
+        match rule {
+            "areBridgeTxsPaid" | "rskip434" => None,
+            "rskip144" | "rskip351" | "rskip535" => Some(1),
+            _ => Some(0),
+        }
+    }
+
+    #[test]
+    fn every_rule_activates_where_rskjs_regtest_conf_puts_it() {
+        let regtest = RskHardforkConfig::rskj_regtest();
+        let wrong: Vec<String> = SCHEDULE
+            .iter()
+            .filter_map(|&(rule, active, _, _)| {
+                let rskj = on_rskj_regtest(rule);
+                let e = check(&regtest, active, rskj).err()?;
+                Some(format!("{rule}: {e}; rskj: {rskj:?}"))
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "rules off rskj's regtest schedule:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// rskj's `regtest.conf`, as its latest release (VETIVER-9.0.4) ships it:
+    /// its `hardforkActivationHeights`, and the `consensusRules` the ladder
+    /// takes (`rskip97` is the header's alone, and the CLI takes it), with
+    /// `-1` for never.
+    #[rustfmt::skip]
+    const REGTEST_CONF_HARDFORKS: &[(&str, i64)] = &[
+        ("bahamas", 0), ("afterBridgeSync", -1), ("orchid", 0), ("orchid060", 0),
+        ("wasabi100", 0), ("twoToThree", 0), ("papyrus200", 0), ("iris300", 0),
+        ("hop400", 0), ("hop401", 0), ("fingerroot500", 0), ("arrowhead600", 0),
+        ("arrowhead631", -1), ("lovell700", 0), ("reed800", 0), ("reed810", 0),
+        ("vetiver900", 0), ("tbd1000", -1),
+    ];
+    const REGTEST_CONF_RULES: &[(&str, i64)] = &[
+        ("rskipUMM", 1),
+        ("rskip144", 1),
+        ("rskip351", 1),
+        ("rskip535", 1),
+    ];
+
+    /// rskj's `regtest.conf`, name by name, on rustock's own regtest ladder
+    /// is `rskj_regtest`, rule for rule: what a node replaying rskj's
+    /// regtest blocks would pass by hand, and what `--genesis` gives it.
+    /// `tbd1000` is taken and changes nothing.
+    #[test]
+    fn rskj_regtest_conf_by_name_is_rskj_regtest() {
+        let named = |list: &[(&str, i64)]| -> Vec<(String, Option<u64>)> {
+            list.iter()
+                .map(|&(n, h)| (n.to_string(), u64::try_from(h).ok()))
+                .collect()
+        };
+        let (by_name, unmodelled) = RskHardforkConfig::regtest()
+            .with_rskj_overrides(&named(REGTEST_CONF_HARDFORKS), &named(REGTEST_CONF_RULES))
+            .unwrap();
+        assert_eq!(unmodelled, ["tbd1000"]);
+        let built_in = RskHardforkConfig::rskj_regtest();
+        for &(rule, active, _, _) in SCHEDULE {
+            for n in [0, 1, 2, LATER] {
+                assert_eq!(active(&by_name, n), active(&built_in, n), "{rule} at #{n}");
+            }
+        }
+        for n in [0, 1, LATER] {
+            assert_eq!(by_name.runs_sublists(n), built_in.runs_sublists(n), "#{n}");
+            assert_eq!(by_name.spec_id(n), built_in.spec_id(n), "#{n}");
+        }
     }
 }

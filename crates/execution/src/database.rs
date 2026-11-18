@@ -10,7 +10,7 @@ use revm::bytecode::Bytecode;
 use revm::state::AccountInfo;
 use rustock_trie::{
     TrieNode, TrieStore, TrieKeySlice,
-    account_key, code_key, storage_key,
+    account_key, code_key, storage_key, storage_prefix_key,
     AccountState,
 };
 use rustock_storage::BlockStore;
@@ -50,6 +50,9 @@ pub struct RskDatabase {
     /// Cache of code by hash, populated during `basic_ref` calls.
     /// Uses `RefCell` because `DatabaseRef` methods take `&self`.
     code_cache: RefCell<HashMap<B256, Bytecode>>,
+    /// The number and hash of the parent of the block run on this view, whose
+    /// ancestors BLOCKHASH answers from ([`RskDatabase::for_block`]).
+    parent: Option<(u64, B256)>,
 }
 
 impl RskDatabase {
@@ -58,7 +61,34 @@ impl RskDatabase {
         store: Arc<dyn TrieStore>,
         block_store: Arc<BlockStore>,
     ) -> Self {
-        Self { root, store, block_store, code_cache: RefCell::new(HashMap::new()) }
+        Self {
+            root,
+            store,
+            block_store,
+            code_cache: RefCell::new(HashMap::new()),
+            parent: None,
+        }
+    }
+
+    /// The block run on this view, or the block a call runs as part of.
+    /// BLOCKHASH answers from that block's own ancestors: rskj's
+    /// `Program.getBlockHash` asks `IndexedBlockStore.getBlockHashByNumber`
+    /// with the block's parent, which walks back from it. On the main chain
+    /// that is the main chain's block; beside it, the fork's, down to where
+    /// the fork leaves the main chain. Without it, the main chain's.
+    pub fn for_block(mut self, header: &rustock_core::Header) -> Self {
+        self.parent = header
+            .number
+            .checked_sub(1)
+            .map(|number| (number, header.parent_hash));
+        self
+    }
+
+    /// rskj `MutableRepository.isContract`: whether `address` holds the
+    /// storage-prefix marker `setupContract` writes, in the state this
+    /// database reads.
+    pub fn has_contract_marker(&self, address: &Address) -> Result<bool, RskDbError> {
+        Ok(self.trie_get(&storage_prefix_key(address))?.is_some())
     }
 
     /// Reads one key, distinguishing "not in the trie" from "the trie is
@@ -120,8 +150,13 @@ impl DatabaseRef for RskDatabase {
             None => revm::primitives::KECCAK_EMPTY,
         };
 
+        // Code is the bytes saved, and runs as they are. rskj has no EIP-7702,
+        // so code that starts 0xEF01 names no other account's code to run: its
+        // 0xEF is no opcode, and a call to it fails there. Such code could be
+        // deployed until RSKIP544 (vetiver900). `Bytecode::new_raw` would read
+        // it as a designation, and panic where it isn't one.
         let bytecode = match code {
-            Some(c) => Bytecode::new_raw(c.into()),
+            Some(c) => Bytecode::new_legacy(c.into()),
             None => Bytecode::default(),
         };
 
@@ -190,9 +225,25 @@ impl DatabaseRef for RskDatabase {
     }
 
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
-        self.block_store
-            .canonical_hash(number)
-            .map_err(|e| RskDbError::BlockStore(e.to_string()))?
+        let store_error = |e: anyhow::Error| RskDbError::BlockStore(e.to_string());
+        let canonical = |n: u64| self.block_store.canonical_hash(n).map_err(store_error);
+        // Up the run block's parents while they are beside the main chain;
+        // from the first that is on it, the main chain's index answers.
+        if let Some((mut n, mut hash)) = self.parent {
+            while n > number && canonical(n)? != Some(hash) {
+                hash = self
+                    .block_store
+                    .header(hash)
+                    .map_err(store_error)?
+                    .ok_or_else(|| RskDbError::BlockStore(format!("block {hash} not found")))?
+                    .parent_hash;
+                n -= 1;
+            }
+            if n == number {
+                return Ok(hash);
+            }
+        }
+        canonical(number)?
             .ok_or_else(|| RskDbError::BlockStore(format!("block {} not found", number)))
     }
 }

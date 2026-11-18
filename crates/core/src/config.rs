@@ -29,7 +29,8 @@ pub struct ActivationHeights {
     /// Papyrus200 hardfork – enables RSKIP156 (difficulty divisor 50 -> 400).
     pub papyrus200: u64,
     /// Iris300 hardfork – enables RSKIP180 (960-byte merged-mining merkle
-    /// proof cap).
+    /// proof cap) and RSKIP179 (a header's timestamp must sit near that of
+    /// the Bitcoin header that merge-mined it).
     pub iris300: u64,
     /// Fingerroot500 hardfork – enables RSKIP252 (transaction gas price cap).
     pub fingerroot500: u64,
@@ -37,6 +38,11 @@ pub struct ActivationHeights {
     /// Bitcoin-to-RSK timestamp window on testnet (5 minutes to 2 hours).
     /// Read only on testnet; mainnet keeps 5 minutes at every height.
     pub hop400: u64,
+    /// Reed810 hardfork, where `reference.conf` puts RSKIP144 and RSKIP351.
+    /// Read here only so that moving it moves them where the chain keeps
+    /// them there ([`Self::set_rskj_hardfork`]); the execution ladder
+    /// schedules the upgrade itself.
+    pub reed810: u64,
     /// Height at which RSKIP97 -- "no 10-minute difficulty drop" -- activates,
     /// or `None` where it never does.
     ///
@@ -53,12 +59,39 @@ pub struct ActivationHeights {
     /// Height at which RSKIP-144 (parallel transaction sublists) activates,
     /// or `None` where it never does. rskj gates it on `reed810`.
     ///
-    /// The header decoder needs it: after an RSKIP-351 version byte, one
-    /// trailing item is the sublist edges where RSKIP-144 is active and the
-    /// V2 base event where it is not (rskj `BlockFactory` decides by the same
-    /// activation). rskj's own regtest is the second case: `rskip144 = -1`
-    /// with `rskip535 = 1`.
+    /// The header's layout needs it: from here on, where RSKIP-351 is active
+    /// too, a header carries the sublist edges, empty for a block that runs
+    /// as one list (rskj `BlockFactory` and `BlockHeaderBuilder`).
     pub rskip144: Option<u64>,
+    /// Height at which RSKIP351 -- versioned headers, the version and its
+    /// extension where a header had only a logs bloom -- activates, or
+    /// `None` where it never does. rskj's `reference.conf` sets it at
+    /// reed810, which mainnet has at -1, so no mainnet header carries it.
+    pub rskip351: Option<u64>,
+    /// Height at which RSKIP290 -- testnet's minimum difficulty raised to
+    /// 550,000,000 -- activates, or `None` where it never does.
+    /// `reference.conf` sets it at hop400, and `testnet.conf` overrides it to
+    /// #2,581,800, half a million blocks sooner. rskj applies it on testnet
+    /// alone (`Constants.getMinimumDifficulty`), so on the other chains it
+    /// is recorded but changes nothing: see [`ChainConfig::min_difficulty_at`].
+    pub rskip290: Option<u64>,
+    /// Height at which RSKIPUMM -- a UMM root after the uncle count --
+    /// activates, or `None` where it never does. `reference.conf` sets it at
+    /// papyrus200, which mainnet and testnet keep, and rskj's regtest at
+    /// block 1. rskj's `BlockFactory` reads the field by this height, and its
+    /// miner writes it, empty, from here on (`BlockHeaderBuilder`).
+    pub rskip_umm: Option<u64>,
+    /// Height at which RSKIP535 -- a versioned header's base event --
+    /// activates, or `None` where it never does. `reference.conf` leaves it
+    /// at -1, which mainnet keeps; testnet sets it at vetiver900 (#7,604,200)
+    /// and regtest at 1. With RSKIP351 it makes a header version 2
+    /// (`ActivationConfig.getHeaderVersion`).
+    pub rskip535: Option<u64>,
+    /// Below this height rskj takes a full header one field short of its
+    /// layout where the base event is enabled, and gives it an empty base
+    /// event (`BlockFactory.isInBaseEventRecoveryWindow`): on testnet alone,
+    /// below `BASE_EVENT_RECOVERY_UPPER_BOUND`, #7,800,000. `None` elsewhere.
+    pub base_event_recovery_below: Option<u64>,
 }
 
 /// Process-wide activation heights, consulted by block-hash computation
@@ -80,19 +113,83 @@ impl ActivationHeights {
 
     /// Set the height this struct carries for an rskj upgrade name, for the
     /// names it carries: `orchid`, `wasabi100`, `papyrus200`, `iris300`,
-    /// `fingerroot500`, and `reed810`, which is RSKIP-144's height. `None`
-    /// is rskj's `-1`. Any other name is the execution ladder's to judge and
-    /// is left alone here.
+    /// `hop400`, `fingerroot500` and `reed810`. `None` is rskj's `-1`. Any
+    /// other name is the execution ladder's to judge and is left alone here.
+    ///
+    /// The rules `reference.conf` puts at an upgrade move with it where the
+    /// chain keeps them there: RSKIPUMM with papyrus200, RSKIP290 with
+    /// hop400, RSKIP144 and RSKIP351 with reed810. A chain that sets its own,
+    /// as rskj's regtest does and testnet for RSKIP290, keeps them.
     pub fn set_rskj_hardfork(&mut self, name: &str, height: Option<u64>) {
         let never = u64::MAX;
+        let at = |upgrade: u64| (upgrade != never).then_some(upgrade);
         match name {
             "orchid" => self.orchid = height.unwrap_or(never),
             "wasabi100" => self.wasabi100 = height.unwrap_or(never),
-            "papyrus200" => self.papyrus200 = height.unwrap_or(never),
+            "papyrus200" => {
+                if self.rskip_umm == at(self.papyrus200) {
+                    self.rskip_umm = height;
+                }
+                self.papyrus200 = height.unwrap_or(never);
+            }
             "iris300" => self.iris300 = height.unwrap_or(never),
+            "hop400" => {
+                if self.rskip290 == at(self.hop400) {
+                    self.rskip290 = height;
+                }
+                self.hop400 = height.unwrap_or(never);
+            }
             "fingerroot500" => self.fingerroot500 = height.unwrap_or(never),
-            "reed810" => self.rskip144 = height,
+            "reed810" => {
+                let followed = at(self.reed810);
+                for rule in [&mut self.rskip144, &mut self.rskip351] {
+                    if *rule == followed {
+                        *rule = height;
+                    }
+                }
+                self.reed810 = height.unwrap_or(never);
+            }
             _ => {}
+        }
+    }
+
+    /// Whether `number` is at or past `height`, rskj's `isActive`.
+    fn reached(height: Option<u64>, number: u64) -> bool {
+        height.is_some_and(|height| number >= height)
+    }
+
+    /// Whether a header at `number` carries a UMM root (RSKIPUMM).
+    pub fn umm_active(&self, number: u64) -> bool {
+        Self::reached(self.rskip_umm, number)
+    }
+
+    /// Whether RSKIP-144's sublist edges are a header field at `number`:
+    /// rskj reads and writes them where RSKIP351 and RSKIP144 are both
+    /// active.
+    pub fn edges_active(&self, number: u64) -> bool {
+        Self::reached(self.rskip351, number) && Self::reached(self.rskip144, number)
+    }
+
+    /// Whether a header at `number` is versioned (RSKIP351).
+    pub fn rskip351_active(&self, number: u64) -> bool {
+        Self::reached(self.rskip351, number)
+    }
+
+    /// rskj `BlockFactory.isBaseEventEnabled`: RSKIP535 and RSKIP351 both.
+    pub fn base_event_enabled(&self, number: u64) -> bool {
+        Self::reached(self.rskip535, number) && Self::reached(self.rskip351, number)
+    }
+
+    /// rskj `ActivationConfig.getHeaderVersion`: 2 with RSKIP535, 1 without
+    /// it, and 0 before RSKIP351.
+    pub fn header_version(&self, number: u64) -> u8 {
+        match (
+            self.rskip351_active(number),
+            Self::reached(self.rskip535, number),
+        ) {
+            (false, _) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
         }
     }
 
@@ -104,10 +201,20 @@ impl ActivationHeights {
             iris300: 3_614_800,
             fingerroot500: 5_468_000,
             hop400: 4_598_500,
+            // main.conf: `reed810 = -1`.
+            reed810: u64::MAX,
             // reference.conf: `rskip97 = orchid`, not overridden by main.conf.
             rskip97: Some(729_000),
-            // main.conf: reed810 = -1.
+            // reference.conf: `rskip144 = reed810` and `rskip351 = reed810`.
             rskip144: None,
+            rskip351: None,
+            // reference.conf: `rskip290 = hop400`. Mainnet's floor stays 7e15.
+            rskip290: Some(4_598_500),
+            // reference.conf: `rskipUMM = papyrus200`.
+            rskip_umm: Some(2_392_700),
+            // reference.conf: `rskip535 = -1`, which main.conf keeps.
+            rskip535: None,
+            base_event_recovery_below: None,
         }
     }
 
@@ -121,10 +228,21 @@ impl ActivationHeights {
             iris300: 2_060_500,
             fingerroot500: 4_015_800,
             hop400: 3_103_000,
+            // testnet.conf: `reed810 = 7139600`.
+            reed810: 7_139_600,
             // testnet.conf: `rskip97 = -1  # disable orchid difficulty drop`.
             rskip97: None,
-            // testnet.conf: reed810.
+            // reference.conf: `rskip144 = reed810` and `rskip351 = reed810`.
             rskip144: Some(7_139_600),
+            rskip351: Some(7_139_600),
+            // testnet.conf: `rskip290 = 2581800`, not hop400.
+            rskip290: Some(2_581_800),
+            // reference.conf: `rskipUMM = papyrus200`.
+            rskip_umm: Some(863_000),
+            // testnet.conf: `rskip535 = 7604200`, vetiver900's height.
+            rskip535: Some(7_604_200),
+            // BlockFactory.BASE_EVENT_RECOVERY_UPPER_BOUND, testnet's alone.
+            base_event_recovery_below: Some(7_800_000),
         }
     }
 
@@ -132,15 +250,33 @@ impl ActivationHeights {
         Self {
             orchid: 0,
             wasabi100: 0,
+            // regtest.conf puts papyrus200 at 0, but nothing read here from it
+            // applies on regtest: RSKIP156's divisor skips it
+            // (`Constants.getDifficultyBoundDivisor`), and its UMM root has
+            // its own height below.
             papyrus200: u64::MAX,
             iris300: 0,
             fingerroot500: 0,
             hop400: 0,
+            // regtest.conf: `reed810 = 0`, which rskj's regtest ladder
+            // schedules (`--genesis`) and rustock's own doesn't; RSKIP144 and
+            // RSKIP351 have their own heights below, so they don't move with it.
+            reed810: 0,
             // regtest.conf: `rskip97 = -1`, same as testnet.
             rskip97: None,
-            // regtest.conf: `rskip144 = -1`; rustock's regtest ladder does
-            // not schedule reed810 either.
-            rskip144: None,
+            // regtest.conf: `rskip144 = 1`. On rskj's regtest blocks run as
+            // their sublists from here; rustock's own regtest ladder runs
+            // none, so its blocks run as one list and carry empty edges.
+            rskip144: Some(1),
+            // regtest.conf: `rskip351 = 1`.
+            rskip351: Some(1),
+            // reference.conf's hop400, which regtest.conf puts at genesis.
+            rskip290: Some(0),
+            // regtest.conf: `rskipUMM = 1`, not papyrus200.
+            rskip_umm: Some(1),
+            // regtest.conf: `rskip535 = 1`.
+            rskip535: Some(1),
+            base_event_recovery_below: None,
         }
     }
 }
@@ -151,17 +287,24 @@ pub struct ChainConfig {
     pub network_id: u64,
     pub duration_limit: u64,
     pub difficulty_divisor: U256,
+    /// rskj `Constants.minimumDifficulty`. The floor in force at a height,
+    /// which testnet raises from RSKIP290, is [`ChainConfig::min_difficulty_at`].
     pub min_difficulty: U256,
+    /// The greatest difficulty at which a block below RSKIP98 (orchid) may
+    /// be signed by a fallback-mining key rather than merge-mined: rskj
+    /// `Constants.getFallbackMiningDifficulty()`. 14 x 10^15 on mainnet and
+    /// testnet, zero on regtest.
+    pub fallback_mining_difficulty: U256,
     /// rskj `Constants.newBlockMaxSecondsInTheFuture`: how far past the
     /// node's clock a header may be timestamped. 60 on mainnet, 540 on
     /// testnet, 0 on regtest, where zero turns the timestamp rule off
-    /// altogether (parent comparison included), as it does in rskj.
+    /// altogether (parent comparison and RSKIP179 included), as it does in
+    /// rskj.
     pub max_future_block_time: u64,
     pub gas_limit_bound_divisor: u64,
     /// rskj `Constants.getMinGasLimit()`: 3,000,000 on every network
     /// (`GasLimitRule`). Every rskj genesis declares more.
     pub min_gas_limit: u64,
-    pub max_gas_limit: u64,
     /// The gas the sequential sublist is guaranteed under RSKIP-144
     /// (rskj `Constants.getMinSequentialSetGasLimit`). Absent from the
     /// RSKIP, which says every sublist gets `block gas limit / (N + 1)`;
@@ -197,10 +340,10 @@ impl ChainConfig {
             duration_limit: 14,
             difficulty_divisor: U256::from(50),
             min_difficulty: U256::from(7_000_000_000_000_000u64), // 7e15, FALLBACK_MINING_DIFFICULTY / 2
+            fallback_mining_difficulty: U256::from(14_000_000_000_000_000u64),
             max_future_block_time: 60,
             gas_limit_bound_divisor: 1024,
             min_gas_limit: 3_000_000,
-            max_gas_limit: 1_000_000_000,
             min_sequential_set_gas_limit: 10_000_000,
             activation_heights: ActivationHeights::mainnet(),
             genesis_spec: None,
@@ -217,10 +360,10 @@ impl ChainConfig {
             duration_limit: 14,
             difficulty_divisor: U256::from(50),
             min_difficulty: U256::from(131072),
+            fallback_mining_difficulty: U256::from(14_000_000_000_000_000u64),
             max_future_block_time: 540,
             gas_limit_bound_divisor: 1024,
             min_gas_limit: 3_000_000,
-            max_gas_limit: 1_000_000_000,
             min_sequential_set_gas_limit: 10_000_000,
             activation_heights: ActivationHeights::testnet(),
             genesis_spec: None,
@@ -237,10 +380,10 @@ impl ChainConfig {
             duration_limit: 10,
             difficulty_divisor: U256::from(2048),
             min_difficulty: U256::from(1),
+            fallback_mining_difficulty: U256::ZERO,
             max_future_block_time: 0,
             gas_limit_bound_divisor: 1024,
             min_gas_limit: 3_000_000,
-            max_gas_limit: 10_000_000,
             min_sequential_set_gas_limit: 6_800_000,
             activation_heights: ActivationHeights::regtest(),
             genesis_spec: None,
@@ -250,13 +393,36 @@ impl ChainConfig {
         }
     }
 
+    /// The least difficulty a block at `number` may have: rskj
+    /// `Constants.getMinimumDifficulty`. `min_difficulty`, except on testnet
+    /// from RSKIP290, where it is 550,000,000. A falling difficulty is raised
+    /// to it, and before RSKIP97 a block ten minutes late drops to it.
+    ///
+    /// Holding testnet to 131,072 there made rustock expect 548,625,000 of
+    /// #6,360,768, a late block whose parent sat at the 550,000,000 floor,
+    /// and its snapshot sync refused the header.
+    pub fn min_difficulty_at(&self, number: u64) -> U256 {
+        // rskj's TESTNET_CHAIN_ID and TESTNET2_CHAIN_ID.
+        let testnet = matches!(self.chain_id, 31 | 34);
+        match self.activation_heights.rskip290 {
+            Some(height) if testnet && number >= height => U256::from(550_000_000u64),
+            _ => self.min_difficulty,
+        }
+    }
+
+    /// rskj `RskContext` loads a genesis file with `useRskip92Encoding` as
+    /// RSKIP92, an orchid rule, is active at block 0.
+    fn rskip92_at_genesis(&self) -> bool {
+        self.activation_heights.orchid == 0
+    }
+
     /// Returns the well-known genesis hash for this network, if one exists.
     /// Mainnet and testnet have hardcoded hashes because Java's RLP encoding
     /// of the genesis difficulty includes a leading zero byte that differs
     /// from standard encoding, producing a different hash.
     pub fn known_genesis_hash(&self) -> Option<B256> {
         if let Some(spec) = &self.genesis_spec {
-            return Some(spec.hash());
+            return Some(spec.hash_encoded(self.rskip92_at_genesis()));
         }
         match self.chain_id {
             30 => Some("0xf88529d4ab262c0f4d042e9d8d3f2472848eaafe1a9b7213f57617eb40a9f9e0".parse().unwrap()),
@@ -271,7 +437,7 @@ impl ChainConfig {
         let empty_trie_hash: B256 = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421".parse().unwrap();
 
         if let Some(spec) = &self.genesis_spec {
-            return spec.header();
+            return spec.header_encoded(self.rskip92_at_genesis());
         }
 
         match self.chain_id {
@@ -300,14 +466,17 @@ impl ChainConfig {
                 bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from_static(&[0x00])),
                 cached_hash: None,
                 cached_hash_for_merged_mining: None,
+                kept: Self::genesis_difficulty_as_written(),
             },
+            // rskj's `orchid-testnet.json`, with what `GenesisLoaderImpl` and
+            // `GenesisHeader` fill in: the uncles' hash and the two roots.
             31 => Header {
                 parent_hash: B256::ZERO,
-                ommers_hash: B256::ZERO,
-                beneficiary: Address::ZERO,
+                ommers_hash: empty_list_hash,
+                beneficiary: "0x3333333333333333333333333333333333333333".parse().unwrap(),
                 state_root: "0x45bce5168430c42b3d568331753f900a32457b4f3748697cbd8375ff4da72641".parse().unwrap(),
-                transactions_root: B256::ZERO,
-                receipts_root: B256::ZERO,
+                transactions_root: empty_trie_hash,
+                receipts_root: empty_trie_hash,
                 logs_bloom: Default::default(),
                 extension_data: None,
                 difficulty: U256::from(0x00100000),
@@ -321,11 +490,12 @@ impl ChainConfig {
                 uncle_count: 0,
                 umm_root: None,
                 version_fields: None,
-                bitcoin_merged_mining_header: None,
-                bitcoin_merged_mining_merkle_proof: None,
-                bitcoin_merged_mining_coinbase_transaction: None,
+                bitcoin_merged_mining_header: Some(Bytes::from_static(&[0x00])),
+                bitcoin_merged_mining_merkle_proof: Some(Bytes::from_static(&[0x00])),
+                bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from_static(&[0x00])),
                 cached_hash: None,
                 cached_hash_for_merged_mining: None,
+                kept: Self::genesis_difficulty_as_written(),
             },
             _ => Header {
                 parent_hash: B256::ZERO,
@@ -364,8 +534,20 @@ impl ChainConfig {
                 bitcoin_merged_mining_coinbase_transaction: None,
                 cached_hash: None,
                 cached_hash_for_merged_mining: None,
+                kept: None,
             },
         }
+    }
+
+    /// Mainnet's and testnet's genesis files write the difficulty
+    /// `0x0000100000`, and rskj's `GenesisHeader` writes it back, and hashes
+    /// it, as written: kept, so that the genesis written to the store reads
+    /// back with the network's genesis hash.
+    fn genesis_difficulty_as_written() -> Option<Box<crate::types::header::KeptFields>> {
+        Some(Box::new(crate::types::header::KeptFields {
+            difficulty: Some(Bytes::from_static(&hex_literal::hex!("0000100000"))),
+            ..Default::default()
+        }))
     }
 
 /// The ten accounts rskj's regtest genesis funds, in its own order.
@@ -586,6 +768,7 @@ mod tests {
         assert_eq!(heights.wasabi100, 1_591_000);
         assert_eq!(heights.papyrus200, 2_392_700);
         assert_eq!(heights.iris300, 3_614_800);
+        assert_eq!(heights.hop400, 4_598_500);
         assert_eq!(heights.fingerroot500, 5_468_000);
     }
 
@@ -602,6 +785,7 @@ mod tests {
         assert_eq!(heights.wasabi100, 0);
         assert_eq!(heights.papyrus200, 863_000);
         assert_eq!(heights.iris300, 2_060_500);
+        assert_eq!(heights.hop400, 3_103_000);
         assert_eq!(heights.fingerroot500, 4_015_800);
     }
 
@@ -611,6 +795,152 @@ mod tests {
         assert_eq!(heights.orchid, 0);
         assert_eq!(heights.wasabi100, 0);
         assert_eq!(heights.papyrus200, u64::MAX);
+    }
+
+    /// The heights a header's layout is read by, as rskj's `reference.conf`,
+    /// `testnet.conf` and `regtest.conf` set them, and `BlockFactory`'s
+    /// testnet recovery bound.
+    #[test]
+    fn header_layout_heights_are_rskjs() {
+        let layout = |h: ActivationHeights| {
+            (
+                h.rskip_umm,
+                h.rskip144,
+                h.rskip351,
+                h.rskip535,
+                h.base_event_recovery_below,
+            )
+        };
+        assert_eq!(
+            layout(ActivationHeights::mainnet()),
+            (Some(2_392_700), None, None, None, None)
+        );
+        assert_eq!(
+            layout(ActivationHeights::testnet()),
+            (
+                Some(863_000),
+                Some(7_139_600),
+                Some(7_139_600),
+                Some(7_604_200),
+                Some(7_800_000)
+            )
+        );
+        assert_eq!(
+            layout(ActivationHeights::regtest()),
+            (Some(1), Some(1), Some(1), Some(1), None)
+        );
+    }
+
+    /// rskj `ActivationConfig.getHeaderVersion` and the fields `BlockFactory`
+    /// reads by height, on testnet's heights: the UMM root from papyrus200,
+    /// version 1 with edges from reed810, version 2 with a base event from
+    /// RSKIP535.
+    #[test]
+    fn a_header_is_laid_out_by_its_height() {
+        let t = ActivationHeights::testnet();
+        assert!(!t.umm_active(862_999));
+        assert!(t.umm_active(863_000));
+        for (number, version, edges, base_event) in [
+            (7_139_599, 0, false, false),
+            (7_139_600, 1, true, false),
+            (7_604_199, 1, true, false),
+            (7_604_200, 2, true, true),
+        ] {
+            assert_eq!(t.header_version(number), version, "#{number}");
+            assert_eq!(t.rskip351_active(number), version > 0, "#{number}");
+            assert_eq!(t.edges_active(number), edges, "#{number}");
+            assert_eq!(t.base_event_enabled(number), base_event, "#{number}");
+        }
+        // RSKIP535 without RSKIP351 is no version and no base event; RSKIP351
+        // without RSKIP144, no edges.
+        let alone = ActivationHeights {
+            rskip351: None,
+            ..ActivationHeights::regtest()
+        };
+        assert_eq!(alone.header_version(5), 0);
+        assert!(!alone.base_event_enabled(5));
+        let no_144 = ActivationHeights {
+            rskip144: None,
+            ..ActivationHeights::regtest()
+        };
+        assert_eq!(no_144.header_version(5), 2);
+        assert!(!no_144.edges_active(5));
+    }
+
+    /// `reference.conf` has `rskipUMM = papyrus200`, and `rskip144` and
+    /// `rskip351` at reed810: moving the upgrade moves them where the chain
+    /// keeps them there, and not on regtest, which sets its own.
+    #[test]
+    fn rules_follow_their_upgrade_where_the_chain_has_them_follow() {
+        let mut mainnet = ActivationHeights::mainnet();
+        mainnet.set_rskj_hardfork("papyrus200", Some(100));
+        assert_eq!((mainnet.papyrus200, mainnet.rskip_umm), (100, Some(100)));
+        mainnet.set_rskj_hardfork("papyrus200", None);
+        assert_eq!((mainnet.papyrus200, mainnet.rskip_umm), (u64::MAX, None));
+        mainnet.set_rskj_hardfork("papyrus200", Some(7));
+        assert_eq!(mainnet.rskip_umm, Some(7));
+
+        mainnet.set_rskj_hardfork("reed810", Some(9_002_504));
+        let reed = |h: &ActivationHeights| (h.reed810, h.rskip144, h.rskip351);
+        assert_eq!(
+            reed(&mainnet),
+            (9_002_504, Some(9_002_504), Some(9_002_504))
+        );
+        mainnet.set_rskj_hardfork("reed810", None);
+        assert_eq!(reed(&mainnet), (u64::MAX, None, None));
+        let mut testnet = ActivationHeights::testnet();
+        testnet.set_rskj_hardfork("reed810", Some(8_000_000));
+        assert_eq!(
+            reed(&testnet),
+            (8_000_000, Some(8_000_000), Some(8_000_000))
+        );
+
+        let mut regtest = ActivationHeights::regtest();
+        regtest.set_rskj_hardfork("papyrus200", Some(0));
+        assert_eq!((regtest.papyrus200, regtest.rskip_umm), (0, Some(1)));
+        regtest.set_rskj_hardfork("reed810", Some(5));
+        assert_eq!(reed(&regtest), (5, Some(1), Some(1)));
+    }
+
+    /// `reference.conf` has RSKIP297 and RSKIP290 at hop400. Moving hop400
+    /// moves RSKIP297's wider Bitcoin timestamp window, which testnet reads
+    /// at it, and RSKIP290 where the chain keeps it there: `testnet.conf`
+    /// gives RSKIP290 a height of its own.
+    #[test]
+    fn hop400_moves_what_the_chain_keeps_at_it() {
+        use crate::validation::merged_mining::BitcoinTimestampRule;
+
+        let mut testnet = ChainConfig::testnet();
+        testnet
+            .activation_heights
+            .set_rskj_hardfork("hop400", Some(3_200_000));
+        assert_eq!(
+            (
+                testnet.activation_heights.hop400,
+                testnet.activation_heights.rskip290
+            ),
+            (3_200_000, Some(2_581_800))
+        );
+        let rule = BitcoinTimestampRule {
+            config: std::sync::Arc::new(testnet),
+        };
+        assert_eq!(
+            rule.max_timestamps_diff(3_199_999),
+            BitcoinTimestampRule::DEFAULT_MAX_TIMESTAMPS_DIFF_IN_SECS
+        );
+        assert_eq!(
+            rule.max_timestamps_diff(3_200_000),
+            BitcoinTimestampRule::TESTNET_MAX_TIMESTAMPS_DIFF_IN_SECS
+        );
+
+        let mut mainnet = ActivationHeights::mainnet();
+        mainnet.set_rskj_hardfork("hop400", Some(5_000_000));
+        assert_eq!(
+            (mainnet.hop400, mainnet.rskip290),
+            (5_000_000, Some(5_000_000))
+        );
+        mainnet.set_rskj_hardfork("hop400", None);
+        assert_eq!((mainnet.hop400, mainnet.rskip290), (u64::MAX, None));
     }
 
     #[test]
@@ -664,13 +994,71 @@ mod tests {
         assert_eq!(orchid_state_root(&root, &store), config.genesis_header().state_root);
     }
 
+    /// Testnet's genesis header is the one rskj builds from
+    /// `orchid-testnet.json`: the file's coinbase and the zero byte it gives
+    /// each merged-mining field, and what `GenesisLoaderImpl` and
+    /// `GenesisHeader` fill in, the empty list's hash for the uncles and the
+    /// empty trie's for the transactions and receipts. Hashed as rskj hashes
+    /// a genesis block, with the difficulty as the file writes it, those
+    /// fields give testnet's genesis hash.
     #[test]
     fn test_testnet_genesis_header() {
         let config = ChainConfig::testnet();
         let genesis = config.genesis_header();
         assert_eq!(genesis.number, 0);
         assert_eq!(genesis.difficulty, U256::from(0x00100000));
-        assert!(genesis.bitcoin_merged_mining_header.is_none());
+
+        let zero_byte = Bytes::from_static(&[0x00]);
+        let file = crate::rskj_genesis::GenesisSpec {
+            parent_hash: B256::ZERO,
+            coinbase: Address::repeat_byte(0x33),
+            timestamp: 0,
+            extra_data: Bytes::from_static(&hex_literal::hex!("434d272841")),
+            gas_limit: U256::from(0x4c4b40),
+            difficulty_bytes: Bytes::from_static(&hex_literal::hex!("0000100000")),
+            minimum_gas_price: U256::ZERO,
+            bitcoin_merged_mining_header: zero_byte.clone(),
+            bitcoin_merged_mining_merkle_proof: zero_byte.clone(),
+            bitcoin_merged_mining_coinbase_transaction: zero_byte,
+            alloc: Vec::new(),
+            state_root: Some(
+                "0x45bce5168430c42b3d568331753f900a32457b4f3748697cbd8375ff4da72641"
+                    .parse()
+                    .unwrap(),
+            ),
+        };
+        assert_eq!(Some(file.hash()), config.known_genesis_hash());
+        // The file's header carries that hash; this one leaves it to
+        // `known_genesis_hash`.
+        let as_rskj_builds_it = Header {
+            cached_hash: None,
+            ..file.header()
+        };
+        assert_eq!(genesis, as_rskj_builds_it);
+    }
+
+    /// Mainnet's and testnet's genesis headers hash to the networks' genesis
+    /// hashes, and so do they as this node writes them to its store and reads
+    /// them back: rskj's `GenesisHeader` hashes the difficulty as the genesis
+    /// file writes it, `0x0000100000`.
+    #[test]
+    fn the_stored_genesis_reads_back_with_the_networks_genesis_hash() {
+        use crate::types::header::HeaderForm;
+        for (config, heights) in [
+            (ChainConfig::mainnet(), ActivationHeights::mainnet()),
+            (ChainConfig::testnet(), ActivationHeights::testnet()),
+        ] {
+            let genesis = config.genesis_header();
+            let known = config.known_genesis_hash().unwrap();
+            assert_eq!(genesis.clone().with_activations(&heights).hash(), known);
+            let read = Header::decode_in(
+                &mut genesis.encode_stored().as_slice(),
+                &heights,
+                HeaderForm::Stored,
+            )
+            .unwrap();
+            assert_eq!(read.hash(), known, "chain {}", config.chain_id);
+        }
     }
 
     #[test]

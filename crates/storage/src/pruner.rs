@@ -191,6 +191,20 @@ impl BlockStore {
         }))
     }
 
+    /// Records `number` as the oldest block held, for a database that begins
+    /// above genesis without having been pruned to it: one loaded from a
+    /// state copy (`--import`) holds only the blocks the copy carried.
+    /// Everything that reads the floor -- the invariants, lineage proofs, the
+    /// canonical index's fill, the lowest block the node says it serves --
+    /// then knows there is nothing below it to look for.
+    pub fn set_history_floor(&self, number: u64, hash: B256, total_difficulty: U256) -> Result<()> {
+        self.set_prune_floor(&PruneFloor {
+            number,
+            hash,
+            total_difficulty,
+        })
+    }
+
     /// Sets the floor directly, for tests that need a pruned node without
     /// running a sweep to build one.
     pub fn set_prune_floor_for_test(
@@ -466,6 +480,7 @@ mod tests {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         }
     }
 

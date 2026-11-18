@@ -35,10 +35,14 @@ rocksdb = { workspace = true }
 libc = { workspace = true }
 alloy-rlp = { workspace = true }
 flate2 = "1"
-# HTTPS client for the external-IP lookup (src/public_ip.rs): rustls with the
-# ring provider and Mozilla's root store, not the lettre/smtp stack.
+# HTTPS client for the external-IP lookup (src/public_ip.rs) and for --import
+# (src/https.rs): rustls with the ring provider and Mozilla's root store, not
+# the lettre/smtp stack. --import fetches Rootstock's signed state copies as
+# rskj's does, with the signers' index.json and the copy's SHA-256.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
+serde_json = "1"
+sha2 = { workspace = true }
 
 [features]
 # Enable outgoing email for peg-out alerts (adds the SMTP transport to the
@@ -47,7 +51,6 @@ smtp = ["rustock-alerts/smtp"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
-serde_json = "1"
 # For the examples that decode a peg-in's bitcoin transaction straight out of
 # the call data, without executing the block. `validation_cost` also reaches
 # through it for `secp256k1`, the rust-bitcoin bindings to the C

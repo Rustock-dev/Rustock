@@ -1,12 +1,12 @@
 use crate::dto::LogDto;
-use crate::helpers::{parse_b256, parse_block_number, to_hex_b256, to_hex_u64};
+use crate::helpers::{parse_b256, to_hex_b256, to_hex_u64};
 use crate::server::RpcState;
 use crate::types::*;
 use alloy_primitives::{Address, B256};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 /// Block range an `eth_getLogs` may span when the operator has set no limit.
 ///
@@ -43,16 +43,28 @@ impl FilterStore {
 
     fn insert(&self, filter: Filter) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.filters.write().unwrap().insert(id, filter);
+        self.filters
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, filter);
         id
     }
 
     fn get(&self, id: u64) -> Option<Filter> {
-        self.filters.read().unwrap().get(&id).cloned()
+        self.filters
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .cloned()
     }
 
     fn update_last_polled(&self, id: u64, block: u64) {
-        if let Some(f) = self.filters.write().unwrap().get_mut(&id) {
+        if let Some(f) = self
+            .filters
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&id)
+        {
             f.last_polled_block = block;
         }
     }
@@ -61,7 +73,12 @@ impl FilterStore {
     /// now. Called straight after the difference has been handed to the
     /// caller.
     fn replace_reported(&self, id: u64, now: std::collections::HashSet<B256>) {
-        if let Some(f) = self.filters.write().unwrap().get_mut(&id) {
+        if let Some(f) = self
+            .filters
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&id)
+        {
             if let FilterKind::PendingTransaction { reported } = &mut f.kind {
                 *reported = now;
             }
@@ -69,7 +86,11 @@ impl FilterStore {
     }
 
     fn remove(&self, id: u64) -> bool {
-        self.filters.write().unwrap().remove(&id).is_some()
+        self.filters
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id)
+            .is_some()
     }
 }
 
@@ -105,13 +126,18 @@ pub fn eth_get_logs(id: Value, params: &Value, state: &RpcState) -> JsonRpcRespo
     };
 
     let head_num = head_number(&state.store).unwrap_or(0);
-    let filter = parse_log_filter(filter_obj, head_num);
+    let filter = match parse_log_filter(filter_obj, head_num) {
+        Ok(filter) => filter,
+        Err((code, message)) => return JsonRpcResponse::error(id, code, message),
+    };
 
     let from = filter.from_block.unwrap_or(head_num);
     let to = filter.to_block.unwrap_or(head_num);
 
     let max_range = state.logs_max_blocks.max(1);
-    if to > from + max_range {
+    // Measured as a difference, which cannot overflow: a `fromBlock` near 2^64
+    // would carry `from + max_range` past the top.
+    if to.saturating_sub(from) > max_range {
         return JsonRpcResponse::error(
             id,
             INVALID_PARAMS,
@@ -129,7 +155,10 @@ pub fn eth_new_filter(id: Value, params: &Value, state: &RpcState) -> JsonRpcRes
     };
 
     let head_num = head_number(&state.store).unwrap_or(0);
-    let log_filter = parse_log_filter(filter_obj, head_num);
+    let log_filter = match parse_log_filter(filter_obj, head_num) {
+        Ok(filter) => filter,
+        Err((code, message)) => return JsonRpcResponse::error(id, code, message),
+    };
 
     let filter = Filter {
         kind: FilterKind::Log(log_filter),
@@ -274,6 +303,11 @@ fn collect_logs(from: u64, to: u64, filter: &LogFilter, state: &RpcState) -> Vec
     // nothing.
     let use_bloom = filter_constrains_anything(filter);
 
+    // Nothing above the head has a block to read, and a range a client names
+    // may end anywhere up to 2^64 - 1 (an installed filter's is never checked
+    // against the cap). Walked number by number, the rest would be a request
+    // that never ends, holding a worker thread for good.
+    let to = to.min(head_number(&state.store).unwrap_or(0));
     for num in from..=to {
         let Some(block_hash) = state.store.canonical_hash(num).ok().flatten() else {
             continue;
@@ -382,14 +416,17 @@ fn matches_filter(log: &rustock_core::Log, filter: &LogFilter) -> bool {
     true
 }
 
-fn parse_log_filter(obj: &Value, head_num: u64) -> LogFilter {
-    let from_block = obj.get("fromBlock")
-        .and_then(|v| v.as_str())
-        .and_then(|s| parse_block_number(s, head_num));
-
-    let to_block = obj.get("toBlock")
-        .and_then(|v| v.as_str())
-        .and_then(|s| parse_block_number(s, head_num));
+/// A log filter as rskj reads it. Its blocks are read as
+/// `crate::helpers::parse_filter_block` says, and one rskj can't read is an
+/// error, not the head.
+fn parse_log_filter(obj: &Value, head_num: u64) -> Result<LogFilter, (i64, String)> {
+    let block = |key: &str| {
+        obj.get(key)
+            .map(|value| crate::helpers::parse_filter_block(value, head_num))
+            .transpose()
+    };
+    let from_block = block("fromBlock")?;
+    let to_block = block("toBlock")?;
 
     let addresses = parse_address_filter(obj.get("address"));
 
@@ -413,7 +450,12 @@ fn parse_log_filter(obj: &Value, head_num: u64) -> LogFilter {
         })
         .unwrap_or_default();
 
-    LogFilter { from_block, to_block, addresses, topics }
+    Ok(LogFilter {
+        from_block,
+        to_block,
+        addresses,
+        topics,
+    })
 }
 
 fn parse_address_filter(v: Option<&Value>) -> Vec<Address> {

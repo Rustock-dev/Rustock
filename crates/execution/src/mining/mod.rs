@@ -23,11 +23,16 @@ pub mod partition;
 pub mod workload;
 pub mod fork_detection;
 pub mod merkle;
+pub mod min_gas_price;
 pub mod server;
 pub mod uncles;
 pub mod template;
 pub mod timed;
 
+pub use min_gas_price::{
+    BtcExchangeRateSource, FixedMinGasPriceProvider, MinGasPriceProvider, MinGasPriceProviderType,
+    StableMinGasPriceProvider,
+};
 pub use server::{
     ChainAccess, CommitOutcome, ImportResult, MinerServer, MinerWork, RebuildPolicy,
     StoreChainAccess, SubmissionRateLimiter, SubmitError, SubmittedBlockInfo, SyncGate,
@@ -36,9 +41,9 @@ pub use server::{
 pub use uncles::{UNCLE_GENERATION_LIMIT, UNCLE_LIST_LIMIT, select_uncles};
 pub use timed::{Pow, TimedMiner, TimedSchedule};
 pub use template::{
-    BlockTemplate, BlockTemplateBuilder, MiningConfig, NoPendingTransactions, PendingTransaction,
-    PendingTransactionSource, TemplateError, difficulty_to_target, next_minimum_gas_price,
-    remasc_transaction,
+    BlockTemplate, BlockTemplateBuilder, GAS_LIMIT_TARGET, MiningConfig, NoPendingTransactions,
+    PendingTransaction, PendingTransactionSource, REGTEST_GAS_LIMIT_TARGET, TemplateError,
+    difficulty_to_target, next_minimum_gas_price, remasc_transaction,
 };
 
 #[cfg(test)]

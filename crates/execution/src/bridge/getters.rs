@@ -139,12 +139,7 @@ pub fn get_federator_public_key<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("getFederatorPublicKey: args too short"));
-    }
-    let index: usize = U256::from_be_slice(&args[..32])
-        .try_into()
-        .map_err(|_| PrecompileError::other("getFederatorPublicKey: index out of range"))?;
+    let index = index_arg(args, "getFederatorPublicKey")?;
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let fed = super::peg::active_federation(ctx, config, hardfork_cfg, block_number);
     let key = member_key_at(&fed.members, index, KeyType::Btc, "Federator")?;
@@ -257,35 +252,13 @@ pub fn is_btc_tx_hash_already_processed<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 64 {
-        return Err(PrecompileError::other("isBtcTxHashAlreadyProcessed: args too short"));
-    }
-    let offset = U256::from_be_slice(&args[0..32]).to::<usize>();
-    if offset + 32 > args.len() {
-        return Ok(PrecompileOutput::new(gas_cost, abi_encode_bool(false)));
-    }
-    let len = U256::from_be_slice(&args[offset..offset + 32]).to::<usize>();
-    if offset + 32 + len > args.len() {
-        return Ok(PrecompileOutput::new(gas_cost, abi_encode_bool(false)));
-    }
-    let hash_str = &args[offset + 32..offset + 32 + len];
-    let hash_hex = String::from_utf8_lossy(hash_str);
+    // rskj: `Sha256Hash.wrap((String) args[0])` inside a catch-all that throws a
+    // VMException, so a string that is not 64 lower-case hex digits reverts
+    // the call rather than answering false.
+    let hash_display = hash_arg(args, "isBtcTxHashAlreadyProcessed")?;
     // rskj goes through getHeightIfBtcTxhashIsAlreadyProcessed, which checks
     // the legacy btcTxHashesAP map first at every era (and loads it, so the
     // post-call save persists the possibly-empty map entry).
-    let mut hash_display = [0u8; 32];
-    let ok = hash_hex.len() == 64
-        && (0..32).all(|i| {
-            u8::from_str_radix(&hash_hex[2 * i..2 * i + 2], 16)
-                .map(|b| {
-                    hash_display[i] = b;
-                    true
-                })
-                .unwrap_or(false)
-        });
-    if !ok {
-        return Ok(PrecompileOutput::new(gas_cost, abi_encode_bool(false)));
-    }
     let mut hash_internal = hash_display;
     hash_internal.reverse();
     let processed = super::tx::is_btc_tx_processed(ctx, &hash_internal);
@@ -318,11 +291,17 @@ pub fn is_btc_tx_hash_already_processed<CTX: crate::RskContextTr>(
 // was found from the *serialized* whitelist cells at mainnet #1,590,999.)
 
 /// `getLockWhitelistSize()` → int256, one-off plus unlimited entries.
+///
+/// Every lock-whitelist getter that reads the whitelist writes it back as the
+/// call returns, as rskj's `save()` does for whatever the call loaded (see
+/// `save_lock_whitelist`). Only a getter run in a transaction keeps that
+/// write, so only one reached before RSKIP88 made them local calls.
 pub fn get_lock_whitelist_size<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let entries = merged_whitelist(ctx);
+    let entries = merged_whitelist(&loaded_and_saved_whitelist(ctx, hardfork_cfg));
     Ok(PrecompileOutput::new(gas_cost, abi_encode_int(entries.len() as i64)))
 }
 
@@ -338,14 +317,13 @@ pub fn get_lock_whitelist_address<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("getLockWhitelistAddress: args too short"));
-    }
-    let index = U256::from_be_slice(&args[..32]);
-    let entries = merged_whitelist(ctx);
+    let index = index_arg(args, "getLockWhitelistAddress")?;
+    let entries = merged_whitelist(&loaded_and_saved_whitelist(ctx, hardfork_cfg));
 
-    let address = match index.try_into().ok().and_then(|i: usize| entries.get(i)) {
+    // rskj `getLockWhitelistEntryByIndex`: a negative index is not found either.
+    let address = match usize::try_from(index).ok().and_then(|i| entries.get(i)) {
         // rskj: "Empty string is returned when address is not found".
         None => String::new(),
         Some((hash160, _)) => p2pkh_base58_address(hash160, config),
@@ -373,18 +351,21 @@ pub fn get_lock_whitelist_entry_by_address<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let Some(addr_str) = abi_decode_string(args, 0) else {
+    let Some(addr_str) = crate::abi::Args::new(args).string(0) else {
         return Err(PrecompileError::other(
             "getLockWhitelistEntryByAddress: malformed string argument",
         ));
     };
 
+    // rskj parses the address before it reads the whitelist, so one that
+    // doesn't parse leaves the whitelist unread and unwritten.
     let Some(hash160) = parse_network_address_hash160(&addr_str, config) else {
         return Ok(PrecompileOutput::new(gas_cost, abi_encode_int(ADDRESS_NOT_EXIST)));
     };
 
-    let value = merged_whitelist(ctx)
+    let value = merged_whitelist(&loaded_and_saved_whitelist(ctx, hardfork_cfg))
         .into_iter()
         .find(|(h, _)| *h == hash160)
         .map_or(ADDRESS_NOT_EXIST, |(_, cap)| match cap {
@@ -396,16 +377,28 @@ pub fn get_lock_whitelist_entry_by_address<CTX: crate::RskContextTr>(
     Ok(PrecompileOutput::new(gas_cost, abi_encode_int(value)))
 }
 
+/// rskj `getLockWhitelist` for the block being run, written back as the call
+/// returns.
+fn loaded_and_saved_whitelist<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) -> LockWhitelist {
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let whitelist = LockWhitelist::load(ctx, hardfork_cfg.has_rskip87(block_number));
+    whitelist.save(ctx);
+    whitelist
+}
+
 /// The whitelist as rskj's `LockWhitelist` holds it: one-off and unlimited
 /// entries in one map, ordered by hash160 ascending. `None` marks an unlimited
 /// entry, `Some(cap)` a one-off entry's `maxTransferValue`.
-fn merged_whitelist<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<([u8; 20], Option<u64>)> {
-    let mut entries: Vec<([u8; 20], Option<u64>)> = load_one_off_whitelist(ctx)
-        .0
-        .into_iter()
-        .map(|(hash160, cap)| (hash160, Some(cap)))
+fn merged_whitelist(whitelist: &LockWhitelist) -> Vec<([u8; 20], Option<u64>)> {
+    let mut entries: Vec<([u8; 20], Option<u64>)> = whitelist
+        .one_off
+        .iter()
+        .map(|&(hash160, cap)| (hash160, Some(cap)))
         .collect();
-    entries.extend(load_unlimited_whitelist(ctx).into_iter().map(|h| (h, None)));
+    entries.extend(whitelist.unlimited.iter().map(|&h| (h, None)));
     // `UnsignedBytes.lexicographicalComparator()` over the 20-byte hash160.
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     entries
@@ -421,14 +414,18 @@ fn p2pkh_base58_address(hash160: &[u8; 20], config: &BridgeConstants) -> String 
     bitcoin::base58::encode_check(&payload)
 }
 
-fn p2pkh_version(config: &BridgeConstants) -> u8 {
+/// bitcoinj `NetworkParameters.getAddressHeader`: the version of a P2PKH
+/// address on the Bridge's network.
+pub(super) fn p2pkh_version(config: &BridgeConstants) -> u8 {
     match config.btc_network {
         super::constants::BtcNetwork::Mainnet => 0,
         _ => 111,
     }
 }
 
-fn p2sh_version(config: &BridgeConstants) -> u8 {
+/// bitcoinj `NetworkParameters.getP2SHHeader`: the version of a P2SH address
+/// on the Bridge's network.
+pub(super) fn p2sh_version(config: &BridgeConstants) -> u8 {
     match config.btc_network {
         super::constants::BtcNetwork::Mainnet => 5,
         _ => 196,
@@ -441,7 +438,10 @@ fn p2sh_version(config: &BridgeConstants) -> u8 {
 ///
 /// The version is checked but then discarded, because the whitelist's TreeMap
 /// comparator looks at the hash160 alone.
-fn parse_network_address_hash160(addr: &str, config: &BridgeConstants) -> Option<[u8; 20]> {
+pub(super) fn parse_network_address_hash160(
+    addr: &str,
+    config: &BridgeConstants,
+) -> Option<[u8; 20]> {
     let decoded = bitcoin::base58::decode_check(addr).ok()?;
     if decoded.len() != 21 {
         return None;
@@ -483,23 +483,25 @@ fn parse_key_type(value: &str) -> Option<KeyType> {
     }
 }
 
-fn member_key(member: &super::federation::StoredMember, key_type: KeyType) -> [u8; 33] {
-    match key_type {
-        KeyType::Btc => member.btc,
-        KeyType::Rsk => member.rsk,
-        KeyType::Mst => member.mst,
-    }
+/// The member's key of `key_type` as rskj answers it (`getPubKey`, or
+/// `getPubKey(true)` for the RSK and MST keys): 33 compressed bytes, or the
+/// one byte `00` for the point at infinity.
+fn member_key(member: &super::federation::StoredMember, key_type: KeyType) -> Vec<u8> {
+    let key = match key_type {
+        KeyType::Btc => &member.btc,
+        KeyType::Rsk => &member.rsk,
+        KeyType::Mst => &member.mst,
+    };
+    super::federation::key_encoding(key).to_vec()
 }
 
-/// The `(index, keyType)` pair the `*PublicKeyOfType` methods take.
-fn decode_index_and_key_type(args: &[u8]) -> Result<(usize, KeyType), PrecompileError> {
-    if args.len() < 64 {
-        return Err(PrecompileError::other("PublicKeyOfType: args too short"));
-    }
-    let index = U256::from_be_slice(&args[..32])
-        .try_into()
-        .map_err(|_| PrecompileError::other("PublicKeyOfType: index out of range"))?;
-    let key_type = abi_decode_string(args, 1)
+/// The `(index, keyType)` pair the `*PublicKeyOfType` methods take: the index
+/// as rskj's `intValue()`, the key type through `KeyType.byValue`, which
+/// throws for anything but "btc", "rsk" and "mst".
+fn decode_index_and_key_type(args: &[u8]) -> Result<(i32, KeyType), PrecompileError> {
+    let index = index_arg(args, "PublicKeyOfType")?;
+    let key_type = crate::abi::Args::new(args)
+        .string(1)
         .as_deref()
         .and_then(parse_key_type)
         .ok_or_else(|| PrecompileError::other("PublicKeyOfType: unknown key type"))?;
@@ -507,17 +509,20 @@ fn decode_index_and_key_type(args: &[u8]) -> Result<(usize, KeyType), Precompile
 }
 
 /// rskj `FederationSupportImpl.getFederationMemberPublicKeyOfType`: an index
-/// outside the member list throws `IndexOutOfBoundsException`, which the
-/// Bridge turns into a `VMException` -- the call **reverts**, it does not
-/// return empty bytes.
+/// outside the member list, a negative one included, throws
+/// `IndexOutOfBoundsException`, which the Bridge turns into a `VMException`
+/// -- the call **reverts**, it does not return empty bytes. The index is
+/// checked only here, after the caller has found the federation: with no
+/// federation to look in, rskj answers empty whatever the index.
 fn member_key_at(
     members: &[super::federation::StoredMember],
-    index: usize,
+    index: i32,
     key_type: KeyType,
     who: &'static str,
-) -> Result<[u8; 33], PrecompileError> {
-    members
-        .get(index)
+) -> Result<Vec<u8>, PrecompileError> {
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| members.get(index))
         .map(|m| member_key(m, key_type))
         .ok_or_else(|| {
             PrecompileError::Other(
@@ -559,12 +564,7 @@ pub fn get_pending_federator_public_key<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("getPendingFederatorPublicKey: args too short"));
-    }
-    let index: usize = U256::from_be_slice(&args[..32])
-        .try_into()
-        .map_err(|_| PrecompileError::other("getPendingFederatorPublicKey: index out of range"))?;
+    let index = index_arg(args, "getPendingFederatorPublicKey")?;
 
     if bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY).is_empty() {
         return Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&[]).into()));
@@ -646,12 +646,7 @@ pub fn get_retiring_federator_public_key<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("getRetiringFederatorPublicKey: args too short"));
-    }
-    let index: usize = U256::from_be_slice(&args[..32])
-        .try_into()
-        .map_err(|_| PrecompileError::other("getRetiringFederatorPublicKey: index out of range"))?;
+    let index = index_arg(args, "getRetiringFederatorPublicKey")?;
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let Some(fed) = super::peg::retiring_federation(ctx, config, hardfork_cfg, block_number) else {
         return Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&[]).into()));
@@ -686,13 +681,16 @@ pub fn get_proposed_federation_address<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
     config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let Some(fed) = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY) else {
         return Ok(PrecompileOutput::new(gas_cost, abi_encode_string("").into()));
     };
     let keys: Vec<[u8; 33]> = fed.members.iter().map(|m| m.btc).collect();
     let format = super::peg::federation_format_version_pub(ctx, PROPOSED_FEDERATION_FORMAT_VERSION_KEY);
-    let redeem = super::peg::federation_redeem_for_format_pub(&keys, format, config);
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let redeem =
+        super::peg::federation_redeem_for_format_pub(&keys, format, config, hardfork_cfg, block_number);
     let hash160 = super::peg::federation_output_hash160(&redeem, format);
     let address = super::governance::p2sh_base58_address(&hash160, config);
     Ok(PrecompileOutput::new(gas_cost, abi_encode_string(&address).into()))
@@ -763,31 +761,50 @@ pub fn get_btc_tx_hash_processed_height<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let Some(hash_hex) = abi_decode_string(args, 0) else {
-        return Err(PrecompileError::other(
-            "getBtcTxHashProcessedHeight: malformed string argument",
-        ));
-    };
-    let Some(mut hash) = parse_btc_hash_display(&hash_hex) else {
-        // rskj: `Sha256Hash.wrap` throws, the Bridge wraps it in a VMException.
-        return Err(PrecompileError::other(
-            "getBtcTxHashProcessedHeight: not a 32-byte hash",
-        ));
-    };
+    // rskj: `Sha256Hash.wrap` throws, the Bridge wraps it in a VMException.
+    let mut hash = hash_arg(args, "getBtcTxHashProcessedHeight")?;
     hash.reverse();
     let height = super::tx::get_btc_tx_processed_height(ctx, &hash).map_or(-1i64, |h| h as i64);
     Ok(PrecompileOutput::new(gas_cost, abi_encode_int(height)))
 }
 
-fn parse_btc_hash_display(hex_str: &str) -> Option<[u8; 32]> {
-    if hex_str.len() != 64 {
+/// A method's first argument as an index: `((BigInteger) args[0]).intValue()`.
+fn index_arg(args: &[u8], method: &str) -> Result<i32, PrecompileError> {
+    crate::abi::Args::new(args)
+        .int(0)
+        .map(|index| index.int_value())
+        .ok_or_else(|| PrecompileError::Other(format!("{method}: no index").into()))
+}
+
+/// A method's first argument as a BTC transaction hash in display order:
+/// `Sha256Hash.wrap((String) args[0])`, whose lower-case-only hex decoding
+/// and 32-byte check both throw.
+fn hash_arg(args: &[u8], method: &str) -> Result<[u8; 32], PrecompileError> {
+    crate::abi::Args::new(args)
+        .string(0)
+        .as_deref()
+        .and_then(sha256_hash_from_hex)
+        .ok_or_else(|| PrecompileError::Other(format!("{method}: not a 32-byte hash").into()))
+}
+
+/// `Sha256Hash.wrap(String)`: bitcoinj's `Utils.HEX`, Guava's lower-case
+/// base16, decodes the string, and the hash must be 32 bytes. Upper-case
+/// digits are refused.
+fn sha256_hash_from_hex(hex: &str) -> Option<[u8; 32]> {
+    let digit = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let digits = hex.as_bytes();
+    if digits.len() != 64 {
         return None;
     }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(hex_str.get(2 * i..2 * i + 2)?, 16).ok()?;
+    let mut hash = [0u8; 32];
+    for (byte, pair) in hash.iter_mut().zip(digits.chunks_exact(2)) {
+        *byte = (digit(pair[0])? << 4) | digit(pair[1])?;
     }
-    Some(out)
+    Some(hash)
 }
 
 /// The federation creation time as the era reports it: milliseconds before
@@ -802,23 +819,6 @@ fn creation_time_for_era(
     } else {
         millis as i64
     }
-}
-
-/// ABI-decode the `string` at parameter slot `slot`.
-fn abi_decode_string(args: &[u8], slot: usize) -> Option<String> {
-    let head = slot * 32;
-    if args.len() < head + 32 {
-        return None;
-    }
-    let offset: usize = U256::from_be_slice(&args[head..head + 32]).try_into().ok()?;
-    if args.len() < offset + 32 {
-        return None;
-    }
-    let len: usize = U256::from_be_slice(&args[offset..offset + 32]).try_into().ok()?;
-    if args.len() < offset + 32 + len {
-        return None;
-    }
-    String::from_utf8(args[offset + 32..offset + 32 + len].to_vec()).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -846,6 +846,10 @@ pub fn get_state_for_btc_release_client<CTX: crate::RskContextTr>(
     let data = bridge_load_bytes_named(ctx, PEGOUTS_WAITING_FOR_SIGNATURES_KEY);
     let waiting = super::peg::deserialize_rsk_txs_waiting_for_signatures(&data);
     let serialized = super::peg::serialize_rsk_txs_waiting_for_signatures(&waiting);
+    // rskj's `save()` writes back the set the call read, the empty list where
+    // the cell held nothing. Only a transaction's call keeps that, so only one
+    // before RSKIP88, which made this a local call.
+    bridge_store_bytes_named(ctx, PEGOUTS_WAITING_FOR_SIGNATURES_KEY, &serialized);
     let encoded = serialization::rlp_encode_list(&[serialized]);
     Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&encoded).into()))
 }
@@ -903,8 +907,12 @@ pub fn get_state_for_svp_client<CTX: crate::RskContextTr>(
 pub fn get_state_for_debugging<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
+    // rskj builds the state from `getBtcBlockchainBestChainHeight()`, which
+    // seeds a store nothing has seeded yet (`ensureBtcBlockStore`).
+    super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg)?;
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     // rskj `BridgeState.shouldUsePapyrusEncoding` == RSKIP146.
     let papyrus = hardfork_cfg.has_rskip146(block_number);
@@ -917,16 +925,42 @@ pub fn get_state_for_debugging<CTX: crate::RskContextTr>(
             PEGOUTS_WAITING_FOR_SIGNATURES_KEY,
         )),
     );
-    let queue = super::peg::load_release_request_queue(ctx, papyrus);
+    // rskj's serializers each take their half of a collection: with the
+    // hashes from RSKIP146 the entries that carry one (`getEntriesWithHash`,
+    // `getEntriesWithHashOrdered`), before it the entries that carry none.
+    let queue: Vec<_> = super::peg::load_release_request_queue(ctx, papyrus)
+        .into_iter()
+        .filter(|entry| entry.rsk_tx_hash.is_some() == papyrus)
+        .collect();
     let queue_bytes = if papyrus {
         super::peg::serialize_release_queue_with_hash(&queue)
     } else {
         super::peg::serialize_release_queue_legacy(&queue)
     };
-    let confirmations = super::peg::load_pegout_confirmation_set(ctx, papyrus);
+    let confirmations: Vec<_> = super::peg::load_pegout_confirmation_set(ctx, papyrus)
+        .into_iter()
+        .filter(|entry| entry.rsk_tx_hash.is_some() == papyrus)
+        .collect();
     let confirmations_bytes =
         super::peg::serialize_pegouts_waiting_for_confirmations(&confirmations, papyrus);
     let next_pegout = bridge_load_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY).to::<u64>();
+
+    // rskj's `save()` writes back what the call read, each as rskj serializes
+    // it, the empty list where a cell held nothing; the next peg-out height
+    // only where RSKIP271 has it read. Only a transaction's call keeps that,
+    // so only one before RSKIP88, which made this a local call.
+    store_federation_utxos(ctx, hardfork_cfg, block_number, &utxos);
+    bridge_store_bytes_named(
+        ctx,
+        PEGOUTS_WAITING_FOR_SIGNATURES_KEY,
+        &waiting_for_signatures,
+    );
+    super::peg::write_back_release_request_queue(ctx, papyrus);
+    let all_confirmations = super::peg::load_pegout_confirmation_set(ctx, papyrus);
+    super::peg::store_pegout_confirmation_set(ctx, &all_confirmations, papyrus);
+    if hardfork_cfg.has_rskip271(block_number) {
+        bridge_store_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY, U256::from(next_pegout));
+    }
 
     let encoded = serialization::rlp_encode_list(&[
         // encodeBigInteger, not encodeElement: a minimal-length integer.
@@ -1012,7 +1046,7 @@ fn abi_encode_string(s: &str) -> Vec<u8> {
     abi_encode_bytes(s.as_bytes())
 }
 
-fn abi_encode_bytes(data: &[u8]) -> Vec<u8> {
+pub(crate) fn abi_encode_bytes(data: &[u8]) -> Vec<u8> {
     // rskj's `SolidityType.BytesType.encode` sizes the data section as
     // `((len - 1) / 32 + 1) * 32` with Java's truncating division, so an EMPTY
     // `bytes` still emits one 32-byte zero word (-1/32 == 0 → 1 word): empty
@@ -1109,7 +1143,7 @@ mod tests {
         store_one_off_whitelist(&mut ctx, &[([0x11; 20], 500), ([0x22; 20], 600)], 1_000);
         store_unlimited_whitelist(&mut ctx, &[[0x33; 20]]);
 
-        let out = get_lock_whitelist_size(&mut ctx, 0).unwrap();
+        let out = get_lock_whitelist_size(&mut ctx, 0, &hardforks()).unwrap();
         assert_eq!(as_int(&out), 3);
     }
 
@@ -1171,7 +1205,53 @@ mod tests {
         address: &str,
         config: &BridgeConstants,
     ) -> PrecompileOutput {
-        get_lock_whitelist_entry_by_address(ctx, &abi_string_arg(address), 0, config).unwrap()
+        get_lock_whitelist_entry_by_address(ctx, &abi_string_arg(address), 0, config, &hardforks())
+            .unwrap()
+    }
+
+    /// A getter that reads the whitelist writes it back as the call returns,
+    /// as rskj's `save()` does for whatever the call loaded (upstream #291),
+    /// so on a store that never held it the cells appear: the unlimited one
+    /// from RSKIP87 on. The by-address getter parses the address first, and
+    /// one that doesn't parse leaves the whitelist unread.
+    #[test]
+    fn the_whitelist_getters_write_the_whitelist_back() {
+        fn cells<CTX: crate::RskContextTr>(ctx: &mut CTX) -> (String, String) {
+            let mut cell =
+                |key: &str| alloy_primitives::hex::encode(bridge_load_bytes_named(ctx, key));
+            (cell(LOCK_WHITELIST_KEY), cell(UNLIMITED_LOCK_WHITELIST_KEY))
+        }
+        let read = ("c5847fffffff".to_string(), "c0".to_string());
+        let config = mainnet();
+
+        let mut ctx = ctx_at(1_000_000);
+        assert_eq!(
+            as_int(&get_lock_whitelist_size(&mut ctx, 0, &hardforks()).unwrap()),
+            0
+        );
+        assert_eq!(cells(&mut ctx), read);
+
+        let mut ctx = ctx_at(728_999);
+        get_lock_whitelist_size(&mut ctx, 0, &hardforks()).unwrap();
+        assert_eq!(
+            cells(&mut ctx),
+            ("c5847fffffff".to_string(), String::new()),
+            "before RSKIP87, the one-off cell alone"
+        );
+
+        let mut ctx = ctx_at(1_000_000);
+        get_lock_whitelist_address(&mut ctx, &[0u8; 32], 0, &config, &hardforks()).unwrap();
+        assert_eq!(cells(&mut ctx), read);
+
+        let mut ctx = ctx_at(1_000_000);
+        assert_eq!(
+            as_int(&query_whitelist(&mut ctx, "not an address", &config)),
+            -1
+        );
+        assert_eq!(cells(&mut ctx), (String::new(), String::new()), "unread");
+        let stranger = p2pkh_base58_address(&[0x99; 20], &config);
+        assert_eq!(as_int(&query_whitelist(&mut ctx, &stranger, &config)), -1);
+        assert_eq!(cells(&mut ctx), read);
     }
 
     /// ABI head+tail for a single `string` argument.
@@ -1213,7 +1293,7 @@ mod tests {
         let at = |ctx: &mut _, i: u64| {
             let mut arg = [0u8; 32];
             arg[24..32].copy_from_slice(&i.to_be_bytes());
-            as_string(&get_lock_whitelist_address(ctx, &arg, 0, &config).unwrap())
+            as_string(&get_lock_whitelist_address(ctx, &arg, 0, &config, &hardforks()).unwrap())
         };
         assert_eq!(
             at(&mut ctx, 0),
@@ -1230,7 +1310,7 @@ mod tests {
     fn lock_whitelist_order_is_unsigned() {
         let mut ctx = ctx_at(1_000_000);
         store_one_off_whitelist(&mut ctx, &[([0xff; 20], 1), ([0x01; 20], 2)], 1_000);
-        let merged = merged_whitelist(&mut ctx);
+        let merged = merged_whitelist(&LockWhitelist::load(&mut ctx, true));
         assert_eq!(
             merged.iter().map(|(h, _)| h[0]).collect::<Vec<_>>(),
             vec![0x01, 0xff]
@@ -1394,6 +1474,65 @@ mod tests {
         );
     }
 
+    /// Testnet's history: each of the nine federations committed between
+    /// RSKIP383 (#4,015,800) and RSKIP419 (#6,110,487) became the active one
+    /// 120 blocks after its commitment. rskj's public testnet node answers
+    /// `getFederationCreationBlockNumber` with the previous federation's block
+    /// at the 119th block and with the new one's at the 120th.
+    #[test]
+    fn testnets_federations_before_lovell_became_active_after_120_blocks() {
+        let (config, forks) = (BridgeConstants::testnet(), RskHardforkConfig::testnet());
+        // (the previous federation's creation block, the committed one's)
+        let history = [
+            (3_945_006, 4_019_051),
+            (4_019_051, 4_063_391),
+            (4_063_391, 4_258_297),
+            (4_258_297, 4_487_930),
+            (4_487_930, 5_334_163),
+            (5_334_163, 5_787_959),
+            (5_787_959, 5_854_737),
+            (5_854_737, 6_065_057),
+            (6_065_057, 6_068_377),
+        ];
+        for (previous, committed) in history {
+            for (block, active) in [(committed + 119, previous), (committed + 120, committed)] {
+                let mut ctx = ctx_at(block);
+                store_federation(&mut ctx, NEW_FEDERATION_KEY, &[member(1)], 1_000, committed);
+                store_federation(&mut ctx, OLD_FEDERATION_KEY, &[member(2)], 900, previous);
+                let out = get_federation_creation_block_number(&mut ctx, 0, &config, &forks);
+                assert_eq!(as_int(&out.unwrap()), active as i64, "testnet #{block}");
+            }
+        }
+    }
+
+    /// With nothing stored, the active federation is the genesis federation,
+    /// built in the format its network's constants name. Mainnet's and testnet's
+    /// are standard multisig, as rskj's public nodes answer
+    /// `getFederationAddress` at block 1. rskj's regtest's is a P2SH-P2WSH ERP
+    /// federation, as an independent port of rskj's `P2shErpRedeemScriptBuilder`
+    /// computes it; before, rustock built
+    /// every genesis federation as standard multisig.
+    #[test]
+    fn the_genesis_federation_is_built_in_its_networks_format() {
+        for (config, forks, address) in [
+            (mainnet(), hardforks(), "39AHNvUmzaYgewA8yCtBtNsfRz7QD7ZJYi"),
+            (
+                BridgeConstants::testnet(),
+                RskHardforkConfig::testnet(),
+                "2N1N5mdHWmRUfv49f7GnUeFfuyLcBQK7hj2",
+            ),
+            (
+                BridgeConstants::rskj_regtest(),
+                RskHardforkConfig::regtest(),
+                "2MvQSG61B4LtKLECeo1dRDeDWXgJfnr3fC7",
+            ),
+        ] {
+            let mut ctx = ctx_at(1);
+            let out = get_federation_address(&mut ctx, 0, &config, &forks).unwrap();
+            assert_eq!(as_string(&out), address);
+        }
+    }
+
     // ---- creation time units ----
 
     /// RSKIP419 changes the unit from milliseconds to seconds. Storage keeps
@@ -1493,16 +1632,24 @@ mod tests {
     fn state_for_debugging_has_six_fields_with_the_height_as_an_integer() {
         let mut ctx = ctx_at(6_500_000);
         let forks = hardforks();
-        let out = get_state_for_debugging(&mut ctx, 0, &forks).unwrap();
+        let config = mainnet();
+        let out = get_state_for_debugging(&mut ctx, 0, &config, &forks).unwrap();
         let rlp = as_bytes(&out);
 
         let fields = crate::bridge::serialization::rlp_decode_list(&rlp)
             .expect("BridgeState is an RLP list");
         assert_eq!(fields.len(), 6, "btcHeight, utxos, waitingFS, queue, pegouts, nextHeight");
 
-        // An empty store gives height 0, which `encodeBigInteger` renders as
-        // the empty byte string rather than a zero byte.
-        assert!(fields[0].is_empty() || fields[0] == vec![0u8], "height as an integer");
+        // The height comes from `getBtcBlockchainBestChainHeight()`, which
+        // seeds an empty store, so it's the checkpoint's: a minimal-length
+        // integer, as `encodeBigInteger` writes it.
+        let checkpoint = config.btc_checkpoint.unwrap().1;
+        let minimal: Vec<u8> = checkpoint
+            .to_be_bytes()
+            .into_iter()
+            .skip_while(|b| *b == 0)
+            .collect();
+        assert_eq!(fields[0], minimal, "height as an integer");
         // The middle four are byte strings holding their own RLP lists.
         for (i, field) in fields.iter().enumerate().take(5).skip(1) {
             assert!(
@@ -1510,6 +1657,53 @@ mod tests {
                 "field {i} should carry a serialized collection"
             );
         }
+    }
+
+    /// From RSKIP146 `BridgeState.getEncoded` serializes the release-request
+    /// queue and the peg-outs waiting for confirmations with their hashes,
+    /// and rskj's serializers take only the entries that carry one: a request
+    /// or a peg-out from before RSKIP146 is left out, not written with a zero
+    /// hash.
+    #[test]
+    fn state_for_debugging_leaves_out_what_carries_no_hash() {
+        use crate::bridge::peg::{
+            serialize_pegouts_waiting_for_confirmations, serialize_release_queue_legacy,
+            serialize_release_queue_with_hash, store_pegout_confirmation_set,
+            PegoutWaitingForConfirmations, ReleaseRequest,
+        };
+        use crate::bridge::storage::{bridge_storage_key, bridge_store_bytes};
+        let mut ctx = ctx_at(6_500_000);
+        let request = |tag: u8, hash: Option<[u8; 32]>| ReleaseRequest {
+            btc_dest_hash160: [tag; 20],
+            amount_satoshis: 1_000_000,
+            rsk_tx_hash: hash,
+        };
+        bridge_store_bytes(
+            &mut ctx,
+            bridge_storage_key("releaseRequestQueue"),
+            &serialize_release_queue_legacy(&[request(1, None)]),
+        );
+        let hashed = request(2, Some([0x22; 32]));
+        bridge_store_bytes(
+            &mut ctx,
+            bridge_storage_key("releaseRequestQueueWithTxHash"),
+            &serialize_release_queue_with_hash(std::slice::from_ref(&hashed)),
+        );
+        let pegout = |tag: u8, hash: Option<[u8; 32]>| PegoutWaitingForConfirmations {
+            btc_tx_raw: vec![tag; 10],
+            rsk_block_height: 5,
+            rsk_tx_hash: hash,
+        };
+        let confirming = pegout(4, Some([0x44; 32]));
+        store_pegout_confirmation_set(&mut ctx, &[pegout(3, None), confirming.clone()], true);
+
+        let out = get_state_for_debugging(&mut ctx, 0, &mainnet(), &hardforks()).unwrap();
+        let fields = crate::bridge::serialization::rlp_decode_list(&as_bytes(&out)).unwrap();
+        assert_eq!(fields[3], serialize_release_queue_with_hash(&[hashed]));
+        assert_eq!(
+            fields[4],
+            serialize_pegouts_waiting_for_confirmations(&[confirming], true)
+        );
     }
 
     // ---- BTC tx index ----
@@ -1606,5 +1800,42 @@ mod tests {
         assert_eq!(out[31], 32); // offset
         assert_eq!(out[63], 33); // length
         assert_eq!(out[64], 0xAA);
+    }
+
+    /// rskj `Sha256Hash.wrap(String)` decodes with Guava's lower-case base16
+    /// and wants 32 bytes, so an upper-case or short hash throws: it is not
+    /// read as a hash that was never processed.
+    #[test]
+    fn a_tx_hash_string_must_be_64_lower_case_hex_digits() {
+        let mut ctx = ctx_at(1);
+        let lower = "ab".repeat(32);
+        let args = |s: &str| abi_encode_bytes(s.as_bytes());
+        let out = is_btc_tx_hash_already_processed(&mut ctx, &args(&lower), 0).unwrap();
+        assert_eq!(as_int(&out), 0);
+        assert!(
+            is_btc_tx_hash_already_processed(&mut ctx, &args(&lower.to_uppercase()), 0).is_err()
+        );
+        assert!(get_btc_tx_hash_processed_height(&mut ctx, &args("ab"), 0).is_err());
+    }
+
+    /// rskj's `IntType` reads an empty payload as zero, so an index-taking
+    /// getter called with no arguments at all answers for index 0.
+    #[test]
+    fn no_arguments_is_index_zero() {
+        let mut ctx = ctx_at(1);
+        let empty = get_federator_public_key(&mut ctx, &[], 0, &mainnet(), &hardforks()).unwrap();
+        let zero =
+            get_federator_public_key(&mut ctx, &[0u8; 32], 0, &mainnet(), &hardforks()).unwrap();
+        assert_eq!(empty.bytes, zero.bytes);
+        assert_eq!(as_bytes(&empty).len(), 33);
+    }
+
+    #[test]
+    fn a_hash_string_is_64_lower_case_hex_digits() {
+        let lower = "00".repeat(31) + "ab";
+        assert_eq!(sha256_hash_from_hex(&lower).map(|h| h[31]), Some(0xAB));
+        assert_eq!(sha256_hash_from_hex(&lower.to_uppercase()), None);
+        assert_eq!(sha256_hash_from_hex(&lower[2..]), None);
+        assert_eq!(sha256_hash_from_hex(&("0".repeat(61) + "\u{FFFD}")), None);
     }
 }

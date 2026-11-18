@@ -1,82 +1,143 @@
-use crate::dto::CallRequest;
+use crate::dto::{CallArguments, CallRequest};
+use crate::params::{uncaught, Refusal};
 use crate::server::RpcState;
-use crate::state::resolve_state_root;
+
 use crate::types::*;
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Bytes, U256};
 use rustock_core::Transaction;
-use rustock_execution::RskExecutor;
+use rustock_execution::{GasEstimate, RskExecutor};
 use serde_json::{json, Value};
 
 use crate::helpers::to_hex_bytes;
 
+/// The gas `eth_call` runs with when the call names none, and the most it
+/// runs with when it names more: rskj's `rpc.callGasCap` as its
+/// `reference.conf` ships it. `CallArgumentsToByteArray.gasLimitForCall`
+/// takes the call's gas, or `0x5AF3107A4000` when it names none
+/// (`getGasLimit`), and the cap when that is more.
+///
+/// A local call is no longer held to the block's gas limit (see
+/// `RskHandler::as_local_call`), so this is what bounds its run.
+pub const CALL_GAS_CAP: u64 = 10_000_000;
+
+/// The gas every `eth_estimateGas` runs with, whatever the call names, and
+/// the most it answers: rskj's `rpc.gasEstimationCap` as its `reference.conf`
+/// ships it (`EthModule.estimateGas` passes it as the gas limit;
+/// `internalEstimateGas` caps the answer at it).
+pub const GAS_ESTIMATION_CAP: u64 = 6_800_000;
+
+/// A call's arguments, checked as rskj's `CallArgumentsParam` checks them
+/// before the method runs. `None` for `null`, which reaches the method as no
+/// arguments at all: it throws when it comes to read them, and nothing
+/// catches that.
+fn call_arguments(params: &Value) -> Result<Option<CallArguments>, Refusal> {
+    match params.get(0) {
+        None => Err((
+            INVALID_PARAMS,
+            "Missing or invalid call request".to_string(),
+        )),
+        Some(Value::Null) => Ok(None),
+        Some(arguments) => CallArguments::read(arguments).map(Some),
+    }
+}
+
 pub fn eth_call(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
-    let Some(call_req) = params.get(0).and_then(CallRequest::from_json) else {
-        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid call request");
+    let refuse = |id: Value, (code, message): Refusal| JsonRpcResponse::error(id, code, message);
+    let arguments = match call_arguments(params) {
+        Ok(arguments) => arguments,
+        Err(refusal) => return refuse(id, refusal),
     };
-    let block_param = params.get(1).and_then(|v| v.as_str()).unwrap_or("latest");
+    let block_param = match crate::helpers::call_block(params.get(1), &state.store) {
+        Ok(block) => block,
+        Err(refusal) => return refuse(id, refusal),
+    };
 
     let Some((trie_store, hardfork_cfg)) = state.trie_store.clone().zip(state.hardfork_cfg.clone()) else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Execution engine not available");
     };
 
-    let Some((root, header)) = resolve_state_root(block_param, state) else {
-        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
+    // rskj has the block in hand before it reads the call's numbers, and
+    // looks for the block's state only as it runs the call (`EthModule.call`).
+    let found = crate::state::state_at(&block_param, state);
+    if let Err(none @ crate::state::NoState::Block) = found {
+        return crate::state::no_execution_state(&id, &block_param, none);
+    }
+    let call_req = match arguments
+        .ok_or_else(uncaught)
+        .and_then(CallArguments::request)
+    {
+        Ok(request) => request,
+        Err(refusal) => return refuse(id, refusal),
+    };
+    let (root, header) = match found {
+        Ok(found) => found,
+        Err(none) => return crate::state::no_execution_state(&id, &block_param, none),
     };
 
-    let sender = call_req.from.unwrap_or(Address::ZERO);
-    let tx = build_call_tx(&call_req, &header, &root, sender, state);
-    let executor = RskExecutor::new(hardfork_cfg, state.store.clone());
+    let tx = build_call_tx(&call_req, &root, state);
+    let executor = state.executor(hardfork_cfg);
 
-    match executor.execute_local_call(&header, &tx, sender, &root, trie_store) {
-        Ok(result) => {
-            if result.output.is_empty() {
-                JsonRpcResponse::success(id, json!("0x"))
-            } else {
-                JsonRpcResponse::success(id, json!(to_hex_bytes(&result.output)))
-            }
-        }
+    // A program that ends with REVERT is an error of its own; one that fails
+    // any other way answers with no data, as a call that runs nothing does
+    // (`EthModule.call`).
+    match executor.execute_local_call(&header, &tx, call_req.from, &root, trie_store) {
+        Ok(result) if result.reverted => crate::revert::answer(id, &result.output),
+        Ok(result) => JsonRpcResponse::success(id, json!(to_hex_bytes(&result.output))),
         Err(e) => JsonRpcResponse::error(id, INTERNAL_ERROR, format!("Execution failed: {e}")),
     }
 }
 
 pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
-    let Some(call_req) = params.get(0).and_then(CallRequest::from_json) else {
-        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid call request");
+    let refuse = |id: Value, (code, message): Refusal| JsonRpcResponse::error(id, code, message);
+    let arguments = match call_arguments(params) {
+        Ok(arguments) => arguments,
+        Err(refusal) => return refuse(id, refusal),
     };
-    let block_param = params.get(1).and_then(|v| v.as_str()).unwrap_or("latest");
+    let block_param = match crate::helpers::estimate_block(params.get(1)) {
+        Ok(block) => block,
+        Err(refusal) => return refuse(id, refusal),
+    };
 
     let Some((trie_store, hardfork_cfg)) = state.trie_store.clone().zip(state.hardfork_cfg.clone()) else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Execution engine not available");
     };
 
-    let Some((root, header)) = resolve_state_root(block_param, state) else {
-        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
+    let (root, header) = match crate::state::execution_state(&id, &block_param, state) {
+        Ok(found) => found,
+        Err(refused) => return refused,
+    };
+    // An estimate has its state in hand before it reads the call's numbers
+    // (`EthModule.estimateGas`).
+    let call_req = match arguments
+        .ok_or_else(uncaught)
+        .and_then(CallArguments::estimate_request)
+    {
+        Ok(request) => request,
+        Err(refusal) => return refuse(id, refusal),
     };
 
-    let sender = call_req.from.unwrap_or(Address::ZERO);
-    let executor = RskExecutor::new(hardfork_cfg, state.store.clone());
+    let executor = state.executor(hardfork_cfg);
 
-    let gas_cap = call_req.gas.unwrap_or(header.gas_limit.to::<u64>());
+    // rskj runs every estimate at its cap; the call's own gas isn't read.
+    let gas_cap = GAS_ESTIMATION_CAP;
 
-    let mut tx = build_call_tx(&call_req, &header, &root, sender, state);
+    let mut tx = build_call_tx(&call_req, &root, state);
     tx.gas_limit = U256::from(gas_cap);
 
     if state.gas_estimator_binary_search {
         return estimate_by_binary_search(
-            id, &call_req, &header, &root, sender, state, &executor, trie_store, gas_cap,
+            id, &call_req, &header, &root, state, &executor, trie_store, gas_cap,
         );
     }
 
     // One execution, at the cap, with the estimation inspector attached. See
     // `rustock_execution::gas_estimator` for why the three things it records
     // are enough to answer without searching.
-    match executor.estimate_gas_exact(&header, &tx, sender, &root, trie_store, gas_cap) {
-        Ok((estimate, true, _)) => {
+    match executor.estimate_gas_exact(&header, &tx, call_req.from, &root, trie_store, gas_cap) {
+        Ok(GasEstimate::Gas(estimate)) => {
             JsonRpcResponse::success(id, json!(crate::helpers::to_hex_u64(estimate)))
         }
-        Ok((_, false, _)) => {
-            JsonRpcResponse::error(id, INTERNAL_ERROR, "Transaction would revert")
-        }
+        Ok(GasEstimate::Reverted(output)) => crate::revert::answer(id, &output),
         Err(e) => JsonRpcResponse::error(id, INTERNAL_ERROR, format!("Execution failed: {e}")),
     }
 }
@@ -94,7 +155,6 @@ fn estimate_by_binary_search(
     call_req: &CallRequest,
     header: &rustock_core::types::header::Header,
     root: &rustock_trie::TrieNode,
-    sender: Address,
     state: &RpcState,
     executor: &RskExecutor,
     trie_store: std::sync::Arc<dyn rustock_trie::TrieStore>,
@@ -113,13 +173,18 @@ fn estimate_by_binary_search(
     let mut lo = 0u64;
     let mut hi = gas_cap;
 
-    // First check if the transaction even succeeds at the gas cap
-    let mut tx = build_call_tx(call_req, header, root, sender, state);
+    // First check if the transaction even succeeds at the gas cap. One that
+    // reverts is answered as a revert, and one that fails any other way has
+    // no smaller limit to find: it is estimated at what it used, as rskj
+    // estimates it (`RskExecutor::estimate_gas_exact`).
+    let mut tx = build_call_tx(call_req, root, state);
     tx.gas_limit = U256::from(hi);
-    match executor.execute_local_call(header, &tx, sender, root, trie_store.clone()) {
+    match executor.execute_local_call(header, &tx, call_req.from, root, trie_store.clone()) {
+        Ok(result) if result.reverted => return crate::revert::answer(id, &result.output),
         Ok(result) if result.success => {}
-        Ok(_) => {
-            return JsonRpcResponse::error(id, INTERNAL_ERROR, "Transaction would revert");
+        Ok(result) => {
+            let used = result.gas_used.min(gas_cap);
+            return JsonRpcResponse::success(id, json!(crate::helpers::to_hex_u64(used)));
         }
         Err(e) => {
             return JsonRpcResponse::error(id, INTERNAL_ERROR, format!("Execution failed: {e}"));
@@ -128,10 +193,16 @@ fn estimate_by_binary_search(
 
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
-        let mut probe_tx = build_call_tx(call_req, header, root, sender, state);
+        let mut probe_tx = build_call_tx(call_req, root, state);
         probe_tx.gas_limit = U256::from(mid);
 
-        match executor.execute_local_call(header, &probe_tx, sender, root, trie_store.clone()) {
+        match executor.execute_local_call(
+            header,
+            &probe_tx,
+            call_req.from,
+            root,
+            trie_store.clone(),
+        ) {
             Ok(result) if result.success => hi = mid,
             _ => lo = mid,
         }
@@ -140,28 +211,29 @@ fn estimate_by_binary_search(
     JsonRpcResponse::success(id, json!(crate::helpers::to_hex_u64(hi)))
 }
 
-/// eth_call/eth_estimateGas are simulations: default the nonce to the
-/// sender's current one and the gas price to the block minimum so the
-/// executor's transaction validation passes (rskj skips those checks for
-/// local calls).
+/// The transaction `eth_call` and `eth_estimateGas` run, with rskj's defaults
+/// for what the call leaves out (`CallArgumentsToByteArray`): a gas price of
+/// 0 (`getGasPrice`), [`CALL_GAS_CAP`]'s gas (`gasLimitForCall`; an estimate
+/// sets its own), no value. The nonce is the sender's, as
+/// `ReversibleTransactionExecutor` builds it; a local call doesn't check it.
+/// A call that names no sender is from rskj's null address
+/// (`getFromAddress`), which no transaction is ever from: its nonce is 0.
 fn build_call_tx(
     req: &CallRequest,
-    header: &rustock_core::Header,
     root: &rustock_trie::TrieNode,
-    sender: Address,
     state: &RpcState,
 ) -> Transaction {
-    let sender_nonce = crate::state::trie_get_account(
-        root,
-        &rustock_trie::account_key(&sender),
-        state,
-    )
-    .map(|a| a.nonce.to::<u64>())
-    .unwrap_or(0);
+    let sender_nonce = req
+        .from
+        .and_then(|sender| {
+            crate::state::trie_get_account(root, &rustock_trie::account_key(&sender), state)
+        })
+        .map(|a| a.nonce.to::<u64>())
+        .unwrap_or(0);
     Transaction {
         nonce: sender_nonce,
-        gas_price: req.gas_price.unwrap_or(header.minimum_gas_price),
-        gas_limit: req.gas.map(U256::from).unwrap_or(header.gas_limit),
+        gas_price: req.gas_price.unwrap_or(U256::ZERO),
+        gas_limit: U256::from(req.gas.map_or(CALL_GAS_CAP, |gas| gas.min(CALL_GAS_CAP))),
         to: req.to.map(|a| Bytes::copy_from_slice(a.as_slice())).unwrap_or_default(),
         value: req.value.unwrap_or(U256::ZERO),
         input: req.data.as_deref().map(Bytes::copy_from_slice).unwrap_or_default(),

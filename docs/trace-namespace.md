@@ -195,6 +195,13 @@ the intrinsic 21,000 — while every subtrace reports its own frame's spend.
 `action.gas` is the frame's gas (limit less intrinsic), which is why the
 tracer records `root_gas` separately.
 
+Its `result.output` is always `0x`, for the same reason: `addTrace` starts
+from `ProgramResult.empty()` and adds only the gas and the revert flag, so
+what the transaction's call returned is nowhere in its own trace. A caller
+that wants the return data has to replay the call. A creation's `code` is the
+exception, because `addTrace` reads it from the trace (`trace.getResult()`)
+and not from that result.
+
 **…except when no `Program` was built, where `action.gas` is `0x0`.**
 `TransactionExecutor.extractTrace` has two branches:
 
@@ -207,9 +214,19 @@ else {
 ```
 
 That hard-coded `0L` is what `action.gas` reports for a plain rBTC transfer
-to a codeless account, and for a call straight to a precompile. The tracer
-reproduces it by watching `initialize_interp`, which revm fires exactly when
-it builds an interpreter for a frame — rskj's `program != null`.
+to a codeless account, for a call straight to a precompile, and for a
+creation with no init code (`create()` builds a `Program` only for data that
+is not empty). The tracer reproduces it by watching `initialize_interp`,
+which revm fires when it builds an interpreter for a frame — rskj's
+`program != null`, but for that creation, where revm builds one and rskj
+does not.
+
+The second branch sets no error and no revert flag either, so such a trace
+never has an `error`, whatever became of the transaction. A call straight to
+a precompile with too little gas for it fails, its receipt says so, and its
+trace still carries a `result`. A transaction the Bridge runs before RSKIP136,
+or free of charge for the federation, never enters the EVM here; its trace is
+made the same way, as REMASC's is.
 
 **Every RSK block ends with REMASC, and it gets a trace.** It takes the
 `program == null` branch above, so `trace_block` on any mainnet block returns

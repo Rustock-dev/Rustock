@@ -18,11 +18,10 @@ pub struct BridgeConstants {
 
     // -- Header relay --
 
-    /// Maximum BTC headers accepted in a single `receiveHeaders` call.
-    pub max_btc_headers_per_rsk_block: u32,
     /// Minimum seconds between `receiveHeader` calls (rate limiting).
     pub min_seconds_between_calls_receive_header: u64,
-    /// Maximum depth for BTC blockchain queries.
+    /// rskj `maxDepthBlockchainAccepted`: how far below the BTC chain's head
+    /// `receiveHeader` takes a header, 25 on every network.
     pub max_depth_blockchain_accepted: u32,
 
     // -- Peg-in / peg-out limits --
@@ -49,15 +48,30 @@ pub struct BridgeConstants {
 
     // -- Update period --
 
-    /// How often `updateCollections` should be called (in RSK blocks).
+    /// rskj `updateBridgeExecutionPeriod`: how often a federator calls
+    /// `updateCollections`, in milliseconds. Only rskj's federator reads it;
+    /// neither node does.
     pub update_bridge_execution_period: u64,
 
     // -- BTC block index --
 
-    /// BTC height when the block index feature activates.
+    /// rskj `btcHeightWhenBlockIndexActivates`: from RSKIP199, a main-chain
+    /// height below it is found only within
+    /// `max_depth_to_search_blocks_below_index_activation` of the head
+    /// (`getStoredBlockAtMainChainHeight`).
     pub btc_height_when_block_index_activates: u32,
     /// Max depth to search blocks below the index activation height.
     pub max_depth_to_search_blocks_below_index_activation: u32,
+
+    // -- Pegout index --
+    /// rskj `btcHeightWhenPegoutTxIndexActivates`: the Bitcoin height the
+    /// pegout index (RSKIP379) was estimated to start at.
+    pub btc_height_when_pegout_tx_index_activates: u32,
+    /// rskj `pegoutTxIndexGracePeriodInBtcBlocks`. From RSKIP379,
+    /// `registerBtcTransaction` classifies a transaction by the index when its
+    /// block is at least this far past `btc_height_when_pegout_tx_index_activates`,
+    /// and by the legacy rules below it (`PegUtils.getTransactionType`).
+    pub pegout_tx_index_grace_period_in_btc_blocks: u32,
 
     /// BTC transaction confirmation max depth.
     pub btc_transaction_confirmation_max_depth: u32,
@@ -71,13 +85,11 @@ pub struct BridgeConstants {
     // -- Free bridge transactions (pre-areBridgeTxsPaid) --
 
     /// Genesis federation BTC public keys (compressed hex), from rskj
-    /// Federation*NetConstants. Their derived RSK addresses may send free
-    /// transactions to the Bridge before areBridgeTxsPaid activates.
+    /// Federation*NetConstants. Their derived RSK addresses, and the
+    /// federation-change, lock-whitelist and fee-per-KB authorizers', may send
+    /// free transactions to the Bridge before areBridgeTxsPaid activates
+    /// (rskj `BridgeUtils.isFreeBridgeTx`; `executor::free_bridge_senders`).
     pub genesis_federation_public_keys: &'static [&'static str],
-    /// Authorized senders for free bridge txs (uncompressed hex): the
-    /// federation-change, lock-whitelist and feePerKb authorizer keys
-    /// (rskj BridgeUtils.isFromAuthorizedSender).
-    pub authorized_free_tx_keys: &'static [&'static str],
     /// Lock-whitelist change authorizer keys (rskj WhitelistConstants,
     /// AddressBasedAuthorizer with minimum ONE).
     pub whitelist_authorizer_keys: &'static [&'static str],
@@ -106,6 +118,10 @@ pub struct BridgeConstants {
     pub federation_activation_age_legacy: u64,
     /// Post-RSKIP383 activation age.
     pub federation_activation_age: u64,
+    /// rskj `FederationTestNetConstants.preLovellActivationAge`: testnet's
+    /// activation age from RSKIP383 until RSKIP419. The other networks have
+    /// none, and use `federation_activation_age` from RSKIP383 on.
+    pub federation_activation_age_pre_lovell: Option<u64>,
     /// RSKIP419 SVP validation window, in RSK blocks: a proposed federation
     /// must pass the Sign Validation Protocol within this many blocks of its
     /// creation or the proposal is discarded (rskj FederationConstants
@@ -124,6 +140,11 @@ pub struct BridgeConstants {
     /// in a millis field: Instant.ofEpochMilli semantics, rskj
     /// genesisFederationCreationTime).
     pub genesis_federation_creation_time_millis: u64,
+    /// rskj `FederationConstants.genesisFederationType`, the format the genesis
+    /// federation is built in (`FederationSupportImpl.getGenesisFederation`):
+    /// 1000, standard multisig, on mainnet and testnet; 4000, P2SH-P2WSH ERP
+    /// with the ERP keys and delay, on rskj's regtest.
+    pub genesis_federation_format: u64,
 
     /// Hash160 of the hardcoded "old federation" P2SH address (rskj
     /// FederationConstants.oldFederationAddress). A btc tx spending this
@@ -165,9 +186,8 @@ impl BridgeConstants {
             btc_network: BtcNetwork::Mainnet,
             btc2rsk_minimum_acceptable_confirmations: 100,
             rsk2btc_minimum_acceptable_confirmations: 4000,
-            max_btc_headers_per_rsk_block: 500,
             min_seconds_between_calls_receive_header: 300,
-            max_depth_blockchain_accepted: 4320,
+            max_depth_blockchain_accepted: 25,
             legacy_minimum_pegin_tx_value: 1_000_000, // 0.01 BTC
             minimum_pegin_tx_value: 500_000,           // 0.005 BTC
             legacy_minimum_pegout_tx_value: 800_000,   // 0.008 BTC
@@ -175,9 +195,12 @@ impl BridgeConstants {
             minimum_pegout_value_percentage_to_receive_after_fee: 80,
             max_inputs_per_pegout_transaction: 50,
             number_of_blocks_between_pegouts: 360,
-            update_bridge_execution_period: 1,
-            btc_height_when_block_index_activates: 696_000,
+            update_bridge_execution_period: 180_000,
+            btc_height_when_block_index_activates: 696_022,
             max_depth_to_search_blocks_below_index_activation: 4320,
+            btc_height_when_pegout_tx_index_activates: 837_589,
+            // THIRTY_DAYS_IN_BTC_BLOCKS
+            pegout_tx_index_grace_period_in_btc_blocks: 4320,
             btc_transaction_confirmation_max_depth: 4320,
             // 5 × MILLICOIN = 5 × 100_000 = 500_000 sat/KB
             genesis_fee_per_kb: 500_000,
@@ -198,18 +221,6 @@ impl BridgeConstants {
                 "03f909ae15558c70cc751aff9b1f495199c325b13a9e5b934fd6299cd30ec50be8",
                 "02c6018fcbd3e89f3cf9c7f48b3232ea3638eb8bf217e59ee290f5f0cfb2fb9259",
                 "03b65694ccccda83cbb1e56b31308acd08e993114c33f66a456b627c2c1c68bed6",
-            ],
-            // federationChange + lockWhitelist + feePerKb authorizers
-            // (FederationMainNetConstants, WhitelistMainNetConstants,
-            // FeePerKbMainNetConstants)
-            authorized_free_tx_keys: &[
-                "04e593d4cde25137b13f19462bc4c02e97ba2ed5a3860813497abf9b4eeb9259e37e0384d12cfd2d9a7a0ba606b31ee34317a9d7f4a8591c6bcf5dfd5563248b2f",
-                "045e7f2563e73d44d149c19cffca36e1898597dc759d76166b8104103c0d3f351a8a48e3a224544e9a649ad8ebcfdbd6c39744ddb85925f19c7e3fd48f07fc1c06",
-                "0441945e4e272936106f6200b36162f3510e8083535c15e175ac82deaf828da955b85fd72b7534f2a34cedfb45fa63b728cc696a2bd3c5d39ec799ec2618e9aa9f",
-                "041a2449e9d63409c5a8ea3a21c4109b1a6634ee88fd57176d45ea46a59713d5e0b688313cf252128a3e49a0b2effb4b413e5a2525a6fa5894d059f815c9d9efa6",
-                "0448f51638348b034995b1fd934fe14c92afde783e69f120a46ee16eb6bdc2e4f6b5e37772094c68c0dea2b1be3d96ea9651a9eebda7304914c8047f4e3e251378",
-                "0484c66f75548baf93e322574adac4e4579b6a53f8d11fab640e14c90118e6983ef24b0de349a3e88f72e81e771ae1c897cef446fd7f4da71778c532aee3b6c41b",
-                "04bb6435dc1ea12da843ebe213893d136c1624acd681fff82551498ae00bf28e9323164b00daf925fa75177463b8254a2aae8a1713e4d851a84ea369c193e9ce51",
             ],
             // WhitelistMainNetConstants single authorizer key
             whitelist_authorizer_keys: &[
@@ -238,11 +249,13 @@ impl BridgeConstants {
             ],
             federation_activation_age_legacy: 18_500,
             federation_activation_age: 40_320,
+            federation_activation_age_pre_lovell: None,
             validation_period_duration_in_blocks: 20_000,
             funds_migration_age_begin: 0,
             funds_migration_age_end: 10_585,
             special_case_funds_migration_age_end: 172_800,
             genesis_federation_creation_time_millis: 1_514_948_400,
+            genesis_federation_format: 1000,
             // 35JUi1FxabGdhygLhnNUEFG4AgvpNMgxK1
             old_federation_address_hash160: [
                 0x27, 0x9d, 0x4b, 0x44, 0xe8, 0xcf, 0x5e, 0x3f, 0x04, 0xc0, 0xea, 0x21, 0xc7,
@@ -271,9 +284,8 @@ impl BridgeConstants {
             btc_network: BtcNetwork::Testnet,
             btc2rsk_minimum_acceptable_confirmations: 10,
             rsk2btc_minimum_acceptable_confirmations: 10,
-            max_btc_headers_per_rsk_block: 500,
             min_seconds_between_calls_receive_header: 300,
-            max_depth_blockchain_accepted: 4320,
+            max_depth_blockchain_accepted: 25,
             legacy_minimum_pegin_tx_value: 1_000_000,
             minimum_pegin_tx_value: 500_000,
             legacy_minimum_pegout_tx_value: 500_000,
@@ -281,9 +293,11 @@ impl BridgeConstants {
             minimum_pegout_value_percentage_to_receive_after_fee: 80,
             max_inputs_per_pegout_transaction: 50,
             number_of_blocks_between_pegouts: 360,
-            update_bridge_execution_period: 1,
-            btc_height_when_block_index_activates: 2_000_000,
+            update_bridge_execution_period: 180_000,
+            btc_height_when_block_index_activates: 2_039_594,
             max_depth_to_search_blocks_below_index_activation: 4320,
+            btc_height_when_pegout_tx_index_activates: 2_589_553,
+            pegout_tx_index_grace_period_in_btc_blocks: 1440,
             btc_transaction_confirmation_max_depth: 4320,
             // 1 × MILLICOIN = 100_000 sat/KB
             genesis_fee_per_kb: 100_000,
@@ -293,18 +307,6 @@ impl BridgeConstants {
                 "02afc230c2d355b1a577682b07bc2646041b5d0177af0f98395a46018da699b6da",
                 "0344a3c38cd59afcba3edcebe143e025574594b001700dec41e59409bdbd0f2a09",
                 "034844a99cd7028aa319476674cc381df006628be71bc5593b8b5fdb32bb42ef85",
-            ],
-            // federationChange + lockWhitelist + feePerKb authorizers
-            // (FederationTestNetConstants, WhitelistTestNetConstants,
-            // FeePerKbTestNetConstants)
-            authorized_free_tx_keys: &[
-                "04d9052c2022f6f35da53f04f02856ff5e59f9836eec03daad0328d12c5c66140205da540498e46cd05bf63c1201382dd84c100f0d52a10654159965aea452c3f2",
-                "04bf889f2035c8c441d7d1054b6a449742edd04d202f44a29348b4140b34e2a81ce66e388f40046636fd012bd7e3cecd9b951ffe28422334722d20a1cf6c7926fb",
-                "047e707e4f67655c40c539363fb435d89574b8fe400971ba0290de9c2adbb2bd4e1e5b35a2188b9409ff2cc102292616efc113623483056bb8d8a02bf7695670ea",
-                "04bf7e3bca7f7c58326382ed9c2516a8773c21f1b806984bb1c5c33bd18046502d97b28c0ea5b16433fbb2b23f14e95b36209f304841e814017f1ede1ecbdcfce3",
-                "04701d1d27f8c2ae97912d96fb1f82f10c2395fd320e7a869049268c6b53d2060dfb2e22e3248955332d88cd2ae29a398f8f3858e48dd6d8ffbc37dfd6d1aa4934",
-                "045ef89e4a5645dc68895dbc33b4c966c3a0a52bb837ecdd2ba448604c4f47266456d1191420e1d32bbe8741f8315fde4d1440908d400e5998dbed6549d499559b",
-                "0455db9b3867c14e84a6f58bd2165f13bfdba0703cb84ea85788373a6a109f3717e40483aa1f8ef947f435ccdf10e530dd8b3025aa2d4a7014f12180ee3a301d27",
             ],
             // WhitelistTestNetConstants single authorizer key
             whitelist_authorizer_keys: &[
@@ -333,11 +335,13 @@ impl BridgeConstants {
             ],
             federation_activation_age_legacy: 60,
             federation_activation_age: 2_400,
+            federation_activation_age_pre_lovell: Some(120),
             validation_period_duration_in_blocks: 2_000,
             funds_migration_age_begin: 60,
             funds_migration_age_end: 900,
             special_case_funds_migration_age_end: 900,
             genesis_federation_creation_time_millis: 1_538_967_600,
+            genesis_federation_format: 1000,
             // 2N7ZgQyhFKm17RbaLqygYbS7KLrQfapyZzu
             old_federation_address_hash160: [
                 0x9d, 0x0f, 0x4e, 0xb1, 0xed, 0xb9, 0xbc, 0xb7, 0x07, 0x8b, 0x36, 0xf4, 0x13,
@@ -360,18 +364,43 @@ impl BridgeConstants {
         }
     }
 
-    /// rskj's `BridgeRegTestConstants`: [`BridgeConstants::regtest`] with
-    /// rskj's default regtest genesis federation, which REMASC pays from the
-    /// first payout block on. rustock's own regtest has no federation; a chain
-    /// started from an rskj genesis file (`--genesis`) is rskj's regtest and
-    /// needs this one, or the federators' accounts are never created.
+    /// rskj's `BridgeRegTestConstants` and `FederationRegTestConstants`. A chain
+    /// started from an rskj genesis file (`--genesis`) is rskj's regtest and runs
+    /// on these; rustock's own regtest ([`BridgeConstants::regtest`]) is another
+    /// chain, with no federation and quicker settings of its own.
+    ///
+    /// The genesis federation is rskj's default regtest one: three keys, built
+    /// as a P2SH-P2WSH ERP federation with the regtest ERP keys and a 500-block
+    /// delay, at 2MvQSG61B4LtKLECeo1dRDeDWXgJfnr3fC7. REMASC pays it from the
+    /// first payout block on, or the federators' accounts are never created,
+    /// and its members' Bridge transactions are free while `areBridgeTxsPaid`
+    /// is off.
+    ///
+    /// Five authorizers vote its federation changes, 'auth-a' to 'auth-e',
+    /// and three decide (`FederationRegTestConstants`, MAJORITY).
     pub fn rskj_regtest() -> Self {
         Self {
+            btc2rsk_minimum_acceptable_confirmations: 3,
+            rsk2btc_minimum_acceptable_confirmations: 3,
+            min_seconds_between_calls_receive_header: 300,
+            number_of_blocks_between_pegouts: 50,
+            update_bridge_execution_period: 15_000,
+            btc_height_when_block_index_activates: 10,
+            max_depth_to_search_blocks_below_index_activation: 5,
             genesis_federation_public_keys: &[
                 "0362634ab57dae9cb373a5d536e66a8c4f67468bbcfb063809bab643072d78a124",
                 "03c5946b3fbae03a654237da863c9ed534e0878657175b132b8ca630f245df04db",
                 "02cd53fc53a07f211641a677d250f6de99caf620e8e77071e811a28b3bcddf0be1",
             ],
+            federation_change_authorizer_keys: &[
+                "04dde17c5fab31ffc53c91c2390136c325bb8690dc135b0840075dd7b86910d8ab9e88baad0c32f3eea8833446a6bc5ff1cd2efa99ecb17801bcb65fc16fc7d991",
+                "04af886c67231476807e2a8eee9193878b9d94e30aa2ee469a9611d20e1e1c1b438e5044148f65e6e61bf03e9d72e597cb9cdea96d6fc044001b22099f9ec403e2",
+                "045d4dedf9c69ab3ea139d0f0da0ad00160b7663d01ce7a6155cd44a3567d360112b0480ab6f31cac7345b5f64862205ea7ccf555fcf218f87fa0d801008fecb61",
+                "04709f002ac4642b6a87ea0a9dc76eeaa93f71b3185985817ec1827eae34b46b5d869320efb5c5cbe2a5c13f96463fe0210710b53352a4314188daffe07bd54154",
+                "04aff62315e9c18004392a5d9e39496ff5794b2d9f43ab4e8ade64740d7fdfe896969be859b43f26ef5aa4b5a0d11808277b4abfa1a07cc39f2839b89cc2bc6b4c",
+            ],
+            genesis_federation_format: 4000,
+            block_with_too_much_chain_work_height: i32::MAX as u32,
             ..Self::regtest()
         }
     }
@@ -381,9 +410,8 @@ impl BridgeConstants {
             btc_network: BtcNetwork::Regtest,
             btc2rsk_minimum_acceptable_confirmations: 1,
             rsk2btc_minimum_acceptable_confirmations: 10,
-            max_btc_headers_per_rsk_block: 500,
             min_seconds_between_calls_receive_header: 0,
-            max_depth_blockchain_accepted: 4320,
+            max_depth_blockchain_accepted: 25,
             legacy_minimum_pegin_tx_value: 1_000_000,
             minimum_pegin_tx_value: 500_000,
             legacy_minimum_pegout_tx_value: 500_000,
@@ -394,11 +422,13 @@ impl BridgeConstants {
             update_bridge_execution_period: 1,
             btc_height_when_block_index_activates: 0,
             max_depth_to_search_blocks_below_index_activation: 4320,
+            // rskj's regtest's, which `rskj_regtest` keeps too.
+            btc_height_when_pegout_tx_index_activates: 250,
+            pegout_tx_index_grace_period_in_btc_blocks: 100,
             btc_transaction_confirmation_max_depth: 4320,
             genesis_fee_per_kb: 100_000,
-            // Regtest has areBridgeTxsPaid from genesis; no free senders needed.
+            // rustock's own regtest has no federation; `rskj_regtest` has rskj's.
             genesis_federation_public_keys: &[],
-            authorized_free_tx_keys: &[],
             // WhitelistRegTestConstants single authorizer key
             whitelist_authorizer_keys: &[
                 "04641fb250d7ca7a1cb4f530588e978013038ec4294d084d248869dd54d98873e45c61d00ceeaeeb9e35eab19fa5fbd8f07cb8a5f0ddba26b4d4b18349c09199ad",
@@ -414,21 +444,23 @@ impl BridgeConstants {
             increase_locking_cap_authorizer_keys: &[
                 "04450bbaab83ec48b3cb8fbb077c950ee079733041c039a8c4f1539e5181ca1a27589eeaf0fbf430e49d2909f14c767bf6909ad6845831f683416ee12b832e36ed",
             ],
-            // FederationRegTestConstants authorizer keys (majority = 3 of 5)
+            // The first three of rskj's FederationRegTestConstants authorizer
+            // keys, GenNodeKey's 'auth-a' to 'auth-c' (majority = 2 of 3); rskj's
+            // regtest has all five (`rskj_regtest`).
             federation_change_authorizer_keys: &[
                 "04dde17c5fab31ffc53c91c2390136c325bb8690dc135b0840075dd7b86910d8ab9e88baad0c32f3eea8833446a6bc5ff1cd2efa99ecb17801bcb65fc16fc7d991",
                 "04af886c67231476807e2a8eee9193878b9d94e30aa2ee469a9611d20e1e1c1b438e5044148f65e6e61bf03e9d72e597cb9cdea96d6fc044001b22099f9ec403e2",
                 "045d4dedf9c69ab3ea139d0f0da0ad00160b7663d01ce7a6155cd44a3567d360112b0480ab6f31cac7345b5f64862205ea7ccf555fcf218f87fa0d801008fecb61",
-                "04709f002ac4642b6a87ea0a9dc76eeaa93f71b3185985817ec1827eae34b46b5d869320efb5c5cbe2a5c13f96463fe0210710b53352a4314188daffe07bd54154",
-                "04aff62315e9c18004392a5d9e39496ff5794b2d9f43ab4e8ade64740d7fdfe896969be859b43f26ef5aa4b5a0d11808277b4abfa1a07cc39f2839b89cc2bc6b4c",
             ],
             federation_activation_age_legacy: 10,
             federation_activation_age: 150,
+            federation_activation_age_pre_lovell: None,
             validation_period_duration_in_blocks: 125,
             funds_migration_age_begin: 15,
             funds_migration_age_end: 150,
             special_case_funds_migration_age_end: 150,
             genesis_federation_creation_time_millis: 1_451_606_400_000,
+            genesis_federation_format: 1000,
             // 2N7ZgQyhFKm17RbaLqygYbS7KLrQfapyZzu (same as testnet)
             old_federation_address_hash160: [
                 0x9d, 0x0f, 0x4e, 0xb1, 0xed, 0xb9, 0xbc, 0xb7, 0x07, 0x8b, 0x36, 0xf4, 0x13,
@@ -508,5 +540,74 @@ mod tests {
         assert_eq!(BridgeConstants::mainnet().legacy_minimum_pegout_tx_value, 800_000);
         assert_eq!(BridgeConstants::testnet().legacy_minimum_pegout_tx_value, 500_000);
         assert_eq!(BridgeConstants::regtest().legacy_minimum_pegout_tx_value, 500_000);
+    }
+
+    /// rskj's `maxDepthBlockchainAccepted` is 25 on every network.
+    #[test]
+    fn rskj_max_depth_blockchain_accepted() {
+        for c in [
+            BridgeConstants::mainnet(),
+            BridgeConstants::testnet(),
+            BridgeConstants::regtest(),
+        ] {
+            assert_eq!(c.max_depth_blockchain_accepted, 25);
+        }
+    }
+
+    /// rskj's `btcHeightWhenBlockIndexActivates`: 696,022 on mainnet and
+    /// 2,039,594 on testnet.
+    #[test]
+    fn rskj_btc_height_when_block_index_activates() {
+        assert_eq!(
+            BridgeConstants::mainnet().btc_height_when_block_index_activates,
+            696_022
+        );
+        assert_eq!(
+            BridgeConstants::testnet().btc_height_when_block_index_activates,
+            2_039_594
+        );
+    }
+
+    /// rskj's pegout index starts at Bitcoin height 841,909 on mainnet
+    /// (837,589 and 30 days) and 2,590,993 on testnet (2,589,553 and 10 days).
+    #[test]
+    fn rskj_pegout_tx_index_heights() {
+        for (c, activates, grace) in [
+            (BridgeConstants::mainnet(), 837_589, 4320),
+            (BridgeConstants::testnet(), 2_589_553, 1440),
+        ] {
+            assert_eq!(c.btc_height_when_pegout_tx_index_activates, activates);
+            assert_eq!(c.pegout_tx_index_grace_period_in_btc_blocks, grace);
+        }
+    }
+
+    /// A chain from an rskj genesis file runs on rskj's `BridgeRegTestConstants`
+    /// and `FederationRegTestConstants`, not on rustock's own regtest's.
+    #[test]
+    fn rskj_regtest_is_rskjs_regtest() {
+        let rskj = BridgeConstants::rskj_regtest();
+        assert_eq!(rskj.btc2rsk_minimum_acceptable_confirmations, 3);
+        assert_eq!(rskj.rsk2btc_minimum_acceptable_confirmations, 3);
+        assert_eq!(rskj.min_seconds_between_calls_receive_header, 300);
+        assert_eq!(rskj.number_of_blocks_between_pegouts, 50);
+        assert_eq!(rskj.update_bridge_execution_period, 15_000);
+        assert_eq!(rskj.btc_height_when_block_index_activates, 10);
+        assert_eq!(rskj.max_depth_to_search_blocks_below_index_activation, 5);
+        assert_eq!(rskj.genesis_federation_public_keys.len(), 3);
+        assert_eq!(rskj.genesis_federation_format, 4000);
+        assert_eq!(rskj.block_with_too_much_chain_work_height, i32::MAX as u32);
+        assert_eq!(rskj.erp_fed_activation_delay, 500);
+        assert_eq!(rskj.btc_height_when_pegout_tx_index_activates, 250);
+        assert_eq!(rskj.pegout_tx_index_grace_period_in_btc_blocks, 100);
+
+        // rustock's own regtest keeps its own settings and has no federation.
+        let own = BridgeConstants::regtest();
+        assert!(own.genesis_federation_public_keys.is_empty());
+        assert_eq!(own.number_of_blocks_between_pegouts, 1);
+
+        for c in [BridgeConstants::mainnet(), BridgeConstants::testnet()] {
+            assert_eq!(c.genesis_federation_format, 1000);
+            assert_eq!(c.update_bridge_execution_period, 180_000);
+        }
     }
 }

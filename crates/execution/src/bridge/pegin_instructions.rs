@@ -26,7 +26,8 @@
 //!   back to **legacy** (version-0) processing. Modeled here as `Ok(None)`.
 //! * `PeginInstructionsException` / `PeginInstructionsParseException` (more
 //!   than one RSKT OP_RETURN, an unsupported protocol version, a bad data
-//!   length, or a bad refund-address type) → the v1 peg-in is **rejected**
+//!   length, a bad refund-address type, or any output whose script bitcoinj
+//!   can't parse) → the v1 peg-in is **rejected**
 //!   (refund + mark processed + `rejected_pegin(PEGIN_V1_INVALID_PAYLOAD)`).
 //!   Modeled here as `Err(PeginInstructionsError)`.
 
@@ -99,6 +100,11 @@ pub fn build_pegin_instructions(
 /// magic. Returns the payload of the single match (`Ok(Some)`), `Ok(None)` if
 /// there is none (`NoOpReturnException`), or `Err` if more than one carries the
 /// RSKT magic (`PeginInstructionsException`).
+///
+/// `hasOpReturnForRsk` reads every output's script with `getScriptPubKey()`,
+/// OP_RETURN or not, and the `ScriptException` of one bitcoinj can't parse
+/// reaches `buildPeginInstructions`' catch, which throws a
+/// `PeginInstructionsException` for it: `Err` as well, whichever output it is.
 fn extract_op_return_data(
     btc_tx: &BtcTransaction,
 ) -> Result<Option<Vec<u8>>, PeginInstructionsError> {
@@ -106,6 +112,9 @@ fn extract_op_return_data(
     let mut occurrences = 0u32;
 
     for output in &btc_tx.output {
+        if !super::rskj_sender_compat::parses_as_script(output.script_pubkey.as_bytes()) {
+            return Err(PeginInstructionsError);
+        }
         if let Some(data) = op_return_rsk_payload(output.script_pubkey.as_bytes()) {
             found = Some(data);
             occurrences += 1;
@@ -336,5 +345,47 @@ mod tests {
         let tx = tx_with_outputs(vec![other1, rsk, other2]);
         let instr = build_pegin_instructions(&tx).unwrap().unwrap();
         assert_eq!(instr.rsk_destination, dest);
+    }
+
+    /// rskj reads every output's script looking for the RSKT payload, and a
+    /// script bitcoinj can't parse throws, OP_RETURN or not, before or after
+    /// the payload, or with no payload at all. One it can parse, however
+    /// unusual, is passed over.
+    #[test]
+    fn an_output_bitcoinj_cannot_parse_is_an_invalid_payload() {
+        let rsk = op_return_script(&rsk_op_return_payload(1, [0x33; 20], None));
+        // OP_PUSHDATA1 with no length; a push of two bytes with one left.
+        for unparseable in [
+            vec![0x4c],
+            vec![0x02, 0x01],
+            vec![0x6a, 0x4c],
+            vec![0x6a, 0x05, b'R'],
+        ] {
+            let unparseable = ScriptBuf::from_bytes(unparseable);
+            for outputs in [
+                vec![unparseable.clone()],
+                vec![rsk.clone(), unparseable.clone()],
+                vec![unparseable.clone(), rsk.clone()],
+            ] {
+                assert_eq!(
+                    build_pegin_instructions(&tx_with_outputs(outputs)),
+                    Err(PeginInstructionsError)
+                );
+            }
+        }
+
+        // OP_PUSHDATA1 of nothing, and an opcode on its own.
+        let unusual = vec![
+            ScriptBuf::from_bytes(vec![0x4c, 0x00]),
+            ScriptBuf::from_bytes(vec![0xff]),
+        ];
+        assert_eq!(
+            build_pegin_instructions(&tx_with_outputs(unusual.clone())),
+            Ok(None)
+        );
+        let instr = build_pegin_instructions(&tx_with_outputs([unusual, vec![rsk]].concat()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(instr.rsk_destination, [0x33; 20]);
     }
 }

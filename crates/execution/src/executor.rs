@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::database::RskDatabase;
-use crate::env::{block_env_from_header, tx_env_from_rsk_tx};
+use crate::env::{block_env_from_header, header_fits_program_invoke, tx_env_from_rsk_tx};
 use crate::hardfork::RskHardforkConfig;
 use crate::precompiles::{rsk_precompiles, BridgeTxContext, RskPrecompileProvider, REMASC_ADDR};
 
@@ -30,9 +30,56 @@ pub struct TxExecutionResult {
     pub created_address: Option<Address>,
     /// The transaction reached REMASC or the Bridge, so under RSKIP-144 it
     /// may only sit in the sequential sublist
-    /// (`SEQUENTIAL_ONLY_PRECOMPILES`). True whatever the call returned --
-    /// reaching the precompile is what counts.
+    /// (`SEQUENTIAL_ONLY_PRECOMPILES`). As rskj counts it: whatever the call
+    /// returned, and though it was refused for the depth or the caller's
+    /// balance, but not from under a constructor of a CREATE or CREATE2
+    /// (`RskHandler`'s `note_call`).
     pub reached_sequential_only: bool,
+    /// rskj's `ProgramResult.isRevert`: the transaction's own program ended
+    /// with REVERT, and `output` is what it reverted with. `eth_call` and
+    /// `eth_estimateGas` answer a revert as an error of its own. A precompile
+    /// the transaction calls itself has no program and never ends so: what
+    /// one throws, `RskHandler` settles as rskj does.
+    pub reverted: bool,
+}
+
+/// What one execution says of the gas a transaction needs
+/// ([`RskExecutor::estimate_gas_exact`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GasEstimate {
+    /// The gas to give it.
+    Gas(u64),
+    /// Its program ended with REVERT, with this output.
+    Reverted(Vec<u8>),
+}
+
+/// Who a local call is from: the sender it names, or nobody. rskj runs a call
+/// that names no sender from its null address, which is not the zero address
+/// (`RskHandler`'s `no_sender`). An `Address` is a sender named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalSender(Option<Address>);
+
+impl LocalSender {
+    /// The address the call runs from here: the sender's, or the zero address.
+    fn address(self) -> Address {
+        self.0.unwrap_or(Address::ZERO)
+    }
+
+    fn is_nobody(self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl From<Address> for LocalSender {
+    fn from(sender: Address) -> Self {
+        Self(Some(sender))
+    }
+}
+
+impl From<Option<Address>> for LocalSender {
+    fn from(sender: Option<Address>) -> Self {
+        Self(sender)
+    }
 }
 
 /// What the miner's execution mode left out of the block, by index into the
@@ -149,6 +196,16 @@ fn merge_markers(into: &mut crate::state::ContractMarkers, from: crate::state::C
     }
     into.bump_remasc_sender |= from.bump_remasc_sender;
     into.raw_storage.extend(from.raw_storage);
+    into.created.extend(from.created);
+    for addr in from.deleted {
+        if !into.deleted.contains(&addr) {
+            into.deleted.push(addr);
+        }
+    }
+    into.null_account = match (into.null_account, from.null_account) {
+        (Some(paid), Some(more)) => Some(paid + more),
+        (paid, more) => paid.or(more),
+    };
 }
 
 /// Fold one sublist's state into the block's reported state.
@@ -211,6 +268,10 @@ pub struct RskExecutor {
     /// sublists -- which is every block on a chain where RSKIP-144 is
     /// unscheduled.
     execution_threads: usize,
+    /// rskj `Constants.getMinSequentialSetGasLimit`: the gas the sequential
+    /// sublist is guaranteed where a block runs as its sublists, and with it
+    /// the gas limit of every sublist (`BlockUtils.getSublistGasLimit`).
+    min_sequential_set_gas_limit: u64,
 }
 
 impl RskExecutor {
@@ -247,6 +308,15 @@ impl RskExecutor {
         self
     }
 
+    /// The gas the sequential sublist is guaranteed (rskj
+    /// `Constants.getMinSequentialSetGasLimit`), for a chain whose constants
+    /// are not those of the network its id names. The default is that
+    /// network's: 10,000,000 on mainnet and testnet, 6,800,000 on regtest.
+    pub fn with_min_sequential_set_gas_limit(mut self, gas: u64) -> Self {
+        self.min_sequential_set_gas_limit = gas;
+        self
+    }
+
     pub fn execution_threads(&self) -> usize {
         self.execution_threads
     }
@@ -275,6 +345,7 @@ impl RskExecutor {
         };
         let bridge_constants = bridge_constants_for(hardfork_cfg.chain_id);
         let free_bridge_senders = free_bridge_senders(&bridge_constants);
+        let min_sequential_set_gas_limit = min_sequential_set_gas_limit_for(hardfork_cfg.chain_id);
         Self {
             hardfork_cfg,
             block_store,
@@ -285,6 +356,7 @@ impl RskExecutor {
             // Sequential unless a caller asks otherwise, so an executor built
             // by a tool or a test behaves as it always has.
             execution_threads: 1,
+            min_sequential_set_gas_limit,
         }
     }
 
@@ -317,7 +389,7 @@ impl RskExecutor {
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<TxExecutionResult, ExecutionError> {
-        self.execute_tx_inner(header, tx, sender, state_root, trie_store, false)
+        self.execute_tx_inner(header, tx, sender.into(), state_root, trie_store, false)
     }
 
     /// Execute a transaction as a **local call** -- rskj's
@@ -325,43 +397,77 @@ impl RskExecutor {
     /// `eth_estimateGas` and marks the transaction with
     /// `TransactionExecutor.setLocalCall(true)`.
     ///
-    /// The only behavioural difference is that Bridge methods marked
-    /// `LocalOnly` run instead of throwing (`Bridge.validateLocalCall`,
-    /// Bridge.java:431). Those are the read-only getters -- the federation
-    /// address, the BTC blockchain head, the peg-out queue sizes -- which rskj
-    /// deliberately refuses to answer on-chain so that no contract can depend
-    /// on them. Nothing here is reachable from block execution, so it cannot
-    /// affect consensus.
+    /// It differs from a transaction of a block in two ways, neither of them
+    /// reachable from block execution:
+    /// - it passes every gate `TransactionExecutor.init()` holds a transaction
+    ///   to, is charged no gas and keeps the sender's nonce (see
+    ///   `RskHandler`'s `local_call`);
+    /// - Bridge methods marked `LocalOnly` run instead of throwing
+    ///   (`Bridge.validateLocalCall`, Bridge.java:431). Those are the read-only
+    ///   getters -- the federation address, the BTC blockchain head, the
+    ///   peg-out queue sizes -- which rskj deliberately refuses to answer
+    ///   on-chain so that no contract can depend on them.
+    ///
+    /// `sender` is the sender the call names, or `None` where it names none
+    /// ([`LocalSender`]).
     pub fn execute_local_call(
         &self,
         header: &Header,
         tx: &rustock_core::Transaction,
-        sender: Address,
+        sender: impl Into<LocalSender>,
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<TxExecutionResult, ExecutionError> {
-        self.execute_tx_inner(header, tx, sender, state_root, trie_store, true)
+        self.execute_tx_inner(header, tx, sender.into(), state_root, trie_store, true)
+    }
+
+    /// A transaction's `TxEnv`, and a local call's gas price where revm's
+    /// can't hold it (`env::local_call_env`).
+    fn tx_env_for(
+        &self,
+        tx: &rustock_core::Transaction,
+        sender: Address,
+        local_call: bool,
+    ) -> Result<(revm::context::TxEnv, Option<U256>), ExecutionError> {
+        if local_call {
+            return crate::env::local_call_env(tx, sender);
+        }
+        Ok((tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg)?, None))
+    }
+
+    /// rskj's `ProgramResult.isRevert` for a transaction's result: its own
+    /// program ended with REVERT.
+    fn program_reverted<H>(exec: &revm::context::result::ExecutionResult<H>) -> bool {
+        matches!(exec, revm::context::result::ExecutionResult::Revert { .. })
     }
 
     fn execute_tx_inner(
         &self,
         header: &Header,
         tx: &rustock_core::Transaction,
-        sender: Address,
+        sender: LocalSender,
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
         local_call: bool,
     ) -> Result<TxExecutionResult, ExecutionError> {
+        let no_sender = local_call && sender.is_nobody();
+        let sender = sender.address();
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
-        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg);
-        let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
+        let (tx_env, whole_gas_price) = self.tx_env_for(tx, sender, local_call)?;
+        let db = RskDatabase::new(
+            state_root.clone(),
+            trie_store.clone(),
+            self.block_store.clone(),
+        )
+        .for_block(header);
 
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
 
         let mut chain_ext = crate::raw_storage::RskChainExt::default();
         chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
         chain_ext.btc_block_cache = self.btc_block_cache.clone();
+        chain_ext.whole_gas_price = whole_gas_price;
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
             .with_block(block_env)
@@ -372,6 +478,7 @@ impl RskExecutor {
             rsk_precompiles(&self.hardfork_cfg, header.number),
             &self.hardfork_cfg,
             Some(self.block_store.clone()),
+            header.parent_hash,
             self.remasc_config.clone(),
         )
         .with_bridge_config(self.bridge_constants.clone());
@@ -383,6 +490,7 @@ impl RskExecutor {
             }
         }
         let invisible_flag = precompile_provider.invisible_exception_flag();
+        let aborts_caller = precompile_provider.aborts_caller_flag();
         let reached_sequential_only = precompile_provider.reached_sequential_only_slot();
         let active_precompiles: Vec<Address> =
             rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
@@ -405,15 +513,19 @@ impl RskExecutor {
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
+            self.hardfork_cfg.has_rskip169(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             self.hardfork_cfg.has_push0(header.number),
             self.hardfork_cfg.has_basefee(header.number),
             self.hardfork_cfg.has_rskip91(header.number),
+            !self.hardfork_cfg.has_rskip103(header.number),
+            !self.hardfork_cfg.has_rskip150(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
+            !self.hardfork_cfg.has_rskip191(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
-            header.beneficiary,
+            crate::rsk_instructions::BlockWords::of(header),
         );
 
         let exec_out = {
@@ -424,10 +536,17 @@ impl RskExecutor {
                 !self.hardfork_cfg.has_rskip453(header.number),
                 self.hardfork_cfg.has_rskip125(header.number),
                 invisible_flag,
+                aborts_caller,
                 pre_rskip150_precompiles,
                 active_precompiles,
                 self.hardfork_cfg.has_rskip171(header.number),
-            );
+            )
+            .failing_programs(!header_fits_program_invoke(header))
+            .with_rskip90(self.hardfork_cfg.has_rskip90(header.number))
+            .with_rskip174(self.hardfork_cfg.has_rskip174(header.number))
+            .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
+            .from_nobody(no_sender)
+            .with_reached_sequential_only(reached_sequential_only.clone());
             let out = handler
                 .run(&mut evm)
                 .map_err(|e: revm::context::result::EVMError<_>| {
@@ -443,6 +562,7 @@ impl RskExecutor {
 
         let exec = result.result;
         let success = exec.is_success();
+        let reverted = Self::program_reverted(&exec);
         let gas_used = exec.gas_used();
         let output = exec.output().map(|o| o.to_vec()).unwrap_or_default();
         let logs = exec.into_logs();
@@ -457,6 +577,7 @@ impl RskExecutor {
             output,
             logs,
             created_address,
+            reverted,
         })
     }
 
@@ -485,14 +606,20 @@ impl RskExecutor {
     ) -> Result<(TxExecutionResult, crate::tracer::ProgramTrace), ExecutionError> {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
-        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg);
-        let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
+        let (tx_env, whole_gas_price) = self.tx_env_for(tx, sender, local_call)?;
+        let db = RskDatabase::new(
+            state_root.clone(),
+            trie_store.clone(),
+            self.block_store.clone(),
+        )
+        .for_block(header);
 
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
 
         let mut chain_ext = crate::raw_storage::RskChainExt::default();
         chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
         chain_ext.btc_block_cache = self.btc_block_cache.clone();
+        chain_ext.whole_gas_price = whole_gas_price;
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
             .with_block(block_env)
@@ -503,6 +630,7 @@ impl RskExecutor {
             rsk_precompiles(&self.hardfork_cfg, header.number),
             &self.hardfork_cfg,
             Some(self.block_store.clone()),
+            header.parent_hash,
             self.remasc_config.clone(),
         )
         .with_bridge_config(self.bridge_constants.clone());
@@ -514,6 +642,7 @@ impl RskExecutor {
             }
         }
         let invisible_flag = precompile_provider.invisible_exception_flag();
+        let aborts_caller = precompile_provider.aborts_caller_flag();
         let reached_sequential_only = precompile_provider.reached_sequential_only_slot();
         let active_precompiles: Vec<Address> =
             rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
@@ -538,15 +667,19 @@ impl RskExecutor {
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
+            self.hardfork_cfg.has_rskip169(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             self.hardfork_cfg.has_push0(header.number),
             self.hardfork_cfg.has_basefee(header.number),
             self.hardfork_cfg.has_rskip91(header.number),
+            !self.hardfork_cfg.has_rskip103(header.number),
+            !self.hardfork_cfg.has_rskip150(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
+            !self.hardfork_cfg.has_rskip191(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
-            header.beneficiary,
+            crate::rsk_instructions::BlockWords::of(header),
         );
 
         let exec_out = {
@@ -556,10 +689,16 @@ impl RskExecutor {
                 !self.hardfork_cfg.has_rskip453(header.number),
                 self.hardfork_cfg.has_rskip125(header.number),
                 invisible_flag,
+                aborts_caller,
                 pre_rskip150_precompiles,
                 active_precompiles,
                 self.hardfork_cfg.has_rskip171(header.number),
-            );
+            )
+            .failing_programs(!header_fits_program_invoke(header))
+            .with_rskip90(self.hardfork_cfg.has_rskip90(header.number))
+            .with_rskip174(self.hardfork_cfg.has_rskip174(header.number))
+            .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
+            .with_reached_sequential_only(reached_sequential_only.clone());
             use revm::inspector::InspectorHandler;
             let out = handler
                 .inspect_run(&mut evm)
@@ -576,6 +715,7 @@ impl RskExecutor {
 
         let exec = result.result;
         let success = exec.is_success();
+        let reverted = Self::program_reverted(&exec);
         let gas_used = exec.gas_used();
         let output = exec.output().map(|o| o.to_vec()).unwrap_or_default();
         let outcome = TracedOutcome::of(tx, sender, &exec, &output);
@@ -588,6 +728,14 @@ impl RskExecutor {
         // reverted transaction looks like.
         let mut trace = evm.inspector.take_trace();
         outcome.apply_to(&mut trace);
+        let transfers = {
+            use revm::context_interface::ContextTr;
+            std::mem::take(&mut evm.ctx.chain_mut().precompile_transfers)
+        };
+        let to = Address::try_from(tx.to.as_ref()).ok();
+        if let Some(subtraces) = crate::tracer::precompile_subtraces(to, success, transfers) {
+            trace.subtraces = subtraces;
+        }
 
         Ok((
             TxExecutionResult {
@@ -596,6 +744,7 @@ impl RskExecutor {
                 output,
                 logs,
                 created_address,
+                reverted,
                 reached_sequential_only: reached_sequential_only
                     .load(std::sync::atomic::Ordering::Relaxed),
             },
@@ -606,9 +755,14 @@ impl RskExecutor {
 
     /// Estimate a transaction's gas in one execution.
     ///
-    /// Returns `(estimate, success, output)`. On failure the estimate is zero
-    /// and the output is the revert data, so the caller can report the reason
-    /// rather than a number.
+    /// A program that ends with REVERT has no estimate: rskj answers with what
+    /// it reverted with (`EthModule.estimateGas`), and so does
+    /// [`GasEstimate::Reverted`]. A run that fails any other way is estimated
+    /// as one that doesn't fail is, from the gas it used
+    /// (`EthModule.internalEstimateGas`): where a program failed, all it was
+    /// given, which is the cap. And a creation without data is estimated at
+    /// 0: rskj's `create()` works out what is left of its gas and spends none
+    /// in the result the estimate is read from (TransactionExecutor.java:406).
     ///
     /// The floor matters: a plain value transfer never enters the
     /// interpreter, so the inspector sees no opcodes and reports no peak. Its
@@ -617,18 +771,23 @@ impl RskExecutor {
         &self,
         header: &Header,
         tx: &rustock_core::Transaction,
-        sender: Address,
+        sender: impl Into<LocalSender>,
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
         cap: u64,
-    ) -> Result<(u64, bool, Vec<u8>), ExecutionError> {
+    ) -> Result<GasEstimate, ExecutionError> {
         let (result, telemetry) =
             self.execute_tx_for_estimate(header, tx, sender, state_root, trie_store, true)?;
-        if !result.success {
-            return Ok((0, false, result.output));
+        if result.reverted {
+            return Ok(GasEstimate::Reverted(result.output));
         }
-        let estimate = telemetry.estimate(cap);
-        Ok((estimate, true, result.output))
+        if tx.to.is_empty() && tx.input.is_empty() {
+            return Ok(GasEstimate::Gas(0));
+        }
+        if !result.success {
+            return Ok(GasEstimate::Gas(result.gas_used.min(cap)));
+        }
+        Ok(GasEstimate::Gas(telemetry.estimate(cap)))
     }
 
     /// The same execution as `execute_tx_inner`, with the gas-estimation
@@ -645,21 +804,31 @@ impl RskExecutor {
         &self,
         header: &Header,
         tx: &rustock_core::Transaction,
-        sender: Address,
+        sender: impl Into<LocalSender>,
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
         local_call: bool,
     ) -> Result<(TxExecutionResult, crate::gas_estimator::EstimateTelemetry), ExecutionError> {
+        let sender = sender.into();
+        let no_sender = local_call && sender.is_nobody();
+        let sender = sender.address();
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
-        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg);
-        let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
+        let (tx_env, whole_gas_price) = self.tx_env_for(tx, sender, local_call)?;
+        let gas_limit = tx_env.gas_limit;
+        let db = RskDatabase::new(
+            state_root.clone(),
+            trie_store.clone(),
+            self.block_store.clone(),
+        )
+        .for_block(header);
 
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
 
         let mut chain_ext = crate::raw_storage::RskChainExt::default();
         chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
         chain_ext.btc_block_cache = self.btc_block_cache.clone();
+        chain_ext.whole_gas_price = whole_gas_price;
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
             .with_block(block_env)
@@ -670,6 +839,7 @@ impl RskExecutor {
             rsk_precompiles(&self.hardfork_cfg, header.number),
             &self.hardfork_cfg,
             Some(self.block_store.clone()),
+            header.parent_hash,
             self.remasc_config.clone(),
         )
         .with_bridge_config(self.bridge_constants.clone());
@@ -681,6 +851,7 @@ impl RskExecutor {
             }
         }
         let invisible_flag = precompile_provider.invisible_exception_flag();
+        let aborts_caller = precompile_provider.aborts_caller_flag();
         let reached_sequential_only = precompile_provider.reached_sequential_only_slot();
         let active_precompiles: Vec<Address> =
             rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
@@ -705,15 +876,19 @@ impl RskExecutor {
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
+            self.hardfork_cfg.has_rskip169(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             self.hardfork_cfg.has_push0(header.number),
             self.hardfork_cfg.has_basefee(header.number),
             self.hardfork_cfg.has_rskip91(header.number),
+            !self.hardfork_cfg.has_rskip103(header.number),
+            !self.hardfork_cfg.has_rskip150(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
+            !self.hardfork_cfg.has_rskip191(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
-            header.beneficiary,
+            crate::rsk_instructions::BlockWords::of(header),
         );
 
         let exec_out = {
@@ -723,10 +898,17 @@ impl RskExecutor {
                 !self.hardfork_cfg.has_rskip453(header.number),
                 self.hardfork_cfg.has_rskip125(header.number),
                 invisible_flag,
+                aborts_caller,
                 pre_rskip150_precompiles,
                 active_precompiles,
                 self.hardfork_cfg.has_rskip171(header.number),
-            );
+            )
+            .failing_programs(!header_fits_program_invoke(header))
+            .with_rskip90(self.hardfork_cfg.has_rskip90(header.number))
+            .with_rskip174(self.hardfork_cfg.has_rskip174(header.number))
+            .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
+            .from_nobody(no_sender)
+            .with_reached_sequential_only(reached_sequential_only.clone());
             use revm::inspector::InspectorHandler;
             let out = handler
                 .inspect_run(&mut evm)
@@ -743,20 +925,19 @@ impl RskExecutor {
 
         let exec = result.result;
         let success = exec.is_success();
+        let reverted = Self::program_reverted(&exec);
         let gas_used = exec.gas_used();
         let output = exec.output().map(|o| o.to_vec()).unwrap_or_default();
         // `spent` is revm's pre-refund figure -- limit minus remaining --
-        // which is the same quantity rskj's `getGasUsed()` holds, and what an
-        // estimate has to cover. `used()` is after the refund and would
-        // under-report.
+        // which is what an estimate has to cover, and what rskj's
+        // `getGasUsed() + getDeductedRefund()` comes to. `used()` is after
+        // the refund and would under-report.
         let spent = exec.gas().spent();
-        let refunded = exec.gas().final_refunded();
         let logs = exec.into_logs();
 
         let created_address = Self::extract_created_address(tx, sender, &success);
 
-        let telemetry =
-            std::mem::take(&mut evm.inspector).into_telemetry(spent, refunded);
+        let telemetry = std::mem::take(&mut evm.inspector).into_telemetry(gas_limit, spent);
 
         Ok((
             TxExecutionResult {
@@ -765,6 +946,7 @@ impl RskExecutor {
                 output,
                 logs,
                 created_address,
+                reverted,
                 reached_sequential_only: reached_sequential_only
                     .load(std::sync::atomic::Ordering::Relaxed),
             },
@@ -780,6 +962,8 @@ impl RskExecutor {
     /// Runs on the journal as it stands immediately after the transaction, so
     /// the balances are the ones that transaction produced. No database reads:
     /// the baseline comes from revm's per-transaction `original_info`.
+    /// `null_account` is what REMASC paid rskj's null address, which revm
+    /// doesn't hold (`ContractMarkers::null_account`).
     fn check_tx_supply(
         state: &revm::state::EvmState,
         transaction_id: usize,
@@ -787,9 +971,11 @@ impl RskExecutor {
         index: usize,
         fees_withheld: U256,
         fees_settled: U256,
+        null_account: Option<U256>,
     ) -> Result<(), ExecutionError> {
         let report = crate::supply::transaction_supply_change(state, transaction_id)
-            .with_fees_in_transit(fees_withheld, fees_settled);
+            .with_fees_in_transit(fees_withheld, fees_settled)
+            .with_null_account(null_account);
         if report.is_balanced() {
             return Ok(());
         }
@@ -864,6 +1050,7 @@ impl RskExecutor {
             crate::tracer::RskTracer::new(0),
             TracedTxs::None,
             U256::ZERO,
+            &[],
             true,
             Some(&mut dropped),
         )?;
@@ -985,16 +1172,18 @@ impl RskExecutor {
         // With one there is nothing to run concurrently *with*, and a single
         // run over the whole block reaches the same state for less.
         //
-        // RSKIP-144 is also required, and not only because a header cannot
-        // carry edges without it. Running the sublists separately is sound
-        // *because* the fees are postponed: credited per transaction, every
-        // sublist would add its own fees to REMASC's balance as read from
-        // the state they all start from, and committing them in order keeps
-        // the last one rather than the sum. The block would silently lose a
-        // sublist's fees.
+        // The block must also run as its sublists (`runs_sublists`), and not
+        // only because a header cannot carry edges without RSKIP-144. Running
+        // the sublists separately is sound *because* the fees are postponed:
+        // credited per transaction, every sublist would add its own fees to
+        // REMASC's balance as read from the state they all start from, and
+        // committing them in order keeps the last one rather than the sum.
+        // The block would silently lose a sublist's fees. Where rskj runs a
+        // block as one list, its edges decide nothing, and it runs as one
+        // list here too.
         if self.execution_threads <= 1
             || parallel.len() < 2
-            || !self.hardfork_cfg.has_rskip144(header.number)
+            || !self.hardfork_cfg.runs_sublists(header.number)
         {
             return self.run_sublist(
                 header,
@@ -1005,6 +1194,7 @@ impl RskExecutor {
                 inspector,
                 traced,
                 U256::ZERO,
+                &[],
                 true,
                 None,
             );
@@ -1064,6 +1254,7 @@ impl RskExecutor {
             inspector.fresh_like(),
             TracedTxs::None,
             U256::ZERO,
+            &[],
             true,
             None,
         )?;
@@ -1132,6 +1323,7 @@ impl RskExecutor {
                             template.fresh_like(),
                             traced,
                             U256::ZERO,
+                            &[],
                             false,
                             None,
                         );
@@ -1202,6 +1394,12 @@ impl RskExecutor {
             .iter()
             .map(|(r, _)| r.paid_fees)
             .fold(U256::ZERO, |a, b| a + b);
+        // What the parallel sublists deleted, where RSKIP-131 refuses a
+        // creation in the sequential one (rskj `executeParallel`).
+        let deleted_before: Vec<Address> = runs
+            .iter()
+            .flat_map(|(r, _)| r.markers.deleted.iter().copied())
+            .collect();
         let at_sequential = std::time::Instant::now();
         let (sequential_result, mut traces) = self.run_sublist(
             header,
@@ -1212,6 +1410,7 @@ impl RskExecutor {
             inspector,
             traced,
             fees_carried,
+            &deleted_before,
             false,
             None,
         )?;
@@ -1290,6 +1489,10 @@ impl RskExecutor {
         // `totalPaidFees` into the sequential executor the same way, so that
         // the settlement at the REMASC transaction covers the whole block.
         fees_carried: U256,
+        // `deleted_before`: what the sublists run before this one deleted.
+        // rskj hands the parallel sublists' `deletedAccounts` to the
+        // sequential one (`BlockExecutor.executeParallel`), for RSKIP-131.
+        deleted_before: &[Address],
         // `run_maintenance`: run the block-level precompile maintenance
         // first. True for the run that starts the block and false for every
         // later sublist -- rskj's `maintainPrecompiledContractStorageRoots`
@@ -1307,12 +1510,19 @@ impl RskExecutor {
     > {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
-        let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
+        // BLOCKHASH reads the block's own ancestors, beside the main chain too.
+        let db = RskDatabase::new(
+            state_root.clone(),
+            trie_store.clone(),
+            self.block_store.clone(),
+        )
+        .for_block(header);
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
 
         let mut chain_ext = crate::raw_storage::RskChainExt::default();
         chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
         chain_ext.btc_block_cache = self.btc_block_cache.clone();
+        chain_ext.deleted_in_block.extend(deleted_before.iter().copied());
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
             .with_block(block_env)
@@ -1323,6 +1533,7 @@ impl RskExecutor {
             rsk_precompiles(&self.hardfork_cfg, header.number),
             &self.hardfork_cfg,
             Some(self.block_store.clone()),
+            header.parent_hash,
             self.remasc_config.clone(),
         )
         .with_bridge_config(self.bridge_constants.clone());
@@ -1331,6 +1542,7 @@ impl RskExecutor {
         // it between transactions.
         let bridge_ctx_slot = precompile_provider.bridge_tx_context_slot();
         let invisible_flag = precompile_provider.invisible_exception_flag();
+        let aborts_caller = precompile_provider.aborts_caller_flag();
         let called_precompiles = precompile_provider.called_precompiles_slot();
         let reached_sequential_only = precompile_provider.reached_sequential_only_slot();
         let active_precompiles: Vec<Address> =
@@ -1356,23 +1568,28 @@ impl RskExecutor {
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
+            self.hardfork_cfg.has_rskip169(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             self.hardfork_cfg.has_push0(header.number),
             self.hardfork_cfg.has_basefee(header.number),
             self.hardfork_cfg.has_rskip91(header.number),
+            !self.hardfork_cfg.has_rskip103(header.number),
+            !self.hardfork_cfg.has_rskip150(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
+            !self.hardfork_cfg.has_rskip191(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
-            header.beneficiary,
+            crate::rsk_instructions::BlockWords::of(header),
         );
 
         // rskj builds every sublist executor with `postponeFeePayment = true`
-        // once RSKIP-144 is active (`TransactionListExecutor`), accumulates
-        // the fees, and credits the block's whole total to REMASC just before
-        // the REMASC transaction runs
-        // (`addFeesToRemascIfEnabled`). Before RSKIP-144 it credits per
-        // transaction, which is what this node did at every height.
+        // where a block runs as its sublists (`TransactionListExecutor`),
+        // accumulates the fees, and credits the block's whole total to REMASC
+        // just before the REMASC transaction runs
+        // (`addFeesToRemascIfEnabled`). Run as one list (`executeInternal`),
+        // it credits per transaction, which is what this node did at every
+        // height.
         //
         // The end state is identical -- the same total reaches the same
         // account before anything can observe it, REMASC being last. What
@@ -1382,7 +1599,7 @@ impl RskExecutor {
         // It is also what makes parallel sublists mergeable at all: crediting
         // per transaction has every sublist writing REMASC's account cell,
         // and those writes would have to be summed rather than merged.
-        let postpone_fees = self.hardfork_cfg.has_rskip144(header.number);
+        let postpone_fees = self.hardfork_cfg.runs_sublists(header.number);
         let mut remasc_tx_seen = false;
         // Whether this run ends the block. Only the run that does may settle
         // fees nobody claimed; a parallel sublist ends without reaching the
@@ -1390,12 +1607,28 @@ impl RskExecutor {
         // its fees once on its own account and again when the sequential
         // sublist settles the block's total.
         let ends_the_block = range.end == transactions.len();
-        // Whether this run is the whole block as one, with nothing before or
-        // after it. Only then is the block's gas limit the container a
-        // transaction has to fit in (see the fit rule below); a sublist's
-        // container is the sublist's own limit, which this run does not know.
-        let whole_block = run_maintenance && ends_the_block;
-        let block_gas_limit = header.gas_limit.saturating_to::<u64>();
+        // rskj `TransactionExecutor.init` holds each transaction's gas limit
+        // to a container (`gasIsValid`, below): the block's gas limit or,
+        // where the block runs as its sublists, the gas limit of the sublist
+        // that runs it (`BlockUtils.getSublistGasLimit`).
+        let sublists = self.hardfork_cfg.runs_sublists(header.number);
+        let edges: &[i16] = header
+            .version_fields
+            .as_ref()
+            .and_then(|v| v.edges.as_deref())
+            .unwrap_or(&[]);
+        let block_gas = header.gas_limit_as_gas();
+        // Where rskj can't build a program from this header, every
+        // transaction that runs code fails (`RskHandler::failing_programs`).
+        let fails_programs = !header_fits_program_invoke(header);
+        let (parallel_gas, sequential_gas) = crate::mining::partition::sublist_gas_limits(
+            block_gas.unwrap_or_default(),
+            rustock_core::validation::block_rules::TX_EXECUTION_THREADS as u64,
+            self.min_sequential_set_gas_limit,
+        );
+        // The sublist whose container the last transaction was held to, and
+        // `total_gas` when that container began.
+        let mut container: Option<(Option<crate::collision::SublistId>, u64)> = None;
         // Mining mode only: senders with a dropped transaction. Their later
         // ones cannot execute (the nonce is now out of sequence) and rskj's
         // `executeAndFill` discards them on the nonce check; dropping them
@@ -1466,34 +1699,90 @@ impl RskExecutor {
             // RSKIP-144: everything this transaction touches belongs to the
             // sublist that runs it. Inert unless the block declares edges.
             crate::collision::begin_transaction(i);
+            // TXINDEX, before RSKIP191, pushes the transaction's place in its
+            // block, counted from 0 as rskj's `BlockExecutor` counts it. A
+            // miner's candidate that is dropped keeps its place, as in rskj.
+            crate::rsk_instructions::set_transaction_index(i as u64);
 
             // rskj `TransactionExecutor.gasIsValid`: a transaction's gas
-            // **limit** must fit in the container's limit minus the gas
-            // **used** before it. The two quantities differ on purpose -- a
-            // sender's over-provisioned limit costs the block nothing once
-            // the transaction has run -- and the rule is consensus: in rskj a
-            // transaction that does not fit is invalid, and a block carrying
-            // one is rejected ("Too much gas used in this block"). Mining
-            // mode drops it instead, as rskj's `executeAndFill` does.
+            // **limit** must fit in its container's limit minus the gas
+            // **used** before it in that container. The two quantities
+            // differ on purpose -- a sender's over-provisioned limit costs
+            // the block nothing once the transaction has run -- and the rule
+            // is consensus: in rskj a transaction that does not fit is
+            // invalid, and a block carrying one is rejected ("Too much gas
+            // used in this block or sublist"). Mining mode drops it instead,
+            // as rskj's `executeAndFill` does.
             //
-            // REMASC declares no gas and is exempt by construction. Checked
-            // only when this run's container is the block itself: a sublist
-            // run is measured against the sublist's limit, which the
-            // partition validator enforces separately.
-            if !Self::is_remasc_tx(tx) && (whole_block || discard_unfitting.is_some()) {
-                let tx_gas_limit = tx.gas_limit.saturating_to::<u64>();
-                let fits = total_gas.saturating_add(tx_gas_limit) <= block_gas_limit;
-                let sender_dropped = dropped_senders.contains(sender);
-                if !fits || sender_dropped {
+            // Where the block runs as its sublists, the container is the
+            // transaction's sublist, and the count restarts with each one.
+            // On testnet's 12,000,000-gas blocks a parallel sublist has
+            // 1,000,000 and the sequential one 10,000,000; at 10,000,000 or
+            // less, the parallel sublists have nothing at all. REMASC declares
+            // no gas and so fits, unless what ran before it has already
+            // overflowed its container, as in rskj.
+            //
+            // The miner places transactions in sublists only after this run,
+            // so it holds each one to what any placement needs: the block's
+            // gas less all that ran before it, and the larger sublist's gas.
+            // rskj's miner, placing as it executes, holds it to the larger
+            // sublist less what its sequential sublist has used
+            // (`executeForMiningAfterRSKIP144`).
+            let is_remasc = tx.is_remasc(i, transactions.len());
+            let Some(block_gas) = block_gas else {
+                // rskj throws reading it (`GasCost.toGas`), and the block is
+                // not imported.
+                return Err(ExecutionError::Evm(format!(
+                    "the block's gas limit 0x{} is not gas: eight bytes with the top bit set",
+                    alloy_primitives::hex::encode(header.gas_limit_bytes())
+                )));
+            };
+            let mining = discard_unfitting.is_some();
+            let (container_used, container_limit) = if mining {
+                (total_gas, block_gas)
+            } else {
+                let sublist = sublists
+                    .then(|| crate::collision::sublist_of(i, edges))
+                    .flatten();
+                let since = match container {
+                    Some((running, since)) if running == sublist => since,
+                    _ => {
+                        container = Some((sublist, total_gas));
+                        total_gas
+                    }
+                };
+                let limit = match (sublists, sublist) {
+                    (false, _) => block_gas,
+                    (true, Some(_)) => parallel_gas,
+                    (true, None) => sequential_gas,
+                };
+                (total_gas - since, limit)
+            };
+            let fits = |gas: u64| {
+                gas_fits(gas, container_used, container_limit)
+                    && !(mining && sublists && gas > parallel_gas.max(sequential_gas))
+            };
+            let tx_gas = match tx.gas() {
+                Some(gas) if fits(gas) && (is_remasc || !dropped_senders.contains(sender)) => gas,
+                unfit => {
+                    let available = container_limit.saturating_sub(container_used);
                     if let Some(dropped) = discard_unfitting.as_deref_mut() {
                         debug!(
                             tx_index = i,
-                            tx_gas_limit,
-                            available = block_gas_limit.saturating_sub(total_gas),
-                            sender_dropped,
+                            tx_gas = ?unfit,
+                            available,
+                            sender_dropped = dropped_senders.contains(sender),
                             "mining: dropping a transaction that does not fit the block"
                         );
-                        dropped.unfitting.push(i);
+                        // A gas limit rskj cannot read throws, and its miner
+                        // reports the transaction as invalid for the pool to
+                        // forget (`invalidTransactions`). One that only does
+                        // not fit stays pending.
+                        if unfit.is_some() {
+                            dropped.unfitting.push(i);
+                        } else {
+                            dropped.invalid.push(i);
+                        }
                         dropped_senders.insert(*sender);
                         {
                             use revm::context_interface::ContextTr;
@@ -1501,25 +1790,19 @@ impl RskExecutor {
                         }
                         continue;
                     }
-                    return Err(ExecutionError::Evm(format!(
-                        "Too much gas used in this block: available in block: {} tx sent: {}",
-                        block_gas_limit.saturating_sub(total_gas),
-                        tx_gas_limit
-                    )));
+                    return Err(ExecutionError::Evm(match unfit {
+                        Some(gas) => format!(
+                            "Too much gas used in this block or sublist: available: {available} tx sent: {gas}"
+                        ),
+                        None => format!(
+                            "transaction {i}'s gas limit is not gas: eight bytes with the top bit set"
+                        ),
+                    }));
                 }
-            }
+            };
 
-            if Self::is_remasc_tx(tx) {
+            if is_remasc {
                 debug!(tx_index = i, "executing REMASC system call");
-                if traced.includes(i) {
-                    // REMASC never enters the EVM here, so the tracer records
-                    // nothing -- but rskj still produces a trace for it
-                    // (`TransactionExecutor.extractTrace`'s `program == null`
-                    // branch), and `trace_block` would otherwise be short one
-                    // entry per block. An empty trace renders as the
-                    // zero-gas, no-subtrace `call` rskj emits.
-                    traces.insert(i, crate::tracer::ProgramTrace::default());
-                }
                 // rskj `TransactionListExecutor.addFeesToRemascIfEnabled`:
                 // with the fees postponed, the block's whole total is
                 // credited to REMASC immediately BEFORE the REMASC
@@ -1550,14 +1833,43 @@ impl RskExecutor {
                     let _ = evm.ctx.journal_mut().load_account(REMASC_ADDR);
                     evm.ctx.journal_mut().touch_account(REMASC_ADDR);
                 }
+                // What REMASC reads that fails is the node's store, never the
+                // block: rskj holds every block it runs a block on.
                 crate::remasc::process_miners_fees(
                     &mut evm.ctx,
                     &self.remasc_config,
                     &self.bridge_constants,
                     &self.hardfork_cfg,
                     Some(&self.block_store),
+                    header,
                 )
-                .map_err(|e| ExecutionError::Evm(format!("REMASC: {e:?}")))?;
+                .map_err(|e| {
+                    ExecutionError::Database(crate::database::RskDbError::BlockStore(format!(
+                        "REMASC: {e:?}"
+                    )))
+                })?;
+                let transfers = {
+                    use revm::context_interface::ContextTr;
+                    std::mem::take(&mut evm.ctx.chain_mut().precompile_transfers)
+                };
+                if traced.includes(i) {
+                    // REMASC never enters the EVM here, so the tracer records
+                    // nothing -- but rskj still produces a trace for it
+                    // (`TransactionExecutor.extractTrace`'s `program == null`
+                    // branch), and `trace_block` would otherwise be short one
+                    // entry per block: the zero-gas `call` rskj emits, with a
+                    // CALL subtrace for each payment REMASC made
+                    // (`RemascFeesPayer.transferPayment`).
+                    let subtraces =
+                        crate::tracer::precompile_subtraces(Some(REMASC_ADDR), true, transfers);
+                    traces.insert(
+                        i,
+                        crate::tracer::ProgramTrace {
+                            subtraces: subtraces.unwrap_or_default(),
+                            ..Default::default()
+                        },
+                    );
+                }
                 {
                     use revm::context_interface::ContextTr;
                     // rskj `RemascStorageProvider.saveSiblings` runs on every
@@ -1572,6 +1884,8 @@ impl RskExecutor {
                         .raw_storage
                         .put(REMASC_ADDR, siblings_slot, Some(vec![0xc0]));
                     evm.ctx.chain_mut().raw_storage.commit_call();
+                    // What REMASC paid rskj's null address, for the trie.
+                    markers.null_account = evm.ctx.chain_mut().null_account.take();
                 }
 
                 // Drain the mining_fee_topic logs into the receipt.
@@ -1599,11 +1913,20 @@ impl RskExecutor {
                     output: Vec::new(),
                     logs,
                     created_address: None,
+                    reverted: false,
                 });
                 if crate::supply::per_transaction_enabled() {
                     use revm::context_interface::ContextTr;
                     let st = &evm.ctx.journal_mut().inner.state;
-                    Self::check_tx_supply(st, supply_tid, header.number, i, U256::ZERO, settled_now)?;
+                    Self::check_tx_supply(
+                        st,
+                        supply_tid,
+                        header.number,
+                        i,
+                        U256::ZERO,
+                        settled_now,
+                        markers.null_account,
+                    )?;
                 }
                 // RSKIP-144: what this transaction read and wrote, attributed
                 // to its sublist. Inert unless the block declares sublist
@@ -1621,7 +1944,10 @@ impl RskExecutor {
 
             // Update per-transaction Bridge context before execution.
             // This provides the Bridge precompile with:
-            //   - rsk_tx_hash: used for RSKIP146 release queue entries
+            //   - rsk_tx_hash: used for RSKIP146 release queue entries. A
+            //     contract's call to the Bridge is handed another, the hash of
+            //     the internal transaction rskj makes of it, which
+            //     `RskPrecompileProvider` works out from this one.
             //   - btc_sender_hash160: used as BTC peg-out destination (matches rskj's
             //     BridgeUtils.recoverBtcAddressFromEthTransaction)
             {
@@ -1635,6 +1961,7 @@ impl RskExecutor {
                 if let Ok(mut guard) = bridge_ctx_slot.lock() {
                     *guard = BridgeTxContext {
                         rsk_tx_hash,
+                        origin_tx_hash: rsk_tx_hash,
                         btc_sender_hash160,
                         rsk_sender: *sender,
                         // A transaction in a block is never a local call.
@@ -1644,23 +1971,128 @@ impl RskExecutor {
                 }
             }
 
-            // Direct Bridge calls that revm's gas validation cannot model:
+            // A transaction's own call to a precompile that rskj runs in a way
+            // revm's gas validation cannot model (`TransactionExecutor.call`):
             // - free bridge transactions (pre-areBridgeTxsPaid): gas_limit 0,
             //   nothing charged (Transaction.transactionCost == 0,
             //   Bridge.getGasForData == 0);
             // - paid calls before RSKIP136 (bahamas): rskj checked the limit
-            //   against the precompile cost ALONE and recorded
-            //   gasUsed = precompileCost + intrinsicCost, possibly above the
-            //   tx gas limit (mainnet #3307: 31280 used with a 30000 limit).
+            //   against the precompile's price ALONE and recorded
+            //   gasUsed = price + intrinsicCost, possibly above the tx gas
+            //   limit (mainnet #3307: 31280 used with a 30000 limit). REMASC
+            //   asks for nothing (`RemascContract.getGasForData`), so the rule
+            //   changes nothing for it, and its calls stay in the EVM.
             let is_free = self.is_free_bridge_tx(tx, *sender, header.number);
-            let is_pre136_bridge = !self.hardfork_cfg.has_rskip136(header.number)
-                && tx.to.len() == 20
-                && tx.to.as_ref() == crate::precompiles::BRIDGE_ADDR.as_slice();
-            if is_free || is_pre136_bridge {
-                debug!(tx_index = i, is_free, "executing direct bridge call");
+            let before_rskip136 =
+                !self.hardfork_cfg.has_rskip136(header.number) && tx.to.len() == 20;
+            let is_pre136_bridge =
+                before_rskip136 && tx.to.as_ref() == crate::precompiles::BRIDGE_ADDR.as_slice();
+            // Any other precompile is run now: it writes nothing, so what it
+            // does is known before the transaction is charged.
+            let pre136_outcome = if before_rskip136 && !is_pre136_bridge {
+                evm.precompiles.run_for_a_transaction(
+                    &evm.ctx,
+                    Address::from_slice(tx.to.as_ref()),
+                    tx.input.as_ref(),
+                    tx_gas,
+                )
+            } else {
+                None
+            };
+            if is_free || is_pre136_bridge || pre136_outcome.is_some() {
+                let callee = Address::from_slice(tx.to.as_ref());
+                debug!(tx_index = i, is_free, %callee, "executing a direct precompile call");
+                use crate::native::Outcome;
                 use revm::context_interface::journaled_state::account::JournaledAccountTr;
                 use revm::context_interface::{ContextTr, JournalTr};
-                // rskj increments the sender nonce in init(), outside the
+                // rskj `Transaction.transactionCost`: nothing for a free Bridge
+                // transaction, and 68 for a byte of data that isn't zero, 16
+                // from RSKIP400.
+                let basic: u64 = if is_free {
+                    0
+                } else {
+                    let nonzero = if self.hardfork_cfg.has_reduced_calldata_cost(header.number) {
+                        16
+                    } else {
+                        68
+                    };
+                    21_000
+                        + tx.input
+                            .iter()
+                            .map(|b| if *b == 0 { 4u64 } else { nonzero })
+                            .sum::<u64>()
+                };
+                // rskj `TransactionExecutor.init`, which revm's own checks are
+                // for every other transaction: a limit that pays the intrinsic
+                // cost, the sender's next nonce, and a balance that covers the
+                // value and, for a priced transaction, the whole limit. Mining
+                // takes a call only where the balance covers what it can come
+                // to past its limit as well: rskj would take that whatever the
+                // sender holds (see the fee below), which this node can't. A
+                // precompile's run says what that is; the Bridge's price is
+                // known only as it runs, so for it the most it can be.
+                let most = match &pre136_outcome {
+                    Some(Outcome::Returned { gas, .. } | Outcome::Null { gas }) => {
+                        gas.saturating_add(basic)
+                    }
+                    Some(_) => tx_gas,
+                    None => tx_gas.saturating_add(basic),
+                };
+                let refusal = {
+                    let account = evm
+                        .ctx
+                        .journal_mut()
+                        .load_account(*sender)
+                        .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?;
+                    let (nonce, balance) = (account.data.info.nonce, account.data.info.balance);
+                    let covers = |gas: u64| {
+                        let cost = if basic > 0 {
+                            tx.gas_price
+                                .checked_mul(U256::from(gas))
+                                .and_then(|cost| cost.checked_add(tx.value))
+                        } else {
+                            Some(tx.value)
+                        };
+                        cost.is_some_and(|cost| balance >= cost)
+                    };
+                    if tx_gas < basic {
+                        Some((
+                            format!("Not enough gas for transaction execution: tx needs: {basic} tx sent: {tx_gas}"),
+                            true,
+                        ))
+                    } else if nonce != tx.nonce {
+                        Some((
+                            format!("Invalid nonce: required: {nonce} , tx.nonce: {}", tx.nonce),
+                            true,
+                        ))
+                    } else if !covers(tx_gas) {
+                        Some((format!("Not enough cash: Sender cash: {balance}"), true))
+                    } else if discard_unfitting.is_some() && !covers(most) {
+                        Some((
+                            "its sender may not cover the gas past its limit".to_string(),
+                            false,
+                        ))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((reason, refused)) = refusal {
+                    if let Some(drops) = discard_unfitting.as_deref_mut() {
+                        debug!(tx_index = i, %reason, "mining: dropping a direct precompile call");
+                        // What rskj refuses its miner reports as invalid, for
+                        // the pool to forget. The other stays pending.
+                        if refused {
+                            drops.invalid.push(i);
+                        } else {
+                            drops.unfitting.push(i);
+                        }
+                        dropped_senders.insert(*sender);
+                        evm.ctx.chain_mut().raw_storage.discard_tx();
+                        continue;
+                    }
+                    return Err(ExecutionError::Evm(format!("transaction {i}: {reason}")));
+                }
+                // rskj increments the sender nonce in `execute()`, outside the
                 // execution rollback scope.
                 {
                     let mut acc = evm.ctx.journal_mut().load_account_mut(*sender)
@@ -1668,136 +2100,233 @@ impl RskExecutor {
                     acc.data.bump_nonce();
                 }
 
-                // Warm the Bridge account: outside revm's transact flow the
+                // Warm the callee: outside revm's transact flow the
                 // precompile warm-set is not populated and journal sloads on
                 // a cold account fail.
-                let _ = evm.ctx.journal_mut()
-                    .load_account(crate::precompiles::BRIDGE_ADDR);
-
-                // Pre-RSKIP136 gas accounting (rskj TransactionExecutor.call).
-                let (gas_used, enough_gas) = if is_free {
-                    (0u64, true)
-                } else {
-                    let required = crate::bridge::bridge_call_gas_cost(
-                        &mut evm.ctx,
-                        tx.input.as_ref(),
-                        &self.bridge_constants,
-                        &self.hardfork_cfg,
-                    )
-                    .unwrap_or(0);
-                    let basic: u64 = 21_000
-                        + tx.input.iter()
-                            .map(|b| if *b == 0 { 4u64 } else { 68 })
-                            .sum::<u64>();
-                    let limit = tx.gas_limit.to::<u64>();
-                    if limit >= required {
-                        // gasUsed may exceed the limit; that is consensus here.
-                        (required.saturating_add(basic), true)
-                    } else {
-                        // rskj execError: all gas consumed, nothing executed.
-                        (limit, false)
-                    }
-                };
+                let _ = evm.ctx.journal_mut().load_account(callee);
 
                 let mut invisible_exception = false;
-                let (success, output, logs) = if enough_gas {
-                    let tx_ctx = bridge_ctx_slot.lock().map(|g| g.clone()).unwrap_or_default();
-                    let use_v2 = self.hardfork_cfg.has_stored_block_v2(header.number);
-                    let checkpoint = evm.ctx.journal_mut().checkpoint();
-                    let outcome = crate::bridge::execute_bridge(
-                        &mut evm.ctx,
-                        tx.input.as_ref(),
-                        u64::MAX, // cost already accounted above
-                        &self.bridge_constants,
-                        Some(&self.block_store),
-                        use_v2,
-                        &self.hardfork_cfg,
-                        &tx_ctx,
-                        *sender,
-                        1, // a direct top-level tx is depth 1 (not a contract call)
-                        crate::bridge::BridgeCallKind::Call, // a tx is always a plain CALL
-                        tx.value, // top-level call value = the tx value
-                    );
-                    match outcome {
-                        Ok(out) => {
-                            evm.ctx.chain_mut().raw_storage.commit_call();
-                            evm.ctx.journal_mut().checkpoint_commit();
-                            // rskj transfers the endowment after execute()
-                            // returns without throwing.
-                            if !tx.value.is_zero() {
-                                let _ = evm.ctx.journal_mut().transfer(
-                                    *sender,
-                                    crate::precompiles::BRIDGE_ADDR,
-                                    tx.value,
-                                );
-                            }
-                            // rskj setupContract after a successful direct
-                            // precompile call (TransactionExecutor.call).
-                            if !markers.precompiles.contains(&crate::precompiles::BRIDGE_ADDR) {
-                                markers.precompiles.push(crate::precompiles::BRIDGE_ADDR);
-                            }
-                            // Drain bridge events into the receipt like revm
-                            // does for normal transactions.
-                            let logs = evm.ctx.journal_mut().take_logs();
-                            (true, out.bytes.to_vec(), logs)
-                        }
-                        Err(e) if crate::bridge::is_invisible_exception(&e) => {
-                            // rskj invisible exception: receipt SUCCESS with
-                            // the spent gas, no logs, no endowment — but the
-                            // sender is charged the FULL gas limit.
-                            evm.ctx.chain_mut().raw_storage.discard_call();
-                            // RSKIP-144: the writes this call attempted are
-                            // about to be popped off the journal. The EVM's
-                            // own frames are covered in `rsk_handler`; a
-                            // direct bridge call never enters one.
-                            if crate::collision::records_attempted_writes() {
-                                let j = &evm.ctx.journal_mut().inner;
-                                crate::collision::note_journal_entries(&j.journal, &j.state);
-                            }
-                            evm.ctx.journal_mut().checkpoint_revert(checkpoint);
-                            crate::collision::forget_entries_above(
-                                evm.ctx.journal_mut().inner.journal.len(),
-                            );
-                            invisible_exception = true;
-                            (true, Vec::new(), Vec::new())
-                        }
-                        Err(e) => {
-                            evm.ctx.chain_mut().raw_storage.discard_call();
-                            // RSKIP-144: the writes this call attempted are
-                            // about to be popped off the journal. The EVM's
-                            // own frames are covered in `rsk_handler`; a
-                            // direct bridge call never enters one.
-                            if crate::collision::records_attempted_writes() {
-                                let j = &evm.ctx.journal_mut().inner;
-                                crate::collision::note_journal_entries(&j.journal, &j.state);
-                            }
-                            evm.ctx.journal_mut().checkpoint_revert(checkpoint);
-                            crate::collision::forget_entries_above(
-                                evm.ctx.journal_mut().inner.journal.len(),
-                            );
-                            debug!(tx_index = i, error = %e, "direct bridge call failed");
-                            (false, Vec::new(), Vec::new())
-                        }
+                let (gas_used, success, output, logs) = match pre136_outcome {
+                    // What `getGasForData` asked for came to more than the whole
+                    // limit: rskj's execError, all the gas used and nothing run.
+                    Some(Outcome::OutOfGas) => (tx_gas, false, Vec::new(), Vec::new()),
+                    // `execute` threw: rskj's invisible exception, as for the
+                    // Bridge below.
+                    Some(Outcome::Threw { gas, reason }) => {
+                        debug!(tx_index = i, %reason, "direct precompile call threw");
+                        invisible_exception = true;
+                        (gas.saturating_add(basic), true, Vec::new(), Vec::new())
                     }
-                } else {
-                    (false, Vec::new(), Vec::new())
+                    Some(Outcome::Fatal(reason)) => return Err(ExecutionError::Evm(reason)),
+                    // It returned, or returned rskj's null, which is no output.
+                    // rskj sets the callee up as a contract and moves the value
+                    // to it, which creates its account even where there is none
+                    // to move (`Repository.transfer`).
+                    Some(Outcome::Returned { gas, output }) => {
+                        let _ = evm.ctx.journal_mut().transfer(*sender, callee, tx.value);
+                        if !markers.precompiles.contains(&callee) {
+                            markers.precompiles.push(callee);
+                        }
+                        (gas.saturating_add(basic), true, output.to_vec(), Vec::new())
+                    }
+                    Some(Outcome::Null { gas }) => {
+                        let _ = evm.ctx.journal_mut().transfer(*sender, callee, tx.value);
+                        if !markers.precompiles.contains(&callee) {
+                            markers.precompiles.push(callee);
+                        }
+                        (gas.saturating_add(basic), true, Vec::new(), Vec::new())
+                    }
+                    // The Bridge, whose price depends on what its storage holds.
+                    None => {
+                        // Pre-RSKIP136 gas accounting (rskj TransactionExecutor.call).
+                        let (gas_used, enough_gas) = if is_free {
+                            (0u64, true)
+                        } else {
+                            let required = crate::bridge::bridge_call_gas_cost(
+                                &mut evm.ctx,
+                                tx.input.as_ref(),
+                                &self.bridge_constants,
+                                &self.hardfork_cfg,
+                            )
+                            .unwrap_or(0);
+                            let limit = tx_gas;
+                            if limit >= required {
+                                // gasUsed may exceed the limit; that is consensus here.
+                                (required.saturating_add(basic), true)
+                            } else {
+                                // rskj execError: all gas consumed, nothing executed.
+                                (limit, false)
+                            }
+                        };
+                        let (success, output, logs) = if enough_gas {
+                            let tx_ctx = bridge_ctx_slot
+                                .lock()
+                                .map(|g| g.clone())
+                                .unwrap_or_default();
+                            let use_v2 = self.hardfork_cfg.has_stored_block_v2(header.number);
+                            let checkpoint = evm.ctx.journal_mut().checkpoint();
+                            // The logs the journal holds before the call, to tell
+                            // the call's own apart if it throws (below).
+                            let logs_before = evm.ctx.journal().logs().len();
+                            let outcome = crate::bridge::execute_bridge(
+                                &mut evm.ctx,
+                                tx.input.as_ref(),
+                                u64::MAX, // cost already accounted above
+                                &self.bridge_constants,
+                                Some(&self.block_store),
+                                use_v2,
+                                &self.hardfork_cfg,
+                                &tx_ctx,
+                                *sender,
+                                1, // a direct top-level tx is depth 1 (not a contract call)
+                                crate::bridge::BridgeCallKind::Call, // a tx is always a plain CALL
+                                tx.value, // top-level call value = the tx value
+                            );
+                            match outcome {
+                                Ok(out) => {
+                                    evm.ctx.chain_mut().raw_storage.commit_call();
+                                    evm.ctx.journal_mut().checkpoint_commit();
+                                    // rskj transfers the endowment after execute()
+                                    // returns without throwing.
+                                    if !tx.value.is_zero() {
+                                        let _ = evm.ctx.journal_mut().transfer(
+                                            *sender,
+                                            crate::precompiles::BRIDGE_ADDR,
+                                            tx.value,
+                                        );
+                                    }
+                                    // rskj setupContract after a successful direct
+                                    // precompile call (TransactionExecutor.call).
+                                    let bridge = crate::precompiles::BRIDGE_ADDR;
+                                    if !markers.precompiles.contains(&bridge) {
+                                        markers.precompiles.push(bridge);
+                                    }
+                                    // Drain bridge events into the receipt like revm
+                                    // does for normal transactions.
+                                    let logs = evm.ctx.journal_mut().take_logs();
+                                    (true, out.bytes.to_vec(), logs)
+                                }
+                                Err(e) if crate::bridge::is_invisible_exception(&e) => {
+                                    // rskj invisible exception: receipt SUCCESS with
+                                    // the spent gas and no endowment, but the sender is
+                                    // charged the FULL gas limit. What the method logged
+                                    // before it threw stays in the receipt: the Bridge
+                                    // writes its logs straight into the result's list,
+                                    // which only the VM's path clears on a throw
+                                    // (`TransactionExecutor.go` returns at `vm == null`),
+                                    // and the receipt takes that list.
+                                    let kept = evm.ctx.journal().logs()[logs_before..].to_vec();
+                                    evm.ctx.chain_mut().raw_storage.discard_call();
+                                    // RSKIP-144: the writes this call attempted are
+                                    // about to be popped off the journal. The EVM's
+                                    // own frames are covered in `rsk_handler`; a
+                                    // direct bridge call never enters one.
+                                    if crate::collision::records_attempted_writes() {
+                                        let j = &evm.ctx.journal_mut().inner;
+                                        crate::collision::note_journal_entries(
+                                            &j.journal, &j.state,
+                                        );
+                                    }
+                                    evm.ctx.journal_mut().checkpoint_revert(checkpoint);
+                                    crate::collision::forget_entries_above(
+                                        evm.ctx.journal_mut().inner.journal.len(),
+                                    );
+                                    invisible_exception = true;
+                                    (true, Vec::new(), kept)
+                                }
+                                Err(e) => {
+                                    evm.ctx.chain_mut().raw_storage.discard_call();
+                                    // RSKIP-144: the writes this call attempted are
+                                    // about to be popped off the journal. The EVM's
+                                    // own frames are covered in `rsk_handler`; a
+                                    // direct bridge call never enters one.
+                                    if crate::collision::records_attempted_writes() {
+                                        let j = &evm.ctx.journal_mut().inner;
+                                        crate::collision::note_journal_entries(
+                                            &j.journal, &j.state,
+                                        );
+                                    }
+                                    evm.ctx.journal_mut().checkpoint_revert(checkpoint);
+                                    crate::collision::forget_entries_above(
+                                        evm.ctx.journal_mut().inner.journal.len(),
+                                    );
+                                    debug!(tx_index = i, error = %e, "direct bridge call failed");
+                                    (false, Vec::new(), Vec::new())
+                                }
+                            }
+                        } else {
+                            // Out of gas before `execute`. rskj's `go()` commits the
+                            // repository all the same, with what `getGasForData` wrote
+                            // straight into it (a BTC store its cost seeded): the
+                            // writes this keeps of the cost's.
+                            evm.ctx.chain_mut().raw_storage.discard_call();
+                            (false, Vec::new(), Vec::new())
+                        };
+                        (gas_used, success, output, logs)
+                    }
                 };
+
+                // Every transaction's, traced or not, so that one's can't reach
+                // the next transaction's trace.
+                let transfers = std::mem::take(&mut evm.ctx.chain_mut().precompile_transfers);
+                if traced.includes(i) {
+                    // The precompile never enters the EVM here, so the tracer
+                    // records nothing, but rskj traces the transaction all
+                    // the same (`TransactionExecutor.extractTrace`'s
+                    // `program == null` branch, as for REMASC above): its own
+                    // call with no gas, and a CALL subtrace for each transfer
+                    // the Bridge made. Left out, every later transaction of
+                    // the block would be answered with the trace of the one
+                    // after it.
+                    let subtraces =
+                        crate::tracer::precompile_subtraces(Some(callee), success, transfers);
+                    traces.insert(
+                        i,
+                        crate::tracer::ProgramTrace {
+                            subtraces: subtraces.unwrap_or_default(),
+                            ..Default::default()
+                        },
+                    );
+                }
 
                 // Fees go to REMASC like the revm path (block beneficiary).
                 // An invisible exception charges the full gas limit
                 // (rskj TransactionExecutionSummary.getFee when failed).
                 let fee_gas = if invisible_exception {
-                    tx.gas_limit.to::<u64>()
+                    tx_gas
                 } else {
                     gas_used
                 };
-                let fee = U256::from(fee_gas) * tx.gas_price;
+                let fee = U256::from(fee_gas).saturating_mul(tx.gas_price);
                 if !fee.is_zero() {
-                    let _ = evm.ctx.journal_mut().transfer(
-                        *sender,
-                        crate::precompiles::REMASC_ADDR,
-                        fee,
-                    );
+                    // The sender pays it. Before RSKIP136 a call can come to
+                    // more than its limit, and rskj takes that whatever the
+                    // sender holds: `TransactionExecutor.finalization` adds a
+                    // negative leftover, and the balance goes below zero, which
+                    // rskj stores signed (`RLP.encodeSignedCoinNonNullZero`).
+                    // A balance can't here, so such a block is refused.
+                    let paid = evm
+                        .ctx
+                        .journal_mut()
+                        .load_account_mut(*sender)
+                        .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?
+                        .decr_balance(fee);
+                    if !paid {
+                        return Err(ExecutionError::Evm(format!(
+                            "transaction {i} used {gas_used} gas on a limit of {tx_gas}, and its \
+                             sender can't pay for the rest: rskj leaves the sender's balance \
+                             below zero, which this node can't hold"
+                        )));
+                    }
+                    // REMASC has it now, or with the block's other fees where
+                    // they wait (`postponeFeePayment`).
+                    if !postpone_fees {
+                        evm.ctx
+                            .journal_mut()
+                            .load_account_mut(crate::precompiles::REMASC_ADDR)
+                            .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?
+                            .incr_balance(fee);
+                    }
                 }
                 // What this transaction paid in that nobody was credited
                 // with, for the per-transaction supply check.
@@ -1806,18 +2335,29 @@ impl RskExecutor {
 
                 total_gas += gas_used;
                 tx_results.push(TxExecutionResult {
-                    // This branch exists only to call the Bridge.
-                    reached_sequential_only: true,
+                    // REMASC and the Bridge bar a transaction from a parallel
+                    // sublist.
+                    reached_sequential_only: crate::precompiles::SEQUENTIAL_ONLY_PRECOMPILES
+                        .contains(&callee),
                     gas_used,
                     success,
                     output,
                     logs,
                     created_address: None,
+                    reverted: false,
                 });
                 if crate::supply::per_transaction_enabled() {
                     use revm::context_interface::ContextTr;
                     let st = &evm.ctx.journal_mut().inner.state;
-                    Self::check_tx_supply(st, supply_tid, header.number, i, withheld_now, U256::ZERO)?;
+                    Self::check_tx_supply(
+                        st,
+                        supply_tid,
+                        header.number,
+                        i,
+                        withheld_now,
+                        U256::ZERO,
+                        None,
+                    )?;
                 }
                 // RSKIP-144: what this transaction read and wrote, attributed to
                 // its sublist. Inert unless the block declares sublist edges.
@@ -1832,7 +2372,25 @@ impl RskExecutor {
                 continue;
             }
 
-            let tx_env = tx_env_from_rsk_tx(tx, *sender, &self.hardfork_cfg);
+            let tx_env = match tx_env_from_rsk_tx(tx, *sender, &self.hardfork_cfg) {
+                Ok(env) => env,
+                // A gas price this node's EVM cannot carry; see
+                // `tx_env_from_rsk_tx`. The miner drops it as one the EVM
+                // refused.
+                Err(e) if discard_unfitting.is_some() => {
+                    debug!(tx_index = i, error = %e, "mining: dropping a transaction the EVM cannot carry");
+                    if let Some(drops) = discard_unfitting.as_deref_mut() {
+                        drops.invalid.push(i);
+                    }
+                    dropped_senders.insert(*sender);
+                    {
+                        use revm::context_interface::ContextTr;
+                        evm.ctx.chain_mut().raw_storage.discard_tx();
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             // Per-tx precompile marker tracking: drained below only if the
             // transaction commits (rskj cacheTrack rollback drops markers).
@@ -1850,7 +2408,11 @@ impl RskExecutor {
             // whatever was there, so before RSKIP174 (iris300) deploying onto
             // an address that already holds a balance destroys it. Someone
             // funding a deploy address before the deployment lands loses the
-            // money, and the chain's supply drops with it.
+            // money, and the chain's supply drops with it -- unless the
+            // creation fails: the account is written in `cacheTrack`, which
+            // rskj's `go` rolls back then. So the handler takes the balance in
+            // the creation's frame, which a failure takes back
+            // (`RskHandler::with_rskip174`).
             //
             // revm does the sane thing and keeps the balance, which is the
             // post-iris300 rule, so only the earlier window needs this. The
@@ -1860,6 +2422,11 @@ impl RskExecutor {
             //
             // Testnet #647,051 is a live instance -- 0.05 RBTC sitting at the
             // deploy address, gone in the reference node's post-state.
+            //
+            // The fresh account's nonce is zero too. Only a hash collision
+            // gives an address a creation derives a nonce, or code, which
+            // revm would refuse the creation for; the nonce is reset here,
+            // before the frame opens, and code is left alone.
             if tx.to.is_empty() && !self.hardfork_cfg.has_rskip174(header.number) {
                 use revm::context_interface::journaled_state::account::JournaledAccountTr;
                 use revm::context_interface::{ContextTr, JournalTr};
@@ -1867,24 +2434,18 @@ impl RskExecutor {
                 // Read before taking a mutable handle, so an address with
                 // nothing in it is not materialised into an empty account that
                 // the state root would then have to carry.
-                let occupied = evm
+                let has_nonce = evm
                     .ctx
                     .journal_mut()
                     .load_account(created)
-                    .map(|a| !a.data.info.balance.is_zero() || a.data.info.nonce != 0)
+                    .map(|a| a.data.info.nonce != 0)
                     .unwrap_or(false);
-                if occupied {
+                if has_nonce {
                     let mut acc = evm
                         .ctx
                         .journal_mut()
                         .load_account_mut(created)
                         .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?;
-                    // `new AccountState()` -- nonce and balance both zero.
-                    // Code lives under its own trie key and createAccount does
-                    // not touch it, so an address holding code still collides
-                    // in revm where rskj would overwrite. Reaching that needs a
-                    // hash collision, so it is left alone rather than modelled.
-                    acc.data.set_balance(U256::ZERO);
                     acc.data.set_nonce(0);
                 }
             }
@@ -1897,11 +2458,17 @@ impl RskExecutor {
                 !self.hardfork_cfg.has_rskip453(header.number),
                 self.hardfork_cfg.has_rskip125(header.number),
                 invisible_flag.clone(),
+                aborts_caller.clone(),
                 pre_rskip150_precompiles.clone(),
                 active_precompiles.clone(),
                 self.hardfork_cfg.has_rskip171(header.number),
             )
-            .postponing_fees(postpone_fees);
+            .postponing_fees(postpone_fees)
+            .failing_programs(fails_programs)
+            .with_rskip90(self.hardfork_cfg.has_rskip90(header.number))
+            .with_rskip174(self.hardfork_cfg.has_rskip174(header.number))
+            .with_called_precompiles(called_precompiles.clone())
+            .with_reached_sequential_only(reached_sequential_only.clone());
                 // `inspect_run` for the one transaction being traced, `run`
                 // for every other -- and `run` is the same code path an EVM
                 // built without an inspector takes, because revm carries the
@@ -1941,14 +2508,26 @@ impl RskExecutor {
             };
 
             let success = result.is_success();
+            let reverted = Self::program_reverted(&result);
             let gas_used = result.gas_used();
             let output = result.output().map(|o| o.to_vec()).unwrap_or_default();
+            // Every transaction's, traced or not, so that one's can't reach the
+            // next transaction's trace.
+            let transfers = {
+                use revm::context_interface::ContextTr;
+                std::mem::take(&mut evm.ctx.chain_mut().precompile_transfers)
+            };
             if traced.includes(i) {
                 // Taken here, not after the block: `take_trace` resets the
                 // tracer so the next transaction starts with an empty tree,
                 // and `result` is about to be consumed by `into_logs`.
                 let mut trace = evm.inspector.take_trace();
                 TracedOutcome::of(tx, *sender, &result, &output).apply_to(&mut trace);
+                let to = Address::try_from(tx.to.as_ref()).ok();
+                if let Some(subtraces) = crate::tracer::precompile_subtraces(to, success, transfers)
+                {
+                    trace.subtraces = subtraces;
+                }
                 traces.insert(i, trace);
             }
             let logs = result.into_logs();
@@ -1982,7 +2561,7 @@ impl RskExecutor {
             // Mirror what RskHandler paid REMASC: the full gas limit on an
             // invisible exception, the spent gas otherwise.
             let fee_gas = if invisible_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                tx.gas_limit.to::<u64>()
+                tx_gas
             } else {
                 gas_used
             };
@@ -1999,12 +2578,21 @@ impl RskExecutor {
                 output,
                 logs,
                 created_address,
+                reverted,
             });
 
             if crate::supply::per_transaction_enabled() {
                 use revm::context_interface::ContextTr;
                 let st = &evm.ctx.journal_mut().inner.state;
-                Self::check_tx_supply(st, supply_tid, header.number, i, withheld_now, U256::ZERO)?;
+                Self::check_tx_supply(
+                    st,
+                    supply_tid,
+                    header.number,
+                    i,
+                    withheld_now,
+                    U256::ZERO,
+                    None,
+                )?;
             }
             // RSKIP-144: what this transaction read and wrote, attributed to
             // its sublist. Inert unless the block declares sublist edges.
@@ -2030,14 +2618,27 @@ impl RskExecutor {
             // the touched flag. A later tx that touches the address re-marks
             // Touched, which apply_state_changes reads as "alive again at
             // block end" (mainnet #3173807).
+            //
+            // Until then it does not exist (rskj `isExist`): loaded as not
+            // existing, like an account the trie never had. And the block
+            // keeps rskj's `deletedAccounts`, for RSKIP-131, and the contracts
+            // its transactions created and left standing, which hold rskj's
+            // marker whatever code they ended with.
             {
-                use revm::context_interface::ContextTr;
-                for account in evm.ctx.journal_mut().inner.state.values_mut() {
+                let skipped = &markers.skip_created;
+                let ctx = &mut evm.ctx;
+                let block = &mut ctx.chain;
+                for (address, account) in ctx.journaled_state.inner.state.iter_mut() {
                     if account.is_selfdestructed_locally() {
                         account.selfdestruct();
                         account.unmark_selfdestructed_locally();
                         account.unmark_created_locally();
                         account.unmark_touch();
+                        account.status |= revm::state::AccountStatus::LoadedAsNotExisting;
+                        block.deleted_in_block.insert(*address);
+                        block.created_in_block.remove(address);
+                    } else if account.is_created_locally() && !skipped.contains(address) {
+                        block.created_in_block.insert(*address);
                     }
                 }
             }
@@ -2070,6 +2671,11 @@ impl RskExecutor {
         {
             use revm::context_interface::ContextTr;
             markers.raw_storage = evm.ctx.chain_mut().raw_storage.drain();
+            let block = &evm.ctx.chain;
+            markers.created = block.created_in_block.iter().copied().collect();
+            markers.created.sort_unstable();
+            markers.deleted = block.deleted_in_block.iter().copied().collect();
+            markers.deleted.sort_unstable();
         }
         let state = evm.finalize();
 
@@ -2098,19 +2704,6 @@ impl RskExecutor {
             && tx.to.as_ref() == crate::precompiles::BRIDGE_ADDR.as_slice()
             && !self.hardfork_cfg.has_are_bridge_txs_paid(block_number)
             && self.free_bridge_senders.contains(&sender)
-    }
-
-    /// Detect the REMASC synthetic transaction: v=0, r=0, s=0, gas_limit=0,
-    /// to=REMASC_ADDR. The gas_limit=0 check distinguishes real REMASC system
-    /// calls from normal transactions that happen to call REMASC with valid gas.
-    fn is_remasc_tx(tx: &rustock_core::Transaction) -> bool {
-        if tx.v != 0 || !tx.r.is_zero() || !tx.s.is_zero() {
-            return false;
-        }
-        if !tx.gas_limit.is_zero() {
-            return false;
-        }
-        tx.to.len() == 20 && tx.to.as_ref() == REMASC_ADDR.as_slice()
     }
 
     /// For contract creation transactions, compute the created address from
@@ -2210,8 +2803,14 @@ impl TracedOutcome {
     fn apply_to(self, trace: &mut crate::tracer::ProgramTrace) {
         trace.contract_address = self.contract_address;
         trace.result = self.result;
-        trace.error = self.error;
-        trace.reverted = self.reverted;
+        // rskj sets these two on the program's trace (`extractTrace`:
+        // `program.getTrace().result(..).error(..).revert(..)`). Where no
+        // program ran it makes a new trace and sets neither, so a call
+        // straight to a precompile that fails is traced with no error.
+        if trace.ran_program {
+            trace.error = self.error;
+            trace.reverted = self.reverted;
+        }
     }
 }
 
@@ -2238,16 +2837,43 @@ pub fn bridge_constants_for(chain_id: u64) -> crate::bridge::constants::BridgeCo
 }
 
 /// The senders whose transactions to the Bridge are free before
-/// `areBridgeTxsPaid`: the genesis federation and the authorized free-tx
-/// keys (rskj `BridgeUtils.isFreeBridgeTx`). Shared by the executor and the
-/// transaction pool, which must agree on what costs nothing.
+/// `areBridgeTxsPaid` (rskj `BridgeUtils.isFreeBridgeTx`): the genesis
+/// federation's members and the federation-change, lock-whitelist and
+/// fee-per-KB authorizers (`isFromAuthorizedSender`). Shared by the executor
+/// and the transaction pool, which must agree on what costs nothing.
 pub fn free_bridge_senders(constants: &crate::bridge::constants::BridgeConstants) -> Vec<Address> {
     constants
         .genesis_federation_public_keys
         .iter()
-        .chain(constants.authorized_free_tx_keys.iter())
+        .chain(constants.federation_change_authorizer_keys)
+        .chain(constants.whitelist_authorizer_keys)
+        .chain(constants.fee_per_kb_authorizer_keys)
         .filter_map(|hex| rsk_address_from_pubkey_hex(hex))
         .collect()
+}
+
+/// rskj `Constants.getMinSequentialSetGasLimit` on the network a chain id
+/// names, as [`bridge_constants_for`] picks its Bridge constants.
+fn min_sequential_set_gas_limit_for(chain_id: u64) -> u64 {
+    use rustock_core::config::ChainConfig;
+    match chain_id {
+        crate::hardfork::RSK_MAINNET_CHAIN_ID => ChainConfig::mainnet(),
+        crate::hardfork::RSK_TESTNET_CHAIN_ID => ChainConfig::testnet(),
+        _ => ChainConfig::regtest(),
+    }
+    .min_sequential_set_gas_limit
+}
+
+/// rskj `TransactionExecutor.gasIsValid`, the half that reads the
+/// container: a transaction's gas limit must fit in what the transactions
+/// before it left of the container. The sum caps at `Long.MAX_VALUE`
+/// (`GasCost.add`), and reaching the cap is refused whatever the container.
+/// The other half, that the limit covers the intrinsic cost, is the EVM's
+/// own check.
+fn gas_fits(tx_gas: u64, used: u64, container: u64) -> bool {
+    const LONG_MAX: u64 = i64::MAX as u64;
+    let cumulative = tx_gas.saturating_add(used).min(LONG_MAX);
+    cumulative <= container && cumulative != LONG_MAX
 }
 
 /// Derives an RSK address from a secp256k1 public key in SEC1 hex
@@ -2350,13 +2976,17 @@ mod tests {
             paid_fees: U256::ZERO,
             minimum_gas_price: U256::from(0),
             uncle_count: 0,
-            umm_root: None,
+            // A UMM root where a store's heights, this process's, read one.
+            umm_root: rustock_core::config::ActivationHeights::current()
+                .umm_active(number)
+                .then(Bytes::new),
             version_fields: None,
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         }
     }
 
@@ -2431,29 +3061,154 @@ mod tests {
         );
     }
 
-    /// KNOWN DIVERGENCE (#295): a caller that caps the gas it forwards
-    /// survives here, where rskj kills the transaction.
-    ///
-    /// rskj's escaping `RuntimeException` ends the transaction regardless of
-    /// how much gas the caller still held. Modelling the throw as a
-    /// spent-everything precompile error reproduces that only when the caller
-    /// forwarded everything, because then the caller runs out too. A caller
-    /// using `call{gas: n}` keeps the rest and carries on.
-    ///
-    /// Pinned rather than left unsaid, so the gap is visible and so that
-    /// closing it fails this test instead of passing silently.
+    /// Before RSKIP197 a throw fails the contract that made the call however
+    /// much gas it held back (#295): rskj's `RuntimeException` leaves the VM,
+    /// and `VM.steps` spends all the contract's gas. Here the contract is the
+    /// transaction's own call, so the transaction is charged its whole limit,
+    /// though it forwarded only 50,000.
     #[test]
-    fn a_capped_forward_still_survives_the_pre_rskip197_throw() {
+    fn a_pre_rskip197_throw_fails_the_caller_however_much_gas_it_held_back() {
         let used = bridge_throw_gas_with_capped_forward(2_060_499);
-        assert_eq!(
-            used, 96_733,
-            "only the forwarded 50,000 is burned; rskj would charge the whole \
-             1,000,000 limit -- see #295"
-        );
+        assert_eq!(used, 1_000_000, "the caller fails with all its gas");
 
         // From iris300 both agree: the caller continues on what it kept.
         let after = bridge_throw_gas_with_capped_forward(2_060_500);
         assert!(after < 150_000, "post-RSKIP197 the caller continues (got {after})");
+    }
+
+    /// A contract's `releaseBtc` before RSKIP185: rskj's
+    /// `BridgeSupport.releaseBtc` throws `Program.OutOfGasException` for a
+    /// contract's request, `Bridge.releaseBtc` lets it through, and
+    /// `Bridge.execute` wraps it in a `VMException` as it wraps any other
+    /// throw. Before RSKIP197, which testnet's iris300 (#2,060,500) brings with
+    /// RSKIP185, that fails the contract that made the call with all its gas,
+    /// though it forwarded only 50,000. From iris300 the request is turned down
+    /// (CALLER_CONTRACT) and the contract goes on to its end.
+    #[test]
+    fn a_contracts_release_before_rskip185_fails_the_contract_with_all_its_gas() {
+        let run = |height: u64| {
+            let store = Arc::new(MemoryTrieStore::new());
+            let sender = Address::repeat_byte(0xAA);
+            let contract = Address::repeat_byte(0xBB);
+            // CALL the Bridge with no data and no value, `releaseBtc`,
+            // forwarding 50,000 gas, then STOP.
+            let mut code: Vec<u8> = vec![
+                0x60, 0x00, // retSize
+                0x60, 0x00, // retOffset
+                0x60, 0x00, // argsSize
+                0x60, 0x00, // argsOffset
+                0x60, 0x00, // value
+                0x73, // PUSH20
+            ];
+            code.extend_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice());
+            code.extend_from_slice(&[0x62, 0x00, 0xc3, 0x50, 0xf1, 0x00]);
+            let root = put_account(
+                &TrieNode::empty(),
+                store.as_ref(),
+                &sender,
+                0,
+                U256::from(10u64).pow(U256::from(18)),
+            );
+            let root =
+                put_account_with_code(&root, store.as_ref(), &contract, 1, U256::ZERO, &code);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::testnet(), block_store);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(contract.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            let result = executor
+                .execute_block(&dummy_header(height), &[(tx, sender)], &root, store)
+                .expect("block executes");
+            (result.tx_results[0].success, result.tx_results[0].gas_used)
+        };
+        assert_eq!(
+            run(2_060_499),
+            (false, 1_000_000),
+            "the contract fails with all its gas"
+        );
+        let (succeeded, used) = run(2_060_500);
+        assert!(succeeded, "from iris300 the contract goes on");
+        assert!(
+            used < 150_000,
+            "from iris300 it pays what it used (got {used})"
+        );
+    }
+
+    /// The Bridge's Bitcoin store is written in bitcoinj's legacy format before
+    /// RSKIP454 and in its 32-byte one from it
+    /// (`RepositoryBtcBlockStoreWithCache.serializeBlock`), on both of the
+    /// executor's paths to the Bridge: the EVM's, which a paid call takes from
+    /// RSKIP136, and the one a call takes before it (mainnet #3,397). `receiveHeaders`,
+    /// called by a member of mainnet's genesis federation, seeds an empty store
+    /// in the format its call is given; the head's cell is 96 bytes in the
+    /// legacy format and 116 in the other.
+    #[test]
+    fn the_btc_store_is_written_in_the_blocks_format_on_both_paths_to_the_bridge() {
+        use crate::abi::encode::{args, Arg};
+        let config = crate::bridge::constants::BridgeConstants::mainnet();
+        let federator = crate::bridge::federation::rsk_address_from_public_key(
+            &crate::bridge::peg::genesis_federation_keys(&config)[0],
+        )
+        .expect("an address");
+        let receive_headers = [
+            crate::abi::selector("receiveHeaders(bytes[])").to_vec(),
+            args(&[Arg::BytesArray(&[&[0u8; 80]])]),
+        ]
+        .concat();
+        let head_cell = |number: u64| -> usize {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = put_account(
+                &TrieNode::empty(),
+                store.as_ref(),
+                &federator,
+                0,
+                U256::from(10u64).pow(U256::from(18)),
+            );
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(receive_headers.clone()),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            let result = executor
+                .execute_block(&dummy_header(number), &[(tx, federator)], &root, store)
+                .expect("block executes");
+            let head = crate::bridge::storage::bridge_storage_key("blockStoreChainHead");
+            result
+                .markers
+                .raw_storage
+                .iter()
+                .rev()
+                .find(|(address, key, _)| {
+                    *address == crate::precompiles::BRIDGE_ADDR && *key == head
+                })
+                .and_then(|(_, _, value)| value.as_ref())
+                .map_or(0, Vec::len)
+        };
+        // Mainnet's lovell700, which brings RSKIP454.
+        let lovell700 = 7_338_024;
+        assert_eq!(head_cell(lovell700 - 1), 96, "the EVM's path, legacy");
+        assert_eq!(head_cell(lovell700), 116, "the EVM's path, 32 bytes");
+        assert_eq!(head_cell(3_000), 96, "before RSKIP136, legacy");
     }
 
     /// Runs the same contract on both sides of testnet iris300 (#2,060,500)
@@ -2477,7 +3232,7 @@ mod tests {
                 0x60, 0x00, // retSize
                 0x60, 0x00, // retOffset
                 0x60, 0x04, // argsSize
-                0x60, 0x00, // argsOffset (selector is the word's high bytes)
+                0x60, 0x1c, // argsOffset: the selector is the word's last four bytes
                 0x60, 0x00, // value
                 0x73, // PUSH20
             ];
@@ -2537,7 +3292,7 @@ mod tests {
             0x60, 0x00, // retSize
             0x60, 0x00, // retOffset
             0x60, 0x04, // argsSize
-            0x60, 0x00, // argsOffset
+            0x60, 0x1c, // argsOffset
             0x60, 0x00, // value
             0x73, // PUSH20
         ];
@@ -2773,6 +3528,930 @@ mod tests {
         assert!(trace.truncated, "and the trace says it was cut short");
     }
 
+    /// An unsigned transaction from a test's funded sender, at no gas price.
+    fn unsigned_tx(
+        nonce: u64,
+        to: Option<Address>,
+        value: u64,
+        gas_limit: u64,
+        input: Vec<u8>,
+    ) -> rustock_core::Transaction {
+        rustock_core::Transaction {
+            nonce,
+            gas_price: U256::ZERO,
+            gas_limit: U256::from(gas_limit),
+            to: to.map_or_else(Bytes::new, |to| Bytes::copy_from_slice(to.as_slice())),
+            value: U256::from(value),
+            input: Bytes::from(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        }
+    }
+
+    /// What a block's run leaves, to hold one run against another: the root
+    /// its changes give the parent's state, precompiles' writes and markers
+    /// included, its gas and fees, and each transaction's gas, success,
+    /// output and logs.
+    #[allow(clippy::type_complexity)]
+    fn block_outcome(
+        result: &BlockExecutionResult,
+        parent: &TrieNode,
+        store: &MemoryTrieStore,
+    ) -> (
+        B256,
+        u64,
+        U256,
+        Vec<(u64, bool, Vec<u8>, Vec<revm::primitives::Log>)>,
+    ) {
+        let root = crate::state::apply_state_changes(
+            parent,
+            store,
+            &result.state_changes,
+            &result.markers,
+        );
+        let receipts = result
+            .tx_results
+            .iter()
+            .map(|r| (r.gas_used, r.success, r.output.clone(), r.logs.clone()))
+            .collect();
+        (
+            root.compute_hash(store),
+            result.gas_used,
+            result.paid_fees,
+            receipts,
+        )
+    }
+
+    /// Runs a block as the chain does, as `trace_*` does (every transaction
+    /// traced) and as `debug_traceTransaction` does (each transaction in
+    /// turn), and requires the same state and receipts of all of them. The
+    /// traced runs go through `inspect_run`, so they agree only while it runs
+    /// the loop the chain runs. Returns the chain's run.
+    fn assert_traced_runs_agree(
+        executor: &RskExecutor,
+        header: &Header,
+        transactions: &[(rustock_core::Transaction, Address)],
+        parent: &TrieNode,
+        store: &Arc<MemoryTrieStore>,
+    ) -> BlockExecutionResult {
+        let plain = executor
+            .execute_block(header, transactions, parent, store.clone())
+            .expect("the block executes");
+        let expected = block_outcome(&plain, parent, store);
+        let (every, traces) = executor
+            .execute_block_call_traced(header, transactions, parent, store.clone())
+            .expect("the block executes with every transaction traced");
+        assert_eq!(traces.len(), transactions.len());
+        assert_eq!(
+            block_outcome(&every, parent, store),
+            expected,
+            "trace_* ran another execution"
+        );
+        for index in 0..transactions.len() {
+            let (one, trace) = executor
+                .execute_block_traced(
+                    header,
+                    transactions,
+                    parent,
+                    store.clone(),
+                    index,
+                    crate::tracer::DEFAULT_MAX_STRUCT_LOGS,
+                )
+                .expect("the block executes with one transaction traced");
+            assert!(trace.is_some());
+            assert_eq!(
+                block_outcome(&one, parent, store),
+                expected,
+                "debug_traceTransaction of transaction {index} ran another execution"
+            );
+        }
+        plain
+    }
+
+    /// An estimate's run of a transaction against the local call's, which
+    /// serves `eth_call`: the same gas, success, output and logs. Returns
+    /// what the estimate's inspector saw.
+    fn assert_estimate_run_agrees(
+        executor: &RskExecutor,
+        header: &Header,
+        tx: &rustock_core::Transaction,
+        sender: Address,
+        state: &TrieNode,
+        store: &Arc<MemoryTrieStore>,
+    ) -> crate::gas_estimator::EstimateTelemetry {
+        let call = executor
+            .execute_local_call(header, tx, sender, state, store.clone())
+            .expect("the call executes");
+        let (estimated, telemetry) = executor
+            .execute_tx_for_estimate(header, tx, sender, state, store.clone(), true)
+            .expect("the estimate executes");
+        assert_eq!(
+            (
+                estimated.gas_used,
+                estimated.success,
+                &estimated.output,
+                &estimated.logs
+            ),
+            (call.gas_used, call.success, &call.output, &call.logs),
+            "eth_estimateGas ran another execution"
+        );
+        telemetry
+    }
+
+    /// A create transaction's data deploying `runtime` (at most 255 bytes):
+    /// CODECOPY it from behind this 12-byte prefix and RETURN it.
+    fn deploying(runtime: &[u8]) -> Vec<u8> {
+        let size = u8::try_from(runtime.len()).unwrap();
+        let mut init = vec![
+            0x60, size, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, size, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(runtime);
+        init
+    }
+
+    /// A trace and an estimate run the loop the chain runs: here
+    /// RSKIP150's call depth of 400, where revm's own loop recurses to 1024,
+    /// and the nonce a top-level create leaves its contract, 0, where revm's
+    /// loop leaves 1. The contract counts its depth in slot 0 and calls
+    /// itself, with value only at the depth RSKIP150 refuses, and rskj counts
+    /// that call for the estimate: `VM.getMessageCall` sets
+    /// `callWithValuePerformed` before `Program.callToAddress` checks the
+    /// depth.
+    #[test]
+    fn a_trace_or_an_estimate_stops_at_rskip150s_depth() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAD);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // n = SLOAD(0) + 1; SSTORE(0, n); CALL(GAS, ADDRESS, n == 401), no
+        // data and no return area; POP; STOP.
+        let runtime = [
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, // return area, data
+            0x60, 0x00, 0x54, 0x60, 0x01, 0x01, // n
+            0x80, 0x60, 0x00, 0x55, // SSTORE(0, n)
+            0x61, 0x01, 0x91, 0x14, // the value: n == 401
+            0x30, 0x5a, 0xf1, 0x50, 0x00, // ADDRESS GAS CALL POP STOP
+        ];
+        // The contract holds a wei, so that revm's loop, which doesn't refuse
+        // the call at depth 401, makes it.
+        let deploy = unsigned_tx(0, None, 1, 1_000_000, deploying(&runtime));
+        let deployed = assert_traced_runs_agree(
+            &executor,
+            &dummy_header(2_500_000),
+            &[(deploy, sender)],
+            &root,
+            &store,
+        );
+        let contract = sender.create(0);
+        assert_eq!(deployed.state_changes[&contract].info.nonce, 0);
+        let root = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &deployed.state_changes,
+            &deployed.markers,
+        );
+
+        let call = unsigned_tx(1, Some(contract), 0, 6_000_000, Vec::new());
+        let header = dummy_header(2_500_001);
+        let called =
+            assert_traced_runs_agree(&executor, &header, &[(call.clone(), sender)], &root, &store);
+        assert!(called.tx_results[0].success);
+        assert_eq!(
+            called.state_changes[&contract].storage[&U256::ZERO].present_value,
+            U256::from(401),
+            "frames at depths 0..=400 run; the call at depth 400 is refused"
+        );
+        let telemetry =
+            assert_estimate_run_agrees(&executor, &header, &call, sender, &root, &store);
+        assert!(telemetry.call_with_value, "the refused call carried value");
+
+        // The call tree: 400 calls, each inside the one before.
+        let (_, traces) = executor
+            .execute_block_call_traced(&header, &[(call, sender)], &root, store.clone())
+            .unwrap();
+        let mut level = &traces[0].subtraces;
+        let mut depth = 0;
+        while let [only] = level.as_slice() {
+            if only.error.is_some() {
+                break;
+            }
+            depth += 1;
+            level = &only.subtraces;
+        }
+        assert_eq!(depth, 400);
+    }
+
+    /// A trace and an estimate run the loop the chain runs: before
+    /// RSKIP453 an internal create whose code deposit can't be paid deploys
+    /// empty code (`Program.finalizeContractCreation`), where revm's loop
+    /// fails the create. Mainnet #1,071,481's RNS Deed.
+    #[test]
+    fn a_trace_or_an_estimate_deploys_empty_code_before_rskip453() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // The child's constructor RETURNs 65,536 bytes, whose deposit no
+        // transaction here can pay. The caller CREATEs it and stores the
+        // address it gets in slot 0.
+        let runtime = [
+            0x66, 0x62, 0x01, 0x00, 0x00, 0x60, 0x00, 0xf3, // PUSH7 the child's init
+            0x60, 0x00, 0x52, // MSTORE at word 0
+            0x60, 0x07, 0x60, 0x19, 0x60, 0x00, 0xf0, // CREATE(0, 25, 7)
+            0x60, 0x00, 0x55, // SSTORE(0, created)
+            0x00,
+        ];
+        let deploy = unsigned_tx(0, None, 0, 1_000_000, deploying(&runtime));
+        let deployed = assert_traced_runs_agree(
+            &executor,
+            &dummy_header(1_071_481),
+            &[(deploy, sender)],
+            &root,
+            &store,
+        );
+        let root = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &deployed.state_changes,
+            &deployed.markers,
+        );
+
+        let caller = sender.create(0);
+        let call = unsigned_tx(1, Some(caller), 0, 1_000_000, Vec::new());
+        let header = dummy_header(1_071_482);
+        let created =
+            assert_traced_runs_agree(&executor, &header, &[(call.clone(), sender)], &root, &store);
+        let child = caller.create(0);
+        assert_eq!(
+            created.state_changes[&caller].storage[&U256::ZERO].present_value,
+            U256::from_be_slice(child.as_slice()),
+            "the create succeeds, with empty code"
+        );
+        assert_estimate_run_agrees(&executor, &header, &call, sender, &root, &store);
+    }
+
+    /// A trace and an estimate run the loop the chain runs: a
+    /// nested constructor's refund is dropped (`Program.finalizeContractCreation`
+    /// passes on no `futureRefund`), where revm's loop keeps it. Mainnet
+    /// #6,362,186.
+    #[test]
+    fn a_trace_or_an_estimate_drops_a_nested_constructors_refund() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAB);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // The child's constructor sets slot 0 and clears it, which earns a
+        // refund, and returns no code. The factory MSTOREs it right-aligned
+        // and CREATEs it.
+        let child_init = [
+            0x60, 0x01, 0x60, 0x00, 0x55, // SSTORE(0, 1)
+            0x60, 0x00, 0x60, 0x00, 0x55, // SSTORE(0, 0)
+            0x60, 0x00, 0x60, 0x00, 0xf3, // RETURN nothing
+        ];
+        let size = u8::try_from(child_init.len()).unwrap();
+        let mut runtime = vec![0x5f + size];
+        runtime.extend_from_slice(&child_init);
+        runtime.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, size, 0x60, 32 - size]);
+        runtime.extend_from_slice(&[0x60, 0x00, 0xf0, 0x00]); // CREATE, STOP
+        let deploy = unsigned_tx(0, None, 0, 2_000_000, deploying(&runtime));
+        let deployed = assert_traced_runs_agree(
+            &executor,
+            &dummy_header(6_362_186),
+            &[(deploy, sender)],
+            &root,
+            &store,
+        );
+        let root = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &deployed.state_changes,
+            &deployed.markers,
+        );
+
+        let call = unsigned_tx(1, Some(sender.create(0)), 0, 2_000_000, Vec::new());
+        let header = dummy_header(6_362_187);
+        let created =
+            assert_traced_runs_agree(&executor, &header, &[(call.clone(), sender)], &root, &store);
+        assert!(created.tx_results[0].success);
+        assert_estimate_run_agrees(&executor, &header, &call, sender, &root, &store);
+    }
+
+    /// A trace and an estimate run the loop the chain runs: before
+    /// RSKIP197 a contract whose call to a precompile throws stops there with
+    /// all its gas spent (`VM.steps`), where revm's loop lets it go on. And
+    /// the trace stops at its CALL, as rskj's VM traces no step after it.
+    #[test]
+    fn a_trace_or_an_estimate_stops_a_precompiles_caller_before_rskip197() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        // The inner contract calls HDWalletUtils with no payload, which names
+        // no method and throws, and stops. The outer one gives it 200,000 gas
+        // and returns what its CALL pushed.
+        let outer = Address::repeat_byte(0xB1);
+        let inner = Address::repeat_byte(0xB2);
+        let mut inner_code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        inner_code.extend_from_slice(crate::precompiles::HD_WALLET_UTILS_ADDR.as_slice());
+        inner_code.extend_from_slice(&[0x5a, 0xf1, 0x00]); // GAS, CALL, STOP
+        let outer_code = call_and_return_pushed(inner, 200_000);
+        let root = put_account_with_code(&root, store.as_ref(), &outer, 1, U256::ZERO, &outer_code);
+        let root = put_account_with_code(&root, store.as_ref(), &inner, 1, U256::ZERO, &inner_code);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let header = dummy_header(2_000_000);
+
+        let to_outer = unsigned_tx(0, Some(outer), 0, 1_000_000, Vec::new());
+        let block = assert_traced_runs_agree(
+            &executor,
+            &header,
+            &[(to_outer.clone(), sender)],
+            &root,
+            &store,
+        );
+        assert_eq!(
+            U256::from_be_slice(&block.tx_results[0].output),
+            U256::ZERO,
+            "the outer contract's CALL pushes 0"
+        );
+        assert_estimate_run_agrees(&executor, &header, &to_outer, sender, &root, &store);
+
+        // The transaction's own frame is the caller: it fails, and its trace
+        // ends at the CALL.
+        let to_inner = unsigned_tx(0, Some(inner), 0, 1_000_000, Vec::new());
+        let plain = executor
+            .execute_tx(&header, &to_inner, sender, &root, store.clone())
+            .unwrap();
+        assert!(!plain.success);
+        let (traced, trace) = executor
+            .execute_tx_traced(
+                &header,
+                &to_inner,
+                sender,
+                &root,
+                store.clone(),
+                false,
+                crate::tracer::DEFAULT_MAX_STRUCT_LOGS,
+            )
+            .unwrap();
+        assert_eq!(
+            (traced.gas_used, traced.success),
+            (plain.gas_used, plain.success)
+        );
+        assert_eq!(
+            trace.struct_logs.last().map(|step| step.op.as_str()),
+            Some("CALL")
+        );
+    }
+
+    /// A trace and an estimate run the loop the chain runs: a frame
+    /// that fails takes back what the precompiles under it wrote outside
+    /// revm's journal, where revm's loop keeps it. A contract
+    /// seeds the Bridge's BTC store through a getter and reverts.
+    #[test]
+    fn a_trace_or_an_estimate_takes_back_a_failed_frames_precompile_writes() {
+        // Code that CALLs `to` with `data` (32 bytes at most), all its gas
+        // and no value, and drops what the CALL pushed.
+        fn call(to: Address, data: &[u8]) -> Vec<u8> {
+            let mut word = [0u8; 32];
+            word[..data.len()].copy_from_slice(data);
+            let mut code = vec![0x7f]; // PUSH32 the data, left-aligned
+            code.extend_from_slice(&word);
+            code.extend_from_slice(&[0x60, 0x00, 0x52]); // MSTORE it at 0
+            let size = u8::try_from(data.len()).unwrap();
+            code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, size, 0x60, 0x00, 0x60, 0x00]);
+            code.push(0x73); // PUSH20 to
+            code.extend_from_slice(to.as_slice());
+            code.extend_from_slice(&[0x5a, 0xf1, 0x50]); // GAS, CALL, POP
+            code
+        }
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let seed = crate::abi::selector("getBtcBlockchainBestChainHeight()");
+        let seeds_and_reverts = Address::repeat_byte(0xC2);
+        let mut seeds_and_reverts_code = call(bridge, &seed);
+        seeds_and_reverts_code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xfd]); // REVERT
+        let entry = Address::repeat_byte(0xE0);
+        let mut entry_code = call(seeds_and_reverts, &[]);
+        entry_code.push(0x00); // STOP
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(&root, store.as_ref(), &entry, 1, U256::ZERO, &entry_code);
+        let root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &seeds_and_reverts,
+            1,
+            U256::ZERO,
+            &seeds_and_reverts_code,
+        );
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store);
+        let header = dummy_header(8_000_000);
+
+        let tx = unsigned_tx(0, Some(entry), 0, 1_000_000, Vec::new());
+        let block =
+            assert_traced_runs_agree(&executor, &header, &[(tx.clone(), sender)], &root, &store);
+        assert!(block.tx_results[0].success);
+        assert!(
+            !block
+                .markers
+                .raw_storage
+                .iter()
+                .any(|(address, _, _)| *address == bridge),
+            "the Bridge's seeding went back with the frame"
+        );
+        assert!(!block.markers.precompiles.contains(&bridge));
+        assert_estimate_run_agrees(&executor, &header, &tx, sender, &root, &store);
+    }
+
+    /// An executor over an empty block store, at mainnet's heights.
+    fn mainnet_executor() -> RskExecutor {
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        RskExecutor::new(RskHardforkConfig::mainnet(), block_store)
+    }
+
+    /// A local call passes every gate rskj's `TransactionExecutor.init()`
+    /// holds a transaction of a block to (upstream #294): with `localCall` set
+    /// it returns as soon as it has the intrinsic cost
+    /// (TransactionExecutor.java:165-167). Each case breaks one gate, and the
+    /// local call runs all the same. It's charged no gas either (`execute()`,
+    /// 292-301): the contract it calls reads the caller's balance less only
+    /// the value, where the chain's transaction has paid for its gas. Nor is
+    /// any fee paid after it (`localCallFinalization`, 631-673), which at a
+    /// price no balance could pay would overflow. A trace and an estimate of
+    /// a local call run the same way.
+    #[test]
+    fn a_local_call_passes_the_gates_a_transaction_of_a_block_is_held_to() {
+        // BALANCE(CALLER), then CALLVALUE: two words.
+        let reader = [
+            0x33, 0x31, 0x60, 0x00, 0x52, 0x34, 0x60, 0x20, 0x52, 0x60, 0x40, 0x60, 0x00, 0xf3,
+        ];
+        let contract = Address::repeat_byte(0xC0);
+        let sender = Address::repeat_byte(0x5E);
+        // A sender with code of its own, which rskj never refuses (revm's
+        // EIP-3607 does, on chain).
+        let coded = Address::repeat_byte(0xC5);
+        let balance = U256::from(10u64).pow(U256::from(18));
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let root = put_account_with_code(&root, store.as_ref(), &contract, 0, U256::ZERO, &reader);
+        let root = put_account(&root, store.as_ref(), &sender, 5, balance);
+        let root = put_account_with_code(&root, store.as_ref(), &coded, 5, balance, &[0x00]);
+        let executor = mainnet_executor();
+        let header = Header {
+            minimum_gas_price: U256::from(10),
+            ..dummy_header(8_000_000)
+        };
+        let call =
+            |nonce: u64, gas_price: u128, gas_limit: u64, value: U256| rustock_core::Transaction {
+                nonce,
+                gas_price: U256::from(gas_price),
+                gas_limit: U256::from(gas_limit),
+                to: Bytes::copy_from_slice(contract.as_slice()),
+                value,
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+        let words = |result: &TxExecutionResult| {
+            assert_eq!(result.output.len(), 64);
+            (
+                U256::from_be_slice(&result.output[..32]),
+                U256::from_be_slice(&result.output[32..]),
+            )
+        };
+        let one = U256::from(1);
+
+        // The chain takes this one, and charges its gas up front.
+        let fits = call(5, 10, 100_000, one);
+        let on_chain = executor
+            .execute_tx(&header, &fits, sender, &root, store.clone())
+            .unwrap();
+        assert_eq!(
+            words(&on_chain),
+            (balance - one - U256::from(10 * 100_000), one)
+        );
+        let local = executor
+            .execute_local_call(&header, &fits, sender, &root, store.clone())
+            .unwrap();
+        assert_eq!(words(&local), (balance - one, one));
+
+        // What the caller is left with, where rskj and this node agree on it:
+        // a sender short of the value goes below zero in rskj, which a balance
+        // here can't.
+        let cases = [
+            (
+                "a nonce ahead of the sender's",
+                sender,
+                call(6, 10, 100_000, one),
+                Some(balance - one),
+                one,
+            ),
+            (
+                "a nonce behind the sender's",
+                sender,
+                call(4, 10, 100_000, one),
+                Some(balance - one),
+                one,
+            ),
+            (
+                "a gas price under the block's minimum",
+                sender,
+                call(5, 9, 100_000, one),
+                Some(balance - one),
+                one,
+            ),
+            (
+                "a gas price no balance could pay",
+                sender,
+                call(5, u128::MAX, 100_000, one),
+                Some(balance - one),
+                one,
+            ),
+            (
+                "a gas limit over the block's",
+                sender,
+                call(5, 10, 6_800_001, one),
+                Some(balance - one),
+                one,
+            ),
+            (
+                "the whole balance and the gas",
+                sender,
+                call(5, 10, 100_000, balance),
+                Some(U256::ZERO),
+                balance,
+            ),
+            (
+                "more than the balance",
+                sender,
+                call(5, 10, 100_000, balance + one),
+                None,
+                balance + one,
+            ),
+            (
+                "a sender with code",
+                coded,
+                call(5, 10, 100_000, one),
+                Some(balance - one),
+                one,
+            ),
+        ];
+        for (case, from, tx, left, value) in cases {
+            if from == sender {
+                assert!(
+                    executor
+                        .execute_tx(&header, &tx, from, &root, store.clone())
+                        .is_err(),
+                    "the chain takes {case}"
+                );
+            }
+            let local = executor
+                .execute_local_call(&header, &tx, from, &root, store.clone())
+                .unwrap_or_else(|e| panic!("a local call with {case}: {e:?}"));
+            assert!(local.success, "{case}");
+            let (caller, sent) = words(&local);
+            assert_eq!(sent, value, "{case}");
+            if let Some(left) = left {
+                assert_eq!(caller, left, "{case}");
+            }
+            let (traced, _) = executor
+                .execute_tx_traced(&header, &tx, from, &root, store.clone(), true, 50)
+                .unwrap_or_else(|e| panic!("a traced local call with {case}: {e:?}"));
+            let (estimated, _) = executor
+                .execute_tx_for_estimate(&header, &tx, from, &root, store.clone(), true)
+                .unwrap_or_else(|e| panic!("an estimate with {case}: {e:?}"));
+            assert_eq!(traced.output, local.output, "{case}");
+            assert_eq!(estimated.output, local.output, "{case}");
+        }
+    }
+
+    /// A local creation isn't held to RSKIP438's limit on initcode, which
+    /// `init()` checks after a local call has returned
+    /// (TransactionExecutor.java:169).
+    #[test]
+    fn a_local_creation_passes_the_limit_on_initcode() {
+        let sender = Address::repeat_byte(0x5E);
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+        let executor = mainnet_executor();
+        let header = dummy_header(8_000_000);
+        // A STOP, and past 49,152 bytes.
+        let tx = unsigned_tx(0, None, 0, 1_000_000, vec![0; 49_153]);
+        assert!(executor
+            .execute_tx(&header, &tx, sender, &root, store.clone())
+            .is_err());
+        let local = executor
+            .execute_local_call(&header, &tx, sender, &root, store)
+            .unwrap();
+        assert!(local.success);
+    }
+
+    /// Before RSKIP174 (iris300) rskj's `create()` writes a creation's
+    /// account over one already at its address, for a local call and an
+    /// estimate as for a block's transaction (`createAccount`'s carry-over
+    /// is `RSKIP174 && isExist`, TransactionExecutor.java:403): a contract
+    /// that reads its own balance as it is created holds only the 7 it was
+    /// sent. From iris300 the 1,000 already there is carried over.
+    #[test]
+    fn before_rskip174_every_run_of_a_creation_holds_only_what_it_was_sent() {
+        let sender = Address::repeat_byte(0x5F);
+        let store = Arc::new(MemoryTrieStore::new());
+        let ether = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, ether);
+        let root = put_account(
+            &root,
+            store.as_ref(),
+            &sender.create(0),
+            0,
+            U256::from(1_000),
+        );
+        // ADDRESS BALANCE, returned as the contract's code.
+        let init = vec![0x30, 0x31, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let tx = unsigned_tx(0, None, 7, 1_000_000, init);
+        let executor = mainnet_executor();
+        for (number, holds) in [(3_614_799u64, 7u64), (3_614_800, 1_007)] {
+            let header = dummy_header(number);
+            let holds = U256::from(holds);
+            let local = executor
+                .execute_local_call(&header, &tx, sender, &root, store.clone())
+                .unwrap();
+            let read = U256::from_be_slice(&local.output);
+            assert_eq!(read, holds, "a local call at #{number}");
+            let (traced, _) = executor
+                .execute_tx_traced(&header, &tx, sender, &root, store.clone(), true, 0)
+                .unwrap();
+            let read = U256::from_be_slice(&traced.output);
+            assert_eq!(read, holds, "a trace at #{number}");
+            let (estimated, _) = executor
+                .execute_tx_for_estimate(&header, &tx, sender, &root, store.clone(), true)
+                .unwrap();
+            assert_eq!(
+                U256::from_be_slice(&estimated.output),
+                holds,
+                "an estimate at #{number}"
+            );
+        }
+    }
+
+    /// rskj's BLOCKHASH answers the block at that height among the run
+    /// block's own ancestors: `Program.getBlockHash` asks
+    /// `IndexedBlockStore.getBlockHashByNumber` with the block's parent, which
+    /// walks back from it (Program.java:1133-1136). A block run beside the
+    /// main chain reads its fork's blocks, and the main chain's below where
+    /// the fork leaves it, in a block's run, a local call, a trace and an
+    /// estimate alike. Here the fork is longer than the main chain, so the
+    /// main chain has no block at its last height.
+    #[test]
+    fn blockhash_answers_from_the_run_blocks_own_ancestors() {
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        // Blocks 0 to 3 of the main chain, and blocks 2 to 4 of a fork from
+        // block 1, each with a beneficiary of its own.
+        let child = |parent: &Header, beneficiary: u8| Header {
+            parent_hash: parent.hash(),
+            beneficiary: Address::repeat_byte(beneficiary),
+            ..dummy_header(parent.number + 1)
+        };
+        let mut main = vec![dummy_header(0)];
+        for _ in 1..4 {
+            let next = child(main.last().unwrap(), 0x01);
+            main.push(next);
+        }
+        let mut fork = vec![child(&main[1], 0xF0)];
+        for _ in 3..5 {
+            let next = child(fork.last().unwrap(), 0xF0);
+            fork.push(next);
+        }
+        for header in main.iter().chain(&fork) {
+            block_store.put_header(header).unwrap();
+        }
+        for header in &main {
+            block_store
+                .put_canonical_hash(header.number, header.hash())
+                .unwrap();
+        }
+        // CALLDATALOAD(0) BLOCKHASH, returned.
+        let code = [
+            0x60, 0x00, 0x35, 0x40, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ];
+        let store = Arc::new(MemoryTrieStore::new());
+        let (sender, contract) = (Address::repeat_byte(0xAA), Address::repeat_byte(0xBB));
+        let ether = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, ether);
+        let root = put_account_with_code(&root, store.as_ref(), &contract, 1, U256::ZERO, &code);
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        // What BLOCKHASH(number) answers in the block after `parent`, each way.
+        let ask = |parent: &Header, number: u64| -> Vec<B256> {
+            let header = child(parent, 0x02);
+            let input = U256::from(number).to_be_bytes::<32>().to_vec();
+            let tx = unsigned_tx(0, Some(contract), 0, 100_000, input);
+            let block = executor
+                .execute_block(&header, &[(tx.clone(), sender)], &root, store.clone())
+                .unwrap();
+            let local = executor
+                .execute_local_call(&header, &tx, sender, &root, store.clone())
+                .unwrap();
+            let (traced, _) = executor
+                .execute_tx_traced(&header, &tx, sender, &root, store.clone(), true, 0)
+                .unwrap();
+            let (estimated, _) = executor
+                .execute_tx_for_estimate(&header, &tx, sender, &root, store.clone(), true)
+                .unwrap();
+            [
+                &block.tx_results[0].output,
+                &local.output,
+                &traced.output,
+                &estimated.output,
+            ]
+            .map(|output| B256::from_slice(output))
+            .to_vec()
+        };
+        for number in 0..4 {
+            let on_main = main[number as usize].hash();
+            assert_eq!(
+                ask(&main[3], number),
+                vec![on_main; 4],
+                "block {number} on the main chain"
+            );
+        }
+        let (one, two, three, four) = (
+            main[1].hash(),
+            fork[0].hash(),
+            fork[1].hash(),
+            fork[2].hash(),
+        );
+        assert_eq!(
+            ask(&fork[2], 4),
+            vec![four; 4],
+            "the parent, where the main chain has none"
+        );
+        assert_eq!(
+            ask(&fork[2], 3),
+            vec![three; 4],
+            "the fork's, past the main chain's"
+        );
+        assert_eq!(ask(&fork[2], 2), vec![two; 4], "the fork's first");
+        assert_eq!(
+            ask(&fork[2], 1),
+            vec![one; 4],
+            "where the fork leaves the main chain"
+        );
+        assert_eq!(ask(&fork[2], 0), vec![main[0].hash(); 4], "below it");
+    }
+
+    /// A local call leaves its sender's nonce as it found it (`execute()`,
+    /// TransactionExecutor.java:292-301), where a transaction of a block bumps
+    /// it before its call runs. Seen from a sender with code that creates a
+    /// contract: the address comes from the nonce the sender holds.
+    #[test]
+    fn a_local_call_leaves_its_senders_nonce() {
+        // CREATE(0, 0, 0), and return the address it made.
+        let creator = [
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00,
+            0xf3,
+        ];
+        let sender = Address::repeat_byte(0xC5);
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account_with_code(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            7,
+            U256::ZERO,
+            &creator,
+        );
+        let tx = unsigned_tx(7, Some(sender), 0, 1_000_000, Vec::new());
+        let local = mainnet_executor()
+            .execute_local_call(&dummy_header(8_000_000), &tx, sender, &root, store)
+            .unwrap();
+        assert!(local.success);
+        assert_eq!(Address::from_slice(&local.output[12..]), sender.create(7));
+    }
+
+    /// A local call's sender has an account by the time its program runs:
+    /// rskj's `Repository.transfer` of the value makes one for it, even of
+    /// nothing (`call()`, TransactionExecutor.java:397). So EXTCODEHASH reads
+    /// it as the empty code's hash, not the zero a missing account reads as.
+    #[test]
+    fn a_local_calls_sender_has_an_account() {
+        // EXTCODEHASH(CALLER)
+        let hasher = [0x33, 0x3f, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let contract = Address::repeat_byte(0xC0);
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account_with_code(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &contract,
+            0,
+            U256::ZERO,
+            &hasher,
+        );
+        let tx = unsigned_tx(0, Some(contract), 0, 100_000, Vec::new());
+        let local = mainnet_executor()
+            .execute_local_call(
+                &dummy_header(8_000_000),
+                &tx,
+                Address::repeat_byte(0x99),
+                &root,
+                store,
+            )
+            .unwrap();
+        assert_eq!(
+            B256::from_slice(&local.output),
+            revm::primitives::KECCAK_EMPTY
+        );
+    }
+
+    /// A local call whose gas limit can't pay its intrinsic cost: where a
+    /// program runs, rskj's `go()` fails it with all its gas as it charges
+    /// the cost, before it runs (TransactionExecutor.java:455), so not even a
+    /// STOP succeeds; where none does, `GasCost.subtract` throws out of
+    /// `executeTransaction`, for an account without code (384), a precompile
+    /// (360) and a creation without data (406). The chain refuses all of
+    /// them. And from RSKIP136 a local call's own call to a precompile whose
+    /// cost its gas can't pay throws too (350, 360).
+    #[test]
+    fn a_local_call_short_of_its_costs_fails_or_throws_as_rskj_does() {
+        let contract = Address::repeat_byte(0xC0);
+        let sender = Address::repeat_byte(0x5E);
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let root = put_account_with_code(&root, store.as_ref(), &contract, 0, U256::ZERO, &[0x00]);
+        let root = put_account(
+            &root,
+            store.as_ref(),
+            &sender,
+            0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+        let executor = mainnet_executor();
+        let header = dummy_header(8_000_000);
+        let identity = Address::with_last_byte(4);
+        let run = |to: Option<Address>, gas: u64, input: Vec<u8>| {
+            let tx = unsigned_tx(0, to, 0, gas, input);
+            (
+                executor.execute_tx(&header, &tx, sender, &root, store.clone()),
+                executor.execute_local_call(&header, &tx, sender, &root, store.clone()),
+            )
+        };
+
+        for (case, to, input) in [
+            ("a call to code", Some(contract), vec![]),
+            ("a creation", None, vec![0x00]),
+        ] {
+            let (on_chain, local) = run(to, 20_000, input);
+            assert!(on_chain.is_err(), "the chain takes {case}");
+            let local = local.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+            assert!(!local.success, "{case}");
+            assert_eq!(local.gas_used, 20_000, "{case}");
+            assert!(local.output.is_empty(), "{case}");
+        }
+        for (case, to, input) in [
+            (
+                "a call to no code",
+                Some(Address::repeat_byte(0x77)),
+                vec![],
+            ),
+            ("a call to a precompile", Some(identity), vec![1; 32]),
+            ("a creation without data", None, vec![]),
+        ] {
+            let (on_chain, local) = run(to, 20_000, input);
+            assert!(on_chain.is_err(), "the chain takes {case}");
+            assert!(local.is_err(), "a local call answers {case}");
+        }
+
+        // The intrinsic cost, 21,000 and 16 a byte, and 10 of the 18 the
+        // identity precompile costs a word.
+        let short = 21_000 + 32 * 16 + 10;
+        assert!(run(Some(identity), short, vec![1; 32]).1.is_err());
+        let (_, local) = run(Some(identity), short + 8, vec![1; 32]);
+        assert_eq!(local.unwrap().output, vec![1; 32]);
+    }
+
     #[test]
     fn test_rskj_call_stipend_is_charged_to_caller() {
         let store = Arc::new(MemoryTrieStore::new());
@@ -2840,7 +4519,10 @@ mod tests {
     ///   21,000 intrinsic + 9 (3 PUSH1) + 3 (PUSH20) + 700 EXTCODECOPY = 21,712.
     #[test]
     fn test_extcodecopy_flat_700_at_lovell700() {
-        assert_eq!(RskHardforkConfig::mainnet().spec_id(7_338_024), SpecId::SHANGHAI);
+        assert_eq!(
+            RskHardforkConfig::mainnet().spec_id(7_338_024),
+            SpecId::SHANGHAI
+        );
 
         let store = Arc::new(MemoryTrieStore::new());
         let root = TrieNode::empty();
@@ -2971,7 +4653,11 @@ mod tests {
         };
         assert_eq!(
             RskExecutor::extract_created_address(&create_tx, sender, &true),
-            Some("0xcd234a471b72ba2f1ccf0a70fcaba648a5eecd8d".parse().unwrap()),
+            Some(
+                "0xcd234a471b72ba2f1ccf0a70fcaba648a5eecd8d"
+                    .parse()
+                    .unwrap()
+            ),
         );
         // A reverted CREATE tx leaves no account.
         assert_eq!(
@@ -3010,8 +4696,7 @@ mod tests {
         let root = put_account(&root, store.as_ref(), &voter1, 0, one_rbtc);
         let root = put_account(&root, store.as_ref(), &voter2, 0, one_rbtc);
 
-        let block_store =
-            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
 
         let vote_tx = |nonce: u64| {
@@ -3040,7 +4725,12 @@ mod tests {
             .execute_block(&header1, &[(vote_tx(0), voter1)], &root, store.clone())
             .expect("block 1");
         assert!(r1.tx_results[0].success);
-        let root2 = crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+        let root2 = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &r1.state_changes,
+            &r1.markers,
+        );
 
         let header2 = dummy_header(632_051);
         let r2 = executor
@@ -3048,9 +4738,8 @@ mod tests {
             .expect("block 2");
         assert!(r2.tx_results[0].success);
 
-        let fee_key = crate::bridge::storage::bridge_storage_key(
-            crate::bridge::storage::FEE_PER_KB_KEY,
-        );
+        let fee_key =
+            crate::bridge::storage::bridge_storage_key(crate::bridge::storage::FEE_PER_KB_KEY);
         let fee_write = r2
             .markers
             .raw_storage
@@ -3160,8 +4849,7 @@ mod tests {
         let sender = Address::repeat_byte(0xAA);
         let one_rbtc = U256::from(10u64).pow(U256::from(18));
         let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
-        let block_store =
-            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
 
         // Init code: COINBASE; SSTORE(0, coinbase); RETURN empty runtime.
@@ -3179,14 +4867,17 @@ mod tests {
             to: Bytes::new(),
             value: U256::ZERO,
             input: Bytes::from(init),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
         let mut header = dummy_header(892_000);
         // A distinctive miner address, distinct from both REMASC_ADDR and the
         // default repeat_byte(0x01).
-        let miner = Address::from_slice(
-            &alloy_primitives::hex!("31fe561eb2c628cd32ec52573d7c4b7e4c278bfa"),
-        );
+        let miner = Address::from_slice(&alloy_primitives::hex!(
+            "31fe561eb2c628cd32ec52573d7c4b7e4c278bfa"
+        ));
         header.beneficiary = miner;
 
         let r1 = executor
@@ -3221,8 +4912,7 @@ mod tests {
         let sender = Address::repeat_byte(0xAA);
         let one_rbtc = U256::from(10u64).pow(U256::from(18));
         let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
-        let block_store =
-            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
 
         // Runtime: CREATE(0,0,0) (empty init → no-code child); SSTORE(0, child).
@@ -3242,7 +4932,10 @@ mod tests {
             to: Bytes::new(),
             value: U256::ZERO,
             input: Bytes::from(init),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
         let header1 = dummy_header(1_591_500);
         let r1 = executor
@@ -3251,11 +4944,16 @@ mod tests {
         assert!(r1.tx_results[0].success);
         let deployed = sender.create(0);
         assert_eq!(
-            r1.state_changes.get(&deployed).expect("creator").info.nonce, 0,
+            r1.state_changes.get(&deployed).expect("creator").info.nonce,
+            0,
             "a top-level CREATE tx keeps nonce 0 even post-RSKIP125"
         );
-        let root2 =
-            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+        let root2 = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &r1.state_changes,
+            &r1.markers,
+        );
 
         // Call the creator → it runs an internal CREATE.
         let call = rustock_core::Transaction {
@@ -3265,7 +4963,10 @@ mod tests {
             to: Bytes::copy_from_slice(deployed.as_slice()),
             value: U256::ZERO,
             input: Bytes::new(),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
         let header2 = dummy_header(1_591_501);
         let r2 = executor
@@ -3275,7 +4976,12 @@ mod tests {
 
         let child = deployed.create(0);
         assert_eq!(
-            r2.state_changes.get(&child).expect("child contract").info.nonce, 1,
+            r2.state_changes
+                .get(&child)
+                .expect("child contract")
+                .info
+                .nonce,
+            1,
             "internal CREATE post-RSKIP125 bumps the created contract nonce to 1"
         );
     }
@@ -3305,14 +5011,11 @@ mod tests {
         let sender = Address::repeat_byte(0xAA);
         let one_rbtc = U256::from(10u64).pow(U256::from(18));
         let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
-        let block_store =
-            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
 
         // Runtime: PUSH1 4; PUSH1 0; SHR (4 >> 0 = 4); PUSH1 0; SSTORE; STOP.
-        let runtime: Vec<u8> = vec![
-            0x60, 0x04, 0x60, 0x00, 0x1c, 0x60, 0x00, 0x55, 0x00,
-        ];
+        let runtime: Vec<u8> = vec![0x60, 0x04, 0x60, 0x00, 0x1c, 0x60, 0x00, 0x55, 0x00];
         let mut init = vec![
             0x60, 0x09, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x09, 0x60, 0x00, 0xf3,
         ];
@@ -3325,7 +5028,10 @@ mod tests {
             to: Bytes::new(),
             value: U256::ZERO,
             input: Bytes::from(init),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
         let header1 = dummy_header(1_591_500);
         let r1 = executor
@@ -3333,8 +5039,12 @@ mod tests {
             .expect("deploy block");
         assert!(r1.tx_results[0].success);
         let deployed = sender.create(0);
-        let root2 =
-            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+        let root2 = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &r1.state_changes,
+            &r1.markers,
+        );
 
         let call = rustock_core::Transaction {
             nonce: 1,
@@ -3343,13 +5053,19 @@ mod tests {
             to: Bytes::copy_from_slice(deployed.as_slice()),
             value: U256::ZERO,
             input: Bytes::new(),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
         let header2 = dummy_header(1_591_501);
         let r2 = executor
             .execute_block(&header2, &[(call, sender)], &root2, store.clone())
             .expect("call block");
-        assert!(r2.tx_results[0].success, "SHR must be a valid opcode at wasabi");
+        assert!(
+            r2.tx_results[0].success,
+            "SHR must be a valid opcode at wasabi"
+        );
         assert!(
             r2.tx_results[0].gas_used < 1_000_000,
             "SHR call must not consume the whole gas limit (invalid opcode)"
@@ -3461,6 +5177,112 @@ mod tests {
             gas_clear > gas_noclear,
             "nested-create constructor clear must not earn a refund: clear={gas_clear} noclear={gas_noclear}"
         );
+    }
+
+    /// Testnet #3,088,983 tx[0] (gas 60,388 against the header's 36,388): a
+    /// contract CREATEs a child whose constructor self-destructs. rskj counts a
+    /// self-destruct's 24,000 refund when the transaction ends, from the set of
+    /// deleted accounts (`TransactionExecutor.refundGas`), and
+    /// `Program.finalizeContractCreation` hands that set up from a constructor;
+    /// what it drops is only the constructor's `futureRefund` (the test above).
+    /// So against a constructor that returns, one that self-destructs costs its
+    /// CALLER and SELFDESTRUCT (5,002) less the 24,000, also where both set and
+    /// clear a slot first, whose 15,000 stays dropped.
+    #[test]
+    fn nested_create_constructor_selfdestruct_refund_is_kept_rskj() {
+        // child init: optionally set then clear slot 0, then SELFDESTRUCT to the
+        // creator or RETURN empty code.
+        let child_init = |clear: bool, destruct: bool| -> Vec<u8> {
+            let mut c = Vec::new();
+            if clear {
+                c.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55]); // slot0 = 1
+                c.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x55]); // slot0 = 0
+            }
+            if destruct {
+                c.extend_from_slice(&[0x33, 0xff]); // CALLER SELFDESTRUCT
+            } else {
+                c.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xf3]); // RETURN empty
+            }
+            c
+        };
+        // factory runtime: MSTORE the child init (right-aligned), then CREATE it.
+        let factory_runtime = |init: &[u8]| -> Vec<u8> {
+            let n = init.len();
+            assert!((1..=32).contains(&n));
+            let off = (32 - n) as u8;
+            let mut r = vec![0x5f + n as u8]; // PUSH{n}
+            r.extend_from_slice(init);
+            r.extend_from_slice(&[0x60, 0x00, 0x52]); // PUSH1 0 MSTORE
+            r.extend_from_slice(&[0x60, n as u8]); // PUSH1 size
+            r.extend_from_slice(&[0x60, off]); // PUSH1 offset
+            r.extend_from_slice(&[0x60, 0x00, 0xf0, 0x00]); // PUSH1 0 (value) CREATE STOP
+            r
+        };
+        // deploy wrapper: CODECOPY the runtime (after the 12-byte prefix) + RETURN.
+        let deploy_init = |runtime: &[u8]| -> Vec<u8> {
+            let l = runtime.len() as u8;
+            let mut d = vec![
+                0x60, l, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, l, 0x60, 0x00, 0xf3,
+            ];
+            d.extend_from_slice(runtime);
+            d
+        };
+
+        // Deploy the factory, call it, and return the call's gas_used.
+        let run = |child: Vec<u8>| -> u64 {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let sender = Address::repeat_byte(0xAB);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::testnet(), block_store);
+
+            let deploy = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(2_000_000),
+                to: Bytes::new(),
+                value: U256::ZERO,
+                input: Bytes::from(deploy_init(&factory_runtime(&child))),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r1 = executor
+                .execute_block(&dummy_header(3_088_982), &[(deploy, sender)], &root, store.clone())
+                .expect("deploy block");
+            assert!(r1.tx_results[0].success, "factory deploy failed");
+            let factory_addr = sender.create(0);
+            let root2 = crate::state::apply_state_changes(
+                &root, store.as_ref(), &r1.state_changes, &r1.markers,
+            );
+            let call = rustock_core::Transaction {
+                nonce: 1,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(2_000_000),
+                to: Bytes::copy_from_slice(factory_addr.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::new(),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r2 = executor
+                .execute_block(&dummy_header(3_088_983), &[(call, sender)], &root2, store.clone())
+                .expect("call block");
+            assert!(r2.tx_results[0].success, "factory call (CREATE) failed");
+            r2.tx_results[0].gas_used
+        };
+
+        for clear in [false, true] {
+            let returns = run(child_init(clear, false));
+            let destructs = run(child_init(clear, true));
+            // CALLER + SELFDESTRUCT (2 + 5,000) against PUSH1 PUSH1 RETURN
+            // (3 + 3), less the self-destruct's refund.
+            assert_eq!(
+                destructs + 24_000,
+                returns + 5_002 - 6,
+                "a nested constructor's self-destruct keeps its refund (clear: {clear})"
+            );
+        }
     }
 
     /// Regression for mainnet #3,631,998 tx[1] (gas used 27,540 vs 27,529, +11,
@@ -4070,6 +5892,138 @@ mod tests {
         );
     }
 
+    /// A CREATE that rskj's `Program.createContract` refuses before it builds
+    /// a program -- here for a value its creator hasn't got -- leaves the
+    /// creator's returnDataBuffer as it was, before iris300 and after: the
+    /// refusal returns before `getProgramResult` resets the buffer, and
+    /// RSKIP171's `cleanReturnDataBuffer` is only on the call paths.
+    /// RETURNDATASIZE after it still reports the previous call's 32 bytes.
+    #[test]
+    fn test_refused_create_keeps_return_data_buffer_at_every_height() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAC);
+        // Source: RETURN 32 zero bytes.
+        let source = Address::repeat_byte(0xB8);
+        let source_code = [0x60, 0x20, 0x60, 0x00, 0xf3];
+        // Main: CALL source; POP; CREATE(1 wei, no code); POP;
+        //       SSTORE(0, RETURNDATASIZE); STOP.
+        let main = Address::repeat_byte(0xB9);
+        let mut main_code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        main_code.extend_from_slice(source.as_slice());
+        main_code.extend_from_slice(&[0x62, 0x0f, 0x42, 0x40, 0xf1, 0x50]);
+        main_code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, 0x01, 0xf0, 0x50]);
+        main_code.extend_from_slice(&[0x3d, 0x60, 0x00, 0x55, 0x00]);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root =
+            put_account_with_code(&root, store.as_ref(), &source, 1, U256::ZERO, &source_code);
+        let root = put_account_with_code(&root, store.as_ref(), &main, 1, U256::ZERO, &main_code);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        // Before iris300 (#3,614,800) and after it.
+        for number in [3_000_000u64, 3_616_094] {
+            let call = plain_tx(0, &main, U256::ZERO);
+            let r = executor
+                .execute_block(
+                    &dummy_header(number),
+                    &[(call, sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("block");
+            assert!(r.tx_results[0].success, "#{number}");
+            let size = r
+                .state_changes
+                .get(&main)
+                .and_then(|a| a.storage.get(&U256::ZERO))
+                .map_or(U256::ZERO, |s| s.present_value);
+            assert_eq!(
+                size,
+                U256::from(32),
+                "#{number}: RETURNDATASIZE after the refused CREATE"
+            );
+        }
+    }
+
+    /// Regression for testnet #5,214,732: when a creation's init code reverts,
+    /// rskj's `Program.getProgramResult` sets the creator's returnDataBuffer to
+    /// `result.getHReturn()`, the creator's own result rather than the
+    /// creation's (`programResult`). A program still running has returned
+    /// nothing, so RETURNDATASIZE after a reverted CREATE reads 0 where revm
+    /// (EIP-211) keeps the revert data, and no activation guards it. A CALL
+    /// that reverts still hands its data over. RSKj's release VETIVER-9.0.4
+    /// reads 0 after such a CREATE and 36 after such a CALL.
+    #[test]
+    fn test_reverted_create_leaves_return_data_empty_at_every_height() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAC);
+        // Reverter: REVERT with 36 zero bytes.
+        let reverter = Address::repeat_byte(0xB8);
+        let reverter_code = [0x60, 0x24, 0x60, 0x00, 0xfd];
+        // Main: CALL reverter; POP; SSTORE(1, RETURNDATASIZE + 1);
+        //       CREATE(0, init that REVERTs with 68 zero bytes); POP;
+        //       SSTORE(0, RETURNDATASIZE + 1); STOP.
+        let main = Address::repeat_byte(0xB9);
+        let mut main_code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        main_code.extend_from_slice(reverter.as_slice());
+        main_code.extend_from_slice(&[0x5a, 0xf1, 0x50]);
+        main_code.extend_from_slice(&[0x3d, 0x60, 0x01, 0x01, 0x60, 0x01, 0x55]);
+        // PUSH5 0x60446000fd; PUSH1 0; MSTORE; CREATE(0, 27, 5); POP.
+        main_code.extend_from_slice(&[
+            0x64, 0x60, 0x44, 0x60, 0x00, 0xfd, 0x60, 0x00, 0x52, 0x60, 0x05, 0x60, 0x1b, 0x60,
+            0x00, 0xf0, 0x50,
+        ]);
+        main_code.extend_from_slice(&[0x3d, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00]);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &reverter,
+            1,
+            U256::ZERO,
+            &reverter_code,
+        );
+        let root = put_account_with_code(&root, store.as_ref(), &main, 1, U256::ZERO, &main_code);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        // Before iris300 (#3,614,800), after it, and after vetiver900 (#8,804,200).
+        for number in [3_000_000u64, 3_616_094, 8_900_000] {
+            let call = plain_tx(0, &main, U256::ZERO);
+            let r = executor
+                .execute_block(
+                    &dummy_header(number),
+                    &[(call, sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("block");
+            assert!(r.tx_results[0].success, "#{number}");
+            let slot = |key: u64| {
+                r.state_changes
+                    .get(&main)
+                    .and_then(|a| a.storage.get(&U256::from(key)))
+                    .map_or(U256::ZERO, |s| s.present_value)
+            };
+            assert_eq!(
+                slot(1),
+                U256::from(37),
+                "#{number}: RETURNDATASIZE + 1 after the reverted CALL"
+            );
+            assert_eq!(
+                slot(0),
+                U256::from(1),
+                "#{number}: RETURNDATASIZE + 1 after the reverted CREATE"
+            );
+        }
+    }
+
     /// Regression for mainnet #1,661,324: rskj's VM.doCODESIZE (RSKIP90, orchid)
     /// reports EXTCODESIZE of an active precompile as 2^256-1. A proxy that
     /// guards `extcodesize(impl) != 0` before forwarding to the BlockHeader
@@ -4125,6 +6079,260 @@ mod tests {
             slot0.present_value, U256::MAX,
             "EXTCODESIZE of an active precompile must be 2^256-1 (RSKIP90)"
         );
+    }
+
+    /// rskj `VM.getMessageCall` adds the 2,300 stipend of a call that moves
+    /// value to the gas the call asks for. Before RSKIP150 (twoToThree,
+    /// mainnet #2,018,000) that is a plain `long` sum: a request of 2^63 - 2,300
+    /// or more (`Program.limitToMaxLong` holds any larger word at 2^63 - 1)
+    /// takes it below zero, `GasCost.add` throws for the negative callee gas,
+    /// and the frame that made the call fails with all its gas. From RSKIP150
+    /// the sum stops at 2^63 - 1 and the call goes ahead.
+    #[test]
+    fn test_pre_rskip150_stipend_sum_past_a_long_fails_the_caller() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAD);
+        // Main: CALL(gas = the calldata's word, sender, value 1, no input, no
+        //       output); POP; SSTORE(0, 1); STOP.
+        let main = Address::repeat_byte(0xBA);
+        let mut main_code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x01, 0x73,
+        ];
+        main_code.extend_from_slice(sender.as_slice());
+        main_code.extend_from_slice(&[
+            0x60, 0x00, 0x35, 0xf1, 0x50, 0x60, 0x01, 0x60, 0x00, 0x55, 0x00,
+        ]);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &main,
+            1,
+            U256::from(1_000),
+            &main_code,
+        );
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let run = |number: u64, gas: U256| {
+            let call = rustock_core::Transaction {
+                input: Bytes::from(gas.to_be_bytes::<32>().to_vec()),
+                ..plain_tx(0, &main, U256::ZERO)
+            };
+            let r = executor
+                .execute_block(
+                    &dummy_header(number),
+                    &[(call, sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("block");
+            let stored = r
+                .state_changes
+                .get(&main)
+                .and_then(|a| a.storage.get(&U256::ZERO))
+                .is_some_and(|s| s.present_value == U256::from(1));
+            (r.tx_results[0].success, r.tx_results[0].gas_used, stored)
+        };
+        // 2^63 - 2,300, the least a sum with the stipend takes past a long.
+        let wraps = U256::from(i64::MAX as u64 - 2_299);
+        assert!(
+            run(2_000_000, wraps - U256::from(1)).2,
+            "2^63 - 2,301 and the stipend make a long"
+        );
+        for gas in [wraps, U256::MAX] {
+            assert_eq!(
+                run(2_000_000, gas),
+                (false, 1_000_000, false),
+                "{gas:#x} before RSKIP150: the caller fails with all its gas"
+            );
+            assert!(run(2_018_000, gas).2, "{gas:#x} from RSKIP150");
+        }
+    }
+
+    /// rskj `VM.calculateCallValue`: before RSKIP103 (orchid060, mainnet
+    /// #1,052,700) STATICCALL takes a value off the stack as CALL does, seven
+    /// arguments in all. The value pays `VT_CALL` and brings the stipend, and
+    /// `Program.callToAddress` moves it to the callee, which runs static. Only
+    /// CALL refuses a value inside a static call, so a contract that runs
+    /// static moves one this way too. From RSKIP103 the value is always zero,
+    /// and STATICCALL takes six.
+    #[test]
+    fn test_pre_rskip103_staticcall_takes_a_value() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAE);
+        let payee = Address::repeat_byte(0xBC);
+        // STATICCALL(gas, `to`, `value`, no input, no output), as rskj reads it
+        // before RSKIP103.
+        let static_call = |to: &Address, value: u8| {
+            let mut code = vec![
+                0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, value, 0x73,
+            ];
+            code.extend_from_slice(to.as_slice());
+            code.extend_from_slice(&[0x5a, 0xfa]);
+            code
+        };
+        // Main: STATICCALL(payee, value 5); SSTORE(0, its result); STOP.
+        let main = Address::repeat_byte(0xBB);
+        let mut main_code = static_call(&payee, 5);
+        main_code.extend_from_slice(&[0x60, 0x00, 0x55, 0x00]);
+        // Relay, which runs static: STATICCALL(payee, value 5); STOP.
+        let relay = Address::repeat_byte(0xC1);
+        let mut relay_code = static_call(&payee, 5);
+        relay_code.push(0x00);
+        // Outer: STATICCALL(relay, value 0); SSTORE(0, its result); STOP.
+        let outer = Address::repeat_byte(0xC2);
+        let mut outer_code = static_call(&relay, 0);
+        outer_code.extend_from_slice(&[0x60, 0x00, 0x55, 0x00]);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(&root, store.as_ref(), &payee, 0, U256::ZERO);
+        let root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &main,
+            1,
+            U256::from(1_000),
+            &main_code,
+        );
+        let root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &relay,
+            1,
+            U256::from(1_000),
+            &relay_code,
+        );
+        let root = put_account_with_code(&root, store.as_ref(), &outer, 1, U256::ZERO, &outer_code);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let run = |number: u64, to: &Address| {
+            let call = plain_tx(0, to, U256::ZERO);
+            let r = executor
+                .execute_block(
+                    &dummy_header(number),
+                    &[(call, sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("block");
+            assert!(r.tx_results[0].success, "#{number}");
+            let result = r
+                .state_changes
+                .get(to)
+                .and_then(|a| a.storage.get(&U256::ZERO))
+                .map_or(U256::ZERO, |s| s.present_value);
+            assert_eq!(result, U256::from(1), "#{number}: the STATICCALL succeeds");
+            let paid = r
+                .state_changes
+                .get(&payee)
+                .map_or(U256::ZERO, |a| a.info.balance);
+            (paid, r.tx_results[0].gas_used)
+        };
+        let (paid_before, gas_before) = run(1_000_000, &main);
+        let (paid_after, gas_after) = run(1_100_000, &main);
+        assert_eq!(
+            paid_before,
+            U256::from(5),
+            "before RSKIP103 the value moves"
+        );
+        assert_eq!(paid_after, U256::ZERO, "from RSKIP103 there is none");
+        assert_eq!(
+            gas_before - gas_after,
+            9_000,
+            "VT_CALL, the stipend coming back unspent"
+        );
+        assert_eq!(
+            run(1_000_000, &outer).0,
+            U256::from(5),
+            "before RSKIP103, from a contract that runs static too"
+        );
+        assert_eq!(run(1_100_000, &outer).0, U256::ZERO);
+    }
+
+    /// rskj `Program.executePrecompiled`, which runs a contract's call to a
+    /// precompile before RSKIP197, makes the output the caller's return data
+    /// only from RSKIP90 (orchid, mainnet #729,000): before it RETURNDATASIZE
+    /// still reads the call before. A precompile call refused for its gas
+    /// cleans the return data only from RSKIP171 (iris300, #3,614,800), as
+    /// `cleanReturnDataBuffer` does nothing before it.
+    #[test]
+    fn test_precompile_calls_and_the_return_data_by_height() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAF);
+        // Returner: RETURN 36 zero bytes.
+        let returner = Address::repeat_byte(0xBD);
+        let returner_code = [0x60, 0x24, 0x60, 0x00, 0xf3];
+        // Main: CALL returner; POP;
+        //       CALL identity (0x04) on 4 bytes with all the gas; POP;
+        //       SSTORE(0, RETURNDATASIZE + 1);
+        //       CALL identity on 32 bytes with no gas, which can't pay it; POP;
+        //       SSTORE(1, RETURNDATASIZE + 1); STOP.
+        let main = Address::repeat_byte(0xBE);
+        let mut main_code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        main_code.extend_from_slice(returner.as_slice());
+        main_code.extend_from_slice(&[0x5a, 0xf1, 0x50]);
+        main_code.extend_from_slice(&[
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x04, 0x60, 0x00, 0x60, 0x00, 0x60, 0x04, 0x5a, 0xf1,
+            0x50,
+        ]);
+        main_code.extend_from_slice(&[0x3d, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55]);
+        main_code.extend_from_slice(&[
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x04, 0x60, 0x00,
+            0xf1, 0x50,
+        ]);
+        main_code.extend_from_slice(&[0x3d, 0x60, 0x01, 0x01, 0x60, 0x01, 0x55, 0x00]);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &returner,
+            1,
+            U256::ZERO,
+            &returner_code,
+        );
+        let root = put_account_with_code(&root, store.as_ref(), &main, 1, U256::ZERO, &main_code);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        // Before orchid, before iris300, and after it.
+        for (number, after_return, after_refusal) in [
+            (700_000u64, 37u64, 37u64),
+            (1_700_000, 5, 5),
+            (3_700_000, 5, 1),
+        ] {
+            let call = plain_tx(0, &main, U256::ZERO);
+            let r = executor
+                .execute_block(
+                    &dummy_header(number),
+                    &[(call, sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("block");
+            assert!(r.tx_results[0].success, "#{number}");
+            let slot = |key: u64| {
+                r.state_changes
+                    .get(&main)
+                    .and_then(|a| a.storage.get(&U256::from(key)))
+                    .map_or(U256::ZERO, |s| s.present_value)
+            };
+            assert_eq!(
+                slot(0),
+                U256::from(after_return),
+                "#{number}: RETURNDATASIZE + 1 after identity returned"
+            );
+            assert_eq!(
+                slot(1),
+                U256::from(after_refusal),
+                "#{number}: RETURNDATASIZE + 1 after identity was refused"
+            );
+        }
     }
 
     /// Regression for mainnet #1,071,481: before RSKIP453 (lovell700) an
@@ -4583,6 +6791,362 @@ mod tests {
             "NEW_ACCT_CALL charged only when target absent \
              (absent={gas_absent}, exists-empty={gas_exists})"
         );
+    }
+
+    /// One transaction to a contract holding `code`, in a state where no
+    /// precompile has an account yet. Answers, for `precompile` afterwards:
+    /// whether it has an account, its storage-prefix marker, and the cell at
+    /// `slot` of its storage.
+    fn after_a_call_from_code(
+        code: &[u8],
+        precompile: Address,
+        slot: U256,
+    ) -> (bool, Option<Vec<u8>>, Option<Vec<u8>>) {
+        let sender = Address::repeat_byte(0xAA);
+        let contract = Address::repeat_byte(0xCC);
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(&root, store.as_ref(), &contract, 1, U256::ZERO);
+        let root = root.put(
+            &TrieKeySlice::from_key(&rustock_trie::code_key(&contract)),
+            code,
+            store.as_ref(),
+        );
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(200_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let result = executor
+            .execute_block(
+                &dummy_header(466_503),
+                &[(tx, sender)],
+                &root,
+                store.clone(),
+            )
+            .expect("block");
+        assert!(result.tx_results[0].success);
+        let root = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &result.state_changes,
+            &result.markers,
+        );
+        let cell = |key: Vec<u8>| root.get(&TrieKeySlice::from_key(&key), store.as_ref());
+        (
+            cell(rustock_trie::account_key(&precompile)).is_some(),
+            cell(rustock_trie::storage_prefix_key(&precompile)),
+            cell(rustock_trie::storage_key(&precompile, &B256::from(slot))),
+        )
+    }
+
+    /// rskj `Program.callToPrecompiledAddress`: the zero-value transfer that
+    /// creates a precompile's account goes to the call's context address,
+    /// which for CALLCODE and DELEGATECALL is the caller itself
+    /// (`msg.getType().isStateless()`). Those leave the precompile with the
+    /// marker `setupContract` writes for the code address and no account, so
+    /// the first CALL to it still pays NEW_ACCT_CALL.
+    #[test]
+    fn a_stateless_call_to_a_precompile_creates_no_account_for_it() {
+        let identity = Address::with_last_byte(0x04);
+        // The call with no input, no output and 3000 gas, then STOP. CALL and
+        // CALLCODE take a value, here zero; DELEGATECALL takes none.
+        let after = |opcode: u8| {
+            let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00];
+            if opcode != 0xf4 {
+                code.extend_from_slice(&[0x60, 0x00]);
+            }
+            code.push(0x73);
+            code.extend_from_slice(identity.as_slice());
+            code.extend_from_slice(&[0x61, 0x0b, 0xb8, opcode, 0x00]);
+            let (account, marker, _) = after_a_call_from_code(&code, identity, U256::ZERO);
+            (account, marker)
+        };
+        let marker = Some(vec![1]);
+        assert_eq!(after(0xf1), (true, marker.clone()), "CALL");
+        assert_eq!(after(0xf2), (false, marker.clone()), "CALLCODE");
+        assert_eq!(after(0xf4), (false, marker), "DELEGATECALL");
+    }
+
+    /// rskj `RemascContract.execute` saves after every method that returns,
+    /// `getStateForDebugging` included, and `RemascStorageProvider.save` always
+    /// writes the siblings cell, through `addStorageBytes`, which creates the
+    /// account of a contract that has none. So REMASC has its account after a
+    /// DELEGATECALL too, which by itself would create none.
+    #[test]
+    fn remascs_state_for_debugging_saves_as_any_remasc_method_does() {
+        // The selector to memory, then DELEGATECALL(3000, REMASC, 28, 4, 0, 0).
+        let mut code = vec![0x63];
+        code.extend_from_slice(&crate::remasc::GET_STATE_FOR_DEBUGGING);
+        code.extend_from_slice(&[0x60, 0x00, 0x52]);
+        code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, 0x04, 0x60, 0x1c, 0x73]);
+        code.extend_from_slice(REMASC_ADDR.as_slice());
+        code.extend_from_slice(&[0x61, 0x0b, 0xb8, 0xf4, 0x00]);
+        assert_eq!(
+            after_a_call_from_code(
+                &code,
+                REMASC_ADDR,
+                crate::remasc::remasc_storage_key("siblings")
+            ),
+            (true, Some(vec![1]), Some(vec![0xc0]))
+        );
+    }
+
+    /// One transaction at mainnet's `block` to a contract that reaches the
+    /// Bridge with `opcode`, `input` and 100,000 gas:
+    /// [`a_precompile_called_from_a_contract`] says what this answers.
+    fn the_bridge_called_from_a_contract(
+        block: u64,
+        opcode: u8,
+        input: &[u8],
+    ) -> (bool, u64, usize) {
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        a_precompile_called_from_a_contract(
+            block_store,
+            &dummy_header(block),
+            crate::precompiles::BRIDGE_ADDR,
+            opcode,
+            input,
+        )
+    }
+
+    /// One transaction in mainnet's block `header` to a contract that reaches
+    /// `precompile` with `opcode`, `input` and 100,000 gas, then stores the
+    /// call's flag plus one in its slot 0. Answers whether the transaction
+    /// succeeded, that slot (2 after a call that succeeded, 1 after one that
+    /// failed, 0 where the contract never got to store it), and how many logs
+    /// the transaction left.
+    fn a_precompile_called_from_a_contract(
+        block_store: Arc<BlockStore>,
+        header: &Header,
+        precompile: Address,
+        opcode: u8,
+        input: &[u8],
+    ) -> (bool, u64, usize) {
+        let sender = Address::repeat_byte(0xAA);
+        let contract = Address::repeat_byte(0xCC);
+        let code_with_input_at = |input_at: u16| {
+            // CODECOPY the input, which follows the code, to memory 0.
+            let mut code = vec![0x60, input.len() as u8, 0x61];
+            code.extend_from_slice(&input_at.to_be_bytes());
+            code.extend_from_slice(&[0x60, 0x00, 0x39]);
+            // No output, the input, and for CALL and CALLCODE no value.
+            code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, input.len() as u8, 0x60, 0x00]);
+            if matches!(opcode, 0xf1 | 0xf2) {
+                code.extend_from_slice(&[0x60, 0x00]);
+            }
+            code.push(0x73);
+            code.extend_from_slice(precompile.as_slice());
+            code.extend_from_slice(&[0x62, 0x01, 0x86, 0xa0, opcode]);
+            // The flag plus one to slot 0, then STOP.
+            code.extend_from_slice(&[0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00]);
+            code
+        };
+        let mut code = code_with_input_at(code_with_input_at(0).len() as u16);
+        code.extend_from_slice(input);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(&root, store.as_ref(), &contract, 1, U256::ZERO);
+        let root = root.put(
+            &TrieKeySlice::from_key(&rustock_trie::code_key(&contract)),
+            &code,
+            store.as_ref(),
+        );
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(500_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let result = executor
+            .execute_block(header, &[(tx, sender)], &root, store.clone())
+            .expect("block");
+        let stored = result
+            .state_changes
+            .get(&contract)
+            .and_then(|account| account.storage.get(&U256::ZERO))
+            .map_or(0, |slot| slot.present_value.to::<u64>());
+        let outcome = &result.tx_results[0];
+        (outcome.success, stored, outcome.logs.len())
+    }
+
+    /// How a contract's call to the Bridge ends in rskj, era by era, at
+    /// mainnet's heights.
+    #[test]
+    fn a_contracts_call_to_the_bridge_ends_as_rskj_ends_it_in_each_era() {
+        let (call, callcode, delegatecall, staticcall) = (0xf1, 0xf2, 0xf4, 0xfa);
+        let selector = |signature: &str| crate::abi::selector(signature).to_vec();
+        // receiveHeaders(bytes[]) of no headers: the array's offset, then its
+        // length. Anyone may call it between RSKIP124 and RSKIP200, and it
+        // returns nothing.
+        let no_headers = {
+            let mut input = selector("receiveHeaders(bytes[])");
+            input.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
+            input.extend_from_slice(&[0u8; 32]);
+            input
+        };
+        let (ended, failed, succeeded) = ((false, 0, 0), (true, 1, 0), (true, 2, 0));
+        let after = the_bridge_called_from_a_contract;
+
+        // Before RSKIP88 `Bridge.getGasForData` throws a NullPointerException
+        // for any call from a contract, which nothing in the VM catches: the
+        // contract ends there.
+        assert_eq!(after(700_000, call, &[0xde, 0xad, 0xbe, 0xef]), ended);
+        // A method with nothing to return answers null before RSKIP417.
+        // Before RSKIP150 `Program.memorySave` reads the null's length, and
+        // that too ends the contract.
+        assert_eq!(after(1_700_000, call, &no_headers), ended);
+        // From RSKIP150 `saveOutAfterExecution` skips a null.
+        assert_eq!(after(2_100_000, call, &no_headers), succeeded);
+        // From RSKIP197 `executePrecompiledAndHandleError` hands the null to
+        // `Memory.write`, which reads its length inside the try: the call
+        // fails and its track is rolled back. The Bridge wrote its logs
+        // straight into the calling program's list, and those stay. No data
+        // is releaseBtc, which from a contract only logs its refusal.
+        assert_eq!(after(4_000_000, call, &[]), (true, 1, 1));
+        // From RSKIP417 such a method answers an empty array.
+        assert_eq!(after(7_000_000, call, &[]), (true, 2, 1));
+        // And from RSKIP417 the Bridge checks the kind of call it was reached
+        // by, releaseBtc with no data included: CALL alone.
+        for kind in [callcode, delegatecall, staticcall] {
+            assert_eq!(after(7_000_000, kind, &[]), failed, "{kind:#x}");
+        }
+        // Before it, every kind of call reaches a method.
+        let height = selector("getBtcBlockchainBestChainHeight()");
+        for kind in [call, callcode, delegatecall, staticcall] {
+            assert_eq!(after(4_000_000, kind, &height), succeeded, "{kind:#x}");
+        }
+        assert_eq!(after(7_000_000, delegatecall, &height), failed);
+        assert_eq!(after(7_000_000, staticcall, &height), succeeded);
+    }
+
+    /// rskj `Bridge.validateLocalCall` asks only from RSKIP88 whether a method
+    /// is for local calls alone. Before it a transaction's own call runs such
+    /// a method and gets its answer; from it the call throws, which a
+    /// transaction's own call shows as no output.
+    #[test]
+    fn before_rskip88_a_transaction_runs_a_local_only_bridge_method() {
+        let output_at = |block: u64| {
+            let store = Arc::new(MemoryTrieStore::new());
+            let sender = Address::repeat_byte(0xAA);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::ZERO,
+                gas_limit: U256::from(100_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::copy_from_slice(&crate::abi::selector("getFederationAddress()")),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let result = executor
+                .execute_block(&dummy_header(block), &[(tx, sender)], &root, store.clone())
+                .expect("block");
+            assert!(result.tx_results[0].success);
+            result.tx_results[0].output.clone()
+        };
+        assert!(!output_at(700_000).is_empty(), "before RSKIP88");
+        assert!(output_at(764_123).is_empty(), "from RSKIP88");
+    }
+
+    /// rskj's `getBitcoinHeader` answers null for a block with no Bitcoin
+    /// header, which only a genesis block read from a file without one is:
+    /// every later block needs one for its proof of work.
+    /// `NativeContract.execute` passes the null on, and `Program` makes of it
+    /// what it makes of the Bridge's.
+    #[test]
+    fn a_native_contracts_null_ends_a_contracts_call_as_rskj_ends_it_in_each_era() {
+        let get_bitcoin_header = {
+            let mut input = crate::abi::selector("getBitcoinHeader(int256)").to_vec();
+            input.extend_from_slice(&[0u8; 32]);
+            input
+        };
+        // Mainnet's block `number`, and a store that holds its parent, which
+        // has no Bitcoin header.
+        let on_a_parent_without_one = |number: u64| {
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let parent = dummy_header(number - 1);
+            assert!(parent.bitcoin_merged_mining_header.is_none());
+            block_store.put_header(&parent).unwrap();
+            block_store
+                .put_canonical_hash(parent.number, parent.hash())
+                .unwrap();
+            let mut header = dummy_header(number);
+            header.parent_hash = parent.hash();
+            (block_store, header)
+        };
+        let from_a_contract = |number: u64| {
+            let (block_store, header) = on_a_parent_without_one(number);
+            a_precompile_called_from_a_contract(
+                block_store,
+                &header,
+                crate::precompiles::BLOCK_HEADER_ADDR,
+                0xf1,
+                &get_bitcoin_header,
+            )
+        };
+        // Before RSKIP150 `Program.memorySave` reads the null's length, which
+        // nothing in the VM catches: the contract ends there.
+        assert_eq!(from_a_contract(1_700_000), (false, 0, 0));
+        // From RSKIP150 `saveOutAfterExecution` skips a null.
+        assert_eq!(from_a_contract(2_100_000), (true, 2, 0));
+        // From RSKIP197 `Memory.write` reads its length inside the try, and
+        // the call fails.
+        assert_eq!(from_a_contract(4_000_000), (true, 1, 0));
+
+        // A transaction's own call succeeds with no output
+        // (`TransactionExecutor.call`).
+        let (block_store, header) = on_a_parent_without_one(4_000_000);
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::ZERO,
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(get_bitcoin_header.clone()),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let result = RskExecutor::new(RskHardforkConfig::mainnet(), block_store)
+            .execute_block(&header, &[(tx, sender)], &root, store.clone())
+            .expect("block");
+        assert!(result.tx_results[0].success);
+        assert!(result.tx_results[0].output.is_empty());
     }
 
     /// rskj `doSUICIDE` (VM.java) charges NEW_ACCT_SUICIDE (25,000) whenever the
@@ -5534,7 +8098,12 @@ mod tests {
         let mine = |prev: BlockHash, merkle_seed: u8| -> bitcoin::block::Header {
             (0u32..10_000)
                 .map(|nonce| hdr(prev, merkle_seed, nonce))
-                .find(crate::bridge::btc_store::check_proof_of_work)
+                .find(|header| {
+                    crate::bridge::btc_rules::verify_header(
+                        header,
+                        crate::bridge::constants::BtcNetwork::Regtest,
+                    )
+                })
                 .expect("regtest PoW is trivial")
         };
 
@@ -5685,6 +8254,237 @@ mod tests {
         // Sanity: the fork block really is stored, so -2 came from the
         // best-chain check and not from the block being missing.
         let _ = b256_to_bitcoin_hash;
+    }
+
+    /// rskj compares a `getBtcTransactionConfirmations` branch in display
+    /// order: with the header's merkle root as bitcoinj reads it, and with the
+    /// witness merkle root as `registerBtcCoinbaseTransaction` stored it, its
+    /// ABI argument untouched. rustock climbed the branch in wire order, so a
+    /// transaction proved through the witness tree got -5 where rskj counts
+    /// its confirmations. And two branch nodes that read as a 64-byte
+    /// transaction make rskj's `combineLeftRight` throw, so the call answers
+    /// nothing: a top-level Bridge call that throws is rskj's invisible
+    /// exception, a successful receipt with no return data.
+    ///
+    /// On regtest: one block of two transactions, a coinbase and one more,
+    /// whose roots are no palindromes, so the order shows.
+    #[test]
+    fn test_btc_transaction_confirmations_compare_in_display_order() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::Version;
+        use bitcoin::consensus::serialize as btc_serialize;
+        use bitcoin::hashes::{sha256d, Hash as _};
+        use bitcoin::{
+            Amount, CompactTarget, OutPoint, ScriptBuf, Sequence, TxIn, TxMerkleNode, TxOut,
+            Witness,
+        };
+        use rustock_core::validation::merged_mining::combine_left_right;
+
+        const BLOCK: u64 = 7_000_000; // every relevant RSKIP active
+        let reversed = |mut hash: [u8; 32]| {
+            hash.reverse();
+            hash
+        };
+
+        // The witness tree: the coinbase's wtxid, zero by definition, then one
+        // more. Its root, in display order, is the ABI argument, and the
+        // coinbase commits to it in wire order.
+        let other_wtxid: [u8; 32] = std::array::from_fn(|i| 0x40 + i as u8);
+        let witness_root = combine_left_right(&[0; 32], &other_wtxid);
+        let reserved = [0u8; 32];
+        let commitment =
+            sha256d::Hash::hash(&[reversed(witness_root), reserved].concat()).to_byte_array();
+        let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        commitment_script.extend_from_slice(&commitment);
+        let coinbase = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(5_000_000_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::from_bytes(commitment_script),
+                },
+            ],
+        };
+        // Without its witness, so that its hash is its txid.
+        let coinbase_bytes = btc_serialize(&coinbase);
+
+        // The block's tree, in wire order.
+        let coinbase_txid = sha256d::Hash::hash(&coinbase_bytes).to_byte_array();
+        let other_txid: [u8; 32] = std::array::from_fn(|i| 0x80 + i as u8);
+        let block_root = sha256d::Hash::hash(&[coinbase_txid, other_txid].concat()).to_byte_array();
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
+            .header
+            .block_hash();
+        let header = (0u32..10_000)
+            .map(|nonce| bitcoin::block::Header {
+                version: Version::from_consensus(1),
+                prev_blockhash: genesis,
+                merkle_root: TxMerkleNode::from_byte_array(block_root),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce,
+            })
+            .find(|header| {
+                crate::bridge::btc_rules::verify_header(
+                    header,
+                    crate::bridge::constants::BtcNetwork::Regtest,
+                )
+            })
+            .expect("regtest PoW is trivial");
+        let block_hash = crate::bridge::btc_chain::bitcoin_hash_to_b256(&header.block_hash()).0;
+
+        // The tree that proves the coinbase: two transactions, the first
+        // matched, flags 1 (the root), 1 (the coinbase), 0 (the other).
+        let mut pmt = 2u32.to_le_bytes().to_vec();
+        pmt.push(2);
+        pmt.extend_from_slice(&coinbase_txid);
+        pmt.extend_from_slice(&other_txid);
+        pmt.extend_from_slice(&[1, 0b011]);
+
+        let word = |n: usize| U256::from(n).to_be_bytes::<32>();
+        let padded = |bytes: &[u8]| {
+            let mut out = word(bytes.len()).to_vec();
+            out.extend_from_slice(bytes);
+            out.resize(32 + bytes.len().div_ceil(32) * 32, 0);
+            out
+        };
+        let mut receive_header = crate::bridge::compute_selector("receiveHeader(bytes)").to_vec();
+        receive_header.extend_from_slice(&word(32));
+        receive_header.extend_from_slice(&padded(&btc_serialize(&header)));
+        let mut register = crate::bridge::compute_selector(
+            "registerBtcCoinbaseTransaction(bytes,bytes32,bytes,bytes32,bytes32)",
+        )
+        .to_vec();
+        let tx_part = padded(&coinbase_bytes);
+        register.extend_from_slice(&word(160));
+        register.extend_from_slice(&block_hash);
+        register.extend_from_slice(&word(160 + tx_part.len()));
+        register.extend_from_slice(&witness_root);
+        register.extend_from_slice(&reserved);
+        register.extend_from_slice(&tx_part);
+        register.extend_from_slice(&padded(&pmt));
+
+        let bridge_tx = |nonce: u64, input: Vec<u8>| rustock_core::Transaction {
+            nonce,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(2_000_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xC1);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store)
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::regtest());
+        let txs = [
+            (bridge_tx(0, receive_header), sender),
+            (bridge_tx(1, register), sender),
+        ];
+        let built = executor
+            .execute_block(&dummy_header(BLOCK), &txs, &root, store.clone())
+            .expect("header and coinbase block");
+        assert!(built.tx_results.iter().all(|r| r.success));
+        let root = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &built.state_changes,
+            &built.markers,
+        );
+
+        // The confirmations, or None where the call throws.
+        let confirmations = |tx_hash: [u8; 32], path: usize, branch: &[[u8; 32]]| {
+            let mut input = crate::bridge::compute_selector(
+                "getBtcTransactionConfirmations(bytes32,bytes32,uint256,bytes32[])",
+            )
+            .to_vec();
+            input.extend_from_slice(&tx_hash);
+            input.extend_from_slice(&block_hash);
+            input.extend_from_slice(&word(path));
+            input.extend_from_slice(&word(128));
+            input.extend_from_slice(&word(branch.len()));
+            branch.iter().for_each(|hash| input.extend_from_slice(hash));
+            let built = executor
+                .execute_block(
+                    &dummy_header(BLOCK),
+                    &[(bridge_tx(2, input), sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("query block");
+            let result = &built.tx_results[0];
+            assert!(
+                result.success,
+                "a top-level Bridge call's receipt succeeds even when it throws"
+            );
+            let answer: Option<[u8; 32]> = result.output.as_slice().try_into().ok();
+            assert!(answer.is_some() || result.output.is_empty());
+            answer.map(alloy_primitives::I256::from_be_bytes::<32>)
+        };
+        let code = |n: i64| Some(alloy_primitives::I256::try_from(n).unwrap());
+
+        // The second transaction, by the block's tree.
+        assert_eq!(
+            confirmations(reversed(other_txid), 1, &[reversed(coinbase_txid)]),
+            code(1)
+        );
+        assert_eq!(
+            confirmations(other_txid, 1, &[coinbase_txid]),
+            code(-5),
+            "wire order proves nothing"
+        );
+        // By the witness tree, where rustock got -5.
+        assert_eq!(confirmations(other_wtxid, 1, &[[0; 32]]), code(1));
+        assert_eq!(
+            confirmations(reversed(other_wtxid), 1, &[[0; 32]]),
+            code(-5)
+        );
+
+        // Nodes that read, left then right, as a 64-byte transaction: one
+        // input, an output index of 0, scripts of two bytes each, one output
+        // of one satoshi.
+        let transaction = [
+            &[1u8, 0, 0, 0][..],
+            &[1],
+            &[0x11; 32],
+            &[0; 4],
+            &[2, 0xaa, 0xbb],
+            &[0xff; 4],
+            &[1],
+            &1i64.to_le_bytes(),
+            &[2, 0xcc, 0xdd],
+            &[0; 4],
+        ]
+        .concat();
+        let left: [u8; 32] = transaction[..32].try_into().unwrap();
+        let right: [u8; 32] = transaction[32..].try_into().unwrap();
+        assert_eq!(
+            confirmations(left, 0, &[right]),
+            None,
+            "rskj's combineLeftRight throws"
+        );
+        assert_eq!(
+            confirmations(right, 0, &[left]),
+            code(-5),
+            "the other way round they are no transaction"
+        );
     }
 
     /// Audit findings FRCR-78 and FRCR-678.
@@ -6262,6 +9062,9 @@ mod tests {
             edges: Some(vec![1, 2]),
             base_event: None,
         });
+        // Testnet's gas limit: each parallel sublist gets 1,000,000 of it. At
+        // 10,000,000 or less they would get none, and no block could split.
+        header.gas_limit = U256::from(12_000_000);
 
         let transactions: Vec<(rustock_core::Transaction, Address)> = (0..3)
             .map(|i| {
@@ -6349,6 +9152,7 @@ mod tests {
         );
 
         let mut header = dummy_header(8_000_000);
+        header.gas_limit = U256::from(12_000_000); // testnet's, room in every sublist
         header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
             version: 1,
             edges: Some(vec![1, 2]),
@@ -6396,6 +9200,511 @@ mod tests {
             collision.key,
             rustock_trie::account_key(&sender),
             "the nonce is what connects them, and it lives in the account cell"
+        );
+    }
+
+    /// A contract that holds nothing and destroys itself only reads the
+    /// account of the beneficiary it names: rskj `VM.doSUICIDE` asks `isExist`
+    /// for the gas, and `Program.suicide` then has no balance to transfer. So
+    /// a sublist that does this and another that reads the same account do
+    /// not collide. revm journals a touch of the beneficiary, which for an
+    /// account that does not exist would count as writing it.
+    #[test]
+    fn a_selfdestruct_with_no_balance_only_reads_its_beneficiary() {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let beneficiary = Address::repeat_byte(0xB1);
+        let [dies, reads] = [0xC1, 0xC2].map(Address::repeat_byte);
+        let senders = [0x11, 0x12, 0x13].map(Address::repeat_byte);
+
+        let rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = senders.iter().fold(TrieNode::empty(), |root, sender| {
+            put_account(&root, store.as_ref(), sender, 0, rbtc)
+        });
+        // PUSH20 beneficiary; SELFDESTRUCT
+        let mut code = vec![0x73];
+        code.extend_from_slice(beneficiary.as_slice());
+        code.push(0xFF);
+        let root = seed_contract(&root, store.as_ref(), &dies, U256::ZERO, &code);
+        // PUSH20 beneficiary; BALANCE; POP
+        let mut code = vec![0x73];
+        code.extend_from_slice(beneficiary.as_slice());
+        code.extend_from_slice(&[0x31, 0x50]);
+        let root = seed_contract(&root, store.as_ref(), &reads, U256::ZERO, &code);
+
+        let mut header = dummy_header(8_000_000); // testnet reed810 is 7,139,600
+        header.gas_limit = U256::from(12_000_000);
+        header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+            version: 1,
+            edges: Some(vec![1, 2]),
+            base_event: None,
+        });
+
+        let tx = |to: &Address| rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(1_000),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(to.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        // One sublist destroys, the other reads, and the last transaction is
+        // the sequential set's.
+        let transactions = vec![
+            (tx(&dies), senders[0]),
+            (tx(&reads), senders[1]),
+            (tx(&Address::repeat_byte(0xA3)), senders[2]),
+        ];
+
+        crate::collision::start(
+            &[1i16, 2],
+            &[],
+            crate::collision::write_semantics(header.number),
+        );
+        let executor =
+            RskExecutor::new(RskHardforkConfig::testnet(), block_store).with_execution_threads(2);
+        let result = executor.execute_block(&header, &transactions, &root, store);
+        let collision = crate::collision::finish()
+            .expect("recording was started")
+            .first_collision()
+            .map(|collision| (collision.kind, collision.key));
+
+        assert!(result.expect("block").tx_results.iter().all(|t| t.success));
+        assert_eq!(collision, None, "both sublists only read the beneficiary");
+    }
+
+    /// Transfers of 1,000 wei, each from a sender of its own with the gas
+    /// limit given, in a testnet block above reed810 -- so one that runs as
+    /// its sublists -- with `block_gas` and `edges`.
+    #[allow(clippy::type_complexity)]
+    fn transfers(
+        gas_limits: &[u64],
+        block_gas: u64,
+        edges: &[i16],
+    ) -> (
+        Header,
+        Vec<(rustock_core::Transaction, Address)>,
+        TrieNode,
+        Arc<dyn TrieStore>,
+    ) {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let mut root = TrieNode::empty();
+        let mut transactions = Vec::new();
+        for (i, &gas) in gas_limits.iter().enumerate() {
+            let sender = Address::repeat_byte(0x10 + i as u8);
+            let rbtc = U256::from(10u64).pow(U256::from(18));
+            root = put_account(&root, store.as_ref(), &sender, 0, rbtc);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(1),
+                gas_limit: U256::from(gas),
+                to: Bytes::copy_from_slice(Address::repeat_byte(0xA0 + i as u8).as_slice()),
+                value: U256::from(1_000),
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            transactions.push((tx, sender));
+        }
+        let mut header = dummy_header(8_000_000); // testnet reed810 is 7,139,600
+        header.gas_limit = U256::from(block_gas);
+        header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+            version: 1,
+            edges: Some(edges.to_vec()),
+            base_event: None,
+        });
+        (header, transactions, root, store)
+    }
+
+    fn execute(
+        executor: RskExecutor,
+        (header, transactions, root, store): (
+            Header,
+            Vec<(rustock_core::Transaction, Address)>,
+            TrieNode,
+            Arc<dyn TrieStore>,
+        ),
+    ) -> Result<BlockExecutionResult, ExecutionError> {
+        executor.execute_block(&header, &transactions, &root, store)
+    }
+
+    fn testnet_executor(threads: usize) -> RskExecutor {
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        RskExecutor::new(RskHardforkConfig::testnet(), block_store).with_execution_threads(threads)
+    }
+
+    fn too_much_gas(result: Result<BlockExecutionResult, ExecutionError>) -> bool {
+        matches!(result, Err(e) if e.to_string().contains("Too much gas used in this block or sublist"))
+    }
+
+    /// rskj `TransactionExecutor.gasIsValid` against the sublist's limit
+    /// (`BlockUtils.getSublistGasLimit`), not the block's. Testnet's
+    /// 12,000,000 gas gives each of the two parallel sublists 1,000,000 and
+    /// the sequential one 10,000,000, on one thread or on two.
+    #[test]
+    fn a_transaction_is_held_to_its_own_sublists_gas() {
+        for threads in [1, 2] {
+            // Sublist 0 is tx0, sublist 1 is tx1, and tx2 is sequential.
+            let exact = transfers(&[1_000_000, 1_000_000, 10_000_000], 12_000_000, &[1, 2]);
+            assert!(
+                execute(testnet_executor(threads), exact).is_ok(),
+                "each fills its own sublist exactly ({threads} threads)"
+            );
+            let parallel = transfers(&[1_000_001, 21_000, 21_000], 12_000_000, &[1, 2]);
+            assert!(
+                too_much_gas(execute(testnet_executor(threads), parallel)),
+                "{threads} threads"
+            );
+            // The block's 12,000,000 has room; the sequential sublist does not.
+            let sequential = transfers(&[21_000, 21_000, 10_000_001], 12_000_000, &[1, 2]);
+            assert!(
+                too_much_gas(execute(testnet_executor(threads), sequential)),
+                "{threads} threads"
+            );
+        }
+    }
+
+    /// The count restarts with each sublist: what one used is not taken from
+    /// another's gas, and within one, what ran is.
+    #[test]
+    fn each_sublist_counts_only_the_gas_its_own_transactions_used() {
+        // tx0 and tx1 share parallel sublist 0. tx0 uses 21,000 of its
+        // 1,000,000, so tx1 may declare 979,000 and no more.
+        let shared = transfers(&[21_000, 979_000, 21_000], 12_000_000, &[2]);
+        assert!(execute(testnet_executor(1), shared).is_ok());
+        let shared = transfers(&[21_000, 979_001, 21_000], 12_000_000, &[2]);
+        assert!(too_much_gas(execute(testnet_executor(1), shared)));
+        // Apart, tx1 has its sublist to itself.
+        let apart = transfers(&[21_000, 1_000_000, 21_000], 12_000_000, &[1, 2]);
+        assert!(execute(testnet_executor(1), apart).is_ok());
+    }
+
+    /// rskj gives the parallel sublists nothing on a block of 10,000,000 gas
+    /// or less, testnet's sequential minimum, so such a block cannot split
+    /// however little its transactions declare.
+    #[test]
+    fn at_ten_million_gas_or_less_a_parallel_sublist_holds_nothing() {
+        let split = transfers(&[21_000, 21_000], 10_000_000, &[1]);
+        assert!(too_much_gas(execute(testnet_executor(1), split)));
+        let whole = transfers(&[21_000, 21_000], 10_000_000, &[]);
+        assert!(execute(testnet_executor(1), whole).is_ok());
+    }
+
+    /// Where rskip351 is moved off reed810, rskj runs an RSKIP-144 block as
+    /// one list (`executeInternal`): the block's gas is the container and the
+    /// edges decide nothing.
+    #[test]
+    fn a_block_run_as_one_list_is_held_to_the_blocks_gas() {
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[("rskip351".to_string(), None)])
+            .unwrap();
+        assert!(moved.has_rskip144(8_000_000) && !moved.runs_sublists(8_000_000));
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(moved, block_store).with_execution_threads(2);
+        let block = || transfers(&[2_000_000, 21_000, 21_000], 12_000_000, &[1, 2]);
+        assert!(execute(executor, block()).is_ok());
+        assert!(
+            too_much_gas(execute(testnet_executor(2), block())),
+            "as testnet ships"
+        );
+    }
+
+    /// A gas limit past eight bytes reads as rskj reads it, `Long.MAX_VALUE`,
+    /// which no block's gas fits; eight bytes with the top bit set throw in
+    /// rskj. Either way the block is refused, and nothing panics.
+    #[test]
+    fn a_gas_limit_rskj_reads_past_any_block_is_refused() {
+        let one = U256::from(1u64);
+        for (gas_limit, refusal) in [
+            (one << 64, "Too much gas used"),
+            (U256::MAX, "Too much gas used"),
+            (one << 63, "is not gas"),
+        ] {
+            let (header, mut transactions, root, store) = transfers(&[21_000], 12_000_000, &[]);
+            transactions[0].0.gas_limit = gas_limit;
+            let err =
+                execute(testnet_executor(1), (header, transactions, root, store)).unwrap_err();
+            assert!(err.to_string().contains(refusal), "{gas_limit}: {err}");
+        }
+    }
+
+    /// A price of 2^128 or more is beyond revm's `TxEnv`. No balance on a real
+    /// network covers it, so rskj refuses the transaction too; here the block
+    /// is refused rather than the node panicking.
+    #[test]
+    fn a_gas_price_past_the_evm_is_refused() {
+        let (header, mut transactions, root, store) = transfers(&[21_000], 12_000_000, &[]);
+        transactions[0].0.gas_price = U256::from(1u64) << 128;
+        let err = execute(testnet_executor(1), (header, transactions, root, store)).unwrap_err();
+        assert!(err.to_string().contains("2^128"), "{err}");
+    }
+
+    /// The miner places transactions only after running them, so it holds each
+    /// to what any placement needs: the block's gas less what ran, and the
+    /// larger sublist's gas -- on testnet's 12,000,000 the sequential
+    /// 10,000,000. A gas limit rskj cannot read is reported as invalid, for
+    /// the pool to forget, and one that only does not fit as unfitting.
+    #[test]
+    fn the_miner_drops_what_no_sublist_could_hold() {
+        let (header, mut transactions, root, store) =
+            transfers(&[10_000_001, 21_000, 21_000, 21_000], 12_000_000, &[]);
+        transactions[2].0.gas_limit = U256::from(1u64) << 63;
+        transactions[3].0.gas_limit = U256::from(1u64) << 64;
+        let (result, drops) = testnet_executor(1)
+            .execute_block_for_mining(&header, &transactions, &root, store.clone())
+            .unwrap();
+        assert_eq!(drops.unfitting, vec![0, 3]);
+        assert_eq!(drops.invalid, vec![2]);
+        assert_eq!(result.tx_results.len(), 1);
+
+        // Where the block runs as one list, the block's gas is all there is.
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let (_, drops) = RskExecutor::new(RskHardforkConfig::mainnet(), block_store)
+            .execute_block_for_mining(&header, &transactions[..2], &root, store)
+            .unwrap();
+        assert!(drops.is_empty(), "{drops:?}");
+    }
+
+    /// The sequential sublist's minimum decides every sublist's gas. Regtest's
+    /// 6,800,000 leaves a 12,000,000 block's parallel sublists 2,600,000 each,
+    /// against 1,000,000 under testnet's 10,000,000.
+    #[test]
+    fn the_sequential_minimum_sets_the_parallel_sublists_gas() {
+        let block = || transfers(&[2_600_000, 21_000], 12_000_000, &[1]);
+        assert!(too_much_gas(execute(testnet_executor(1), block())));
+        let executor = testnet_executor(1).with_min_sequential_set_gas_limit(6_800_000);
+        assert!(execute(executor, block()).is_ok());
+        let over = transfers(&[2_600_001, 21_000], 12_000_000, &[1]);
+        let executor = testnet_executor(1).with_min_sequential_set_gas_limit(6_800_000);
+        assert!(too_much_gas(execute(executor, over)));
+    }
+
+    /// rskj's `GasCost`: `gasIsValid` refuses a sum that reaches
+    /// `Long.MAX_VALUE` (`GasCost.add` caps there) even where the container
+    /// is no smaller. A block's gas limit reads as gas from its bytes
+    /// (`Header::gas_limit_as_gas`): the next test.
+    #[test]
+    fn gas_fits_as_rskj_counts_it() {
+        const LONG_MAX: u64 = i64::MAX as u64;
+
+        assert!(gas_fits(1_000_000, 0, 1_000_000));
+        assert!(!gas_fits(1_000_001, 0, 1_000_000));
+        assert!(!gas_fits(1, 1_000_000, 1_000_000));
+        assert!(gas_fits(LONG_MAX - 1, 0, LONG_MAX));
+        assert!(
+            !gas_fits(LONG_MAX, 0, LONG_MAX),
+            "reaching the cap is refused"
+        );
+        assert!(!gas_fits(1, LONG_MAX - 1, LONG_MAX));
+        assert!(
+            !gas_fits(LONG_MAX, LONG_MAX, u64::MAX),
+            "the sum caps, it does not wrap"
+        );
+    }
+
+    /// rskj holds a block's transactions to its gas limit read as gas from
+    /// its bytes (`GasCost.toGas`): the same 12,000,000 written in nine is
+    /// `Long.MAX_VALUE`, and leaves every sublist room for more.
+    #[test]
+    fn a_block_holds_its_transactions_to_its_gas_limit_read_from_its_bytes() {
+        let block = || transfers(&[21_000, 21_000, 10_000_001], 12_000_000, &[1, 2]);
+        assert!(too_much_gas(execute(testnet_executor(1), block())));
+        let (mut header, transactions, root, store) = block();
+        header.kept = Some(Box::new(rustock_core::types::header::KeptFields {
+            gas_limit: Some(Bytes::from(vec![0, 0, 0, 0, 0, 0, 0xb7, 0x1b, 0x00])),
+            ..Default::default()
+        }));
+        assert!(execute(testnet_executor(1), (header, transactions, root, store)).is_ok());
+    }
+
+    /// GASLIMIT and BASEFEE push the header's values whole, as rskj's program
+    /// holds them (`DataWord`s), where revm's block holds `u64`s.
+    #[test]
+    fn gaslimit_and_basefee_push_the_whole_values() {
+        // Runtime: GASLIMIT; PUSH1 0; MSTORE; BASEFEE; PUSH1 32; MSTORE;
+        // PUSH1 64; PUSH1 0; RETURN.
+        let runtime: Vec<u8> = vec![
+            0x45, 0x60, 0x00, 0x52, 0x48, 0x60, 0x20, 0x52, 0x60, 0x40, 0x60, 0x00, 0xf3,
+        ];
+        // Init: CODECOPY the 13-byte runtime and RETURN it.
+        let mut init = vec![
+            0x60, 0x0d, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x0d, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+
+        let gas_limit = (U256::from(1) << 64) + U256::from(5);
+        let price = (U256::from(1) << 64) + U256::from(7);
+        // lovell700, where BASEFEE is active.
+        let header = Header {
+            gas_limit,
+            minimum_gas_price: price,
+            ..dummy_header(7_338_024)
+        };
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0x45);
+        let rich = U256::from(10u64).pow(U256::from(30));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, rich);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let tx = |nonce: u64, to: Bytes, input: Vec<u8>| rustock_core::Transaction {
+            nonce,
+            gas_price: price,
+            gas_limit: U256::from(1_000_000),
+            to,
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let deployed = executor
+            .execute_block(
+                &header,
+                &[(tx(0, Bytes::new(), init), sender)],
+                &root,
+                store.clone(),
+            )
+            .expect("deploy block");
+        assert!(deployed.tx_results[0].success);
+        let root = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &deployed.state_changes,
+            &deployed.markers,
+        );
+        let contract = Bytes::copy_from_slice(sender.create(0).as_slice());
+        let called = executor
+            .execute_block(
+                &header,
+                &[(tx(1, contract, Vec::new()), sender)],
+                &root,
+                store,
+            )
+            .expect("call block");
+        let output = &called.tx_results[0].output;
+        assert_eq!(U256::from_be_slice(&output[..32]), gas_limit);
+        assert_eq!(U256::from_be_slice(&output[32..]), price);
+    }
+
+    /// rskj builds a program's invocation from the block's header for each
+    /// transaction that runs code, and throws where a field is past 32
+    /// bytes. Nothing catches it: the block is not imported, and a miner
+    /// leaves the transaction out. A transaction that runs no code builds
+    /// none.
+    #[test]
+    fn a_header_past_a_programs_words_fails_what_runs_code() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0x46);
+        let rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let tx = |to: Bytes, input: &[u8]| rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::ZERO,
+            gas_limit: U256::from(1_000_000),
+            to,
+            value: U256::ZERO,
+            input: Bytes::copy_from_slice(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        // A creation whose code is STOP, one with no code, and a transfer.
+        let runs_code = tx(Bytes::new(), &[0x00]);
+        let creates_nothing = tx(Bytes::new(), &[]);
+        let transfer = tx(
+            Bytes::copy_from_slice(Address::repeat_byte(0x47).as_slice()),
+            &[],
+        );
+
+        let one = U256::from(1);
+        for (header, fits) in [
+            (
+                Header {
+                    gas_limit: (one << 255) - one,
+                    ..dummy_header(892_000)
+                },
+                true,
+            ),
+            // 2^255 takes a sign byte: 33 bytes.
+            (
+                Header {
+                    gas_limit: one << 255,
+                    ..dummy_header(892_000)
+                },
+                false,
+            ),
+            (
+                Header {
+                    difficulty: one << 255,
+                    ..dummy_header(892_000)
+                },
+                false,
+            ),
+        ] {
+            let run = |tx: &rustock_core::Transaction| {
+                executor.execute_block(&header, &[(tx.clone(), sender)], &root, store.clone())
+            };
+            assert_eq!(run(&runs_code).is_ok(), fits);
+            assert!(run(&creates_nothing).is_ok());
+            assert!(run(&transfer).is_ok());
+            let (mined, drops) = executor
+                .execute_block_for_mining(
+                    &header,
+                    &[(runs_code.clone(), sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("a miner leaves the transaction out");
+            assert_eq!(mined.tx_results.len(), usize::from(fits));
+            assert_eq!(drops.invalid, if fits { vec![] } else { vec![0] });
+        }
+    }
+
+    /// Run as one list, rskj credits each fee to REMASC as its transaction
+    /// ends -- `executeInternal`'s executors do not postpone -- so a later
+    /// transaction sees it. Run as sublists, the fees wait for the REMASC
+    /// transaction. Only a transaction that reads REMASC's balance can tell.
+    #[test]
+    fn fees_wait_for_remasc_only_where_the_block_runs_as_sublists() {
+        // BALANCE(REMASC), returned as one word.
+        let mut code = vec![0x73];
+        code.extend_from_slice(crate::precompiles::REMASC_ADDR.as_slice());
+        code.extend_from_slice(&[0x31, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+        let reader = Address::repeat_byte(0xCC);
+        let seen = |cfg: RskHardforkConfig| -> U256 {
+            let (header, mut transactions, root, store) =
+                transfers(&[21_000, 100_000], 12_000_000, &[]);
+            let root = put_account_with_code(&root, store.as_ref(), &reader, 1, U256::ZERO, &code);
+            transactions[1].0.to = Bytes::copy_from_slice(reader.as_slice());
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let result = RskExecutor::new(cfg, block_store)
+                .execute_block(&header, &transactions, &root, store)
+                .unwrap();
+            let read = &result.tx_results[1];
+            assert!(read.success);
+            assert_eq!(read.output.len(), 32);
+            U256::from_be_slice(&read.output)
+        };
+
+        assert_eq!(seen(RskHardforkConfig::testnet()), U256::ZERO, "postponed");
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[("rskip351".to_string(), None)])
+            .unwrap();
+        assert_eq!(
+            seen(moved),
+            U256::from(21_000),
+            "tx0's fee, at a gas price of 1"
         );
     }
 
@@ -6992,7 +10301,11 @@ mod tests {
         assert_eq!(result.gas_used, 21_064, "Environment costs 0 gas, total = intrinsic only");
     }
 
-    /// Environment precompile with unknown selector should fail.
+    /// Environment with a selector that names no method: rskj's
+    /// `NativeContract.execute` throws, which in a transaction's own call is
+    /// the invisible exception, a success with no output that used the
+    /// intrinsic gas and nothing more (`getGasForData` is 0 for a payload that
+    /// does not parse).
     #[test]
     fn test_environment_precompile_unknown_selector() {
         let store = Arc::new(MemoryTrieStore::new());
@@ -7024,20 +10337,22 @@ mod tests {
             cached_rlp: None,
         };
 
-        let executor = RskExecutor::new(
-            RskHardforkConfig::all_active(33),
-            block_store,
-        );
+        let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store);
 
         let result = executor
             .execute_tx(&header, &tx, sender, &root, store)
             .unwrap();
 
-        assert!(!result.success, "unknown selector should fail");
+        assert!(result.success, "an invisible exception records success");
+        assert!(result.output.is_empty());
+        assert_eq!(
+            result.gas_used, 21_064,
+            "21,000 and four nonzero bytes at 16"
+        );
     }
 
-    /// Environment precompile called via contract STATICCALL should return
-    /// depth > 1 (one extra level for the contract frame).
+    /// Environment called by the contract a transaction calls: rskj counts
+    /// that contract at depth 0, so the answer is 1 (`EnvironmentTest`).
     #[test]
     fn test_environment_precompile_via_contract() {
         let store = Arc::new(MemoryTrieStore::new());
@@ -7047,9 +10362,7 @@ mod tests {
         let one_rbtc = U256::from(10u64).pow(U256::from(18));
         let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
 
-        let block_store = Arc::new(
-            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
-        );
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
 
         let header = dummy_header(8_000_000);
 
@@ -7074,29 +10387,34 @@ mod tests {
         // PUSH1 0x40          ; 60 40    offset
         // RETURN              ; F3
         let runtime: Vec<u8> = vec![
-            0x63, 0xe8, 0xce, 0x22, 0x74,  // PUSH4 0xe8ce2274
-            0x60, 0x00,                      // PUSH1 0
-            0x52,                            // MSTORE
-            0x60, 0x20,                      // PUSH1 32 (retSize)
-            0x60, 0x40,                      // PUSH1 64 (retOffset)
-            0x60, 0x04,                      // PUSH1 4 (argsSize)
-            0x60, 0x1c,                      // PUSH1 28 (argsOffset)
-            0x63, 0x01, 0x00, 0x00, 0x11,   // PUSH4 0x01000011 (Environment addr)
-            0x5A,                            // GAS
-            0xFA,                            // STATICCALL
-            0x60, 0x20,                      // PUSH1 32 (return size)
-            0x60, 0x40,                      // PUSH1 64 (return offset)
-            0xF3,                            // RETURN
+            0x63, 0xe8, 0xce, 0x22, 0x74, // PUSH4 0xe8ce2274
+            0x60, 0x00, // PUSH1 0
+            0x52, // MSTORE
+            0x60, 0x20, // PUSH1 32 (retSize)
+            0x60, 0x40, // PUSH1 64 (retOffset)
+            0x60, 0x04, // PUSH1 4 (argsSize)
+            0x60, 0x1c, // PUSH1 28 (argsOffset)
+            0x63, 0x01, 0x00, 0x00, 0x11, // PUSH4 0x01000011 (Environment addr)
+            0x5A, // GAS
+            0xFA, // STATICCALL
+            0x60, 0x20, // PUSH1 32 (return size)
+            0x60, 0x40, // PUSH1 64 (return offset)
+            0xF3, // RETURN
         ];
 
         let runtime_len = runtime.len() as u8;
         let mut initcode: Vec<u8> = vec![
-            0x60, runtime_len,
-            0x60, 0x0c,
-            0x60, 0x00,
+            0x60,
+            runtime_len,
+            0x60,
+            0x0c,
+            0x60,
+            0x00,
             0x39,
-            0x60, runtime_len,
-            0x60, 0x00,
+            0x60,
+            runtime_len,
+            0x60,
+            0x00,
             0xF3,
         ];
         initcode.extend_from_slice(&runtime);
@@ -7114,19 +10432,21 @@ mod tests {
             cached_rlp: None,
         };
 
-        let executor = RskExecutor::new(
-            RskHardforkConfig::all_active(33),
-            block_store.clone(),
-        );
+        let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store.clone());
 
         // Deploy
         let deploy_result = executor
             .execute_block(&header, &[(tx, sender)], &root, store.clone())
             .unwrap();
 
-        assert!(deploy_result.tx_results[0].success, "deployment should succeed");
+        assert!(
+            deploy_result.tx_results[0].success,
+            "deployment should succeed"
+        );
 
-        let contract_addr = deploy_result.state_changes.iter()
+        let contract_addr = deploy_result
+            .state_changes
+            .iter()
             .find(|(addr, acct)| {
                 **addr != sender
                     && **addr != header.beneficiary
@@ -7139,16 +10459,28 @@ mod tests {
         let root2 = TrieNode::empty();
         let root2 = put_account(&root2, store.as_ref(), &sender, 1, one_rbtc);
 
-        let code_bytes = deploy_result.state_changes.get(&contract_addr)
-            .unwrap().info.code.as_ref().unwrap().bytes_slice().to_vec();
+        let code_bytes = deploy_result
+            .state_changes
+            .get(&contract_addr)
+            .unwrap()
+            .info
+            .code
+            .as_ref()
+            .unwrap()
+            .bytes_slice()
+            .to_vec();
 
-        use rustock_trie::{TrieKeySlice, code_key, AccountState};
+        use rustock_trie::{code_key, AccountState, TrieKeySlice};
         let ckey = code_key(&contract_addr);
         let root2 = root2.put(&TrieKeySlice::from_key(&ckey), &code_bytes, store.as_ref());
 
         let caccount = AccountState::new(U256::ZERO, U256::ZERO);
         let akey = account_key(&contract_addr);
-        let root2 = root2.put(&TrieKeySlice::from_key(&akey), &caccount.encode(), store.as_ref());
+        let root2 = root2.put(
+            &TrieKeySlice::from_key(&akey),
+            &caccount.encode(),
+            store.as_ref(),
+        );
 
         let call_tx = rustock_core::Transaction {
             nonce: 1,
@@ -7168,7 +10500,11 @@ mod tests {
             .unwrap();
 
         assert!(call_result.success, "contract call should succeed");
-        assert_eq!(call_result.output.len(), 32, "should return 32-byte ABI-encoded uint32");
+        assert_eq!(
+            call_result.output.len(),
+            32,
+            "should return 32-byte ABI-encoded uint32"
+        );
 
         let depth = u32::from_be_bytes([
             call_result.output[28],
@@ -7177,11 +10513,2033 @@ mod tests {
             call_result.output[31],
         ]);
 
-        assert!(
-            depth >= 2,
-            "depth via contract call should be >= 2 (tx frame + contract frame), got {}",
-            depth
+        assert_eq!(
+            depth, 1,
+            "the contract the transaction calls is rskj's depth 0"
         );
+    }
+
+    /// rskj's `nested_environment_calls.txt`: the contract a transaction calls
+    /// is at depth 0 and hears 1 from Environment; two calls further down, 3.
+    #[test]
+    fn environment_counts_the_depth_of_the_contract_that_asks() {
+        // STATICCALL Environment with getCallStackDepth(), return its answer.
+        let leaf_code = [
+            0x63, 0xe8, 0xce, 0x22, 0x74, 0x60, 0x00, 0x52, // mem[28..32] = selector
+            0x60, 0x20, 0x60, 0x00, 0x60, 0x04, 0x60, 0x1c, // ret 0..32, args 28..32
+            0x63, 0x01, 0x00, 0x00, 0x11, 0x5a, 0xfa, 0x50, // Environment, GAS, STATICCALL
+            0x60, 0x20, 0x60, 0x00, 0xf3, // RETURN mem[0..32]
+        ];
+        // CALL the address in calldata's first word with the rest of the
+        // calldata, and return the callee's answer.
+        let relay_code = [
+            0x60, 0x20, 0x36, 0x03, 0x80, // n = CALLDATASIZE - 32
+            0x60, 0x20, 0x60, 0x00, 0x37, // mem[0..n] = calldata[32..]
+            0x60, 0x20, 0x60, 0x00, 0x82, 0x60, 0x00, 0x60,
+            0x00, // ret 0..32, args 0..n, no value
+            0x60, 0x00, 0x35, 0x5a, 0xf1, 0x50, 0x50, // CALL calldata[0..32]
+            0x60, 0x20, 0x60, 0x00, 0xf3, // RETURN mem[0..32]
+        ];
+        let leaf = Address::repeat_byte(0xC0);
+        let relay = Address::repeat_byte(0xB0);
+        let word = |address: Address| {
+            let mut word = vec![0u8; 12];
+            word.extend_from_slice(address.as_slice());
+            word
+        };
+        let depth = |to: Address, calldata: Vec<u8>| {
+            let store = Arc::new(MemoryTrieStore::new());
+            let sender = Address::repeat_byte(0xAA);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+            let root =
+                put_account_with_code(&root, store.as_ref(), &leaf, 1, U256::ZERO, &leaf_code);
+            let root =
+                put_account_with_code(&root, store.as_ref(), &relay, 1, U256::ZERO, &relay_code);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::ZERO,
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(to.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(calldata),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store);
+            let result = executor
+                .execute_tx(&dummy_header(8_000_000), &tx, sender, &root, store)
+                .unwrap();
+            assert!(result.success);
+            U256::from_be_slice(&result.output)
+        };
+        assert_eq!(depth(leaf, Vec::new()), U256::from(1));
+        // The transaction calls the relay, which calls itself, which calls the leaf.
+        let mut path = word(relay);
+        path.extend(word(leaf));
+        assert_eq!(depth(relay, path), U256::from(3));
+    }
+
+    /// The intrinsic gas of a transaction carrying `data`, at `nonzero` a
+    /// nonzero byte: 68, or 16 from RSKIP400.
+    fn intrinsic_gas(data: &[u8], nonzero: u64) -> u64 {
+        21_000
+            + data
+                .iter()
+                .map(|byte| if *byte == 0 { 4 } else { nonzero })
+                .sum::<u64>()
+    }
+
+    /// The extended key of rskj's `ExtractPublicKeyFromExtendedPublicKeyTest`.
+    const XPUB: &str = "xpub661MyMwAqRbcFMGNG2YcHvj3x63bAZN9U5cKikaiQ4zu2D1cvpnZYyXNR9nH62sGp4RR39Ui7SVQSq1PY4JbPuEuu5prVJJC3d5Pogft712";
+
+    /// HDWalletUtils' `extractPublicKeyFromExtendedPublicKey(xpub)`, which
+    /// costs 11,300 and throws for a string that is no extended key.
+    fn extract_public_key_call(xpub: &[u8]) -> Vec<u8> {
+        use crate::abi::encode::{self, Arg};
+        let mut input =
+            crate::abi::selector("extractPublicKeyFromExtendedPublicKey(string)").to_vec();
+        input.extend(encode::args(&[Arg::Bytes(xpub)]));
+        input
+    }
+
+    /// One transaction from a funded sender at 60,000,000 wei a gas, in a
+    /// block of its own.
+    fn execute_alone(
+        cfg: RskHardforkConfig,
+        height: u64,
+        to: Address,
+        value: U256,
+        gas_limit: u64,
+        input: &[u8],
+        contracts: &[(Address, &[u8])],
+    ) -> BlockExecutionResult {
+        try_execute_alone(cfg, height, to, value, gas_limit, input, contracts)
+            .expect("block executes")
+    }
+
+    /// [`execute_alone`], or what fails the block.
+    fn try_execute_alone(
+        cfg: RskHardforkConfig,
+        height: u64,
+        to: Address,
+        value: U256,
+        gas_limit: u64,
+        input: &[u8],
+        contracts: &[(Address, &[u8])],
+    ) -> Result<BlockExecutionResult, ExecutionError> {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let mut root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        for (address, code) in contracts {
+            root = put_account_with_code(&root, store.as_ref(), address, 1, U256::ZERO, code);
+        }
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(60_000_000u64),
+            gas_limit: U256::from(gas_limit),
+            to: Bytes::copy_from_slice(to.as_slice()),
+            value,
+            input: Bytes::copy_from_slice(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(cfg, block_store);
+        executor.execute_block(&dummy_header(height), &[(tx, sender)], &root, store)
+    }
+
+    fn fee(gas: u64) -> U256 {
+        U256::from(gas) * U256::from(60_000_000u64)
+    }
+
+    /// rskj's invisible exception (`TransactionExecutor.call`) for a native
+    /// contract: a transaction whose own call to HDWalletUtils throws succeeds
+    /// with no output, having used its intrinsic gas and the method's 11,300.
+    /// Its sender pays for the whole limit, which REMASC receives, and keeps
+    /// the value, and the precompile's account is left as it was. The same
+    /// call with a key it can read is a plain success.
+    #[test]
+    fn a_native_contract_that_throws_in_a_transactions_own_call_is_an_invisible_exception() {
+        let hd_wallet = crate::precompiles::HD_WALLET_UTILS_ADDR;
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let value = U256::from(7);
+
+        let input = extract_public_key_call(b"this-is-not-an-xpub");
+        let result = execute_alone(
+            RskHardforkConfig::all_active(33),
+            8_000_000,
+            hd_wallet,
+            value,
+            1_000_000,
+            &input,
+            &[],
+        );
+        let receipt = &result.tx_results[0];
+        assert!(receipt.success, "the receipt records success");
+        assert!(receipt.output.is_empty());
+        assert_eq!(receipt.gas_used, intrinsic_gas(&input, 16) + 11_300);
+        assert_eq!(
+            result.state_changes.get(&sender).unwrap().info.balance,
+            one_rbtc - fee(1_000_000),
+            "the sender pays for the whole limit and keeps the value"
+        );
+        assert_eq!(
+            result
+                .state_changes
+                .get(&crate::precompiles::REMASC_ADDR)
+                .unwrap()
+                .info
+                .balance,
+            fee(1_000_000)
+        );
+        assert_eq!(result.paid_fees, fee(1_000_000));
+        assert!(
+            result
+                .state_changes
+                .get(&hd_wallet)
+                .is_none_or(|account| !account.is_touched()),
+            "the precompile's account is left as it was"
+        );
+        assert!(
+            !result.markers.precompiles.contains(&hd_wallet),
+            "no setupContract"
+        );
+
+        let input = extract_public_key_call(XPUB.as_bytes());
+        let result = execute_alone(
+            RskHardforkConfig::all_active(33),
+            8_000_000,
+            hd_wallet,
+            value,
+            1_000_000,
+            &input,
+            &[],
+        );
+        let receipt = &result.tx_results[0];
+        assert!(receipt.success);
+        let used = intrinsic_gas(&input, 16) + 11_300;
+        assert_eq!(receipt.gas_used, used);
+        assert_eq!(
+            result.paid_fees,
+            fee(used),
+            "a success pays for the gas it used"
+        );
+        assert_eq!(
+            result.state_changes.get(&hd_wallet).unwrap().info.balance,
+            value
+        );
+        assert!(result.markers.precompiles.contains(&hd_wallet));
+    }
+
+    /// A transaction's own call that cannot pay what a native contract asks
+    /// for fails, using all its gas (`TransactionExecutor.call`'s execError).
+    #[test]
+    fn a_direct_call_short_of_a_native_contracts_gas_fails_with_all_of_it() {
+        let hd_wallet = crate::precompiles::HD_WALLET_UTILS_ADDR;
+        let input = extract_public_key_call(XPUB.as_bytes());
+        let enough = intrinsic_gas(&input, 16) + 11_300;
+        let result = execute_alone(
+            RskHardforkConfig::all_active(33),
+            8_000_000,
+            hd_wallet,
+            U256::ZERO,
+            enough - 1,
+            &input,
+            &[],
+        );
+        assert!(!result.tx_results[0].success);
+        assert_eq!(result.tx_results[0].gas_used, enough - 1);
+        assert_eq!(result.paid_fees, fee(enough - 1));
+        let result = execute_alone(
+            RskHardforkConfig::all_active(33),
+            8_000_000,
+            hd_wallet,
+            U256::ZERO,
+            enough,
+            &input,
+            &[],
+        );
+        assert!(result.tx_results[0].success);
+        assert_eq!(result.tx_results[0].gas_used, enough);
+    }
+
+    /// rskj `TransactionExecutor.call`: before RSKIP136 (bahamas, mainnet
+    /// #3,397) what a transaction's own call to a precompile asks for
+    /// (`getGasForData`) is held to the whole gas limit (`enoughGas`), and the
+    /// transaction uses it on top of its intrinsic cost, past the limit if it
+    /// comes to that. From RSKIP136 the two together are held to the limit.
+    /// The Bridge's calls ran this way already; ECRECOVER asks for 3,000
+    /// whatever it is given.
+    #[test]
+    fn before_rskip136_a_direct_precompile_call_is_held_to_its_limit_by_its_price_alone() {
+        let ecrecover = Address::with_last_byte(1);
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let value = U256::from(7);
+        let run = |height| {
+            execute_alone(
+                RskHardforkConfig::mainnet(),
+                height,
+                ecrecover,
+                value,
+                21_000,
+                &[],
+                &[],
+            )
+        };
+
+        let result = run(3_396);
+        let receipt = &result.tx_results[0];
+        assert!(receipt.success);
+        assert_eq!(receipt.gas_used, 24_000, "3,000 on top of 21,000");
+        assert_eq!(result.paid_fees, fee(24_000));
+        assert_eq!(
+            result.state_changes.get(&sender).unwrap().info.balance,
+            one_rbtc - value - fee(24_000)
+        );
+        assert_eq!(
+            result.state_changes.get(&ecrecover).unwrap().info.balance,
+            value
+        );
+        assert!(
+            result.markers.precompiles.contains(&ecrecover),
+            "setupContract"
+        );
+
+        let result = run(3_397);
+        let receipt = &result.tx_results[0];
+        assert!(
+            !receipt.success,
+            "from RSKIP136, 21,000 can't pay for 24,000"
+        );
+        assert_eq!(receipt.gas_used, 21_000);
+        assert_eq!(result.paid_fees, fee(21_000));
+        assert!(result
+            .state_changes
+            .get(&ecrecover)
+            .is_none_or(|account| account.info.balance.is_zero()));
+        assert!(!result.markers.precompiles.contains(&ecrecover));
+    }
+
+    /// The same for a native contract, with RSKIP136 moved off bahamas as a
+    /// `consensusRules` entry moves it: HDWalletUtils asks for 11,300, which
+    /// before RSKIP136 a transaction carrying only its intrinsic gas pays. A
+    /// call that throws there is rskj's invisible exception all the same, and
+    /// its sender pays for its whole limit. The blocks run as their sublists,
+    /// so each fee reaches REMASC once, with the block's others.
+    #[test]
+    fn before_rskip136_a_direct_native_contract_call_is_held_to_its_limit_by_its_price_alone() {
+        let hd_wallet = crate::precompiles::HD_WALLET_UTILS_ADDR;
+        let remasc = crate::precompiles::REMASC_ADDR;
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let value = U256::from(7);
+        let (cfg, _) = RskHardforkConfig::all_active_parallel(33)
+            .with_rskj_overrides(&[], &[("rskip136".to_string(), Some(9_000_000))])
+            .unwrap();
+        assert!(cfg.runs_sublists(8_000_000));
+        let run = |height, input: &[u8]| {
+            let limit = intrinsic_gas(input, 16);
+            (
+                limit,
+                execute_alone(cfg.clone(), height, hd_wallet, value, limit, input, &[]),
+            )
+        };
+        let remasc_holds = |result: &BlockExecutionResult| {
+            result
+                .state_changes
+                .get(&remasc)
+                .map_or(U256::ZERO, |account| account.info.balance)
+        };
+
+        let reads = extract_public_key_call(XPUB.as_bytes());
+        let (limit, result) = run(8_000_000, &reads);
+        let receipt = &result.tx_results[0];
+        assert!(receipt.success);
+        assert!(!receipt.output.is_empty());
+        assert_eq!(receipt.gas_used, limit + 11_300, "past its limit");
+        assert_eq!(result.paid_fees, fee(limit + 11_300));
+        assert_eq!(
+            remasc_holds(&result),
+            fee(limit + 11_300),
+            "REMASC is paid once"
+        );
+        assert_eq!(
+            result.state_changes.get(&sender).unwrap().info.balance,
+            one_rbtc - value - fee(limit + 11_300)
+        );
+        assert_eq!(
+            result.state_changes.get(&hd_wallet).unwrap().info.balance,
+            value
+        );
+        assert!(result.markers.precompiles.contains(&hd_wallet));
+
+        let throws = extract_public_key_call(b"this-is-not-an-xpub");
+        let (limit, result) = run(8_000_000, &throws);
+        let receipt = &result.tx_results[0];
+        assert!(receipt.success, "the receipt records success");
+        assert!(receipt.output.is_empty());
+        assert_eq!(receipt.gas_used, limit + 11_300);
+        assert_eq!(
+            result.paid_fees,
+            fee(limit),
+            "the sender pays for its whole limit"
+        );
+        assert_eq!(remasc_holds(&result), fee(limit));
+        assert_eq!(
+            result.state_changes.get(&sender).unwrap().info.balance,
+            one_rbtc - fee(limit),
+            "and keeps the value"
+        );
+        assert!(result
+            .state_changes
+            .get(&hd_wallet)
+            .is_none_or(|account| !account.is_touched()));
+        assert!(!result.markers.precompiles.contains(&hd_wallet));
+
+        for input in [reads, throws] {
+            let (limit, result) = run(9_000_000, &input);
+            let receipt = &result.tx_results[0];
+            assert!(
+                !receipt.success,
+                "from RSKIP136 its limit can't pay for 11,300 more"
+            );
+            assert_eq!(receipt.gas_used, limit);
+            assert_eq!(result.paid_fees, fee(limit));
+            assert_eq!(remasc_holds(&result), fee(limit));
+        }
+    }
+
+    /// Where a block runs as its sublists, each fee reaches REMASC with the
+    /// block's others, just before the REMASC transaction or after the last
+    /// one (`postponeFeePayment`). A transaction's own call to the Bridge
+    /// before RSKIP136 paid its fee to REMASC straight away as well, and
+    /// REMASC had it twice.
+    #[test]
+    fn before_rskip136_a_direct_bridge_call_pays_remasc_once_where_fees_wait() {
+        let (cfg, _) = RskHardforkConfig::all_active_parallel(33)
+            .with_rskj_overrides(&[], &[("rskip136".to_string(), Some(9_000_000))])
+            .unwrap();
+        let input = crate::abi::selector("getBtcBlockchainBestChainHeight()").to_vec();
+        let result = execute_alone(
+            cfg,
+            8_000_000,
+            crate::precompiles::BRIDGE_ADDR,
+            U256::ZERO,
+            1_000_000,
+            &input,
+            &[],
+        );
+        let receipt = &result.tx_results[0];
+        assert!(receipt.success);
+        assert_eq!(result.paid_fees, fee(receipt.gas_used));
+        assert_eq!(
+            result
+                .state_changes
+                .get(&crate::precompiles::REMASC_ADDR)
+                .unwrap()
+                .info
+                .balance,
+            fee(receipt.gas_used)
+        );
+    }
+
+    /// Before RSKIP136 a transaction's own call to a precompile can use more
+    /// gas than its limit, and rskj takes the excess from its sender whatever
+    /// the sender holds: `TransactionExecutor.finalization` adds a negative
+    /// leftover, and the balance goes below zero, which rskj stores signed
+    /// (`RLP.encodeSignedCoinNonNullZero`). This node's balances can't go
+    /// below zero, so it refuses such a block rather than reach another state.
+    #[test]
+    fn before_rskip136_a_sender_who_cannot_cover_the_excess_fails_the_block() {
+        let ecrecover = Address::with_last_byte(1);
+        let sender = Address::repeat_byte(0xAA);
+        let price = U256::from(60_000_000u64);
+        let value = U256::from(7);
+        let store = Arc::new(MemoryTrieStore::new());
+        // What rskj asks a sender to hold before it runs the transaction:
+        // the value and the whole limit (`TransactionExecutor.init`).
+        let holds = value + U256::from(21_000) * price;
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, holds);
+        let tx = rustock_core::Transaction {
+            gas_price: price,
+            gas_limit: U256::from(21_000),
+            ..plain_tx(0, &ecrecover, value)
+        };
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let before = executor.execute_block(
+            &dummy_header(3_396),
+            &[(tx.clone(), sender)],
+            &root,
+            store.clone(),
+        );
+        match before {
+            Err(error) => assert!(error.to_string().contains("below zero"), "{error}"),
+            Ok(_) => panic!("the block executes"),
+        }
+        let after = executor
+            .execute_block(&dummy_header(3_397), &[(tx, sender)], &root, store)
+            .expect("from RSKIP136 the call fails within its limit");
+        assert!(!after.tx_results[0].success);
+    }
+
+    /// rskj `TransactionExecutor.init` holds a transaction to its sender's
+    /// next nonce, a limit that pays its intrinsic cost, and a balance that
+    /// covers its value and whole limit, before anything runs. One that fails
+    /// makes its block invalid, and the miner drops it for the pool to forget.
+    /// A transaction's own call that rskj runs outside its VM, here before
+    /// RSKIP136, is held to the same. Mining also leaves one whose sender
+    /// couldn't pay for what it comes to past its limit, keeping it for later.
+    #[test]
+    fn a_direct_precompile_call_is_held_to_rskjs_checks_before_it_runs() {
+        let ecrecover = Address::with_last_byte(1);
+        let sender = Address::repeat_byte(0xAA);
+        let price = U256::from(60_000_000u64);
+        let value = U256::from(7);
+        let store = Arc::new(MemoryTrieStore::new());
+        // The value and the 24,000 gas a 21,000 limit comes to.
+        let holds = value + U256::from(24_000) * price;
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, holds);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let header = dummy_header(3_396);
+        let call = |nonce: u64, gas_limit: u64, value: U256| rustock_core::Transaction {
+            gas_price: price,
+            gas_limit: U256::from(gas_limit),
+            ..plain_tx(nonce, &ecrecover, value)
+        };
+        let too_much = value + U256::from(3_000) * price + U256::from(1);
+        for (tx, refused) in [
+            (call(1, 21_000, value), "Invalid nonce"),
+            (call(0, 20_999, value), "Not enough gas"),
+            (call(0, 21_000, too_much), "Not enough cash"),
+        ] {
+            match executor.execute_block(&header, &[(tx.clone(), sender)], &root, store.clone()) {
+                Err(error) => assert!(error.to_string().contains(refused), "{error}"),
+                Ok(_) => panic!("{refused}: the block executes"),
+            }
+            let (result, drops) = executor
+                .execute_block_for_mining(&header, &[(tx, sender)], &root, store.clone())
+                .expect("mining");
+            assert!(result.tx_results.is_empty(), "{refused}");
+            assert_eq!(drops.invalid, vec![0], "{refused}");
+        }
+
+        let (result, drops) = executor
+            .execute_block_for_mining(
+                &header,
+                &[(call(0, 21_000, value), sender)],
+                &root,
+                store.clone(),
+            )
+            .expect("mining");
+        assert!(drops.invalid.is_empty() && drops.unfitting.is_empty());
+        assert_eq!(result.tx_results[0].gas_used, 24_000);
+        let short = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            0,
+            holds - U256::from(1),
+        );
+        let (result, drops) = executor
+            .execute_block_for_mining(&header, &[(call(0, 21_000, value), sender)], &short, store)
+            .expect("mining");
+        assert!(result.tx_results.is_empty());
+        assert!(drops.invalid.is_empty());
+        assert_eq!(drops.unfitting, vec![0], "kept for later");
+    }
+
+    /// rskj's BTC block store writes straight into the repository a
+    /// transaction's own call to the Bridge is given, which
+    /// `TransactionExecutor.go` commits however the call ends. So such a call
+    /// that seeds a store nothing has seeded yet keeps the genesis block and
+    /// the head though it then throws (an invisible exception) or runs out of
+    /// gas, and only the height index, which the Bridge's storage provider
+    /// writes when a method returns, is left out. A call that returns writes
+    /// all three, each in its block's layout.
+    #[test]
+    fn a_transactions_own_bridge_call_keeps_the_btc_store_it_seeded_however_it_ends() {
+        use crate::abi::encode::{self, Arg};
+        use crate::bridge::btc_store::{btc_hash_to_storage_key, compute_work, StoredBlock};
+        use crate::bridge::storage::{bridge_storage_key, compound_key, BTC_BLOCK_HEIGHT_KEY};
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        let cells = [
+            btc_hash_to_storage_key(&genesis.block_hash()),
+            bridge_storage_key("blockStoreChainHead"),
+            compound_key(BTC_BLOCK_HEIGHT_KEY, "-", "0"),
+        ];
+        // What the block last wrote to the genesis block's cell, the head's
+        // and the index entry's, after its one transaction to the Bridge.
+        let written = |input: &[u8], gas_limit: u64| {
+            let result = execute_alone(
+                RskHardforkConfig::all_active(33),
+                8_000_000,
+                bridge,
+                U256::ZERO,
+                gas_limit,
+                input,
+                &[],
+            );
+            let last = |cell: &U256| {
+                let raw = &result.markers.raw_storage;
+                let write = raw
+                    .iter()
+                    .rev()
+                    .find(|(address, key, _)| *address == bridge && key == cell);
+                write.and_then(|(_, _, value)| value.clone())
+            };
+            (
+                result.tx_results[0].success,
+                cells.iter().map(last).collect::<Vec<_>>(),
+            )
+        };
+        // The genesis block in RSKIP454's layout, which its cell and the head
+        // both hold, and its hash as the index holds it.
+        let stored =
+            StoredBlock::new(genesis, 0, compute_work(genesis.bits)).serialize_compact_v2();
+        let hash = crate::bridge::btc_chain::bitcoin_hash_to_b256(&genesis.block_hash());
+        let indexed = crate::bridge::serialization::rlp_encode_element(hash.as_slice());
+        let seeded = vec![Some(stored.clone()), Some(stored.clone()), None];
+
+        // Seeded first, then refused for a tree of the wrong size.
+        let mut input = crate::abi::selector(
+            "registerBtcCoinbaseTransaction(bytes,bytes32,bytes,bytes32,bytes32)",
+        )
+        .to_vec();
+        input.extend(encode::args(&[
+            Arg::Bytes(&[]),
+            Arg::Word([0x11; 32]),
+            Arg::Bytes(&[]),
+            Arg::Word([0; 32]),
+            Arg::Word([0; 32]),
+        ]));
+        assert_eq!(written(&input, 1_000_000), (true, seeded.clone()));
+
+        // Seeded by its cost, then out of gas: the cost is 27,000 at least.
+        let mut input = crate::abi::selector(
+            "getBtcTransactionConfirmations(bytes32,bytes32,uint256,bytes32[])",
+        )
+        .to_vec();
+        input.extend(encode::args(&[
+            Arg::Word([0x11; 32]),
+            Arg::Word([0x22; 32]),
+            Arg::Word(encode::int(0)),
+            Arg::Words(&[]),
+        ]));
+        let short = intrinsic_gas(&input, 68) + 1_000;
+        assert_eq!(written(&input, short), (false, seeded));
+
+        let input = crate::abi::selector("getBtcBlockchainBestChainHeight()").to_vec();
+        let all = vec![Some(stored.clone()), Some(stored), Some(indexed)];
+        assert_eq!(written(&input, 1_000_000), (true, all));
+    }
+
+    /// A transaction's own call to the Bridge that can't pay what its
+    /// `getGasForData` works out keeps what working that out wrote straight
+    /// into the repository, since `go()` commits it all the same: here the
+    /// store `getBtcTransactionConfirmations`' cost seeds with mainnet's
+    /// checkpoint, in the block's layout, and none of the height index. On
+    /// both of rskj's paths: from RSKIP136, and before it, where the limit
+    /// is held to the cost alone. No chain has the method before RSKIP136
+    /// (mainnet's bahamas is #3,397, its wasabi100 #1,591,000), so the second
+    /// runs every upgrade but RSKIP136, at mainnet's #1,000.
+    #[test]
+    fn a_bridge_call_short_of_its_cost_keeps_the_store_the_cost_seeded() {
+        use crate::abi::encode::{self, Arg};
+        use crate::bridge::btc_store::{btc_hash_to_storage_key, StoredBlock};
+        use crate::bridge::storage::{bridge_storage_key, compound_key, BTC_BLOCK_HEIGHT_KEY};
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let config = crate::bridge::constants::BridgeConstants::mainnet();
+        let (header_hex, height, work_hex) = config.btc_checkpoint.unwrap();
+        let checkpoint: bitcoin::block::Header =
+            bitcoin::consensus::deserialize(&alloy_primitives::hex::decode(header_hex).unwrap())
+                .unwrap();
+        let work = U256::from_be_slice(&alloy_primitives::hex::decode(work_hex).unwrap());
+        let stored = StoredBlock::new(checkpoint, height, work);
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin).header;
+        let mut input = crate::abi::selector(
+            "getBtcTransactionConfirmations(bytes32,bytes32,uint256,bytes32[])",
+        )
+        .to_vec();
+        input.extend(encode::args(&[
+            Arg::Word([0x11; 32]),
+            Arg::Word([0x22; 32]),
+            Arg::Word(encode::int(0)),
+            Arg::Words(&[]),
+        ]));
+        // Enough for the transaction, short of the cost: 27,000 and the data's.
+        let limit = intrinsic_gas(&input, 68);
+        assert!(limit < 27_000 + 2 * input.len() as u64);
+
+        // What the block wrote to the head, once it's checked the rest.
+        let head = |cfg: RskHardforkConfig, number: u64| {
+            let result = execute_alone(cfg, number, bridge, U256::ZERO, limit, &input, &[]);
+            assert!(!result.tx_results[0].success);
+            assert_eq!(result.tx_results[0].gas_used, limit);
+            let last = |cell: U256| {
+                let raw = &result.markers.raw_storage;
+                let write = raw
+                    .iter()
+                    .rev()
+                    .find(|(address, key, _)| *address == bridge && *key == cell);
+                write.and_then(|(_, _, value)| value.clone())
+            };
+            assert!(last(btc_hash_to_storage_key(&genesis.block_hash())).is_some());
+            assert!(last(btc_hash_to_storage_key(&checkpoint.block_hash())).is_some());
+            for indexed in [0, height] {
+                let cell = compound_key(BTC_BLOCK_HEIGHT_KEY, "-", &indexed.to_string());
+                assert_eq!(last(cell), None);
+            }
+            last(bridge_storage_key("blockStoreChainHead"))
+        };
+        let after = RskHardforkConfig::mainnet();
+        assert!(after.has_rskip136(2_000_000));
+        assert_eq!(
+            head(after, 2_000_000),
+            Some(stored.serialize_compact_legacy())
+        );
+        let before = RskHardforkConfig::all_active(crate::hardfork::RSK_MAINNET_CHAIN_ID);
+        assert!(!before.has_rskip136(1_000));
+        assert_eq!(head(before, 1_000), Some(stored.serialize_compact_v2()));
+    }
+
+    /// rskj gives a contract's call to a precompile a track of its own,
+    /// commits it into the caller's when the call returns, and rolls it back
+    /// with the caller's when the caller fails: what the Bridge wrote, and the
+    /// storage root `callToPrecompiledAddress` gave it (`setupContract`). So a
+    /// contract that seeds an empty BTC store through a getter leaves nothing
+    /// of it behind if it then reverts, or the contract that called it does,
+    /// or it was a constructor that reverts, and the transaction goes on all
+    /// the same. What came before the frame that failed stays: identity's
+    /// storage root, and a seeding a frame that returned made.
+    #[test]
+    fn a_frame_that_fails_takes_back_what_the_precompiles_under_it_wrote() {
+        use crate::bridge::btc_store::{btc_hash_to_storage_key, compute_work, StoredBlock};
+        use crate::bridge::storage::{bridge_storage_key, compound_key, BTC_BLOCK_HEIGHT_KEY};
+        // Code that CALLs `to` with `data` (32 bytes at most), all its gas
+        // and no value, and drops what the CALL pushed.
+        fn call(to: Address, data: &[u8]) -> Vec<u8> {
+            let mut word = [0u8; 32];
+            word[..data.len()].copy_from_slice(data);
+            let mut code = vec![0x7f]; // PUSH32 the data, left-aligned
+            code.extend_from_slice(&word);
+            code.extend_from_slice(&[0x60, 0x00, 0x52]); // MSTORE it at 0
+            let size = u8::try_from(data.len()).unwrap();
+            // No return area, the data as the arguments, no value.
+            code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, size, 0x60, 0x00, 0x60, 0x00]);
+            code.push(0x73); // PUSH20 to
+            code.extend_from_slice(to.as_slice());
+            code.extend_from_slice(&[0x5a, 0xf1, 0x50]); // GAS, CALL, POP
+            code
+        }
+        fn stop(mut code: Vec<u8>) -> Vec<u8> {
+            code.push(0x00);
+            code
+        }
+        fn revert(mut code: Vec<u8>) -> Vec<u8> {
+            code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xfd]);
+            code
+        }
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let identity = Address::with_last_byte(4);
+        let seed = crate::abi::selector("getBtcBlockchainBestChainHeight()");
+
+        let seeds = Address::repeat_byte(0xC1);
+        let seeds_code = stop(call(bridge, &seed));
+        let seeds_and_reverts = Address::repeat_byte(0xC2);
+        let seeds_and_reverts_code = revert(call(bridge, &seed));
+        let reverts_after_seeds = Address::repeat_byte(0xC3);
+        let reverts_after_seeds_code = revert(call(seeds, &[]));
+        // CODECOPY the constructor from behind this prefix, CREATE with it,
+        // drop the address and stop.
+        let creates = Address::repeat_byte(0xC4);
+        let creates_code = {
+            let init = revert(call(bridge, &seed));
+            let size = u8::try_from(init.len()).unwrap();
+            let mut code = vec![0x60, size, 0x60, 16, 0x60, 0x00, 0x39];
+            code.extend_from_slice(&[0x60, size, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x50, 0x00]);
+            code.extend_from_slice(&init);
+            code
+        };
+
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        let cells = [
+            btc_hash_to_storage_key(&genesis.block_hash()),
+            bridge_storage_key("blockStoreChainHead"),
+            compound_key(BTC_BLOCK_HEIGHT_KEY, "-", "0"),
+        ];
+        // A transaction to a contract that calls identity, then `targets`,
+        // and stops: whether it succeeds, what the block last wrote to the
+        // genesis block's cell, the head's and the index entry's, and whether
+        // identity and the Bridge got their storage roots.
+        let entry = Address::repeat_byte(0xE0);
+        let run = |targets: &[Address]| {
+            let calls = targets.iter().map(|target| call(*target, &[]));
+            let entry_code = stop(
+                std::iter::once(call(identity, b"id"))
+                    .chain(calls)
+                    .collect::<Vec<_>>()
+                    .concat(),
+            );
+            let result = execute_alone(
+                RskHardforkConfig::all_active(33),
+                8_000_000,
+                entry,
+                U256::ZERO,
+                1_000_000,
+                &[],
+                &[
+                    (entry, &entry_code[..]),
+                    (seeds, &seeds_code[..]),
+                    (seeds_and_reverts, &seeds_and_reverts_code[..]),
+                    (reverts_after_seeds, &reverts_after_seeds_code[..]),
+                    (creates, &creates_code[..]),
+                ],
+            );
+            let last = |cell: &U256| {
+                let raw = &result.markers.raw_storage;
+                let write = raw
+                    .iter()
+                    .rev()
+                    .find(|(address, key, _)| *address == bridge && key == cell);
+                write.and_then(|(_, _, value)| value.clone())
+            };
+            (
+                result.tx_results[0].success,
+                cells.iter().map(last).collect::<Vec<_>>(),
+                result.markers.precompiles.contains(&identity),
+                result.markers.precompiles.contains(&bridge),
+            )
+        };
+
+        let stored =
+            StoredBlock::new(genesis, 0, compute_work(genesis.bits)).serialize_compact_v2();
+        let hash = crate::bridge::btc_chain::bitcoin_hash_to_b256(&genesis.block_hash());
+        let indexed = crate::bridge::serialization::rlp_encode_element(hash.as_slice());
+        let seeded = vec![Some(stored.clone()), Some(stored), Some(indexed)];
+        assert_eq!(run(&[seeds]), (true, seeded.clone(), true, true));
+        let nothing = vec![None, None, None];
+        for target in [seeds_and_reverts, reverts_after_seeds, creates] {
+            assert_eq!(
+                run(&[target]),
+                (true, nothing.clone(), true, false),
+                "{target}"
+            );
+        }
+        // Seeded by a frame that returned, then a frame that fails writes
+        // nothing and takes nothing back.
+        for then in [seeds_and_reverts, reverts_after_seeds, creates] {
+            assert_eq!(
+                run(&[seeds, then]),
+                (true, seeded.clone(), true, true),
+                "{then}"
+            );
+        }
+    }
+
+    /// rskj reads a pegout's satoshis as a Java `long` (`Coin.toBitcoin`,
+    /// `longValue()`), so 2^63 satoshis or more wrap, as regtest's balances
+    /// of 10^30 wei can reach, and the long decides the rejection. Before
+    /// RSKIP427 a rejection's event carries that long, sign-extended where
+    /// it is negative (`SolidityType.IntType.encodeInt`), and its refund is
+    /// `Coin.fromBitcoin` of it, which `Repository.transfer` moves from the
+    /// sender to the Bridge where it is negative. A contract's call is
+    /// refused with no refund, and its event carries the long alike. From
+    /// RSKIP427 the refund and the event are the call's wei.
+    #[test]
+    fn a_pegout_whose_satoshis_wrap_is_logged_and_refunded_as_rskj_does() {
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let sender = Address::repeat_byte(0xAA);
+        let contract = Address::repeat_byte(0xC5);
+        let plenty = U256::from(10u64).pow(U256::from(30));
+        let in_wei = |satoshis: U256| satoshis * U256::from(10_000_000_000u64);
+        let two_63 = U256::from(1u64) << 63;
+        // A pegout of `satoshis` on mainnet at `height`, past RSKIP185 and
+        // RSKIP219, sent by the sender or through a contract that sends it
+        // to the Bridge with no data, which is releaseBtc: the rejection's
+        // sender and words, and what the sender (its fee aside), the
+        // contract and the Bridge hold after.
+        let run = |height: u64, satoshis: U256, through_contract: bool| {
+            let value = in_wei(satoshis);
+            let store = Arc::new(MemoryTrieStore::new());
+            let mut root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, plenty);
+            let (to, tx_value) = if through_contract {
+                // No return area, no data; the value; the Bridge; all the gas.
+                let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x7f];
+                code.extend_from_slice(&value.to_be_bytes::<32>());
+                code.push(0x73);
+                code.extend_from_slice(bridge.as_slice());
+                code.extend_from_slice(&[0x5a, 0xf1, 0x50, 0x00]); // GAS, CALL, POP, STOP
+                root = put_account_with_code(&root, store.as_ref(), &contract, 1, plenty, &code);
+                (contract, U256::ZERO)
+            } else {
+                (bridge, value)
+            };
+            let gas_price = U256::from(60_000_000u64);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price,
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(to.as_slice()),
+                value: tx_value,
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let result = RskExecutor::new(RskHardforkConfig::mainnet(), block_store)
+                .execute_block(&dummy_header(height), &[(tx, sender)], &root, store)
+                .expect("block executes");
+            let tx = &result.tx_results[0];
+            assert!(tx.success);
+            let [log] = &tx.logs[..] else {
+                panic!("one event, not {}", tx.logs.len());
+            };
+            let topics = log.data.topics();
+            assert_eq!(
+                topics[0],
+                alloy_primitives::keccak256("release_request_rejected(address,uint256,int256)")
+            );
+            let words: Vec<U256> = log.data.data.chunks(32).map(U256::from_be_slice).collect();
+            let holds = |address: &Address| {
+                result
+                    .state_changes
+                    .get(address)
+                    .map_or(U256::ZERO, |account| account.info.balance)
+            };
+            let fee = U256::from(tx.gas_used) * gas_price;
+            (
+                Address::from_word(topics[1]),
+                words,
+                holds(&sender) + fee,
+                holds(&contract),
+                holds(&bridge),
+            )
+        };
+
+        // Short of RSKIP427. Whichever minimum binds, a satoshi is below it.
+        let before = 7_000_000;
+        let reason = run(before, U256::from(1u64), false).1[1];
+        let negative = two_63 + U256::from(5u64); // a long of 5 - 2^63
+        let below_zero = U256::ZERO.wrapping_sub(two_63 - U256::from(5u64));
+        let positive = (two_63 << 1) + U256::from(5u64); // a long of 5
+        let two_64 = in_wei(two_63 << 1);
+        // A long that wraps negative is logged sign-extended and refunded
+        // negative: the Bridge takes 2^63 - 5 satoshis more from the sender.
+        assert_eq!(
+            run(before, negative, false),
+            (
+                sender,
+                vec![below_zero, reason],
+                plenty - two_64,
+                U256::ZERO,
+                two_64
+            )
+        );
+        // One that wraps positive is logged and refunded as the long it is.
+        assert_eq!(
+            run(before, positive, false),
+            (
+                sender,
+                vec![U256::from(5u64), reason],
+                plenty - two_64,
+                U256::ZERO,
+                two_64
+            )
+        );
+        // A contract's is refused with no refund, its long logged alike.
+        let sent = in_wei(negative);
+        assert_eq!(
+            run(before, negative, true),
+            (
+                contract,
+                vec![below_zero, U256::from(2u64)],
+                plenty,
+                plenty - sent,
+                sent
+            )
+        );
+
+        // From RSKIP427 (lovell700) the long still refuses the pegout, and
+        // the sender gets all its wei back, which the event carries.
+        let lovell700 = 7_338_024;
+        let reason = run(lovell700, U256::from(1u64), false).1[1];
+        assert_eq!(
+            run(lovell700, negative, false),
+            (sender, vec![sent, reason], plenty, U256::ZERO, U256::ZERO)
+        );
+    }
+
+    /// rskj `BridgeSupport.requestRelease`: from RSKIP219 a pegout of the
+    /// minimum itself is queued and one a satoshi short refused; before it,
+    /// one of the legacy minimum is refused and one a satoshi over queued.
+    #[test]
+    fn a_pegout_of_the_minimum_is_queued_from_rskip219_and_refused_before_it() {
+        use crate::bridge::storage::{
+            bridge_storage_key, RELEASE_REQUEST_QUEUE_KEY, RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY,
+        };
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let queues = [
+            RELEASE_REQUEST_QUEUE_KEY,
+            RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY,
+        ]
+        .map(bridge_storage_key);
+        let rejected =
+            alloy_primitives::keccak256("release_request_rejected(address,uint256,int256)");
+        // Whether a pegout of `satoshis` at `height` reaches a release queue,
+        // and the reason its rejection logs, if it logs one.
+        let run = |cfg: RskHardforkConfig, height: u64, satoshis: u64| {
+            let value = U256::from(satoshis) * U256::from(10_000_000_000u64);
+            let result = execute_alone(cfg, height, bridge, value, 1_000_000, &[], &[]);
+            let tx = &result.tx_results[0];
+            assert!(tx.success);
+            let raw = &result.markers.raw_storage;
+            let queued = raw
+                .iter()
+                .any(|(address, key, _)| *address == bridge && queues.contains(key));
+            let log = tx.logs.iter().find(|log| log.data.topics()[0] == rejected);
+            (
+                queued,
+                log.map(|log| U256::from_be_slice(&log.data.data[32..])),
+            )
+        };
+        // rustock's regtest has no federation, so its fee estimate is far
+        // below its 250,000-satoshi minimum, which binds: LOW_AMOUNT.
+        let regtest = RskHardforkConfig::regtest;
+        assert_eq!(run(regtest(), 1, 250_000), (true, None));
+        assert_eq!(run(regtest(), 1, 249_999), (false, Some(U256::from(1u64))));
+        // Mainnet before iris300, which brings RSKIP219 and RSKIP185's
+        // events and refunds: the legacy 800,000 satoshis are refused.
+        let mainnet = RskHardforkConfig::mainnet;
+        assert_eq!(run(mainnet(), 3_000_000, 800_001), (true, None));
+        assert_eq!(run(mainnet(), 3_000_000, 800_000), (false, None));
+    }
+
+    /// **No call to a precompile panics the node.**
+    ///
+    /// Anyone can send a transaction, or ask for an `eth_call`, that calls a
+    /// precompile with any bytes at all. Each precompile is called here by a
+    /// transaction of its own, from a contract (CALL, STATICCALL and
+    /// DELEGATECALL) and as a local call, with random payloads, with words at
+    /// the edges of ABI decoding, and with each of its methods' selectors
+    /// followed by such words. The callers are a stranger and the federators
+    /// and authorizers of every network, so the Bridge's guarded methods read
+    /// their arguments too, and the rules are genesis's, mainnet's between
+    /// Papyrus and Iris, and everything on. What each call answers is the
+    /// other tests' business; that the node answers is this one's.
+    #[test]
+    fn no_call_to_a_precompile_panics() {
+        use crate::bridge::constants::BridgeConstants;
+        use crate::precompiles as p;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n.max(1) as u64) as usize
+            }
+            fn bytes(&mut self, n: usize) -> Vec<u8> {
+                (0..n).map(|_| self.next() as u8).collect()
+            }
+            /// An ABI word: an offset, a length, a limit of an integer type, an
+            /// address, a block number, or noise.
+            fn word(&mut self) -> [u8; 32] {
+                let small = |v: u64| U256::from(v).to_be_bytes::<32>();
+                match self.below(11) {
+                    0 => [0; 32],
+                    1 => small([0x20, 0x40, 0x60, 0x80, 0xa0, 0xc0][self.below(6)]),
+                    2 => small(
+                        [1, 2, 20, 31, 32, 33, 64, 65, 100, 255, 256, 1 << 20][self.below(12)],
+                    ),
+                    3 => small(
+                        [
+                            i32::MAX as u64,
+                            1 << 31,
+                            u32::MAX as u64,
+                            1 << 32,
+                            i64::MAX as u64,
+                            1 << 63,
+                            u64::MAX,
+                        ][self.below(7)],
+                    ),
+                    4 => [0xff; 32],
+                    5 => {
+                        let mut word = [0u8; 32];
+                        word[0] = 0x80;
+                        word
+                    }
+                    6 => {
+                        let mut word = [0xff; 32];
+                        word[0] = 0x7f;
+                        word
+                    }
+                    7 => {
+                        let mut word = [0u8; 32];
+                        word[12..].copy_from_slice(&self.bytes(20));
+                        word
+                    }
+                    8 => small(self.next() % 10_000_000),
+                    _ => {
+                        let mut word = [0u8; 32];
+                        word.copy_from_slice(&self.bytes(32));
+                        word
+                    }
+                }
+            }
+        }
+
+        /// A contract that passes its calldata on to `target` with `opcode`
+        /// and returns whatever comes back.
+        fn forwarder(target: Address, opcode: u8) -> Vec<u8> {
+            let mut code = vec![0x36, 0x60, 0x00, 0x60, 0x00, 0x37]; // calldatacopy(0, 0, size)
+            code.extend([0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00]); // out 0,0; in 0,size
+            if opcode == 0xf1 {
+                code.extend([0x60, 0x00]); // no value
+            }
+            code.push(0x73);
+            code.extend_from_slice(target.as_slice());
+            code.extend([0x5a, opcode, 0x50]); // gas, call, drop the flag
+            code.extend([0x3d, 0x60, 0x00, 0x60, 0x00, 0x3e]); // returndatacopy(0, 0, size)
+            code.extend([0x3d, 0x60, 0x00, 0xf3]); // return(0, size)
+            code
+        }
+
+        let numbered = |n: u8| {
+            let mut bytes = [0u8; 20];
+            bytes[19] = n;
+            Address::from(bytes)
+        };
+        let mut targets: Vec<(Address, Vec<[u8; 4]>)> =
+            (1..=9).map(|n| (numbered(n), Vec::new())).collect();
+        targets.extend([
+            (p::BRIDGE_ADDR, crate::bridge::every_selector()),
+            (
+                p::REMASC_ADDR,
+                vec![crate::abi::selector("processMinersFees()")],
+            ),
+            (
+                p::HD_WALLET_UTILS_ADDR,
+                crate::native::hd_wallet::every_selector(),
+            ),
+            (
+                p::BLOCK_HEADER_ADDR,
+                crate::native::block_header::every_selector(),
+            ),
+            (
+                p::ENVIRONMENT_ADDR,
+                vec![crate::abi::selector("getCallStackDepth()")],
+            ),
+            (p::SECP256K1_ADD_ADDR, Vec::new()),
+            (p::SECP256K1_MUL_ADDR, Vec::new()),
+        ]);
+
+        let mut senders = vec![Address::repeat_byte(0xAA)];
+        for constants in [
+            BridgeConstants::mainnet(),
+            BridgeConstants::testnet(),
+            BridgeConstants::regtest(),
+        ] {
+            for keys in [
+                constants.genesis_federation_public_keys,
+                constants.whitelist_authorizer_keys,
+                constants.fee_per_kb_authorizer_keys,
+                constants.increase_locking_cap_authorizer_keys,
+                constants.federation_change_authorizer_keys,
+            ] {
+                senders.extend(keys.iter().take(2).filter_map(|key| {
+                    let key = alloy_primitives::hex::decode(key).ok()?;
+                    crate::bridge::federation::rsk_address_from_public_key(&key)
+                }));
+            }
+        }
+        senders.sort();
+        senders.dedup();
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let mut root = TrieNode::empty();
+        for sender in &senders {
+            root = put_account(&root, store.as_ref(), sender, 0, one_rbtc);
+        }
+        const VIA: [(&str, u8); 3] = [("CALL", 0xf1), ("STATICCALL", 0xfa), ("DELEGATECALL", 0xf4)];
+        let mut forwarders = Vec::new();
+        for (i, (target, _)) in targets.iter().enumerate() {
+            let mut at = [Address::ZERO; 3];
+            for (j, (_, opcode)) in VIA.iter().enumerate() {
+                let mut bytes = [0xEE; 20];
+                bytes[0] = j as u8;
+                bytes[1] = i as u8;
+                at[j] = Address::from(bytes);
+                let code = forwarder(*target, *opcode);
+                root = put_account_with_code(&root, store.as_ref(), &at[j], 1, U256::ZERO, &code);
+            }
+            forwarders.push(at);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let block_store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let mut calls = 0usize;
+        let mut outcomes = [0usize; 4];
+        for (rules, height) in [
+            (RskHardforkConfig::mainnet(), 1u64),
+            (RskHardforkConfig::mainnet(), 3_000_000),
+            (RskHardforkConfig::testnet(), 5_000_000),
+            (RskHardforkConfig::all_active_parallel(33), 8_000_000),
+        ] {
+            let executor = RskExecutor::new(rules, block_store.clone());
+            let header = dummy_header(height);
+            for (i, (target, selectors)) in targets.iter().enumerate() {
+                let mut payloads = vec![Vec::new()];
+                for _ in 0..40 {
+                    let n = rng.below(300);
+                    payloads.push(rng.bytes(n));
+                }
+                for _ in 0..40 {
+                    let words = rng.below(8);
+                    payloads.push((0..words).flat_map(|_| rng.word()).collect());
+                }
+                // Blake2F's exact 213 bytes, with few enough rounds to run.
+                let mut blake = rng.bytes(213);
+                blake[..4].copy_from_slice(&(rng.below(16) as u32).to_be_bytes());
+                blake[212] = rng.below(3) as u8;
+                payloads.push(blake);
+                for selector in selectors {
+                    payloads.push(selector.to_vec());
+                    for _ in 0..20 {
+                        let mut payload = selector.to_vec();
+                        for _ in 0..rng.below(7) {
+                            payload.extend(rng.word());
+                        }
+                        if rng.below(3) == 0 {
+                            let n = rng.below(70);
+                            payload.extend(rng.bytes(n));
+                        }
+                        payloads.push(payload);
+                    }
+                }
+
+                for payload in payloads {
+                    let sender = senders[rng.below(senders.len())];
+                    let value = if rng.below(4) == 0 {
+                        U256::from(rng.below(3))
+                    } else {
+                        U256::ZERO
+                    };
+                    let local = rng.below(4) == 0;
+                    let via = rng.below(VIA.len() + 1);
+                    let (to, how) = match via {
+                        0 => (*target, "directly"),
+                        _ => (forwarders[i][via - 1], VIA[via - 1].0),
+                    };
+                    let tx = rustock_core::Transaction {
+                        nonce: 0,
+                        gas_price: U256::from(60_000_000u64),
+                        gas_limit: U256::from(2_000_000u64),
+                        to: Bytes::copy_from_slice(to.as_slice()),
+                        value,
+                        input: Bytes::copy_from_slice(&payload),
+                        v: 0,
+                        r: U256::ZERO,
+                        s: U256::ZERO,
+                        cached_rlp: None,
+                    };
+                    let answered = catch_unwind(AssertUnwindSafe(|| {
+                        let shape = |tx: &TxExecutionResult| (tx.success, !tx.output.is_empty());
+                        if local {
+                            executor
+                                .execute_local_call(&header, &tx, sender, &root, store.clone())
+                                .map(|tx| shape(&tx))
+                        } else {
+                            executor
+                                .execute_block(
+                                    &header,
+                                    &[(tx.clone(), sender)],
+                                    &root,
+                                    store.clone(),
+                                )
+                                .map(|block| shape(&block.tx_results[0]))
+                        }
+                    }));
+                    assert!(
+                        answered.is_ok(),
+                        "{target} panicked at #{height}, called {how} by {sender}{} with 0x{}",
+                        if local { " as a local call" } else { "" },
+                        alloy_primitives::hex::encode(&payload)
+                    );
+                    match answered.unwrap() {
+                        Ok((true, true)) => outcomes[0] += 1,
+                        Ok((true, false)) => outcomes[1] += 1,
+                        Ok((false, _)) => outcomes[2] += 1,
+                        Err(_) => outcomes[3] += 1,
+                    }
+                    calls += 1;
+                }
+            }
+        }
+        // A fuzz whose calls never got past their own parsing would pass
+        // without testing anything, so some must have run to an answer.
+        let [returned, ..] = outcomes;
+        assert!(calls > 10_000, "only {calls} calls");
+        assert!(
+            returned > calls / 10,
+            "only {returned} of {calls} calls returned anything: {outcomes:?}"
+        );
+    }
+
+    /// A call to `to` with no data and no value, with a gas limit of 1,000,000
+    /// at a gas price of 0.
+    fn bare_call(nonce: u64, to: Address) -> rustock_core::Transaction {
+        rustock_core::Transaction {
+            nonce,
+            gas_price: U256::ZERO,
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(to.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        }
+    }
+
+    /// Runs `code` as a contract, called by a [`bare_call`] from a funded
+    /// sender in a block at `height` on mainnet's rules.
+    fn run_contract(height: u64, code: &[u8]) -> TxExecutionResult {
+        let sender = Address::repeat_byte(0xC1);
+        let contract = Address::repeat_byte(0xC2);
+        let store = Arc::new(MemoryTrieStore::new());
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(&root, store.as_ref(), &contract, 1, U256::ZERO, code);
+        let dir = tempfile::tempdir().unwrap();
+        let executor = RskExecutor::new(
+            RskHardforkConfig::mainnet(),
+            Arc::new(BlockStore::open(dir.path()).unwrap()),
+        );
+        let mut block = executor
+            .execute_block(
+                &dummy_header(height),
+                &[(bare_call(0, contract), sender)],
+                &root,
+                store,
+            )
+            .unwrap();
+        block.tx_results.remove(0)
+    }
+
+    /// DUPN and SWAPN before RSKIP191 (iris300), as rskj's `VM.doDUPN` and
+    /// `doSWAPN` run them: each pops a depth `d`, and DUPN is then DUP(d + 1)
+    /// and SWAPN is SWAP(d + 1), at the same 3 gas, stepping over the byte
+    /// after it, which never runs. Checked against DUP1 to DUP16 and SWAP1 to
+    /// SWAP16, and past them against rskj's stack. A depth the stack doesn't
+    /// reach fails and spends all the gas, as rskj's `verifyStackSize` and
+    /// `intValueCheck` throw. From RSKIP191 every one of them fails, rskj
+    /// throwing invalid-opcode.
+    #[test]
+    fn dupn_and_swapn_run_as_rskj_runs_them_before_rskip191() {
+        const IRIS: u64 = 3_614_800;
+        // Seventeen distinct words, 1 to 17, then `ops`, then `left` words of
+        // the stack written out from the top, and returned.
+        let program = |ops: &[u8], left: usize| {
+            let mut code: Vec<u8> = (1..=17u8).flat_map(|word| [0x60, word]).collect();
+            code.extend_from_slice(ops);
+            for word in 0..left {
+                code.push(0x61); // PUSH2
+                code.extend(((word * 32) as u16).to_be_bytes());
+                code.push(0x52); // MSTORE
+            }
+            code.push(0x61);
+            code.extend(((left * 32) as u16).to_be_bytes());
+            code.extend([0x60, 0x00, 0xf3]); // RETURN
+            code
+        };
+        let words = |output: &[u8]| -> Vec<u64> {
+            output
+                .chunks(32)
+                .map(|word| U256::from_be_slice(word).saturating_to::<u64>())
+                .collect()
+        };
+        // rskj's stack after DUPN or SWAPN of `depth`, top first, or None
+        // where `verifyStackSize` throws.
+        let rskj = |swapn: bool, depth: usize| -> Option<Vec<u64>> {
+            let mut stack: Vec<u64> = (1..=17).collect();
+            let top = stack.len() - 1;
+            if swapn {
+                stack.swap(top, top.checked_sub(depth + 1)?);
+            } else {
+                stack.push(stack[top.checked_sub(depth)?]);
+            }
+            stack.reverse();
+            Some(stack)
+        };
+        for depth in 0..=17u8 {
+            for (swapn, name, opcode, plain, left) in [
+                (false, "DUPN", 0xa8, 0x80, 18),
+                (true, "SWAPN", 0xa9, 0x90, 17),
+            ] {
+                // INVALID after the opcode fails the call if it runs.
+                let code = program(&[0x60, depth, opcode, 0xfe], left);
+                let ran = run_contract(IRIS - 1, &code);
+                match rskj(swapn, depth.into()) {
+                    Some(stack) => {
+                        assert!(ran.success, "{name} of {depth}");
+                        assert_eq!(words(&ran.output), stack, "{name} of {depth}");
+                        if depth < 16 {
+                            let same = run_contract(IRIS - 1, &program(&[plain + depth], left));
+                            assert_eq!(ran.output, same.output, "{name} of {depth}");
+                            // The PUSH1 of the depth is the 3 more.
+                            assert_eq!(ran.gas_used, same.gas_used + 3, "{name} of {depth}");
+                        }
+                    }
+                    None => {
+                        assert!(!ran.success, "{name} of {depth} reaches below the stack");
+                        assert_eq!(ran.gas_used, 1_000_000, "{name} of {depth}");
+                    }
+                }
+                let from = run_contract(IRIS, &code);
+                assert!(!from.success, "{name} is gone from RSKIP191");
+                assert_eq!(from.gas_used, 1_000_000, "{name} from RSKIP191");
+            }
+        }
+        // A depth no Java int holds fails too.
+        for opcode in [0xa8, 0xa9] {
+            let mut ops = vec![0x7f]; // PUSH32
+            ops.extend([0xff; 32]);
+            ops.extend([opcode, 0xfe]);
+            let ran = run_contract(IRIS - 1, &program(&ops, 17));
+            assert!(!ran.success);
+            assert_eq!(ran.gas_used, 1_000_000);
+        }
+    }
+
+    /// rskj's code header (`Program.processAndSkipCodeHeader`, which
+    /// `Program.precompile` runs for every program it builds, on every
+    /// network from genesis, under no rule): code of four bytes or more that
+    /// starts with HEADER (0xFC) runs from byte 4 + code[3], the header's
+    /// length read unsigned, and its jump destinations are found from there,
+    /// so none lies in the header. Code whose header reaches its end fails
+    /// with all its gas, as rskj fails reading past it. The cases of rskj's
+    /// `VMTest.testVersioning_1` and `_2` and `testScriptVersion0` to `3`,
+    /// each made to return what it computes, then the jump destinations, a
+    /// contract's call to such code, and a creation whose init code has a
+    /// header.
+    #[test]
+    fn a_code_header_is_skipped_as_rskj_skips_it() {
+        // Any height: the header is no upgrade's.
+        const HEIGHT: u64 = 1;
+        let word = |value: u8| {
+            let mut word = vec![0u8; 32];
+            word[31] = value;
+            word
+        };
+        // `testVersioning_1`'s code after its header leaves 0x12 on the
+        // stack (0x1234 stored at 0x20, the word at 0x1F loaded), returned.
+        let tail: &[u8] = &[
+            0x61, 0x12, 0x34, 0x60, 0x20, 0x52, 0x60, 0x1f, 0x51, // VMTest's
+            0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, // MSTORE at 0, RETURN 32
+        ];
+        let plain = run_contract(HEIGHT, tail);
+        assert!(plain.success);
+        assert_eq!(plain.output, word(0x12));
+        // testVersioning_1, and testVersioning_2's header of 0x80 = 128
+        // bytes, the length read unsigned. The header costs nothing.
+        let mut long = vec![0xfc, 0x81, 0x01, 0x80];
+        long.extend([0u8; 128]);
+        for header in [&[0xfc, 0x01, 0x01, 0x00][..], &long[..]] {
+            let ran = run_contract(HEIGHT, &[header, tail].concat());
+            assert!(ran.success, "a header of {} bytes", header.len());
+            assert_eq!(
+                ran.output,
+                plain.output,
+                "a header of {} bytes",
+                header.len()
+            );
+            assert_eq!(
+                ran.gas_used,
+                plain.gas_used,
+                "a header of {} bytes",
+                header.len()
+            );
+        }
+        // testScriptVersion3: ten more bytes of header, then STOP.
+        let mut stops = vec![0xfc, 0x01, 0x01, 0x0a];
+        stops.extend(1..=10u8);
+        stops.push(0x00);
+        let ran = run_contract(HEIGHT, &stops);
+        assert!(ran.success);
+        assert_eq!(ran.gas_used, run_contract(HEIGHT, &[0x00]).gas_used);
+        // Each of these fails with all its gas: HEADER with no header behind
+        // it (testScriptVersion0), HEADER after a header (testScriptVersion1
+        // and 2), and a header that reaches the code's end or passes it.
+        for code in [
+            &[0xfc][..],
+            &[0xfc, 0x00, 0x00, 0x00, 0xfc][..],
+            &[0xfc, 0x01, 0x01, 0x00, 0xfc][..],
+            &[0xfc, 0x00, 0x00, 0x00][..],
+            &[0xfc, 0x00, 0x00, 0x05, 0x00, 0x00][..],
+        ] {
+            let ran = run_contract(HEIGHT, code);
+            let hex = alloy_primitives::hex::encode(code);
+            assert!(!ran.success, "{hex}");
+            assert_eq!(ran.gas_used, 1_000_000, "{hex}");
+        }
+        // Jump destinations are found from the header's end: the PUSH32 that
+        // ends this header of one more byte doesn't hide the JUMPDEST at 8,
+        // as it would from byte 0 ...
+        let header: &[u8] = &[0xfc, 0x00, 0x00, 0x01, 0x7f];
+        let jump_to_8: &[u8] = &[0x60, 0x08, 0x56];
+        // At 8: JUMPDEST, then 42 returned.
+        let at_8: &[u8] = &[
+            0x5b, 0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ];
+        let ran = run_contract(HEIGHT, &[header, jump_to_8, at_8].concat());
+        assert!(ran.success);
+        assert_eq!(ran.output, word(0x2a));
+        // ... and a JUMPDEST in the header is none: this header's two more
+        // bytes are a JUMPDEST, at 4, and a STOP.
+        let header: &[u8] = &[0xfc, 0x00, 0x00, 0x02, 0x5b, 0x00];
+        let jump_to_4: &[u8] = &[0x60, 0x04, 0x56];
+        let ran = run_contract(HEIGHT, &[header, jump_to_4].concat());
+        assert!(!ran.success);
+        assert_eq!(ran.gas_used, 1_000_000);
+
+        // A contract's call to code with a header runs it the same way: the
+        // caller is given 0x12 and a success. It CALLs with 100,000 gas,
+        // no value and no data, for 32 bytes at 0, stores the CALL's result
+        // at 0x20, and returns the two words.
+        let sender = Address::repeat_byte(0xC1);
+        let caller = Address::repeat_byte(0xC2);
+        let callee = Address::repeat_byte(0xC3);
+        let mut calls: Vec<u8> = vec![
+            0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        calls.extend_from_slice(callee.as_slice());
+        calls.extend([
+            0x62, 0x01, 0x86, 0xa0, 0xf1, 0x60, 0x20, 0x52, 0x60, 0x40, 0x60, 0x00, 0xf3,
+        ]);
+        let store = Arc::new(MemoryTrieStore::new());
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(&root, store.as_ref(), &caller, 1, U256::ZERO, &calls);
+        let headed: Vec<u8> = [&[0xfc, 0x01, 0x01, 0x00][..], tail].concat();
+        let root = put_account_with_code(&root, store.as_ref(), &callee, 1, U256::ZERO, &headed);
+        // A creation whose init code has a header deploys what the same
+        // init code deploys without one. The header's four bytes are data
+        // the transaction pays for, 68 gas for the 0xFC and 4 for each zero
+        // before RSKIP400, and they cost nothing more.
+        let init: &[u8] = &[0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let create = |nonce: u64, input: Vec<u8>| rustock_core::Transaction {
+            to: Bytes::new(),
+            input: Bytes::from(input),
+            ..bare_call(nonce, Address::ZERO)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let executor = RskExecutor::new(
+            RskHardforkConfig::mainnet(),
+            Arc::new(BlockStore::open(dir.path()).unwrap()),
+        );
+        let block = executor
+            .execute_block(
+                &dummy_header(HEIGHT),
+                &[
+                    (bare_call(0, caller), sender),
+                    (create(1, init.to_vec()), sender),
+                    (
+                        create(2, [&[0xfc, 0x00, 0x00, 0x00][..], init].concat()),
+                        sender,
+                    ),
+                ],
+                &root,
+                store,
+            )
+            .unwrap();
+        let [called, created, created_with_header] = &block.tx_results[..] else {
+            panic!("{} results", block.tx_results.len());
+        };
+        assert!(called.success);
+        assert_eq!(called.output, [word(0x12), word(1)].concat());
+        assert!(created.success && created.created_address.is_some());
+        assert!(created_with_header.success && created_with_header.created_address.is_some());
+        assert_eq!(created_with_header.gas_used, created.gas_used + 68 + 3 * 4);
+    }
+
+    /// The byte after DUPN or SWAPN never runs, rskj's `doDUPN` and `doSWAPN`
+    /// calling `program.step()` twice, though a jump may land on it: rskj's
+    /// jump analysis, like revm's, skips only PUSH data. Where the second
+    /// step leaves the code, rskj's `Program.setPC` stops the program, so
+    /// either opcode among the code's last two bytes ends the call in success,
+    /// where revm would read past its padding.
+    #[test]
+    fn dupn_and_swapn_step_over_the_next_byte_and_stop_past_the_end() {
+        const BEFORE_IRIS: u64 = 3_614_799;
+        let dupn = [0x60, 0x07, 0x60, 0x00, 0xa8]; // 7, depth 0, DUPN
+        let swapn = [0x60, 0x07, 0x60, 0x08, 0x60, 0x00, 0xa9]; // 7, 8, depth 0, SWAPN
+        for (start, gas) in [(&dupn[..], 9), (&swapn[..], 12)] {
+            for (after, succeeds) in [
+                (&[][..], true),
+                (&[0xfe][..], true),
+                (&[0xfe, 0xfe][..], false),
+            ] {
+                let code = [start, after].concat();
+                let ran = run_contract(BEFORE_IRIS, &code);
+                let hex = alloy_primitives::hex::encode(&code);
+                assert_eq!(ran.success, succeeds, "0x{hex}");
+                if succeeds {
+                    assert_eq!(ran.gas_used, 21_000 + gas, "0x{hex}");
+                }
+            }
+        }
+        // Over DUPN onto the JUMPDEST after it.
+        let ran = run_contract(BEFORE_IRIS, &[0x60, 0x04, 0x56, 0xa8, 0x5b, 0x00]);
+        assert!(ran.success);
+        assert_eq!(ran.gas_used, 21_000 + 3 + 8 + 1);
+    }
+
+    /// TXINDEX before RSKIP191, rskj `VM.doTXINDEX`: the index in its block of
+    /// the transaction being executed, counted from 0 as rskj's
+    /// `BlockExecutor` counts; the same in a call that transaction makes, as
+    /// `ProgramInvokeFactoryImpl` passes it on; and 0 in a call outside a
+    /// block, as `ReversibleTransactionExecutor` runs it. It costs 2 gas, and
+    /// from RSKIP191 it fails.
+    #[test]
+    fn txindex_pushes_the_transactions_place_in_its_block_before_rskip191() {
+        const IRIS: u64 = 3_614_800;
+        let sender = Address::repeat_byte(0xC1);
+        let reader = Address::repeat_byte(0xC2);
+        let caller = Address::repeat_byte(0xC3);
+        // TXINDEX, returned.
+        let reader_code = [0xaa, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        // Calls `reader` and returns its answer.
+        let mut caller_code = vec![
+            0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        caller_code.extend_from_slice(reader.as_slice());
+        caller_code.extend([0x5a, 0xf1, 0x50, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+        let store = Arc::new(MemoryTrieStore::new());
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let mut root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        root = put_account_with_code(&root, store.as_ref(), &reader, 1, U256::ZERO, &reader_code);
+        root = put_account_with_code(&root, store.as_ref(), &caller, 1, U256::ZERO, &caller_code);
+        let dir = tempfile::tempdir().unwrap();
+        let executor = RskExecutor::new(
+            RskHardforkConfig::mainnet(),
+            Arc::new(BlockStore::open(dir.path()).unwrap()),
+        );
+        let txs = [
+            (bare_call(0, reader), sender),
+            (bare_call(1, reader), sender),
+            (bare_call(2, caller), sender),
+            (bare_call(3, reader), sender),
+        ];
+        let index = |result: &TxExecutionResult| {
+            assert!(result.success);
+            U256::from_be_slice(&result.output).saturating_to::<u64>()
+        };
+        let block = executor
+            .execute_block(&dummy_header(IRIS - 1), &txs, &root, store.clone())
+            .unwrap();
+        assert_eq!(
+            block.tx_results.iter().map(index).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        // TXINDEX 2, PUSH1 3, MSTORE 3 and 3 for a word of memory, two PUSH1s 6.
+        assert_eq!(block.tx_results[0].gas_used, 21_000 + 17);
+        let outside = executor
+            .execute_local_call(
+                &dummy_header(IRIS - 1),
+                &bare_call(0, reader),
+                sender,
+                &root,
+                store.clone(),
+            )
+            .unwrap();
+        assert_eq!(index(&outside), 0);
+        let from = executor
+            .execute_block(&dummy_header(IRIS), &txs[..1], &root, store)
+            .unwrap();
+        assert!(!from.tx_results[0].success, "TXINDEX is gone from RSKIP191");
+    }
+
+    /// BN128 refusing a point (`BN128PrecompiledContract`): before RSKIP197 it
+    /// answers with no bytes, a plain success; from RSKIP197 it throws, which
+    /// in a transaction's own call is the invisible exception.
+    #[test]
+    fn bn128_refusing_a_point_answers_empty_before_rskip197_and_throws_from_it() {
+        let bn128_add = Address::with_last_byte(6);
+        // (1, 1) is not on the curve.
+        let mut off_curve = vec![0u8; 128];
+        off_curve[31] = 1;
+        off_curve[63] = 1;
+        let used = intrinsic_gas(&off_curve, 68) + 150;
+
+        let before = execute_alone(
+            RskHardforkConfig::mainnet(),
+            3_000_000,
+            bn128_add,
+            U256::ZERO,
+            1_000_000,
+            &off_curve,
+            &[],
+        );
+        assert!(before.tx_results[0].success);
+        assert_eq!(before.tx_results[0].gas_used, used);
+        assert_eq!(
+            before.paid_fees,
+            fee(used),
+            "a success pays for the gas it used"
+        );
+
+        let from = execute_alone(
+            RskHardforkConfig::mainnet(),
+            3_614_801,
+            bn128_add,
+            U256::ZERO,
+            1_000_000,
+            &off_curve,
+            &[],
+        );
+        assert!(from.tx_results[0].success);
+        assert_eq!(from.tx_results[0].gas_used, used);
+        assert_eq!(
+            from.paid_fees,
+            fee(1_000_000),
+            "an invisible exception pays for the whole limit"
+        );
+    }
+
+    /// A contract's call to HDWalletUtils that throws
+    /// (`Program.callToPrecompiledAddress`): from RSKIP197 the call fails and
+    /// costs what the method asked for, and the contract goes on; before it the
+    /// throw fails the contract too, with all its gas (#295).
+    #[test]
+    fn a_native_contract_that_throws_inside_a_call_fails_the_call() {
+        let hd_wallet = crate::precompiles::HD_WALLET_UTILS_ADDR;
+        let caller = Address::repeat_byte(0xBB);
+        // CALL HDWalletUtils with this transaction's calldata and 500,000 gas,
+        // and return what the CALL pushed. The contract keeps the rest of its
+        // gas: RSK has no 63/64 rule, so with GAS it would keep none and run
+        // out after any throw, which would hide what the throw itself does.
+        let mut code: Vec<u8> = vec![
+            0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // mem[0..n] = calldata
+            0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, 0x60,
+            0x00, // no return, args 0..n, no value
+            0x73, // PUSH20
+        ];
+        code.extend_from_slice(hd_wallet.as_slice());
+        code.extend_from_slice(&[
+            0x62, 0x07, 0xa1, 0x20, 0xf1, // PUSH3 500,000, CALL
+            0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, // RETURN the pushed word
+        ]);
+        let contracts: &[(Address, &[u8])] = &[(caller, &code)];
+        let call = |height: u64, input: &[u8]| {
+            let result = execute_alone(
+                RskHardforkConfig::mainnet(),
+                height,
+                caller,
+                U256::ZERO,
+                1_000_000,
+                input,
+                contracts,
+            );
+            result.tx_results.into_iter().next().unwrap()
+        };
+        let bad = extract_public_key_call(b"this-is-not-an-xpub");
+
+        let from = call(3_614_801, &bad);
+        assert!(from.success, "the contract goes on");
+        assert_eq!(
+            U256::from_be_slice(&from.output),
+            U256::ZERO,
+            "the CALL pushes 0"
+        );
+        assert!(
+            from.gas_used < 100_000,
+            "from RSKIP197 the call costs 11,300 and its overhead, not the limit (got {})",
+            from.gas_used
+        );
+
+        let fine = call(3_614_801, &extract_public_key_call(XPUB.as_bytes()));
+        assert_eq!(
+            U256::from_be_slice(&fine.output),
+            U256::from(1),
+            "the CALL pushes 1"
+        );
+
+        let before = call(2_000_000, &bad);
+        assert!(!before.success, "before RSKIP197 the contract fails");
+        assert_eq!(before.gas_used, 1_000_000, "with all its gas");
+    }
+
+    /// The one transaction's result of [`execute_alone`], on mainnet's rules,
+    /// with no value and a gas limit of 1,000,000.
+    fn run_alone(
+        height: u64,
+        to: Address,
+        input: &[u8],
+        contracts: &[(Address, &[u8])],
+    ) -> TxExecutionResult {
+        let block = execute_alone(
+            RskHardforkConfig::mainnet(),
+            height,
+            to,
+            U256::ZERO,
+            1_000_000,
+            input,
+            contracts,
+        );
+        block.tx_results.into_iter().next().unwrap()
+    }
+
+    /// Code that CALLs `to` with no data and no value, giving it `gas`, and
+    /// returns the word the CALL pushed.
+    fn call_and_return_pushed(to: Address, gas: u32) -> Vec<u8> {
+        // No return area, no arguments, no value.
+        let mut code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        code.extend_from_slice(to.as_slice());
+        code.push(0x63); // PUSH4 the gas
+        code.extend_from_slice(&gas.to_be_bytes());
+        code.extend_from_slice(&[
+            0xf1, // CALL
+            0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, // RETURN the pushed word
+        ]);
+        code
+    }
+
+    /// Before RSKIP197 a precompile's throw fails the contract that made the
+    /// call and no more: the contract above it gets 0 from its CALL and goes
+    /// on, having lost all the gas it gave. From RSKIP197 the contract that
+    /// made the call goes on itself.
+    ///
+    /// The outer contract gives the inner one `given` gas. The inner one calls
+    /// HDWalletUtils with no payload, which names no method and throws, and
+    /// then stops.
+    #[test]
+    fn a_pre_rskip197_throw_fails_only_the_contract_that_made_the_call() {
+        let outer = Address::repeat_byte(0xB1);
+        let inner = Address::repeat_byte(0xB2);
+        let mut inner_code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        inner_code.extend_from_slice(crate::precompiles::HD_WALLET_UTILS_ADDR.as_slice());
+        inner_code.extend_from_slice(&[0x5a, 0xf1, 0x00]); // GAS, CALL, STOP
+        let run = |height: u64, given: u32| {
+            let outer_code = call_and_return_pushed(inner, given);
+            let contracts: &[(Address, &[u8])] = &[(outer, &outer_code), (inner, &inner_code)];
+            run_alone(height, outer, &[], contracts)
+        };
+
+        let (less, more) = (run(2_000_000, 200_000), run(2_000_000, 300_000));
+        for before in [&less, &more] {
+            assert!(before.success, "the outer contract goes on");
+            assert_eq!(
+                U256::from_be_slice(&before.output),
+                U256::ZERO,
+                "its CALL pushes 0"
+            );
+        }
+        assert_eq!(
+            more.gas_used - less.gas_used,
+            100_000,
+            "all the gas given is spent"
+        );
+
+        let (less, more) = (run(3_614_801, 200_000), run(3_614_801, 300_000));
+        for from in [&less, &more] {
+            assert!(from.success);
+            assert_eq!(
+                U256::from_be_slice(&from.output),
+                U256::from(1),
+                "its CALL pushes 1"
+            );
+        }
+        assert_eq!(
+            more.gas_used, less.gas_used,
+            "what the inner one left comes back"
+        );
+    }
+
+    /// A contract's call to REMASC, which refuses anything but
+    /// `getStateForDebugging()` from any transaction but the block's REMASC
+    /// one (`Remasc.processMinersFees`). From RSKIP197 the call fails and costs
+    /// REMASC's `getGasForData`, 0, so all the gas given comes back. Before it
+    /// the contract that made the call fails.
+    #[test]
+    fn a_contract_calling_remasc_is_refused_as_rskj_refuses_it() {
+        let caller = Address::repeat_byte(0xB3);
+        let run = |height: u64, given: u32| {
+            let code = call_and_return_pushed(crate::precompiles::REMASC_ADDR, given);
+            let contracts: &[(Address, &[u8])] = &[(caller, &code)];
+            run_alone(height, caller, &[], contracts)
+        };
+
+        let (less, more) = (run(3_614_801, 200_000), run(3_614_801, 300_000));
+        for from in [&less, &more] {
+            assert!(from.success, "the contract goes on");
+            assert_eq!(
+                U256::from_be_slice(&from.output),
+                U256::ZERO,
+                "its CALL pushes 0"
+            );
+        }
+        assert_eq!(more.gas_used, less.gas_used, "all the gas given comes back");
+
+        let before = run(2_000_000, 200_000);
+        assert!(!before.success, "before RSKIP197 the contract fails");
+        assert_eq!(before.gas_used, 1_000_000, "with all its gas");
+    }
+
+    /// `getStateForDebugging()`, the REMASC method with no caller guard,
+    /// answers a transaction and a contract alike with REMASC's state:
+    /// `RemascState.getEncoded`, ABI-encoded. With nothing stored that is two
+    /// zero coins, the empty siblings list and a false flag.
+    #[test]
+    fn remasc_answers_get_state_for_debugging_to_any_caller() {
+        let remasc = crate::precompiles::REMASC_ADDR;
+        let selector = crate::remasc::GET_STATE_FOR_DEBUGGING;
+        let expected = crate::abi::encode_bytes(&[0xc4, 0x80, 0x80, 0xc0, 0x00]);
+
+        let direct = run_alone(3_614_801, remasc, &selector, &[]);
+        assert!(direct.success);
+        assert_eq!(direct.output, expected);
+        assert_eq!(
+            direct.gas_used,
+            intrinsic_gas(&selector, 68),
+            "REMASC asks for no gas"
+        );
+
+        // A contract that makes the same call and returns what it got back.
+        let caller = Address::repeat_byte(0xB4);
+        let mut code = vec![0x63]; // PUSH4 the selector
+        code.extend_from_slice(&selector);
+        code.extend_from_slice(&[
+            0x60, 0x00, 0x52, // MSTORE: the selector is the word's last four bytes
+            0x60, 0x00, 0x60, 0x00, // no return area
+            0x60, 0x04, 0x60, 0x1c, 0x60, 0x00, // arguments 0x1c..0x20, no value
+            0x73, // PUSH20
+        ]);
+        code.extend_from_slice(remasc.as_slice());
+        code.extend_from_slice(&[
+            0x5a, 0xf1, 0x50, // GAS, CALL, POP
+            0x3d, 0x60, 0x00, 0x60, 0x00, 0x3e, // RETURNDATACOPY all of it to 0
+            0x3d, 0x60, 0x00, 0xf3, // RETURN it
+        ]);
+        let contracts: &[(Address, &[u8])] = &[(caller, &code)];
+        let via = run_alone(3_614_801, caller, &[], contracts);
+        assert!(via.success);
+        assert_eq!(via.output, expected);
+    }
+
+    /// Code that hands its own input to `to`, giving it 100,000 gas, and
+    /// returns the word the CALL pushed and the 64 bytes `to` answered into.
+    /// For an input shorter than 512 bytes.
+    fn pass_input_to(to: Address) -> Vec<u8> {
+        let mut code = vec![
+            0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY all of it to 0
+            0x60, 0x40, 0x61, 0x02, 0x20, // a return area of 64 bytes at 544
+            0x36, 0x60, 0x00, 0x60, 0x00, 0x73, // all of it as arguments, no value
+        ];
+        code.extend_from_slice(to.as_slice());
+        code.extend_from_slice(&[
+            0x62, 0x01, 0x86, 0xa0, 0xf1, // PUSH3 100,000, CALL
+            0x61, 0x02, 0x00, 0x52, // MSTORE the pushed word at 512
+            0x60, 0x60, 0x61, 0x02, 0x00, 0xf3, // RETURN the word and the area
+        ]);
+        code
+    }
+
+    /// RSKIP516 (reed800): a contract's input to BLAKE2F is cut to the 213
+    /// bytes BLAKE2F reads (`Program.getInputLength`). Before it BLAKE2F
+    /// refuses a longer input, for its price on the wrong length, 0; from it
+    /// BLAKE2F takes the first 213 bytes and charges their rounds, and a byte
+    /// past them costs only as the transaction's data. A transaction's own
+    /// input is never cut (`TransactionExecutor.call`).
+    #[test]
+    fn a_contracts_input_to_blake2f_is_cut_to_213_bytes_from_reed800() {
+        let blake2f = Address::with_last_byte(9);
+        let caller = Address::repeat_byte(0xB5);
+        let code = pass_input_to(blake2f);
+        let contracts: &[(Address, &[u8])] = &[(caller, &code)];
+        let answer = |result: &TxExecutionResult| {
+            assert!(result.success);
+            let pushed = U256::from_be_slice(&result.output[..32]);
+            (pushed, result.output[32..].to_vec())
+        };
+        // Twelve rounds of the final block.
+        let mut exact = vec![0_u8; 213];
+        exact[3] = 12;
+        exact[212] = 1;
+        let mut long = exact.clone();
+        long.push(0xff);
+
+        let whole = run_alone(8_052_200, caller, &exact, contracts);
+        let (pushed, hash) = answer(&whole);
+        assert_eq!(pushed, U256::from(1));
+        let cut = run_alone(8_052_200, caller, &long, contracts);
+        assert_eq!(answer(&cut), (pushed, hash.clone()), "the first 213 bytes");
+        // RSKIP400's price for a byte of data that isn't zero.
+        assert_eq!(cut.gas_used - whole.gas_used, 16, "the byte past them");
+
+        let before = run_alone(8_052_199, caller, &long, contracts);
+        assert_eq!(answer(&before).0, U256::ZERO, "BLAKE2F refuses it");
+        assert_eq!(cut.gas_used - before.gas_used, 12, "for 0, not 12 rounds");
+
+        assert_eq!(run_alone(8_052_200, blake2f, &exact, &[]).output, hash);
+        let direct = run_alone(8_052_200, blake2f, &long, &[]);
+        assert!(direct.output.is_empty(), "a transaction's input is whole");
+    }
+
+    /// Before RSKIP552 (vetiver900) rskj can't process a block holding a
+    /// transaction that calls BLAKE2F with no data: it reads the data as null,
+    /// and BLAKE2F's `getGasForData` throws a NullPointerException that
+    /// `TransactionExecutor.call` doesn't catch. From RSKIP552 the call costs
+    /// 0 and is refused as any other wrong length, an invisible exception. A
+    /// contract's call with no data was always refused that way.
+    #[test]
+    fn a_transactions_empty_call_to_blake2f_fails_its_block_before_rskip552() {
+        let blake2f = Address::with_last_byte(9);
+        let alone = |height: u64, to: Address, contracts: &[(Address, &[u8])]| {
+            let cfg = RskHardforkConfig::mainnet();
+            try_execute_alone(cfg, height, to, U256::ZERO, 1_000_000, &[], contracts)
+        };
+        let error = alone(8_804_199, blake2f, &[]).unwrap_err().to_string();
+        assert!(error.contains("BLAKE2F"), "{error}");
+
+        let from = alone(8_804_200, blake2f, &[]).unwrap();
+        let direct = &from.tx_results[0];
+        assert!(direct.success && direct.output.is_empty());
+        assert_eq!(direct.gas_used, 21_000, "BLAKE2F asks for nothing");
+
+        let caller = Address::repeat_byte(0xB6);
+        let code = call_and_return_pushed(blake2f, 100_000);
+        let contracts: &[(Address, &[u8])] = &[(caller, &code)];
+        let via = alone(8_804_199, caller, contracts).unwrap();
+        let pushed = U256::from_be_slice(&via.tx_results[0].output);
+        assert_eq!(pushed, U256::ZERO, "a contract's call fails");
     }
 
     fn hex_to_bytes(hex: &str) -> Vec<u8> {
@@ -7302,6 +12660,7 @@ mod tests {
         let parent_number = current_number - 1;
         let mut parent_header = dummy_header(parent_number);
         parent_header.difficulty = U256::from(1);
+        parent_header.uncle_count = 2;
         let parent_hash = parent_header.hash();
         block_store.put_header(&parent_header).unwrap();
         block_store.put_canonical_hash(parent_number, parent_hash).unwrap();
@@ -7359,12 +12718,20 @@ mod tests {
     }
 
     /// Ported from rskj BlockHeaderContractTest.*_whenMethodDisabled_shouldThrowVME:
-    /// both methods fail before RSKIP536 activates (mainnet vetiver900).
+    /// before RSKIP536 (mainnet vetiver900) neither method parses, so the
+    /// contract throws, at no cost. In a transaction's own call that is rskj's
+    /// invisible exception: a success with no output and only the intrinsic gas.
     #[test]
     fn test_rskip536_methods_disabled_before_activation() {
         for sig in ["getDifficultyWithUncles(int256)", "getCumulativeWork(int256)"] {
             let result = rskip536_call(sig, RskHardforkConfig::mainnet(), 8_804_199);
-            assert!(!result.success, "{sig} must fail before vetiver900");
+            assert!(result.success, "{sig}: the throw is invisible");
+            assert!(result.output.is_empty(), "{sig}");
+            assert_eq!(
+                result.gas_used,
+                intrinsic_gas(&bh_input(sig, 0), 16),
+                "{sig}"
+            );
         }
     }
 
@@ -7608,6 +12975,31 @@ mod tests {
         assert_eq!(unique.len(), 22);
     }
 
+    /// rskj's regtest, from a genesis file: its three federators and its seven
+    /// authorizers (five of federation changes, one of the lock whitelist, one
+    /// of the fee per KB) send free Bridge transactions while areBridgeTxsPaid
+    /// is off (`BridgeUtils.isFreeBridgeTx`). rustock's own regtest has no
+    /// federators, and three of the five federation change authorizers.
+    #[test]
+    fn rskj_regtests_free_bridge_senders() {
+        use crate::bridge::constants::BridgeConstants;
+        let federator = rsk_address_from_pubkey_hex(
+            "0362634ab57dae9cb373a5d536e66a8c4f67468bbcfb063809bab643072d78a124",
+        )
+        .unwrap();
+        let rskj: std::collections::HashSet<_> =
+            free_bridge_senders(&BridgeConstants::rskj_regtest())
+                .into_iter()
+                .collect();
+        assert_eq!(rskj.len(), 10);
+        assert!(rskj.contains(&federator));
+        let own: std::collections::HashSet<_> = free_bridge_senders(&BridgeConstants::regtest())
+            .into_iter()
+            .collect();
+        assert_eq!(own.len(), 5);
+        assert!(!own.contains(&federator));
+    }
+
     /// Runs a gas_limit-0 tx to the Bridge through execute_block at the
     /// given mainnet height from the given sender.
     fn run_bridge_tx_gas0(block_number: u64, sender: Address) -> Result<crate::executor::BlockExecutionResult, ExecutionError> {
@@ -7650,6 +13042,43 @@ mod tests {
         assert_eq!(result.gas_used, 0);
     }
 
+    /// A free Bridge transaction is held to its sender's next nonce all the
+    /// same (`TransactionExecutor.init`): rskj refuses one that isn't, and
+    /// the block that holds it.
+    #[test]
+    fn a_free_bridge_tx_is_held_to_its_senders_nonce() {
+        let federator = rsk_address_from_pubkey_hex(
+            "03b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2",
+        )
+        .unwrap();
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &federator,
+            0,
+            U256::ZERO,
+        );
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let tx = rustock_core::Transaction {
+            nonce: 1,
+            gas_price: U256::ZERO,
+            gas_limit: U256::ZERO,
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::copy_from_slice(&block_header_selector("updateCollections()")),
+            v: 28,
+            r: U256::from(1),
+            s: U256::from(1),
+            cached_rlp: None,
+        };
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        match executor.execute_block(&dummy_header(457), &[(tx, federator)], &root, store) {
+            Err(error) => assert!(error.to_string().contains("Invalid nonce"), "{error}"),
+            Ok(_) => panic!("the block executes"),
+        }
+    }
+
     /// From areBridgeTxsPaid on, the same tx goes through normal gas
     /// validation and is rejected (gas_limit 0 < intrinsic cost).
     #[test]
@@ -7661,15 +13090,200 @@ mod tests {
         assert!(run_bridge_tx_gas0(370_000, federator).is_err());
     }
 
-    /// A non-federation sender never gets the free path. Pre-RSKIP136 the
-    /// call is still included: rskj execError (insufficient limit for the
-    /// precompile cost) yields a failed receipt consuming the (zero) limit.
+    /// A non-federation sender never gets the free path, and a limit of 0
+    /// can't pay the intrinsic cost: rskj's `TransactionExecutor.init` refuses
+    /// the transaction before anything runs (`gasIsValid`), and
+    /// `TransactionListExecutor` stops the block there, which makes it
+    /// invalid. The call's own price is never reached.
     #[test]
     fn test_bridge_tx_gas0_fails_for_unknown_sender() {
-        let result = run_bridge_tx_gas0(457, Address::repeat_byte(0xEE))
-            .expect("pre-RSKIP136 direct bridge call is included, not rejected");
-        assert!(!result.tx_results[0].success);
-        assert_eq!(result.tx_results[0].gas_used, 0, "all of the zero gas limit consumed");
+        match run_bridge_tx_gas0(457, Address::repeat_byte(0xEE)) {
+            Err(error) => assert!(error.to_string().contains("Not enough gas"), "{error}"),
+            Ok(_) => panic!("the block executes"),
+        }
+    }
+
+    /// A free Bridge call that throws after it logged keeps its logs in the
+    /// receipt, as rskj keeps them: the Bridge writes its logs straight into
+    /// the result's list, which only the VM's path clears on a throw
+    /// (`TransactionExecutor.go` returns at `vm == null`). On rskj's regtest a
+    /// federator's Bridge transactions are always free; federator1's
+    /// `updateCollections` logs `update_collections` and then refuses a
+    /// confirmed peg-out of no creation hash, made before RSKIP146, as RSKIP375
+    /// refuses it. The receipt is a success at no gas with that one log, and the
+    /// call's writes are dropped.
+    #[test]
+    fn a_free_bridge_call_that_throws_keeps_what_it_logged() {
+        use crate::bridge::peg::{
+            serialize_pegouts_waiting_for_confirmations, PegoutWaitingForConfirmations,
+        };
+        use crate::bridge::storage::{bridge_storage_key, PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY};
+        let federator1 = rsk_address_from_pubkey_hex(
+            "0362634ab57dae9cb373a5d536e66a8c4f67468bbcfb063809bab643072d78a124",
+        )
+        .unwrap();
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &federator1, 0, U256::ZERO);
+        // A peg-out of one input and one output, kept in the cell of no hashes
+        // since block 0.
+        let mut pegout = vec![1, 0, 0, 0, 1];
+        pegout.extend_from_slice(&[0x11; 32]);
+        pegout.extend_from_slice(&[0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 1]);
+        pegout.extend_from_slice(&100_000_000u64.to_le_bytes());
+        pegout.extend_from_slice(&[1, 0x51, 0, 0, 0, 0]);
+        let cell = serialize_pegouts_waiting_for_confirmations(
+            &[PegoutWaitingForConfirmations {
+                btc_tx_raw: pegout,
+                rsk_block_height: 0,
+                rsk_tx_hash: None,
+            }],
+            false,
+        );
+        let key = rustock_trie::storage_key(
+            &crate::precompiles::BRIDGE_ADDR,
+            &B256::from(bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY)),
+        );
+        let root = root.put(&TrieKeySlice::from_key(&key), &cell, store.as_ref());
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::ZERO,
+            gas_limit: U256::ZERO,
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::copy_from_slice(&block_header_selector("updateCollections()")),
+            v: 28,
+            r: U256::from(1),
+            s: U256::from(1),
+            cached_rlp: None,
+        };
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::rskj_regtest(), block_store)
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::rskj_regtest());
+        let header = Header {
+            difficulty: U256::from(1),
+            ..dummy_header(10)
+        };
+        let result = executor
+            .execute_block(&header, &[(tx, federator1)], &root, store)
+            .expect("a refused updateCollections fails the call, never the block");
+        let outcome = &result.tx_results[0];
+        assert!(outcome.success, "the throw is invisible in the receipt");
+        assert_eq!(outcome.gas_used, 0, "a free transaction");
+        assert_eq!(outcome.logs.len(), 1, "update_collections, logged before the throw");
+        assert_eq!(
+            outcome.logs[0].topics()[0],
+            alloy_primitives::keccak256("update_collections(address)")
+        );
+        assert!(
+            !result
+                .markers
+                .raw_storage
+                .iter()
+                .any(|(address, _, _)| *address == crate::precompiles::BRIDGE_ADDR),
+            "the call's writes are dropped"
+        );
+    }
+
+    /// rskj reads every ABI offset, length and count with `intValue()`: the
+    /// word's low 32 bits, the rest ignored. A call with 2^64 added to one of
+    /// those words is therefore the same call. Converting the whole word
+    /// instead panicked the node, for every one of these: the call's gas is
+    /// worked out, or its arguments read, before anything checks the sender.
+    #[test]
+    fn bridge_offsets_are_read_from_their_low_32_bits() {
+        use crate::abi::encode::{self, Arg};
+        let run = |input: &[u8]| {
+            let store = Arc::new(MemoryTrieStore::new());
+            let sender = Address::repeat_byte(0xAA);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let header = dummy_header(7_000_000);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::ZERO,
+                gas_limit: U256::from(200_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::copy_from_slice(input),
+                v: 28,
+                r: U256::from(1),
+                s: U256::from(1),
+                cached_rlp: None,
+            };
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let result = executor
+                .execute_tx(&header, &tx, sender, &root, store)
+                .unwrap();
+            (result.success, result.gas_used)
+        };
+        // Each input ends in a word nothing reads, so that the same call can
+        // carry one more nonzero byte without reading differently: 2^64 added
+        // to its `word`th word, or a 1 in that last word. Both pay the same
+        // calldata gas.
+        let call = |signature: &str, args: &[Arg]| {
+            [
+                block_header_selector(signature).to_vec(),
+                encode::args(args),
+                vec![0; 32],
+            ]
+            .concat()
+        };
+        let high = |input: &[u8], word: usize| {
+            let mut input = input.to_vec();
+            input[4 + 32 * word + 23] = 1;
+            input
+        };
+        let unread = |input: &[u8]| {
+            let mut input = input.to_vec();
+            *input.last_mut().unwrap() = 1;
+            input
+        };
+        let header = [0u8; 80];
+        let one_header = call("receiveHeader(bytes)", &[Arg::Bytes(&header)]);
+        let headers = call("receiveHeaders(bytes[])", &[Arg::BytesArray(&[&header])]);
+        let confirmations = call(
+            "getBtcTransactionConfirmations(bytes32,bytes32,uint256,bytes32[])",
+            &[
+                Arg::Word([1; 32]),
+                Arg::Word([2; 32]),
+                Arg::Word([0; 32]),
+                Arg::Words(&[[3; 32]]),
+            ],
+        );
+        let flyover = call(
+            "registerFastBridgeBtcTransaction(bytes,uint256,bytes,bytes32,bytes,address,bytes,bool)",
+            &[
+                Arg::Bytes(&[1, 0, 0, 0, 1]),
+                Arg::Word([0; 32]),
+                Arg::Bytes(&[0; 3]),
+                Arg::Word([0x11; 32]),
+                Arg::Bytes(&[0; 21]),
+                Arg::Word([0; 32]),
+                Arg::Bytes(&[0; 21]),
+                Arg::Word([0; 32]),
+            ],
+        );
+        // Each call's offsets, then: the header array's count and its element's
+        // offset; the merkle path and the hashes' count; the flyover height.
+        for (name, input, word) in [
+            ("receiveHeader", &one_header, 0),
+            ("receiveHeaders", &headers, 0),
+            ("receiveHeaders", &headers, 1),
+            ("receiveHeaders", &headers, 2),
+            ("getBtcTransactionConfirmations", &confirmations, 2),
+            ("getBtcTransactionConfirmations", &confirmations, 3),
+            ("getBtcTransactionConfirmations", &confirmations, 4),
+            ("registerFastBridgeBtcTransaction", &flyover, 0),
+            ("registerFastBridgeBtcTransaction", &flyover, 1),
+        ] {
+            assert_eq!(
+                run(&high(input, word)),
+                run(&unread(input)),
+                "{name}, word {word}"
+            );
+        }
     }
 
     /// Regression for the sync halt at mainnet #6916: the block's first tx is
@@ -7755,22 +13369,27 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         let root = TrieNode::empty();
         let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
 
-        // The processing block (#1) whose fees REMASC distributes at #4001.
-        let processing = dummy_header(1);
-        let processing_hash = processing.hash();
-        block_store.put_header(&processing).unwrap();
-        block_store.put_canonical_hash(1, processing_hash).unwrap();
+        // The processing block (#1) whose fees REMASC distributes at #4001,
+        // and the seven after it whose uncles could be its siblings, each on
+        // its parent; and #4,000, the parent of the block that runs, which
+        // the main chain's index takes down to them.
+        let mut parent_hash = B256::ZERO;
+        for number in 1..=8 {
+            let mut block = dummy_header(number);
+            block.parent_hash = parent_hash;
+            parent_hash = block.hash();
+            block_store.put_header(&block).unwrap();
+            block_store.put_canonical_hash(number, parent_hash).unwrap();
+        }
+        let parent = dummy_header(4_000);
+        block_store.put_header(&parent).unwrap();
+        block_store
+            .put_canonical_hash(4_000, parent.hash())
+            .unwrap();
 
-        let header = dummy_header(4_001);
-        let remasc_tx = rustock_core::Transaction {
-            nonce: 0,
-            gas_price: U256::ZERO,
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(crate::precompiles::REMASC_ADDR.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
-        };
+        let mut header = dummy_header(4_001);
+        header.parent_hash = parent.hash();
+        let remasc_tx = rustock_core::Transaction::remasc(header.number);
 
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
         let result = executor
@@ -7793,15 +13412,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
 
         // Block #1: REMASC returns early (pre-maturity) but still writes siblings.
         let header = dummy_header(1);
-        let remasc_tx = rustock_core::Transaction {
-            nonce: 0,
-            gas_price: U256::ZERO,
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(crate::precompiles::REMASC_ADDR.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
-        };
+        let remasc_tx = rustock_core::Transaction::remasc(header.number);
 
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
         let result = executor
@@ -8087,9 +13698,11 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         assert!(decoded.is_empty(), "should return empty bytes for depth >= 4000");
     }
 
-    /// Negative depth should fail (rskj throws VMException).
+    /// A negative depth throws (rskj `BlockAccessor.getBlock`) after the method
+    /// is charged 4,000 and two a byte; in a transaction's own call that is
+    /// the invisible exception.
     #[test]
-    fn test_block_header_negative_depth_fails() {
+    fn test_block_header_negative_depth_throws() {
         let store = Arc::new(MemoryTrieStore::new());
         let root = TrieNode::empty();
 
@@ -8110,17 +13723,21 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             gas_limit: U256::from(100_000),
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
-            input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            input: Bytes::from(input.clone()),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
 
-        let executor = RskExecutor::new(
-            RskHardforkConfig::all_active(33),
-            block_store,
-        );
+        let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store);
 
-        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
-        assert!(!result.success, "negative depth should fail");
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+        assert!(result.success, "an invisible exception records success");
+        assert!(result.output.is_empty());
+        assert_eq!(result.gas_used, intrinsic_gas(&input, 16) + 4_000 + 2 * 36);
     }
 
     /// Block not found at depth returns empty bytes.
@@ -8254,6 +13871,55 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         assert_eq!(decoded, vec![0x03, 0x87, 0xEE, 0x40]);
     }
 
+    /// getMinGasPrice returns a minimum gas price past 256 bits whole, as
+    /// rskj's `Coin.getBytes()` does, where the typed field holds `U256::MAX`.
+    #[test]
+    fn test_block_header_get_min_gas_price_past_256_bits() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+
+        let mut parent = dummy_header(99);
+        parent.set_minimum_gas_price(&num_bigint::BigUint::from(2u8).pow(263));
+        let parent_hash = parent.hash();
+        block_store.put_header(&parent).unwrap();
+        block_store.put_canonical_hash(99, parent_hash).unwrap();
+
+        let mut header = dummy_header(100);
+        header.parent_hash = parent_hash;
+
+        let input = bh_input("getMinGasPrice(int256)", 0);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store);
+
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+        assert!(result.success);
+        // 2^263, with the sign byte `toByteArray` writes.
+        assert_eq!(
+            decode_abi_bytes(&result.output),
+            [&[0, 0x80][..], &[0; 32]].concat()
+        );
+    }
+
     /// getGasLimit returns the parent's gas limit.
     #[test]
     fn test_block_header_get_gas_limit() {
@@ -8377,7 +14043,8 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         let mut uncle1 = dummy_header(98);
         uncle1.beneficiary = uncle1_coinbase;
 
-        let parent = dummy_header(99);
+        let mut parent = dummy_header(99);
+        parent.uncle_count = 2;
         let parent_hash = parent.hash();
         block_store.put_header(&parent).unwrap();
         block_store.put_canonical_hash(99, parent_hash).unwrap();
@@ -8452,7 +14119,8 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
     }
 
     /// Ported from rskj BlockHeaderContractTest.negativeUncleIndex:
-    ///   Negative uncle index should fail.
+    ///   a negative uncle index throws, which in a transaction's own call is
+    ///   the invisible exception.
     #[test]
     fn test_rskj_block_header_negative_uncle_index() {
         let store = Arc::new(MemoryTrieStore::new());
@@ -8487,22 +14155,27 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             gas_limit: U256::from(100_000),
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
-            input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            input: Bytes::from(input.clone()),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
 
-        let executor = RskExecutor::new(
-            RskHardforkConfig::all_active(33),
-            block_store,
-        );
+        let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store);
 
-        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
-        assert!(!result.success, "negative uncle index should fail");
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+        assert!(result.success, "an invisible exception records success");
+        assert!(result.output.is_empty());
+        assert_eq!(result.gas_used, intrinsic_gas(&input, 16) + 4_000 + 2 * 68);
     }
 
     /// Ported from rskj BlockHeaderContractTest.getEmptyMergedMiningTags:
-    ///   When parent has no bitcoin_merged_mining_coinbase_transaction,
-    ///   getMergedMiningTags returns empty bytes.
+    ///   when the parent's merged-mining coinbase has no RSK tag,
+    ///   getMergedMiningTags returns empty bytes. (A block with no coinbase
+    ///   at all throws, as rskj's does.)
     #[test]
     fn test_rskj_block_header_empty_merged_mining_tags() {
         let store = Arc::new(MemoryTrieStore::new());
@@ -8516,9 +14189,12 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
         );
 
-        // Parent with no merged mining data at all
-        let parent = dummy_header(99);
-        assert!(parent.bitcoin_merged_mining_coinbase_transaction.is_none());
+        // Merged-mining fields whose coinbase has no RSKBLOCK: tag, as rskj's
+        // test chain has. A header holds the three together or none of them.
+        let mut parent = dummy_header(99);
+        parent.bitcoin_merged_mining_header = Some(Bytes::from(vec![0; 80]));
+        parent.bitcoin_merged_mining_merkle_proof = Some(Bytes::from(vec![0; 32]));
+        parent.bitcoin_merged_mining_coinbase_transaction = Some(Bytes::from(vec![0xAB; 64]));
         let parent_hash = parent.hash();
         block_store.put_header(&parent).unwrap();
         block_store.put_canonical_hash(99, parent_hash).unwrap();
@@ -8546,7 +14222,8 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         assert!(result.success, "empty merged mining should succeed");
 
         let decoded = decode_abi_bytes(&result.output);
-        assert!(decoded.is_empty(), "no coinbase tx → empty merged mining tags");
+        assert_eq!(result.output.len(), 96, "empty bytes, encoded");
+        assert!(decoded.is_empty(), "no RSK tag → empty merged mining tags");
     }
 
     /// Ported from rskj BlockHeaderContractTest.invalidBlockDepth:
@@ -8683,21 +14360,16 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         };
 
         let mut header = dummy_header(block_number);
+        // On the chain the store holds: REMASC reads the blocks before the
+        // one it runs in up from its parent.
+        header.parent_hash = block_store
+            .canonical_hash(block_number.saturating_sub(1))
+            .unwrap()
+            .unwrap_or_default();
         header.beneficiary = Address::repeat_byte(0x99); // actual miner (not used for fee routing)
 
         // The REMASC system tx: unsigned, zero gas (rskj RemascTransaction).
-        let remasc_tx = rustock_core::Transaction {
-            nonce: 0,
-            gas_price: U256::from(0),
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(remasc_addr.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
-        };
+        let remasc_tx = rustock_core::Transaction::remasc(header.number);
 
         // The rskj remasc tests run regtest with a NON-EMPTY genesis
         // federation (injected at construction); our regtest constants have
@@ -8900,20 +14572,10 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
 
         let mut header = dummy_header(15);
         header.beneficiary = Address::repeat_byte(0x99);
+        header.parent_hash = bs.canonical_hash(14).unwrap().unwrap();
 
         // The REMASC system tx: unsigned, zero gas (rskj RemascTransaction).
-        let remasc_tx = rustock_core::Transaction {
-            nonce: 0,
-            gas_price: U256::from(0),
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(remasc_addr.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
-        };
+        let remasc_tx = rustock_core::Transaction::remasc(header.number);
 
         let executor = RskExecutor::new(
             RskHardforkConfig::all_active(33),
@@ -9236,20 +14898,10 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
 
         let mut header = dummy_header(15);
         header.beneficiary = Address::repeat_byte(0x99);
+        header.parent_hash = bs.canonical_hash(14).unwrap().unwrap();
 
         // The REMASC system tx: unsigned, zero gas (rskj RemascTransaction).
-        let remasc_tx = rustock_core::Transaction {
-            nonce: 0,
-            gas_price: U256::from(0),
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(remasc_addr.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
-        };
+        let remasc_tx = rustock_core::Transaction::remasc(header.number);
 
         let executor = RskExecutor::new(
             RskHardforkConfig::all_active(33),
@@ -9389,6 +15041,315 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         assert!(acct.is_created(), "frontier materialises the empty account");
     }
 
+    /// A header whose coinbase is empty: rskj's null address.
+    fn with_null_coinbase(mut header: Header) -> Header {
+        header.beneficiary = Address::ZERO;
+        header.kept = Some(Box::new(rustock_core::types::header::KeptFields {
+            null_coinbase: true,
+            ..Default::default()
+        }));
+        header
+    }
+
+    /// REMASC at the height after `chain`, each block with its uncles, from a
+    /// state where it holds `balance`: what it did, and the state after it.
+    fn remasc_after(
+        chain: &[(Header, Vec<Header>)],
+        config: crate::remasc::RemascConfig,
+        balance: U256,
+    ) -> (BlockExecutionResult, TrieNode, Arc<MemoryTrieStore>) {
+        let blocks = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let mut parent_hash = B256::ZERO;
+        for (number, (block, uncles)) in chain.iter().enumerate() {
+            let mut block = block.clone();
+            block.parent_hash = parent_hash;
+            let hash = block.hash();
+            blocks.put_header_with_hash(hash, &block).unwrap();
+            blocks.put_canonical_hash(number as u64, hash).unwrap();
+            if !uncles.is_empty() {
+                blocks.put_body(hash, &[], uncles).unwrap();
+            }
+            parent_hash = hash;
+        }
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let ether = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, ether);
+        let root = put_account(&root, store.as_ref(), &REMASC_ADDR, 0, balance);
+        let mut header = dummy_header(chain.len() as u64);
+        header.parent_hash = parent_hash;
+        let remasc = rustock_core::Transaction::remasc(header.number);
+        let result = RskExecutor::new(RskHardforkConfig::all_active(33), blocks)
+            .with_remasc_config(config)
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::mainnet())
+            .execute_block(&header, &[(remasc, sender)], &root, store.clone())
+            .unwrap();
+        let after = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &result.state_changes,
+            &result.markers,
+        );
+        (result, after, store)
+    }
+
+    /// The null account in `state`, if it is there.
+    fn null_account_in(state: &TrieNode, store: &MemoryTrieStore) -> Option<AccountState> {
+        let key = rustock_trie::account_key_from_bytes(&[]);
+        state
+            .get(&TrieKeySlice::from_key(&key), store)
+            .and_then(|data| AccountState::decode(&data).ok())
+    }
+
+    /// REMASC's payments are CALL subtraces of the REMASC transaction's
+    /// trace: rskj's `RemascFeesPayer.payMiningFees` makes one in
+    /// `transferPayment` for every payment it logs, from REMASC with gas 0,
+    /// to the payee's word -- zero for the null address -- and
+    /// `TransactionExecutor.call` keeps them for `extractTrace`.
+    #[test]
+    fn remasc_payments_are_call_subtraces_of_its_trace() {
+        use alloy_rlp::Decodable;
+        let miner = Address::repeat_byte(0x11);
+        let fees = U256::from(21_000);
+        let cases: [(fn(Header) -> Header, Address); 2] =
+            [(|block| block, miner), (with_null_coinbase, Address::ZERO)];
+        for (coinbase, payee) in cases {
+            let chain: Vec<(Header, Vec<Header>)> = (0..15)
+                .map(|number| {
+                    let mut block = dummy_header(number);
+                    if number == 5 {
+                        block.beneficiary = miner;
+                        block.paid_fees = fees;
+                        block = coinbase(block);
+                    }
+                    (block, vec![])
+                })
+                .collect();
+            let blocks = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let mut parent_hash = B256::ZERO;
+            for (number, (block, _)) in chain.iter().enumerate() {
+                let mut block = block.clone();
+                block.parent_hash = parent_hash;
+                parent_hash = block.hash();
+                blocks.put_header_with_hash(parent_hash, &block).unwrap();
+                blocks
+                    .put_canonical_hash(number as u64, parent_hash)
+                    .unwrap();
+            }
+            let store = Arc::new(MemoryTrieStore::new());
+            let sender = Address::repeat_byte(0xAA);
+            let root = put_account(&TrieNode::empty(), store.as_ref(), &REMASC_ADDR, 0, fees);
+            let mut header = dummy_header(chain.len() as u64);
+            header.parent_hash = parent_hash;
+            let remasc = rustock_core::Transaction::remasc(header.number);
+            let (result, traces) = RskExecutor::new(RskHardforkConfig::all_active(33), blocks)
+                .with_remasc_config(crate::remasc::RemascConfig::regtest())
+                .with_bridge_constants(crate::bridge::constants::BridgeConstants::mainnet())
+                .execute_block_call_traced(&header, &[(remasc, sender)], &root, store.clone())
+                .unwrap();
+
+            let topic = crate::bridge::events::legacy_topic("mining_fee_topic");
+            let paid: Vec<_> = result.tx_results[0]
+                .logs
+                .iter()
+                .filter(|log| log.topics()[0] == topic)
+                .map(|log| {
+                    let mut data = &log.data.data[..];
+                    alloy_rlp::Header::decode(&mut data).unwrap();
+                    B256::decode(&mut data).unwrap();
+                    (
+                        Address::from_word(log.topics()[1]),
+                        U256::decode(&mut data).unwrap(),
+                    )
+                })
+                .collect();
+            assert!(paid.contains(&(payee, U256::from(3_327))), "{paid:?}");
+            let call = Some(crate::tracer::CallKind::Call);
+            let subtraces: Vec<_> = traces[0]
+                .subtraces
+                .iter()
+                .map(|s| {
+                    let shape = (
+                        s.call_kind,
+                        s.caller,
+                        s.gas,
+                        s.gas_used,
+                        &s.input,
+                        &s.output,
+                    );
+                    assert_eq!(shape, (call, REMASC_ADDR, 0, 0, &vec![], &vec![]));
+                    (s.owner, s.value)
+                })
+                .collect();
+            assert_eq!(subtraces, paid, "one CALL per payment, in order");
+        }
+    }
+
+    /// rskj pays an empty coinbase at its null address, an account of no
+    /// address bytes, what it would pay any coinbase: the same sums, the same
+    /// log but for a payee word of zero, and an account at its own trie key.
+    /// The zero address is another account, and gets nothing.
+    #[test]
+    fn remasc_pays_an_empty_coinbase_at_the_null_address() {
+        let miner = Address::repeat_byte(0x11);
+        let fees = U256::from(21_000);
+        let chain = |coinbase: fn(Header) -> Header| -> Vec<(Header, Vec<Header>)> {
+            (0..15)
+                .map(|number| {
+                    let mut block = dummy_header(number);
+                    if number == 5 {
+                        block.beneficiary = miner;
+                        block.paid_fees = fees;
+                        block = coinbase(block);
+                    }
+                    (block, vec![])
+                })
+                .collect()
+        };
+        let config = crate::remasc::RemascConfig::regtest;
+        let (paid, _, _) = remasc_after(&chain(|block| block), config(), fees);
+        let ((null, state, store), imbalances) = crate::supply::imbalances_while(|| {
+            remasc_after(&chain(with_null_coinbase), config(), fees)
+        });
+
+        // `remasc_basic_distribution_no_siblings`: the coinbase is paid 3,327.
+        assert_eq!(paid.state_changes[&miner].info.balance, U256::from(3_327));
+        assert_eq!(paid.markers.null_account, None);
+        assert_eq!(null.markers.null_account, Some(U256::from(3_327)));
+        // It leaves the journal for the null account's own key, and the
+        // transaction's supply check counts it there: moved, not burnt.
+        assert_eq!(imbalances, Vec::<String>::new());
+        assert!(!null.state_changes.contains_key(&miner));
+        assert!(!null.state_changes.contains_key(&Address::ZERO));
+        assert_eq!(
+            null.state_changes[&REMASC_ADDR].info.balance,
+            paid.state_changes[&REMASC_ADDR].info.balance
+        );
+        let (paid_logs, null_logs) = (&paid.tx_results[0].logs, &null.tx_results[0].logs);
+        assert_eq!(null_logs.len(), paid_logs.len());
+        let (paid_log, null_log) = (paid_logs.last().unwrap(), null_logs.last().unwrap());
+        assert_eq!(
+            paid_log.topics()[1],
+            B256::left_padding_from(miner.as_slice())
+        );
+        assert_eq!(null_log.topics()[1], B256::ZERO);
+        // RLP([the processing block's hash, 3,327]), each block's hash its own.
+        assert_eq!(null_log.data.data[34..], [0x82, 0x0c, 0xff]);
+        assert_eq!(paid_log.data.data[34..], [0x82, 0x0c, 0xff]);
+
+        let account = null_account_in(&state, &store);
+        assert_eq!(
+            account.map(|account| account.balance),
+            Some(U256::from(3_327))
+        );
+        let zero = account_key(&Address::ZERO);
+        assert_eq!(
+            state.get(&TrieKeySlice::from_key(&zero), store.as_ref()),
+            None
+        );
+    }
+
+    /// So are a sibling's empty coinbase and that of the block that included
+    /// it, the publisher's share and the sibling miner's, and the processing
+    /// block's own where it has siblings.
+    #[test]
+    fn remasc_pays_empty_sibling_coinbases_at_the_null_address() {
+        let miner = Address::repeat_byte(0x11);
+        let fees = U256::from(21_000);
+        let chain = |processing: fn(Header) -> Header| -> Vec<(Header, Vec<Header>)> {
+            (0..15)
+                .map(|number| {
+                    let mut block = dummy_header(number);
+                    match number {
+                        5 => {
+                            block.beneficiary = miner;
+                            block.paid_fees = fees;
+                            (processing(block), vec![])
+                        }
+                        6 => {
+                            let uncle = make_uncle(5, Address::ZERO, U256::from(31_500), 0);
+                            (with_null_coinbase(block), vec![with_null_coinbase(uncle)])
+                        }
+                        _ => (block, vec![]),
+                    }
+                })
+                .collect()
+        };
+        let config = crate::remasc::RemascConfig::regtest;
+
+        // `remasc_with_one_sibling`: the publisher 332, each miner 1,497.
+        let (result, state, store) = remasc_after(&chain(|block| block), config(), fees);
+        assert_eq!(result.markers.null_account, Some(U256::from(332 + 1_497)));
+        assert_eq!(result.state_changes[&miner].info.balance, U256::from(1_497));
+        assert!(!result.state_changes.contains_key(&Address::ZERO));
+        let account = null_account_in(&state, &store);
+        assert_eq!(
+            account.map(|account| account.balance),
+            Some(U256::from(1_829))
+        );
+
+        let (result, _, _) = remasc_after(&chain(with_null_coinbase), config(), fees);
+        assert_eq!(
+            result.markers.null_account,
+            Some(U256::from(332 + 1_497 + 1_497))
+        );
+        assert!(!result.state_changes.contains_key(&miner));
+        assert!(!result.state_changes.contains_key(&Address::ZERO));
+    }
+
+    /// What REMASC paid the null address is summed across sublists, as their
+    /// state is, though the one REMASC transaction pays it all.
+    #[test]
+    fn merging_markers_sums_what_remasc_paid_the_null_address() {
+        let paid = |amount: Option<u64>| crate::state::ContractMarkers {
+            null_account: amount.map(U256::from),
+            ..Default::default()
+        };
+        for (into, from, merged) in [
+            (None, None, None),
+            (None, Some(5), Some(5)),
+            (Some(3), None, Some(3)),
+            (Some(3), Some(5), Some(8)),
+        ] {
+            let mut markers = paid(into);
+            merge_markers(&mut markers, paid(from));
+            assert_eq!(
+                markers.null_account,
+                merged.map(U256::from),
+                "{into:?} {from:?}"
+            );
+        }
+    }
+
+    /// rskj's `addBalance` creates the account it pays, even for nothing
+    /// (`remasc_zero_payment_creates_recipient_account`), the null address's
+    /// too.
+    #[test]
+    fn remasc_creates_the_null_account_even_for_nothing() {
+        let mut config = crate::remasc::RemascConfig::regtest();
+        // Before RSKIP85, nothing is not too little to pay.
+        config.rskip85_activation_height = Some(u64::MAX);
+        let chain: Vec<(Header, Vec<Header>)> = (0..15)
+            .map(|number| {
+                let block = dummy_header(number);
+                (
+                    if number == 5 {
+                        with_null_coinbase(block)
+                    } else {
+                        block
+                    },
+                    vec![],
+                )
+            })
+            .collect();
+        let (result, state, store) = remasc_after(&chain, config, U256::ZERO);
+        assert_eq!(result.markers.null_account, Some(U256::ZERO));
+        assert_eq!(
+            null_account_in(&state, &store),
+            Some(AccountState::default())
+        );
+    }
+
     /// Port of rskj `BridgeSupportIT.callUpdateCollectionsChangeGetsOutOfDust`
     /// (regression for mainnet #3,103,055): when a pegout's change output is
     /// dusty, bitcoinj raises it to the non-dust minimum at the recipient's
@@ -9479,7 +15440,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
 
         let header = dummy_header(3_103_055);
         let result = executor
-            .execute_block(&header, &[(tx, sender)], &root, store.clone())
+            .execute_block(&header, &[(tx.clone(), sender)], &root, store.clone())
             .expect("block executes");
         assert!(result.tx_results[0].success, "updateCollections succeeds");
 
@@ -9499,6 +15460,130 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             .map(|a| a.info.balance)
             .unwrap_or_default();
         assert_eq!(bridge_balance, one_rbtc - burned, "burn debits the Bridge");
+
+        // rskj's `transferTo(BURN_ADDRESS, ...)` is a CALL subtrace of the
+        // transaction's trace, from the Bridge with gas 0.
+        let (_, traces) = executor
+            .execute_block_call_traced(&header, &[(tx, sender)], &root, store.clone())
+            .expect("block executes traced");
+        let subtraces: Vec<_> = traces[0]
+            .subtraces
+            .iter()
+            .map(|s| {
+                (
+                    s.call_kind,
+                    s.caller,
+                    s.owner,
+                    s.value,
+                    s.gas,
+                    s.gas_used,
+                    s.input.len(),
+                )
+            })
+            .collect();
+        let call = Some(crate::tracer::CallKind::Call);
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        assert_eq!(subtraces, vec![(call, bridge, burn_addr, burned, 0, 0, 0)]);
+    }
+
+    /// A transaction sent straight to the Bridge carries the Bridge's
+    /// transfers as CALL subtraces: rskj's `BridgeSupport.transferTo`
+    /// adds one, `TransactionExecutor.call` keeps them once `execute` returns
+    /// and `extractTrace` hangs them under the transaction's trace. Here the
+    /// refund of what a sender other than the union bridge sent
+    /// `releaseUnionBridgeRbtc()` (`BridgeSupport.releaseUnionBridgeRbtc`). The
+    /// same call from a contract carries none: `callToPrecompiledAddress`
+    /// reads no subtraces.
+    #[test]
+    fn a_bridge_transfer_is_a_call_subtrace_of_a_transaction_to_the_bridge() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let sender = Address::repeat_byte(0x5e);
+        let contract = Address::repeat_byte(0xca);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let selector = alloy_primitives::keccak256(b"releaseUnionBridgeRbtc()")[..4].to_vec();
+        // MSTORE the selector at 0; CALL(100000, Bridge, 5, 0, 4, 0, 0); STOP.
+        let mut code = vec![0x7f];
+        code.extend_from_slice(&selector);
+        code.extend_from_slice(&[0; 28]);
+        code.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, 0x00, 0x60, 0x00, 0x60, 0x04]);
+        code.extend_from_slice(&[0x60, 0x00, 0x60, 0x05, 0x73]);
+        code.extend_from_slice(bridge.as_slice());
+        code.extend_from_slice(&[0x62, 0x01, 0x86, 0xa0, 0xf1, 0x00]);
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(&root, store.as_ref(), &contract, 0, one_rbtc, &code);
+        let executor = RskExecutor::new(
+            // reed810, for RSKIP502's union bridge methods.
+            RskHardforkConfig::all_active_parallel(33),
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap()),
+        );
+        let tx = |nonce: u64, to: Address, input: &[u8]| rustock_core::Transaction {
+            nonce,
+            gas_price: U256::ZERO,
+            gas_limit: U256::from(300_000),
+            to: Bytes::copy_from_slice(to.as_slice()),
+            value: U256::from(5),
+            input: Bytes::copy_from_slice(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let subtraces = |trace: &crate::tracer::ProgramTrace| {
+            trace
+                .subtraces
+                .iter()
+                .map(|s| (s.call_kind, s.caller, s.owner, s.value, s.gas, s.gas_used))
+                .collect::<Vec<_>>()
+        };
+        let call = Some(crate::tracer::CallKind::Call);
+        let refund = vec![(call, bridge, sender, U256::from(5), 0, 0)];
+
+        // As `trace_*` runs a block. The contract's call comes first, and what
+        // the Bridge transferred in it stays out of the next one's trace.
+        let header = dummy_header(1_000);
+        let transactions = [
+            (tx(0, contract, &[]), sender),
+            (tx(1, bridge, &selector), sender),
+        ];
+        let (result, traces) = executor
+            .execute_block_call_traced(&header, &transactions, &root, store.clone())
+            .expect("the block executes");
+        assert!(result.tx_results.iter().all(|r| r.success));
+        assert_eq!(
+            subtraces(&traces[0]),
+            vec![],
+            "nothing from a contract's call"
+        );
+        assert_eq!(
+            subtraces(&traces[1]),
+            refund,
+            "the refund, under its own trace"
+        );
+
+        // And as one transaction is traced.
+        let (one, trace) = executor
+            .execute_tx_traced(
+                &header,
+                &tx(0, bridge, &selector),
+                sender,
+                &root,
+                store.clone(),
+                false,
+                0,
+            )
+            .expect("the transaction executes");
+        assert!(one.success);
+        assert_eq!(subtraces(&trace), refund);
+
+        // Only a successful call straight to a precompile that transfers.
+        let transfers = || vec![(bridge, sender, U256::from(5))];
+        let attached = |to, success| crate::tracer::precompile_subtraces(to, success, transfers());
+        assert!(attached(Some(bridge), true).is_some());
+        assert!(attached(Some(crate::precompiles::REMASC_ADDR), true).is_some());
+        assert!(attached(Some(bridge), false).is_none());
+        assert!(attached(Some(contract), true).is_none());
+        assert!(attached(None, true).is_none());
     }
 
     /// Deploying onto an address that already holds a balance destroys that
@@ -9889,12 +15974,197 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         assert_eq!(sender_acct.balance, one_rbtc, "burned balance goes nowhere");
     }
 
-    /// Destroy → CREATE2 re-deploy at the same address → destroy again, all
-    /// in one block (the rskj TransactionExecutor comment: "the remote case
-    /// there is a CREATE2 creating a deleted account"). The final destruction
-    /// must win: nothing of the address survives at block end.
+    /// rskj `Program.suicide` transfers only a balance that is not zero
+    /// (`if (!balance.equals(Coin.ZERO))`), so a contract that holds nothing
+    /// leaves the beneficiary it names as it was: one that did not exist still
+    /// does not, though `VM.doSUICIDE` charged the 25,000 for it. revm touches
+    /// the beneficiary whatever the balance, and under RSK's frontier account
+    /// rules a touch creates the account. What else touches it still creates
+    /// it: a balance handed over, and a call for nothing (`addBalance` of
+    /// zero), whether before the destruction or after it.
     #[test]
-    fn selfdestruct_recreate_via_create2_then_selfdestruct_again() {
+    fn selfdestruct_with_no_balance_leaves_the_beneficiary_as_it_was() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+
+        // PUSH20 to; SELFDESTRUCT
+        let destroys = |to: &Address| {
+            let mut code = vec![0x73];
+            code.extend_from_slice(to.as_slice());
+            code.push(0xFF);
+            code
+        };
+        // CALL(GAS, to, 0, 0, 0, 0, 0); POP
+        let calls = |to: &Address| {
+            let mut code = vec![
+                0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+            ];
+            code.extend_from_slice(to.as_slice());
+            code.extend_from_slice(&[0x5A, 0xF1, 0x50]);
+            code
+        };
+
+        // The beneficiaries, none of which exists, and the contracts.
+        let [untouched, paid, called_before, called_after] =
+            [0xB1, 0xB2, 0xB3, 0xB4].map(Address::repeat_byte);
+        let [empty, funded, calls_first, destroyed_inside, calls_last] =
+            [0xC1, 0xC2, 0xC3, 0xC4, 0xC5].map(Address::repeat_byte);
+
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let contracts = [
+            (empty, U256::ZERO, destroys(&untouched)),
+            (funded, U256::from(1_000), destroys(&paid)),
+            (
+                calls_first,
+                U256::ZERO,
+                [calls(&called_before), destroys(&called_before)].concat(),
+            ),
+            (destroyed_inside, U256::ZERO, destroys(&called_after)),
+            (
+                calls_last,
+                U256::ZERO,
+                [calls(&destroyed_inside), calls(&called_after)].concat(),
+            ),
+        ];
+        let root = contracts.iter().fold(root, |root, (addr, balance, code)| {
+            seed_contract(&root, store.as_ref(), addr, *balance, code)
+        });
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let txs: Vec<_> = [empty, funded, calls_first, calls_last]
+            .iter()
+            .enumerate()
+            .map(|(nonce, to)| (plain_tx(nonce as u64, to, U256::ZERO), sender))
+            .collect();
+        let r = executor
+            .execute_block(&dummy_header(3_173_807), &txs, &root, store.clone())
+            .expect("block");
+        assert!(r.tx_results.iter().all(|t| t.success));
+
+        let new_root =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r.state_changes, &r.markers);
+        let account = |addr: &Address| {
+            trie_account(&new_root, store.as_ref(), addr).map(|a| (a.nonce, a.balance))
+        };
+        for gone in [empty, funded, calls_first, destroyed_inside] {
+            assert_eq!(account(&gone), None, "{gone} destroyed itself");
+        }
+        assert_eq!(
+            account(&untouched),
+            None,
+            "nothing was handed over, so nothing made the beneficiary"
+        );
+        assert_eq!(
+            account(&paid),
+            Some((U256::ZERO, U256::from(1_000))),
+            "a balance handed over makes the beneficiary"
+        );
+        assert_eq!(
+            account(&called_before),
+            Some((U256::ZERO, U256::ZERO)),
+            "the call before the destruction made it, and it stays"
+        );
+        assert_eq!(
+            account(&called_after),
+            Some((U256::ZERO, U256::ZERO)),
+            "the call after the destruction makes it"
+        );
+    }
+
+    /// rskj traces a transaction sent straight to the Bridge though no
+    /// program runs for it (`TransactionExecutor.extractTrace`), so a block's
+    /// traces are one to a transaction, in the transactions' order. Before
+    /// RSKIP136, and for the federation's free transactions, the Bridge is
+    /// called outside the EVM, where no tracer hears of it.
+    #[test]
+    fn a_bridge_transaction_run_outside_the_evm_has_its_trace() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let payee = Address::repeat_byte(0xEE);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        // Mainnet's block 3,000 is below bahamas, where RSKIP136 starts.
+        let txs = vec![
+            (
+                plain_tx(0, &crate::precompiles::BRIDGE_ADDR, U256::ZERO),
+                sender,
+            ),
+            (plain_tx(1, &payee, U256::from(1_000)), sender),
+        ];
+        let (result, traces) = executor
+            .execute_block_call_traced(&dummy_header(3_000), &txs, &root, store.clone())
+            .expect("block");
+        assert!(result.tx_results[1].success);
+        assert_eq!(traces.len(), 2, "one trace to a transaction");
+        // The Bridge's is the one rskj makes where no program ran, and the
+        // transfer's is its own.
+        assert_eq!(traces[0].contract_address, "");
+        assert_eq!(traces[1].contract_address, hex::encode(payee));
+    }
+
+    /// Where no program runs for a transaction, rskj's trace of it is a bare
+    /// `SummarizedProgramTrace` (`TransactionExecutor.extractTrace`): no gas,
+    /// no error and no revert, whatever became of the transaction. That is a
+    /// call straight to a precompile, also one that fails for want of gas
+    /// (`call()` returns before any program), and a creation with no init
+    /// code (`create()` builds a `Program` only for data that isn't empty).
+    #[test]
+    fn a_transaction_that_runs_no_program_is_traced_without_gas_or_error() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        // ECRECOVER asks 3,000 gas, and this leaves it 100.
+        let starved = rustock_core::Transaction {
+            gas_limit: U256::from(21_100),
+            ..plain_tx(0, &Address::with_last_byte(1), U256::ZERO)
+        };
+        let codeless = rustock_core::Transaction {
+            to: Bytes::new(),
+            ..plain_tx(1, &Address::ZERO, U256::ZERO)
+        };
+        let txs = vec![(starved, sender), (codeless, sender)];
+        let (result, traces) = executor
+            .execute_block_call_traced(&dummy_header(3_173_807), &txs, &root, store.clone())
+            .expect("block");
+        assert!(
+            !result.tx_results[0].success,
+            "the precompile had too little gas"
+        );
+        assert!(
+            result.tx_results[1].success,
+            "a creation with no code succeeds"
+        );
+        assert_eq!(traces.len(), 2);
+        for (trace, what) in traces
+            .iter()
+            .zip(["the starved call", "the codeless creation"])
+        {
+            assert_eq!(trace.root_gas, 0, "{what}");
+            assert_eq!(trace.error, "", "{what}");
+            assert!(!trace.reverted, "{what}");
+            assert!(trace.subtraces.is_empty(), "{what}");
+        }
+    }
+
+    /// RSKIP-131: from RSKIP125 rskj's `Program.createContract` refuses a
+    /// creation at an address an earlier transaction of the block deleted:
+    /// the `deletedAccounts` that `TransactionExecutor` hands every program
+    /// "in the remote case there is a CREATE2 creating a deleted account".
+    /// Destroy, then CREATE2 at the same address in a later transaction: the
+    /// factory's nonce still goes up, the gas given to the creation is spent,
+    /// and the address stays deleted, so a transfer to it makes a plain
+    /// account.
+    #[test]
+    fn create2_at_an_address_destroyed_earlier_in_the_block_is_refused() {
         let store = Arc::new(MemoryTrieStore::new());
         let sender = Address::repeat_byte(0xAA);
         let factory = Address::repeat_byte(0xFA);
@@ -9906,11 +16176,11 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         let init: [u8; 11] = [0x61, 0x33, 0xFF, 0x60, 0x00, 0x52, 0x60, 0x02, 0x60, 0x1E, 0xF3];
         // Factory runtime: PUSH11 init; PUSH1 0; MSTORE   (init at mem[21..32])
         //                  PUSH1 0 (salt); PUSH1 11 (size); PUSH1 21 (offset);
-        //                  PUSH1 0 (value); CREATE2; POP; STOP
+        //                  PUSH1 0 (value); CREATE2; STOP
         let mut factory_code = vec![0x6A];
         factory_code.extend_from_slice(&init);
         factory_code.extend_from_slice(&[
-            0x60, 0x00, 0x52, 0x60, 0x00, 0x60, 0x0B, 0x60, 0x15, 0x60, 0x00, 0xF5, 0x50, 0x00,
+            0x60, 0x00, 0x52, 0x60, 0x00, 0x60, 0x0B, 0x60, 0x15, 0x60, 0x00, 0xF5, 0x00,
         ]);
         let victim = factory.create2(B256::ZERO, alloy_primitives::keccak256(init));
 
@@ -9928,43 +16198,833 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         let txs = vec![
             (plain_tx(0, &factory, U256::ZERO), sender), // deploy victim
             (plain_tx(1, &victim, U256::ZERO), sender),  // destroy it
-            (plain_tx(2, &factory, U256::ZERO), sender), // re-deploy at same addr
-            (plain_tx(3, &victim, U256::from(7)), sender), // destroy again
+            (plain_tx(2, &factory, U256::ZERO), sender), // CREATE2 at the same address
+            (plain_tx(3, &victim, U256::from(7)), sender), // a transfer to it
         ];
         let r = executor
             .execute_block(&dummy_header(3_173_807), &txs, &root, store.clone())
             .expect("block");
         assert!(r.tx_results.iter().all(|t| t.success));
+        // The refused creation was given all the gas there was, and spent it.
+        assert_eq!(r.tx_results[2].gas_used, 1_000_000);
 
         let new_root =
             crate::state::apply_state_changes(&root, store.as_ref(), &r.state_changes, &r.markers);
-        // If the second CREATE2 had failed (collision against the stale
-        // destroyed entry), tx 3 would have been a plain transfer and the
-        // victim would survive with balance 7.
-        assert!(
-            trie_account(&new_root, store.as_ref(), &victim).is_none(),
-            "victim fully deleted after destroy → CREATE2 re-deploy → destroy"
+        let victim_acct = trie_account(&new_root, store.as_ref(), &victim).expect("an account");
+        assert_eq!(
+            victim_acct.balance,
+            U256::from(7),
+            "the plain account the transfer made"
         );
-        assert!(
-            new_root
-                .get(
-                    &TrieKeySlice::from_key(&rustock_trie::code_key(&victim)),
-                    store.as_ref(),
-                )
-                .is_none(),
-            "victim code deleted"
-        );
-        assert!(
-            new_root
-                .get(
-                    &TrieKeySlice::from_key(&rustock_trie::storage_prefix_key(&victim)),
-                    store.as_ref(),
-                )
-                .is_none(),
-            "victim marker deleted"
-        );
-        // The selfdestruct in tx 3 pays the 7 wei back to the caller.
+        assert_subtree_deleted(&new_root, store.as_ref(), &victim);
+        // Both CREATE2s count on the factory's nonce, the refused one too.
+        let factory_acct = trie_account(&new_root, store.as_ref(), &factory).unwrap();
+        assert_eq!(factory_acct.nonce, U256::from(3));
         let sender_acct = trie_account(&new_root, store.as_ref(), &sender).unwrap();
-        assert_eq!(sender_acct.balance, one_rbtc, "value round-trips via suicide");
+        assert_eq!(sender_acct.balance, one_rbtc - U256::from(7));
+    }
+
+    /// RSKIP-131 across sublists: rskj hands what the parallel sublists
+    /// deleted to the sequential one (`BlockExecutor.executeParallel`), so a
+    /// CREATE2 there at an address a parallel sublist destroyed is refused,
+    /// on one thread or two. Two parallel sublists, as one runs as the whole
+    /// block does.
+    #[test]
+    fn create2_in_the_sequential_sublist_where_a_parallel_one_destroyed_is_refused() {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let destroyer = Address::repeat_byte(0x11);
+        let bystander = Address::repeat_byte(0x13);
+        let creator = Address::repeat_byte(0x12);
+        // The factory and its victim of the test above, the victim deployed.
+        let factory = Address::repeat_byte(0xFA);
+        let init: [u8; 11] = [
+            0x61, 0x33, 0xFF, 0x60, 0x00, 0x52, 0x60, 0x02, 0x60, 0x1E, 0xF3,
+        ];
+        let mut factory_code = vec![0x6A];
+        factory_code.extend_from_slice(&init);
+        factory_code.extend_from_slice(&[
+            0x60, 0x00, 0x52, 0x60, 0x00, 0x60, 0x0B, 0x60, 0x15, 0x60, 0x00, 0xF5, 0x00,
+        ]);
+        let victim = factory.create2(B256::ZERO, alloy_primitives::keccak256(init));
+
+        let mut root = put_account(&TrieNode::empty(), store.as_ref(), &destroyer, 0, one_rbtc);
+        root = put_account(&root, store.as_ref(), &bystander, 0, one_rbtc);
+        root = put_account(&root, store.as_ref(), &creator, 0, one_rbtc);
+        root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &factory,
+            2,
+            U256::ZERO,
+            &factory_code,
+        );
+        root = put_account_with_code(&root, store.as_ref(), &victim, 1, U256::ZERO, &[0x33, 0xFF]);
+        let marker = rustock_trie::storage_prefix_key(&victim);
+        root = root.put(&TrieKeySlice::from_key(&marker), &[1], store.as_ref());
+
+        // Testnet, past reed810 (#7,139,600): {tx0} and {tx1} in parallel
+        // sublists, tx2 sequential.
+        let mut header = dummy_header(8_000_000);
+        header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+            version: 1,
+            edges: Some(vec![1, 2]),
+            base_event: None,
+        });
+        header.gas_limit = U256::from(12_000_000);
+        let tx = |to: &Address| rustock_core::Transaction {
+            gas_limit: U256::from(500_000),
+            ..plain_tx(0, to, U256::ZERO)
+        };
+        let transactions = vec![
+            (tx(&victim), destroyer),
+            (tx(&Address::repeat_byte(0xA1)), bystander),
+            (tx(&factory), creator),
+        ];
+
+        for threads in [1, 2] {
+            let executor = RskExecutor::new(RskHardforkConfig::testnet(), block_store.clone())
+                .with_execution_threads(threads);
+            let r = executor
+                .execute_block(&header, &transactions, &root, store.clone())
+                .expect("block");
+            assert!(
+                r.tx_results.iter().all(|t| t.success),
+                "{threads} thread(s)"
+            );
+            assert_eq!(
+                r.tx_results[2].gas_used, 500_000,
+                "{threads} thread(s): refused"
+            );
+            let new_root = r.applied_root.clone().unwrap_or_else(|| {
+                crate::state::apply_state_changes(
+                    &root,
+                    store.as_ref(),
+                    &r.state_changes,
+                    &r.markers,
+                )
+            });
+            let gone = trie_account(&new_root, store.as_ref(), &victim).is_none();
+            assert!(gone, "{threads} thread(s): the victim stays deleted");
+            assert_subtree_deleted(&new_root, store.as_ref(), &victim);
+            let factory_acct = trie_account(&new_root, store.as_ref(), &factory).unwrap();
+            assert_eq!(factory_acct.nonce, U256::from(3), "{threads} thread(s)");
+        }
+    }
+
+    /// FRCR-279: before RSKIP169 (iris300) rskj's EXTCODEHASH answers a
+    /// contract whose code key holds nothing with 0 (`getCodeHashNonStandard`),
+    /// and from it with `keccak256("")`, as any account without code. A
+    /// contract is an account with the marker `setupContract` writes. The key
+    /// of one made with no code before the block holds nothing. But the
+    /// block's repository keeps what its transactions write in a cache until
+    /// the block ends (`RepositoryLocator.startTrackingAt`, `MutableTrieCache`),
+    /// and there the key of a contract made with no code in the block holds
+    /// the empty code its creation saved, which hashes to `keccak256("")`
+    /// (`MutableTrieCache.getValueHash`; rskj's
+    /// `ExtCodeHashDslTest.invokeEXTCodeHASHWithCacheEmptyDeploy`): here one
+    /// made in the same transaction, and one made earlier in the block. An
+    /// account without the marker answers `keccak256("")` either way -- one
+    /// a creation with no data made too, as rskj's `TransactionExecutor.create`
+    /// doesn't call `setupContract` for it -- and an address with no account 0.
+    ///
+    /// The contract made with no code keeps its marker, too, though a later
+    /// transaction loads it again, which drops revm's flag for a creation.
+    #[test]
+    fn extcodehash_of_a_contract_without_code_before_rskip169_reads_the_blocks_cache() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAC);
+        // Probe: SSTORE(addr, EXTCODEHASH(addr) + 1), the address its calldata.
+        let probe = Address::repeat_byte(0xB0);
+        let probe_code = [
+            0x60, 0x00, 0x35, 0x80, 0x3f, 0x60, 0x01, 0x01, 0x90, 0x55, 0x00,
+        ];
+        // Maker: CREATE with no init code; SSTORE(0, EXTCODEHASH(new) + 1).
+        let maker = Address::repeat_byte(0xB1);
+        let maker_code = [
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x3f, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55,
+            0x00,
+        ];
+        let made = maker.create(1);
+        let codeless = Address::repeat_byte(0xB2);
+        let eoa = Address::repeat_byte(0xB3);
+        let absent = Address::repeat_byte(0xB4);
+        let no_data = sender.create(5);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(&root, store.as_ref(), &probe, 1, U256::ZERO, &probe_code);
+        let root = put_account_with_code(&root, store.as_ref(), &maker, 1, U256::ZERO, &maker_code);
+        // A contract with no code from before the block: its marker, no code.
+        let root = put_account(&root, store.as_ref(), &codeless, 1, U256::ZERO);
+        let marker = rustock_trie::storage_prefix_key(&codeless);
+        let root = root.put(&TrieKeySlice::from_key(&marker), &[1], store.as_ref());
+        let root = put_account(&root, store.as_ref(), &eoa, 0, one_rbtc);
+
+        let probe_tx = |nonce: u64, target: &Address| rustock_core::Transaction {
+            input: Bytes::copy_from_slice(target.into_word().as_slice()),
+            ..plain_tx(nonce, &probe, U256::ZERO)
+        };
+        let txs = vec![
+            (plain_tx(0, &maker, U256::ZERO), sender),
+            (probe_tx(1, &made), sender),
+            (probe_tx(2, &codeless), sender),
+            (probe_tx(3, &eoa), sender),
+            (probe_tx(4, &absent), sender),
+            (
+                rustock_core::Transaction {
+                    to: Bytes::new(),
+                    ..plain_tx(5, &probe, U256::ZERO)
+                },
+                sender,
+            ),
+            (probe_tx(6, &no_data), sender),
+        ];
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let plus_one = |hash: B256| U256::from_be_bytes(hash.0) + U256::from(1);
+        let empty = plus_one(crate::rsk_instructions::KECCAK_EMPTY);
+        // Between papyrus200 (#2,392,700, EXTCODEHASH) and iris300 (#3,614,800),
+        // then past it.
+        for (number, contract) in [(3_000_000u64, plus_one(B256::ZERO)), (3_700_000, empty)] {
+            let r = executor
+                .execute_block(&dummy_header(number), &txs, &root, store.clone())
+                .expect("block");
+            assert!(r.tx_results.iter().all(|t| t.success), "#{number}");
+            let slot = |owner: &Address, key: U256| {
+                r.state_changes
+                    .get(owner)
+                    .and_then(|a| a.storage.get(&key))
+                    .map_or(U256::ZERO, |s| s.present_value)
+            };
+            let probed = |target: &Address| slot(&probe, U256::from_be_slice(target.as_slice()));
+            assert_eq!(
+                slot(&maker, U256::ZERO),
+                empty,
+                "#{number}: made in this transaction"
+            );
+            assert_eq!(probed(&made), empty, "#{number}: made earlier in the block");
+            assert_eq!(
+                probed(&codeless),
+                contract,
+                "#{number}: made before the block"
+            );
+            assert_eq!(probed(&eoa), empty, "#{number}: not a contract");
+            assert_eq!(
+                probed(&absent),
+                plus_one(B256::ZERO),
+                "#{number}: no account"
+            );
+            assert_eq!(
+                probed(&no_data),
+                empty,
+                "#{number}: made with no data, no contract"
+            );
+
+            let new_root = crate::state::apply_state_changes(
+                &root,
+                store.as_ref(),
+                &r.state_changes,
+                &r.markers,
+            );
+            let made_marker = rustock_trie::storage_prefix_key(&made);
+            assert!(
+                new_root
+                    .get(&TrieKeySlice::from_key(&made_marker), store.as_ref())
+                    .is_some(),
+                "#{number}: the contract made with no code keeps its marker"
+            );
+        }
+    }
+
+    /// An account an earlier transaction of the block destroyed doesn't
+    /// exist for the rest of the block (rskj deletes it as that transaction
+    /// ends) until something touches it: EXTCODEHASH answers 0, and a CALL
+    /// to it pays NEW_ACCT_CALL, as for any address with no account. The
+    /// CALL makes it again, a plain account, not a contract: before RSKIP169
+    /// too, though the parent state still holds its marker.
+    #[test]
+    fn an_account_destroyed_earlier_in_the_block_does_not_exist_until_touched() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAC);
+        // Victim: CALLER; SELFDESTRUCT. And an account that stays.
+        let victim = Address::repeat_byte(0xD1);
+        let eoa = Address::repeat_byte(0xE0);
+        // Probes: SSTORE(addr, EXTCODEHASH(addr) + 1), the address their calldata.
+        let probe_code = [
+            0x60, 0x00, 0x35, 0x80, 0x3f, 0x60, 0x01, 0x01, 0x90, 0x55, 0x00,
+        ];
+        let first_probe = Address::repeat_byte(0xB5);
+        let second_probe = Address::repeat_byte(0xB6);
+        // Caller: CALL(1M gas, the address its calldata, 0 wei, no data); POP; STOP.
+        let caller = Address::repeat_byte(0xB7);
+        let caller_code = [
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x35, 0x62,
+            0x0f, 0x42, 0x40, 0xf1, 0x50, 0x00,
+        ];
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let mut root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        root = put_account_with_code(&root, store.as_ref(), &victim, 1, U256::ZERO, &[0x33, 0xFF]);
+        let marker = rustock_trie::storage_prefix_key(&victim);
+        root = root.put(&TrieKeySlice::from_key(&marker), &[1], store.as_ref());
+        root = put_account(&root, store.as_ref(), &eoa, 0, U256::ZERO);
+        for probe in [first_probe, second_probe] {
+            root = put_account_with_code(&root, store.as_ref(), &probe, 1, U256::ZERO, &probe_code);
+        }
+        root = put_account_with_code(&root, store.as_ref(), &caller, 1, U256::ZERO, &caller_code);
+
+        let with_input = |nonce: u64, to: &Address, target: &Address| rustock_core::Transaction {
+            input: Bytes::copy_from_slice(target.into_word().as_slice()),
+            ..plain_tx(nonce, to, U256::ZERO)
+        };
+        let txs = vec![
+            (plain_tx(0, &victim, U256::ZERO), sender), // destroys it
+            (with_input(1, &first_probe, &victim), sender), // EXTCODEHASH: no account
+            (with_input(2, &caller, &victim), sender),  // CALL: a new account
+            (with_input(3, &caller, &eoa), sender),     // CALL: an account
+            (with_input(4, &second_probe, &victim), sender), // EXTCODEHASH: an account
+        ];
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let empty = U256::from_be_bytes(crate::rsk_instructions::KECCAK_EMPTY.0);
+        // Before iris300 (#3,614,800) and after it.
+        for number in [3_000_000u64, 3_700_000] {
+            let r = executor
+                .execute_block(&dummy_header(number), &txs, &root, store.clone())
+                .expect("block");
+            assert!(r.tx_results.iter().all(|t| t.success), "#{number}");
+            let probed = |probe: &Address| {
+                let key = U256::from_be_slice(victim.as_slice());
+                r.state_changes
+                    .get(probe)
+                    .and_then(|a| a.storage.get(&key))
+                    .map_or(U256::ZERO, |s| s.present_value)
+            };
+            assert_eq!(
+                probed(&first_probe),
+                U256::from(1),
+                "#{number}: no account: 0"
+            );
+            assert_eq!(
+                probed(&second_probe),
+                empty + U256::from(1),
+                "#{number}: an account"
+            );
+            assert_eq!(
+                r.tx_results[2].gas_used - r.tx_results[3].gas_used,
+                25_000,
+                "#{number}: a CALL to an address with no account pays NEW_ACCT_CALL"
+            );
+
+            let new_root = crate::state::apply_state_changes(
+                &root,
+                store.as_ref(),
+                &r.state_changes,
+                &r.markers,
+            );
+            let again = trie_account(&new_root, store.as_ref(), &victim).is_some();
+            assert!(again, "#{number}: made again");
+            assert_subtree_deleted(&new_root, store.as_ref(), &victim);
+        }
+    }
+
+    /// One of rskj's runs in `bridge/testdata/rskj_refunded_pegins.txt`.
+    #[derive(Default)]
+    struct RskjRun {
+        name: String,
+        /// Each account's address, nonce, balance and code.
+        accounts: Vec<(Address, u64, U256, Vec<u8>)>,
+        /// The storage cells it starts with: address, key, value.
+        stored: Vec<(Address, U256, Vec<u8>)>,
+        preroot: B256,
+        transactions: Vec<(rustock_core::Transaction, Address)>,
+        /// For each transaction: whether it succeeded, the gas it used, its logs.
+        results: Vec<(bool, u64, Vec<revm::primitives::Log>)>,
+        /// For each transaction, where the file says: the precompiles rskj
+        /// counts it as having called (`precompiledContractsCalled`).
+        called: Vec<Vec<Address>>,
+        /// The Bridge's storage after the transactions.
+        cells: std::collections::BTreeMap<U256, Vec<u8>>,
+        /// Those of its cells that hold more than 4,096 bytes, each by the
+        /// hash and the length of what it holds.
+        long_cells: std::collections::BTreeMap<U256, (B256, usize)>,
+        root: B256,
+    }
+
+    /// The runs a file of rskj's holds, whose header says what each line is.
+    fn rskj_runs(vectors: &str) -> Vec<RskjRun> {
+        let bytes = |field: &str| {
+            if field == "-" {
+                Vec::new()
+            } else {
+                hex::decode(field).unwrap()
+            }
+        };
+        let mut runs: Vec<RskjRun> = Vec::new();
+        for line in vectors.lines().filter(|line| !line.starts_with('#')) {
+            let fields: Vec<&str> = line.split(' ').collect();
+            if fields[0] == "scenario" {
+                runs.push(RskjRun {
+                    name: fields[1].into(),
+                    ..RskjRun::default()
+                });
+                continue;
+            }
+            let Some(run) = runs.last_mut() else {
+                continue;
+            };
+            match fields[0] {
+                "account" => run.accounts.push((
+                    Address::from_slice(&bytes(fields[1])),
+                    fields[2].parse().unwrap(),
+                    U256::from_str_radix(fields[3], 16).unwrap(),
+                    bytes(fields[4]),
+                )),
+                "store" => run.stored.push((
+                    Address::from_slice(&bytes(fields[1])),
+                    U256::from_be_slice(&bytes(fields[2])),
+                    bytes(fields[3]),
+                )),
+                "preroot" => run.preroot = B256::from_slice(&bytes(fields[1])),
+                "tx" => {
+                    let tx = rustock_core::Transaction::from_rskj(&bytes(fields[1])).unwrap();
+                    assert_eq!(
+                        alloy_primitives::keccak256(tx.rlp_for_trie()),
+                        B256::from_slice(&bytes(fields[3])),
+                        "{}: the transaction's hash",
+                        run.name
+                    );
+                    run.transactions
+                        .push((tx, Address::from_slice(&bytes(fields[2]))));
+                }
+                "result" => {
+                    assert_eq!(fields[1], "1", "{}: executed", run.name);
+                    run.results
+                        .push((fields[2] == "1", fields[3].parse().unwrap(), Vec::new()));
+                }
+                "log" => {
+                    let topics = fields[2]
+                        .split(',')
+                        .filter(|topic| *topic != "-")
+                        .map(|topic| B256::from_slice(&bytes(topic)))
+                        .collect();
+                    let log = revm::primitives::Log::new_unchecked(
+                        Address::from_slice(&bytes(fields[1])),
+                        topics,
+                        Bytes::from(bytes(fields[3])),
+                    );
+                    run.results.last_mut().unwrap().2.push(log);
+                }
+                "cell" => {
+                    run.cells
+                        .insert(U256::from_be_slice(&bytes(fields[1])), bytes(fields[2]));
+                }
+                "cellhash" => {
+                    run.long_cells.insert(
+                        U256::from_be_slice(&bytes(fields[1])),
+                        (
+                            B256::from_slice(&bytes(fields[2])),
+                            fields[3].parse().unwrap(),
+                        ),
+                    );
+                }
+                "root" => run.root = B256::from_slice(&bytes(fields[1])),
+                "called" => run.called.push(
+                    fields[1]
+                        .split(',')
+                        .filter(|address| *address != "-")
+                        .map(|address| Address::from_slice(&bytes(address)))
+                        .collect(),
+                ),
+                "itx" | "end" | "enc" => {}
+                other => panic!("an unknown line: {other}"),
+            }
+        }
+        runs
+    }
+
+    /// The state one of rskj's runs starts from: its accounts and its cells.
+    fn state_of_rskj_run(run: &RskjRun) -> (Arc<MemoryTrieStore>, TrieNode) {
+        let store = Arc::new(MemoryTrieStore::new());
+        let mut root = TrieNode::empty();
+        for (address, nonce, balance, code) in &run.accounts {
+            root = put_account(&root, store.as_ref(), address, *nonce, *balance);
+            if !code.is_empty() {
+                let key = rustock_trie::code_key(address);
+                root = root.put(&TrieKeySlice::from_key(&key), code, store.as_ref());
+            }
+        }
+        for (address, key, value) in &run.stored {
+            let key = rustock_trie::storage_key(address, &B256::from(*key));
+            root = root.put(&TrieKeySlice::from_key(&key), value, store.as_ref());
+        }
+        (store, root)
+    }
+
+    /// Runs one of rskj's runs here and holds what comes of it to what came of
+    /// it in rskj: each transaction's outcome, logs and gas, whether it reached
+    /// REMASC or the Bridge where the file says what it called, the Bridge's
+    /// storage, and the state root.
+    fn replays_as_rskj_ran_it(run: &RskjRun) {
+        let (store, root) = state_of_rskj_run(run);
+        assert_eq!(
+            root.compute_hash(store.as_ref()),
+            run.preroot,
+            "{}: the state before",
+            run.name
+        );
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::rskj_regtest(), block_store)
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::rskj_regtest());
+        let header = Header {
+            difficulty: U256::from(1),
+            ..dummy_header(10)
+        };
+        let result = executor
+            .execute_block(&header, &run.transactions, &root, store.clone())
+            .expect("block");
+        assert_eq!(result.tx_results.len(), run.results.len(), "{}", run.name);
+        for (index, (outcome, (success, gas_used, logs))) in
+            result.tx_results.iter().zip(&run.results).enumerate()
+        {
+            let what = format!("{}: transaction {index}", run.name);
+            assert_eq!(outcome.success, *success, "{what}");
+            assert_eq!(outcome.logs.len(), logs.len(), "{what}: how many logs");
+            for (at, (log, rskjs)) in outcome.logs.iter().zip(logs).enumerate() {
+                assert_eq!(log, rskjs, "{what}: log {at}");
+            }
+            assert_eq!(outcome.gas_used, *gas_used, "{what}: gas");
+            if let Some(called) = run.called.get(index) {
+                let reached = called.iter().any(|address| {
+                    crate::precompiles::SEQUENTIAL_ONLY_PRECOMPILES.contains(address)
+                });
+                assert_eq!(
+                    outcome.reached_sequential_only, reached,
+                    "{what}: whether it reached REMASC or the Bridge (rskj called {called:?})"
+                );
+            }
+        }
+        // The Bridge's storage: what it started with, and over it what the
+        // transactions wrote, in order.
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let started_with = run
+            .stored
+            .iter()
+            .cloned()
+            .map(|(address, key, value)| (address, key, Some(value)));
+        let wrote = result.markers.raw_storage.iter().cloned();
+        let mut cells = std::collections::BTreeMap::new();
+        for (_, key, value) in started_with
+            .chain(wrote)
+            .filter(|(address, _, _)| *address == bridge)
+        {
+            match value {
+                Some(value) if !value.is_empty() => cells.insert(key, value),
+                _ => cells.remove(&key),
+            };
+        }
+        let keys: std::collections::BTreeSet<&U256> = cells
+            .keys()
+            .chain(run.cells.keys())
+            .chain(run.long_cells.keys())
+            .collect();
+        for key in keys {
+            let what = format!("{}: the Bridge's cell {key:#066x}", run.name);
+            match run.long_cells.get(key) {
+                // A long cell, which the file holds by its hash and its length.
+                Some(rskjs) => {
+                    let ours = cells
+                        .get(key)
+                        .map(|value| (alloy_primitives::keccak256(value), value.len()));
+                    assert_eq!(ours.as_ref(), Some(rskjs), "{what}");
+                }
+                None => assert_eq!(
+                    cells.get(key).map(hex::encode),
+                    run.cells.get(key).map(hex::encode),
+                    "{what}"
+                ),
+            }
+        }
+        let after = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &result.state_changes,
+            &result.markers,
+        );
+        assert_eq!(
+            after.compute_hash(store.as_ref()),
+            run.root,
+            "{}: the state after",
+            run.name
+        );
+    }
+
+    /// The run of that name among a file's.
+    fn run_named<'a>(runs: &'a [RskjRun], name: &str) -> &'a RskjRun {
+        runs.iter()
+            .find(|run| run.name == name)
+            .unwrap_or_else(|| panic!("no run {name}"))
+    }
+
+    /// What rskj's release does with a peg-in it refunds, read from its own
+    /// `TransactionExecutor` (the testdata's header says how). A member of the
+    /// federation hands the Bridge six Bitcoin headers, and then a transaction
+    /// registers a payment to the federation from a multisig, in the second of
+    /// them.
+    ///
+    /// rskj refunds the payment, with a release it builds as it builds every
+    /// other (`ReleaseTransactionBuilder`): for a P2SH-P2WSH federation, as
+    /// regtest's is and mainnet's since its first change after RSKIP305, with
+    /// the witness program in each input's scriptSig, the unsigned witness, and
+    /// the fee taken over the virtual size. The fee is no less than bitcoinj's
+    /// minimum, which the fee per kilobyte of `low-fee` takes it down to
+    /// (`Wallet.adjustOutputDownwardsForFee`). And rskj ends the refund's
+    /// settling as it ends every release's (`settleReleaseRejection`,
+    /// `processReleaseTransactionInfo`): it logs `pegout_transaction_created`
+    /// after `release_requested` (RSKIP428) and stores the values of what the
+    /// refund spends (RSKIP305).
+    ///
+    /// `flyover` registers a flyover payment over the locking cap, through the
+    /// contract that stands for the liquidity bridge. rskj refunds that one
+    /// the same way, spending the output that pays the federation's flyover
+    /// address, which for a P2SH-P2WSH federation is the P2SH of the flyover
+    /// script's witness program. It names that refund by the hash of the
+    /// block's transaction, not of the contract's call (`getOriginHash`).
+    ///
+    /// In `many-outputs` the payment is in 330 outputs. rskj builds its
+    /// refund, which is over bitcoinj's 100,000 bytes once its inputs are
+    /// filled in and under them while bitcoinj checks
+    /// (`release_tx::fill_inputs`).
+    #[test]
+    fn a_refunded_peg_in_is_registered_as_rskj_registers_it() {
+        let runs = rskj_runs(include_str!("bridge/testdata/rskj_refunded_pegins.txt"));
+        for name in ["direct", "low-fee", "flyover", "many-outputs"] {
+            replays_as_rskj_ran_it(run_named(&runs, name));
+        }
+    }
+
+    /// A contract registers the payment, and rskj hands the Bridge the
+    /// internal transaction it makes of the contract's call. The refund is
+    /// named by that transaction's hash, in `release_requested` and with the
+    /// release where it waits for its confirmations
+    /// (`BridgeSupport.registerBtcTransaction`, `rskTx.getHash()`), not by the
+    /// hash of the transaction in the block.
+    ///
+    /// That hash is over where the call stands among the internal
+    /// transactions of the transaction (`crate::internal_tx`). In `relay` the
+    /// contract the transaction calls hands its call data to the Bridge. In
+    /// `nested` it first calls an account without code, creates a contract
+    /// whose constructor calls one too, makes a STATICCALL to the identity
+    /// precompile, calls a contract that destroys itself and one that calls
+    /// and reverts, makes a call it has no balance for, calls the BlockHeader
+    /// contract and REMASC, makes a CALLCODE, and then a DELEGATECALL to the
+    /// code that reaches the Bridge. In `delegate` it delegates at once.
+    ///
+    /// In `constructor` the contract calls one that destroys itself with no
+    /// balance, which makes no internal transaction, and the Bridge with no
+    /// data, which makes one though the Bridge turns the call down. Then it
+    /// creates a contract whose constructor registers the payment, under the
+    /// creation's internal transaction. In `deploy` the transaction itself
+    /// creates the contract whose constructor registers.
+    #[test]
+    fn a_contract_registers_a_refunded_peg_in_as_rskj_registers_it() {
+        let runs = rskj_runs(include_str!("bridge/testdata/rskj_refunded_pegins.txt"));
+        for name in ["relay", "nested", "delegate", "constructor", "deploy"] {
+            replays_as_rskj_ran_it(run_named(&runs, name));
+        }
+    }
+
+    /// Which transactions reach REMASC or the Bridge, as rskj counts them:
+    /// under RSKIP-144 such a transaction may only sit in a block's sequential
+    /// sublist, and a block with one in a parallel sublist is invalid
+    /// (`TransactionListExecutor`). `testdata/rskj_precompiles_called.txt` is
+    /// rskj's own `TransactionExecutor` running each transaction and saying
+    /// which precompiles it counted (`precompiledContractsCalled`).
+    ///
+    /// rskj counts a call to a precompile as the call starts
+    /// (`Program.callToPrecompiledAddress`), before it checks the depth and the
+    /// caller's balance: a call to the Bridge or REMASC that is then refused
+    /// counts (`calls-bridge-unpaid`, `callcodes-bridge-unpaid`,
+    /// `calls-remasc-unpaid`, and `deep-bridge`, at the depth limit). And a
+    /// program hands what it counted to its caller only from a call, whether
+    /// the call succeeded or not (`Program.executeCode`), and the transaction
+    /// keeps it though it then reverts (`calls-bridge-then-reverts`): what a
+    /// constructor run by CREATE or CREATE2 counted is dropped (the
+    /// `creates-*-calling-*` runs and `deploy-creating-child-calling-bridge`),
+    /// though not the constructor of a transaction that creates
+    /// (`deploy-calling-bridge`), nor what its creator calls once it has ended
+    /// (`creates-reverting-then-calls-bridge`, `creates-empty-then-calls-bridge`).
+    ///
+    /// A block's run, which a block is checked and built with, is held to all
+    /// rskj did; the runs of one transaction by itself (a local call, a
+    /// trace, an estimate) only to what it counted.
+    #[test]
+    fn a_transaction_reaches_remasc_or_the_bridge_as_rskj_counts_it() {
+        let runs = rskj_runs(include_str!("testdata/rskj_precompiles_called.txt"));
+        assert_eq!(runs.len(), 26);
+        let failed: Vec<&str> = runs
+            .iter()
+            .filter(|run| {
+                assert_eq!(run.called.len(), run.results.len(), "{}", run.name);
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    replays_as_rskj_ran_it(run)
+                }))
+                .is_err()
+            })
+            .map(|run| run.name.as_str())
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "{} of 26 differ: {failed:?}",
+            failed.len()
+        );
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::rskj_regtest(), block_store)
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::rskj_regtest());
+        let header = Header {
+            difficulty: U256::from(1),
+            ..dummy_header(10)
+        };
+        for run in &runs {
+            let (store, root) = state_of_rskj_run(run);
+            let (tx, sender) = &run.transactions[0];
+            let reached = run.called[0]
+                .iter()
+                .any(|address| crate::precompiles::SEQUENTIAL_ONLY_PRECOMPILES.contains(address));
+            let alone = executor
+                .execute_tx(&header, tx, *sender, &root, store.clone())
+                .unwrap();
+            let (traced, _) = executor
+                .execute_tx_traced(&header, tx, *sender, &root, store.clone(), false, 0)
+                .unwrap();
+            let (estimated, _) = executor
+                .execute_tx_for_estimate(&header, tx, *sender, &root, store.clone(), false)
+                .unwrap();
+            assert_eq!(
+                [
+                    alone.reached_sequential_only,
+                    traced.reached_sequential_only,
+                    estimated.reached_sequential_only
+                ],
+                [reached; 3],
+                "{}: alone, traced and estimated",
+                run.name
+            );
+        }
+    }
+
+    /// The Bridge's unlogged decisions go with the block that made them
+    /// (`ProcessedBlock::unlogged_peg_events`), and only those that stand. In
+    /// `relay` the contract the transaction calls hands the registration to
+    /// the Bridge, which refunds the peg-in: the block carries that, and the
+    /// thread records nothing once the block is done. Where a contract calls
+    /// the relay instead, and the relay's code ends in REVERT, nothing of the
+    /// registration stands and the block carries nothing of it: a frame that
+    /// fails takes back the decisions made under it, as it does its writes.
+    /// Where the relay ends as it does and the contract then calls one that
+    /// reverts, the registration stands, and so does what it decided.
+    #[test]
+    fn a_block_carries_the_peg_decisions_that_stand() {
+        let runs = rskj_runs(include_str!("bridge/testdata/rskj_refunded_pegins.txt"));
+        let run = run_named(&runs, "relay");
+        let relay = Address::repeat_byte(0xa1);
+        let moved = Address::repeat_byte(0xb2);
+        let reverts = Address::repeat_byte(0xc3);
+        // The relay's code, which ends in STOP, and the same ending in REVERT.
+        let relay_code = run
+            .accounts
+            .iter()
+            .find(|account| account.0 == relay)
+            .map(|account| account.3.clone())
+            .unwrap();
+        assert_eq!(relay_code.last(), Some(&0x00));
+        let relay_reverting = [
+            &relay_code[..relay_code.len() - 1],
+            &[0x60, 0x00, 0x60, 0x00, 0xfd],
+        ]
+        .concat();
+        // A CALL of `to` with all the gas, with the call data or none,
+        // popping its flag.
+        let call = |to: &Address, data: bool| {
+            let size: &[u8] = if data { &[0x36] } else { &[0x60, 0x00] };
+            [
+                &[0x60, 0x00, 0x60, 0x00][..],
+                size,
+                &[0x60, 0x00, 0x60, 0x00, 0x73],
+                to.as_slice(),
+                &[0x5a, 0xf1, 0x50],
+            ]
+            .concat()
+        };
+        let copy_call_data = [0x36, 0x60, 0x00, 0x60, 0x00, 0x37];
+        let decisions = |codes: &[(Address, Vec<u8>)]| {
+            let (store, mut root) = state_of_rskj_run(run);
+            for (address, code) in codes {
+                if *address != relay {
+                    root = put_account(&root, store.as_ref(), address, 1, U256::ZERO);
+                }
+                let key = rustock_trie::code_key(address);
+                root = root.put(&TrieKeySlice::from_key(&key), code, store.as_ref());
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let events = Arc::new(
+                rustock_storage::legacy_event_store::LegacyEventStore::open(
+                    dir.path().to_str().unwrap(),
+                )
+                .unwrap(),
+            );
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let processor = crate::processor::BlockProcessor::new(
+                RskHardforkConfig::rskj_regtest(),
+                block_store,
+            )
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::rskj_regtest())
+            .with_legacy_event_store(events);
+            let block = rustock_core::Block {
+                header: Header {
+                    difficulty: U256::from(1),
+                    ..dummy_header(10)
+                },
+                transactions: run.transactions.iter().map(|(tx, _)| tx.clone()).collect(),
+                ommers: vec![],
+            };
+            let processed = processor
+                .execute_block(&block, &root, store.clone())
+                .expect("block");
+            assert!(
+                !crate::silent::is_recording(),
+                "the thread records once the block is done"
+            );
+            processed
+                .unlogged_peg_events
+                .iter()
+                .map(|decision| decision.kind)
+                .collect::<Vec<_>>()
+        };
+        let stands = decisions(&[]);
+        assert!(
+            stands.contains(&crate::silent::SilentKind::PeginRefunded),
+            "{stands:?}"
+        );
+        let under =
+            |then: &[u8]| [&copy_call_data[..], &call(&moved, true), then, &[0x00]].concat();
+        assert_eq!(
+            decisions(&[(moved, relay_reverting), (relay, under(&[]))]),
+            Vec::new(),
+            "the relay reverts"
+        );
+        assert_eq!(
+            decisions(&[
+                (moved, relay_code.clone()),
+                (reverts, vec![0x60, 0x00, 0x60, 0x00, 0xfd]),
+                (relay, under(&call(&reverts, false))),
+            ]),
+            stands,
+            "a call after the relay's reverts"
+        );
     }
 }

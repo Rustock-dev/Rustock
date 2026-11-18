@@ -72,6 +72,7 @@ fn header(number: u64, parent: B256, state_root: B256, difficulty: u64) -> Heade
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     }
 }
 
@@ -100,6 +101,37 @@ fn chain(
         td += difficulty;
         tds.push(U256::from(td));
         blocks.push(block(h));
+    }
+    (blocks, tds)
+}
+
+/// The same, each block with one uncle as heavy as itself, and totals that
+/// count it as rskj's do.
+fn chain_with_uncles(
+    first_number: u64,
+    n: usize,
+    from_parent: B256,
+    base_td: u64,
+    state_root: B256,
+) -> (Vec<Block>, Vec<U256>) {
+    let difficulty = 100u64;
+    let (mut blocks, mut tds) = (Vec::new(), Vec::new());
+    let (mut parent, mut td) = (from_parent, base_td);
+    for i in 0..n {
+        let number = first_number + i as u64;
+        let uncle = header(number - 1, B256::repeat_byte(0x0c), B256::ZERO, difficulty);
+        let mut h = header(number, parent, state_root, difficulty);
+        h.uncle_count = 1;
+        h.ommers_hash =
+            rustock_execution::processor::compute_ommers_hash(std::slice::from_ref(&uncle));
+        parent = h.hash();
+        td += 2 * difficulty;
+        tds.push(U256::from(td));
+        blocks.push(Block {
+            header: h,
+            transactions: Vec::new(),
+            ommers: vec![uncle],
+        });
     }
     (blocks, tds)
 }
@@ -137,6 +169,8 @@ impl Fixture {
         let genesis = header(0, B256::ZERO, B256::ZERO, 100);
         let hash = genesis.hash();
         self.store.put_header_with_hash(hash, &genesis).expect("genesis");
+        // As `setup_genesis` records it: genesis's total difficulty is its own.
+        self.store.put_total_difficulty(hash, genesis.difficulty).expect("td");
         self.store.put_canonical_hash(0, hash).expect("index");
         hash
     }
@@ -167,7 +201,6 @@ fn headers_for(blocks: &[Block], point: u64, count: u32) -> Vec<Header> {
 
 /// Answers every header and skeleton request the session makes, until it
 /// leaves the header phase. Returns the actions it was left with.
-#[allow(dead_code)] // no caller; see the dead-code issue before deleting
 fn answer_header_walk(
     session: &mut SnapSession,
     blocks: &[Block],
@@ -635,10 +668,413 @@ fn a_body_that_does_not_match_its_header_is_refused() {
     );
 }
 
+/// A snapshot's blocks below its checkpoint complete the walk's compressed
+/// headers.
+///
+/// From RSKIP-351 a chain's headers come compressed: a version-1 or version-2
+/// header holds only the commitment to its extension, the block's logs bloom,
+/// execution edges and base event, and the walk stores it so. The blocks
+/// below the checkpoint come whole, and rskj stores each of them whole
+/// (`SnapshotProcessor.processSnapBlocksResponse`, then
+/// `BlockConnectorHelper.startConnecting`'s `saveBlock`). This node kept the
+/// walk's compressed header beside the body: no bloom to answer with, and no
+/// extension to send beside the body it serves.
+#[test]
+fn the_blocks_below_the_checkpoint_complete_the_walks_compressed_headers() {
+    use crate::tests::{an_extension, compressed};
+    use rustock_core::config::ActivationHeights;
+
+    // Stores that read headers as rskj's regtest does: RSKIP-351 from block 1.
+    let regtest_store = |dir: &tempfile::TempDir| {
+        Arc::new(
+            BlockStore::open(dir.path())
+                .expect("open")
+                .with_activations(ActivationHeights::regtest()),
+        )
+    };
+    let mut f = fixture(20);
+    let dir = tempfile::tempdir().expect("tempdir");
+    f.store = regtest_store(&dir);
+    f._dir = dir;
+    let genesis = f.with_genesis();
+
+    // Each block whole, and its header as the walk is sent it.
+    let mut parent = genesis;
+    let (mut whole, mut walked, mut tds) = (Vec::new(), Vec::new(), Vec::new());
+    for number in 1..=3u64 {
+        let extension = an_extension(number as usize);
+        let sent = compressed(header(number, parent, f.state_root, 100), &extension);
+        let full = sent
+            .with_extension(&extension)
+            .expect("the extension it names");
+        assert_eq!(full.hash(), sent.hash(), "both forms hash alike");
+        parent = sent.hash();
+        walked.insert(0, sent);
+        whole.push(block(full));
+        tds.push(U256::from(100 + 100 * number));
+    }
+
+    // The status carries the checkpoint, whole; the walk brings the headers
+    // under it, compressed.
+    let mut session = f.session(HeaderVerifier::new());
+    session.on_status(std::slice::from_ref(&whole[2]), &tds[2..], 5_000, 0);
+    let started = session.on_headers(3, &walked);
+    assert_eq!(
+        session.phase(),
+        Phase::DownloadingState,
+        "{:?}",
+        session.failure()
+    );
+    for b in &whole[..2] {
+        let held = f.store.header(b.header.hash()).unwrap().expect("walked");
+        assert_eq!(
+            held.extension(),
+            None,
+            "the walk holds #{} compressed",
+            b.header.number
+        );
+    }
+
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let peer_store = regtest_store(&peer_dir);
+    for (b, td) in whole.iter().zip(tds.iter()) {
+        let hash = b.header.hash();
+        peer_store
+            .put_header_with_hash(hash, &b.header)
+            .expect("header");
+        peer_store
+            .put_canonical_hash(b.header.number, hash)
+            .expect("index");
+        peer_store.put_total_difficulty(hash, *td).expect("td");
+    }
+    let server = SnapServer::new(
+        peer_store,
+        f.trie.clone() as Arc<dyn TrieStore>,
+        SnapConfig {
+            server_enabled: true,
+            ..SnapConfig::default()
+        },
+    );
+    let mut actions = started;
+    let mut guard = 0;
+    while session.phase() == Phase::DownloadingState {
+        guard += 1;
+        assert!(guard < 1000, "state download stalled");
+        if actions.is_empty() {
+            actions = session.poll();
+            assert!(!actions.is_empty(), "no work and not finished");
+        }
+        if let Action::RequestChunk { from, budget, .. } = actions.remove(0) {
+            let response = server
+                .chunk(&SnapChunkRequest {
+                    id: 1,
+                    block_number: 3,
+                    from,
+                    chunk_size: budget,
+                    state_root: Some(f.state_root),
+                })
+                .expect("server answers");
+            actions.extend(session.on_chunk(from, &response.payload, Refusal::None));
+        }
+    }
+    assert_eq!(
+        session.phase(),
+        Phase::DownloadingBlocks,
+        "{:?}",
+        session.failure()
+    );
+
+    session.on_blocks(&whole[..2], &tds[..2]);
+    assert_eq!(session.phase(), Phase::Done, "{:?}", session.failure());
+    for (b, bit) in whole[..2].iter().zip(1..) {
+        let held = f.store.header(b.header.hash()).unwrap().expect("held");
+        assert_eq!(
+            held.extension(),
+            Some(an_extension(bit)),
+            "#{} is held whole, with the extension its hash commits to",
+            b.header.number
+        );
+    }
+}
+
+/// The blocks a status brings are kept too, bodies and all, once the walk
+/// vouches for their chain, and are never executed either. Each is held to
+/// its header as it arrives, as rskj holds it
+/// (`SnapshotProcessor.validateAndSaveBlocks`, `BlockRootValidationRule`).
+#[test]
+fn a_status_block_whose_body_is_not_its_headers_is_refused() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (mut blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    blocks[1]
+        .transactions
+        .push(rustock_core::Transaction::default());
+
+    let mut session = f.session(HeaderVerifier::new());
+    session.on_status(&blocks, &tds, 5_000, 0);
+    assert_eq!(session.phase(), Phase::Failed);
+    assert_eq!(
+        session.failure(),
+        Some(&SnapFailure::BadBody {
+            number: 2,
+            what: "transactions"
+        })
+    );
+}
+
+/// Three blocks on `genesis`, each with the transactions `body` gives its
+/// number and a header that commits to them, at a minimum gas price of 1,
+/// which is as far as block 1 may raise it from block 0's none.
+fn chain_carrying(
+    genesis: B256,
+    state_root: B256,
+    body: impl Fn(u64) -> Vec<rustock_core::Transaction>,
+) -> (Vec<Block>, Vec<U256>) {
+    let (mut blocks, mut tds) = (Vec::new(), Vec::new());
+    let mut parent = genesis;
+    for number in 1..=3u64 {
+        let transactions = body(number);
+        let mut h = header(number, parent, state_root, 100);
+        h.minimum_gas_price = U256::from(1);
+        h.transactions_root = rustock_core::ordered_tx_trie_root(&transactions, true);
+        parent = h.hash();
+        tds.push(U256::from(100 + 100 * number));
+        blocks.push(Block {
+            header: h,
+            transactions,
+            ommers: Vec::new(),
+        });
+    }
+    (blocks, tds)
+}
+
+/// A transaction signed for `chain_id`, at the gas price given.
+fn signed_for(chain_id: u64, gas_price: u64) -> rustock_core::Transaction {
+    use k256::ecdsa::{RecoveryId, Signature, SigningKey};
+
+    let mut tx = rustock_core::Transaction {
+        gas_price: U256::from(gas_price),
+        gas_limit: U256::from(21_000),
+        to: vec![0xbb; 20].into(),
+        ..Default::default()
+    };
+    let key = SigningKey::from_slice(&[7u8; 32]).expect("a key");
+    let (signature, recovery_id): (Signature, RecoveryId) = key
+        .sign_prehash_recoverable(tx.signing_hash_eip155(chain_id).as_slice())
+        .expect("signs");
+    let bytes = signature.to_bytes();
+    tx.r = U256::from_be_slice(&bytes[..32]);
+    tx.s = U256::from_be_slice(&bytes[32..]);
+    tx.v = chain_id * 2 + 35 + u64::from(recovery_id.to_byte());
+    tx
+}
+
+/// A session that holds a snapshot's blocks to the rules of rskj's regtest.
+fn session_with_rules(f: &Fixture) -> SnapSession {
+    f.session(HeaderVerifier::new())
+        .with_block_rules(Arc::new(rustock_execution::BlockProcessor::new(
+            rustock_execution::hardfork::RskHardforkConfig::regtest(),
+            f.store.clone(),
+        )))
+}
+
+/// rskj holds each block of a snapshot to the rules that read its contents
+/// (`RskContext.getSnapBlockValidationRule` and
+/// `getSnapBlockParentDependantValidationRule`): here REMASC's place, the gas
+/// price floor and a signature the network takes. A session given the node's
+/// rules refuses a status block that breaks one, with its body the one its
+/// header commits to; a chain that keeps them goes on, and so does any chain
+/// in a session given none.
+#[test]
+fn a_status_block_that_breaks_a_rule_of_its_contents_is_refused() {
+    use rustock_core::validation::block_rules::{RemascValidationRule, TxsMinGasPriceRule};
+    use rustock_core::validation::BlockValidator;
+    use rustock_core::Transaction;
+    use rustock_execution::hardfork::{RSK_MAINNET_CHAIN_ID, RSK_REGTEST_CHAIN_ID};
+    use rustock_execution::ProcessError;
+
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    // A chain whose block 2 holds `second`, the others REMASC alone, and
+    // what a session makes of it as a status.
+    let offered = |second: Vec<Transaction>, mut session: SnapSession| {
+        let (blocks, tds) = chain_carrying(genesis, f.state_root, |number| match number {
+            2 => second.clone(),
+            _ => vec![Transaction::remasc(number)],
+        });
+        session.on_status(&blocks, &tds, 5_000, 0);
+        (session.failure().cloned(), blocks)
+    };
+    let refused = |why: ProcessError| {
+        Some(SnapFailure::InvalidBlock {
+            number: 2,
+            reason: why.to_string(),
+        })
+    };
+
+    let (failure, blocks) = offered(Vec::new(), session_with_rules(&f));
+    let no_remasc = RemascValidationRule
+        .validate_block(&blocks[1])
+        .expect_err("no REMASC transaction");
+    assert_eq!(failure, refused(no_remasc.into()));
+    let (failure, _) = offered(Vec::new(), f.session(HeaderVerifier::new()));
+    assert_eq!(failure, None, "a session given no rules");
+
+    let cheap = vec![signed_for(RSK_REGTEST_CHAIN_ID, 0), Transaction::remasc(2)];
+    let (failure, blocks) = offered(cheap, session_with_rules(&f));
+    let below_the_floor = TxsMinGasPriceRule
+        .validate_block(&blocks[1])
+        .expect_err("a price below the block's minimum");
+    assert_eq!(failure, refused(below_the_floor.into()));
+
+    let for_mainnet = signed_for(RSK_MAINNET_CHAIN_ID, 1);
+    let another_chains = for_mainnet
+        .recover_sender(RSK_REGTEST_CHAIN_ID)
+        .expect_err("signed for another chain");
+    let (failure, _) = offered(
+        vec![for_mainnet, Transaction::remasc(2)],
+        session_with_rules(&f),
+    );
+    assert_eq!(
+        failure,
+        refused(ProcessError::SenderRecovery {
+            index: 0,
+            source: another_chains
+        })
+    );
+
+    let kept = vec![signed_for(RSK_REGTEST_CHAIN_ID, 1), Transaction::remasc(2)];
+    let (failure, _) = offered(kept, session_with_rules(&f));
+    assert_eq!(failure, None, "a chain that keeps the rules");
+}
+
+/// A session given the rules, where it takes the blocks below its
+/// checkpoint: the status brought block 3 alone, the walk its headers, and a
+/// peer the state.
+fn session_awaiting_blocks(f: &Fixture, blocks: &[Block], tds: &[U256]) -> SnapSession {
+    let mut session = session_with_rules(f);
+    session.on_status(std::slice::from_ref(&blocks[2]), &tds[2..], 5_000, 0);
+    let mut actions = session.on_headers(3, &headers_for(blocks, 3, 3));
+    assert_eq!(
+        session.phase(),
+        Phase::DownloadingState,
+        "{:?}",
+        session.failure()
+    );
+
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let peer_store = Arc::new(BlockStore::open(peer_dir.path()).expect("open"));
+    for (b, td) in blocks.iter().zip(tds.iter()) {
+        let hash = b.header.hash();
+        peer_store
+            .put_header_with_hash(hash, &b.header)
+            .expect("header");
+        peer_store
+            .put_canonical_hash(b.header.number, hash)
+            .expect("index");
+        peer_store.put_total_difficulty(hash, *td).expect("td");
+    }
+    let server = SnapServer::new(
+        peer_store,
+        f.trie.clone() as Arc<dyn TrieStore>,
+        SnapConfig {
+            server_enabled: true,
+            ..SnapConfig::default()
+        },
+    );
+    let mut guard = 0;
+    while session.phase() == Phase::DownloadingState {
+        guard += 1;
+        assert!(guard < 1000, "state download stalled");
+        if actions.is_empty() {
+            actions = session.poll();
+            assert!(!actions.is_empty(), "no work and not finished");
+        }
+        if let Action::RequestChunk { from, budget, .. } = actions.remove(0) {
+            let response = server
+                .chunk(&SnapChunkRequest {
+                    id: 1,
+                    block_number: 3,
+                    from,
+                    chunk_size: budget,
+                    state_root: Some(f.state_root),
+                })
+                .expect("server answers");
+            actions.extend(session.on_chunk(from, &response.payload, Refusal::None));
+        }
+    }
+    assert_eq!(
+        session.phase(),
+        Phase::DownloadingBlocks,
+        "{:?}",
+        session.failure()
+    );
+    session
+}
+
+/// And each block below the checkpoint, which comes after the state
+/// (`SnapshotProcessor.processSnapBlocksResponse`): block 1, whose body its
+/// header commits to, carries no REMASC transaction, and nothing of it is
+/// kept.
+#[test]
+fn a_block_below_the_checkpoint_that_breaks_a_rule_of_its_contents_is_refused() {
+    use rustock_core::validation::block_rules::RemascValidationRule;
+    use rustock_core::validation::BlockValidator;
+    use rustock_core::Transaction;
+    use rustock_execution::ProcessError;
+
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain_carrying(genesis, f.state_root, |number| match number {
+        1 => Vec::new(),
+        _ => vec![Transaction::remasc(number)],
+    });
+    let mut session = session_awaiting_blocks(&f, &blocks, &tds);
+
+    session.on_blocks(&blocks[..2], &tds[..2]);
+    assert_eq!(session.phase(), Phase::Failed);
+    let no_remasc = RemascValidationRule
+        .validate_block(&blocks[0])
+        .expect_err("no REMASC transaction");
+    assert_eq!(
+        session.failure(),
+        Some(&SnapFailure::InvalidBlock {
+            number: 1,
+            reason: ProcessError::from(no_remasc).to_string(),
+        })
+    );
+    assert!(
+        f.store.body(blocks[0].header.hash()).unwrap().is_none(),
+        "its body was kept"
+    );
+}
+
+/// Block 0 is held to none of them. It carries no REMASC transaction, and a
+/// peer's answer on a short chain reaches down to it: rskj's own client
+/// stops at the first block whose parent it holds
+/// (`SnapshotProcessor.validateAndSaveBlocks`), so it never judges block 0.
+#[test]
+fn block_0_in_an_answer_is_held_to_no_rule_of_a_blocks_contents() {
+    use rustock_core::Transaction;
+
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain_carrying(genesis, f.state_root, |number| {
+        vec![Transaction::remasc(number)]
+    });
+    let mut session = session_awaiting_blocks(&f, &blocks, &tds);
+
+    let block_0 = block(header(0, B256::ZERO, B256::ZERO, 100));
+    assert_eq!(block_0.header.hash(), genesis);
+    let answer = [block_0, blocks[0].clone(), blocks[1].clone()];
+    session.on_blocks(&answer, &[U256::from(100), tds[0], tds[1]]);
+    assert_eq!(session.phase(), Phase::Done, "{:?}", session.failure());
+}
+
 // ------------------------------------------------------- blaming the peer
 
 use alloy_primitives::B512;
-use crate::snap::driver::{Blame, SnapDriver};
+use crate::snap::driver::{Blame, Peers, SnapDriver};
 use rustock_networking::protocol::{P2pMessage, RskSubMessage};
 use rustock_networking::protocol::snap::Refusal;
 use rustock_networking::scoring::EventType;
@@ -829,6 +1265,235 @@ fn an_rskj_chunk_that_does_not_rebuild_is_charged() {
     assert_eq!(blame[0].event, EventType::InvalidMessage);
 }
 
+/// An rskj chunk of the fixture's state, as an rskj server answers `from`.
+fn rskj_chunk(f: &Fixture, from: u64, cell: u64) -> ChunkPayload {
+    use rustock_trie::snapshot_legacy::{encode_blob, legacy_chunk};
+    let root: [u8; 32] = f.state_root.into();
+    let chunk = legacy_chunk(&root, from, from + cell, f.trie.as_ref()).expect("a chunk");
+    ChunkPayload::Legacy(encode_blob(&chunk).into())
+}
+
+/// An honest rskj chunk is kept, moves the download as far as it reached,
+/// and costs its sender nothing.
+#[test]
+fn an_honest_rskj_chunk_is_kept_and_not_charged() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
+
+    let (mut driver, id, from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    driver.take_blame();
+
+    driver.on_chunk(
+        id,
+        server,
+        &rskj_chunk(&f, from, 4_000),
+        Refusal::None,
+        &peers,
+    );
+
+    assert!(
+        driver.take_blame().is_empty(),
+        "an honest rskj peer was charged"
+    );
+    let (covered, total) = driver.state_progress();
+    assert!(covered > 0, "the chunk moved nothing");
+    assert_eq!(
+        total,
+        Some(rustock_trie::snapshot::total_size(
+            &f.trie_root,
+            f.trie.as_ref()
+        )),
+        "the size of the trie comes from the rebuilt root, not the peer's hint"
+    );
+}
+
+/// An rskj chunk that answers another offset is charged: its nodes are
+/// genuine, but it is not an answer to the question, any more than a proved
+/// chunk for the wrong offset is.
+#[test]
+fn an_rskj_chunk_for_another_offset_is_charged() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
+
+    let (mut driver, id, from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    driver.take_blame();
+
+    let total = rustock_trie::snapshot::total_size(&f.trie_root, f.trie.as_ref());
+    let elsewhere = rskj_chunk(&f, from + total / 2, 1_000);
+    driver.on_chunk(id, server, &elsewhere, Refusal::None, &peers);
+
+    let blame = driver.take_blame();
+    assert_eq!(blame.len(), 1, "got {blame:?}");
+    assert_eq!(blame[0].peer, server);
+    assert_eq!(blame[0].event, EventType::InvalidMessage);
+    assert_eq!(
+        driver.state_progress().0,
+        0,
+        "a chunk for another offset moved the download"
+    );
+}
+
+/// An rskj chunk with nothing of its own -- what rskj answers when the node at
+/// the offset outruns its cell -- is not held against the peer, and the node,
+/// which rskj sends whole on the stack it hands back, is kept.
+#[test]
+fn an_rskj_chunk_with_nothing_of_its_own_is_not_charged() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
+
+    let (mut driver, id, from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    driver.take_blame();
+
+    // A one-byte cell: no node fits, so the chunk carries only the path to it.
+    let nothing = rskj_chunk(&f, from, 1);
+    let ChunkPayload::Legacy(blob) = &nothing else {
+        unreachable!()
+    };
+    let chunk = rustock_trie::snapshot_legacy::decode_blob(blob).expect("decodes");
+    assert!(
+        chunk.nodes.is_empty() && !chunk.post_root.is_empty(),
+        "not the chunk this test is about"
+    );
+
+    driver.on_chunk(id, server, &nothing, Refusal::None, &peers);
+    assert!(
+        driver.take_blame().is_empty(),
+        "charged a peer for the offset it was asked"
+    );
+    assert!(
+        !driver.unhelpful().contains(&server),
+        "stopped asking a peer that can serve"
+    );
+    assert!(
+        driver.state_progress().0 > 0,
+        "the node at the offset, sent whole, was not kept"
+    );
+}
+
+/// **Answers that move nothing end the session**, however well they rebuild.
+/// Each was taken as progress and reset the count of answers in a row that
+/// added nothing, so a session whose answers no longer moved it asked again
+/// forever: testnet's stood at 94% for hours. They count now, and the session
+/// gives up, as it does when every answer declines.
+#[test]
+fn answers_that_move_nothing_end_the_session() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let mut session = f.session(HeaderVerifier::new());
+    session.on_status(&blocks, &tds, 5_000, 0);
+    let top = blocks.last().unwrap().header.number;
+    let mut actions = session.on_headers(top, &headers_for(&blocks, top, top as u32));
+    assert_eq!(
+        session.phase(),
+        Phase::DownloadingState,
+        "{:?}",
+        session.failure()
+    );
+
+    // Every request gets the chunk for the trie's first 2,000 bytes: genuine,
+    // and taken, but after the first time it holds nothing not already held.
+    let first = rskj_chunk(&f, 0, 2_000);
+    let mut answers = 0;
+    while session.phase() == Phase::DownloadingState {
+        if actions.is_empty() {
+            actions = session.poll();
+        }
+        let Some(Action::RequestChunk { from, .. }) = actions.pop() else {
+            panic!("nothing asked, and the session still downloading");
+        };
+        answers += 1;
+        assert!(answers < 1_000, "the session never gave up");
+        actions.extend(session.on_chunk(from, &first, Refusal::None));
+    }
+    assert!(
+        matches!(session.failure(), Some(SnapFailure::NoProgress(_))),
+        "{:?}",
+        session.failure()
+    );
+    assert!(answers > 64, "gave up after {answers} answers");
+}
+
+/// The chunk requests among a batch of outbound messages: id, offset, peer.
+fn chunk_requests(out: &[super::driver::Outbound]) -> Vec<(u64, u64, B512)> {
+    out.iter()
+        .filter_map(|o| {
+            let P2pMessage::RskMessage(m) = &o.message else {
+                return None;
+            };
+            let RskSubMessage::SnapChunkRequest(req) = &m.sub_message else {
+                return None;
+            };
+            Some((req.id, req.from, o.peer))
+        })
+        .collect()
+}
+
+/// After an rskj chunk the session asks for the offset just past where it
+/// stopped, which only an rskj server takes; a server that refuses the offset
+/// as off its grid gets the cell next, not the same offset again.
+#[test]
+fn an_offset_refused_as_off_the_grid_is_asked_on_the_grid_next() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
+
+    let (mut driver, id, from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    driver.on_chunk(
+        id,
+        server,
+        &rskj_chunk(&f, from, 2_000),
+        Refusal::None,
+        &peers,
+    );
+    let (cursor, _) = driver.state_progress();
+    assert!(cursor > 0, "the chunk moved nothing");
+    // Let whatever else the setup left outstanding time out, so the budget
+    // has room for the request this is about. Timing out is charged; that is
+    // not what this test is about.
+    driver.expire(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    driver.take_blame();
+    let out = driver.poll(&peers);
+
+    let exact = chunk_requests(&out);
+    let &(id, asked, peer) = exact
+        .iter()
+        .find(|(_, asked, _)| *asked == cursor + 1)
+        .unwrap_or_else(|| panic!("nothing asked just past the cursor {cursor}: {exact:?}"));
+    assert_ne!(
+        asked % 100_000,
+        0,
+        "the exact offset happens to be on the grid; the test proves nothing"
+    );
+
+    let refused = ChunkPayload::Proved {
+        entries: Vec::new(),
+        witness: Vec::new(),
+    };
+    let out = driver.on_chunk(id, peer, &refused, Refusal::OffsetNotOnGrid, &peers);
+    assert!(
+        driver.take_blame().is_empty(),
+        "a refusal about the offset was charged"
+    );
+    let next = chunk_requests(&out);
+    assert!(
+        next.iter()
+            .any(|(_, asked, _)| *asked == cursor / 100_000 * 100_000),
+        "the refused offset was not replaced by its cell: {next:?}"
+    );
+    assert!(
+        next.iter().all(|(_, asked, _)| *asked != cursor + 1),
+        "the refused offset was asked again: {next:?}"
+    );
+}
+
 /// A peer that offers a chain which does not link is charged for the status,/// A peer that offers a chain which does not link is charged for the status,
 /// not merely ignored.
 #[test]
@@ -895,6 +1560,209 @@ fn a_timed_out_request_is_charged() {
     assert_eq!(blame.len(), 1);
     assert_eq!(blame[0].peer, peers[0]);
     assert_eq!(blame[0].event, EventType::TimeoutMessage);
+}
+
+// ------------------------------------------------ who is asked for what
+
+/// The header walk asks ordinary peers. Its header and skeleton requests are
+/// messages every peer serves, and with only the `snap` peers to ask, the walk
+/// stalled for good on mainnet when the one peer that had offered the
+/// checkpoint stopped answering, with fifteen other peers connected.
+#[test]
+fn the_header_walk_asks_peers_without_snap() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let server = B512::repeat_byte(1);
+    let plain = B512::repeat_byte(2);
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+
+    let out = driver.poll(Peers {
+        snap: &[server],
+        uncles: &[],
+        any: &[server, plain],
+    });
+    let (status_id, kind) = asked(&out[0]);
+    assert_eq!(kind, "status");
+    assert_eq!(
+        out[0].peer, server,
+        "a status request goes only to a snap peer"
+    );
+
+    // Only an ordinary peer is left to ask, as when the server stops answering.
+    let only_plain = Peers {
+        snap: &[],
+        uncles: &[],
+        any: &[plain],
+    };
+    let out = driver.on_status(status_id, server, &blocks, &tds, 5_000, 0, only_plain);
+    assert!(
+        !out.is_empty(),
+        "the walk stalled with an ordinary peer to ask"
+    );
+    for request in &out {
+        let (_, kind) = asked(request);
+        assert!(
+            matches!(kind, "headers" | "skeleton"),
+            "asked an ordinary peer for a {kind}"
+        );
+        assert_eq!(request.peer, plain);
+    }
+}
+
+/// A snapshot message never goes to a peer that did not announce `snap`: rskj
+/// closes the connection on a message id it does not know, so asking the wrong
+/// peer would lose it.
+#[test]
+fn snapshot_requests_go_only_to_snap_peers() {
+    let f = fixture(20);
+    let server = B512::repeat_byte(1);
+    let plain = B512::repeat_byte(2);
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+
+    let out = driver.poll(Peers {
+        snap: &[],
+        uncles: &[plain],
+        any: &[plain],
+    });
+    assert!(
+        out.is_empty(),
+        "asked a peer without snap for a snapshot message"
+    );
+    assert!(driver.outstanding_ids().is_empty());
+
+    let out = driver.poll(Peers {
+        snap: &[server],
+        uncles: &[],
+        any: &[server, plain],
+    });
+    let (_, kind) = asked(&out[0]);
+    assert_eq!(kind, "status");
+    assert_eq!(out[0].peer, server);
+}
+
+/// A request that nobody connected can take is handed back, not lost: once a
+/// peer that can take it is there, it is asked.
+#[test]
+fn a_request_nobody_can_take_is_asked_once_somebody_can() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let server = B512::repeat_byte(1);
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+
+    let out = driver.poll(&[server]);
+    let (status_id, _) = asked(&out[0]);
+    let nobody_for_headers = Peers {
+        snap: &[server],
+        uncles: &[],
+        any: &[],
+    };
+    let out = driver.on_status(
+        status_id,
+        server,
+        &blocks,
+        &tds,
+        5_000,
+        0,
+        nobody_for_headers,
+    );
+    assert!(out.is_empty());
+    assert!(
+        driver.outstanding_ids().is_empty(),
+        "a request that was never sent still counts against the budget"
+    );
+
+    let plain = B512::repeat_byte(2);
+    let out = driver.poll(Peers {
+        snap: &[],
+        uncles: &[],
+        any: &[plain],
+    });
+    assert!(!out.is_empty(), "the walk's requests were lost");
+    assert!(out.iter().all(|request| request.peer == plain));
+}
+
+/// An empty answer hands its range back, to be asked of somebody else.
+///
+/// Left marked as asked, it never was again. When the range was the walk's
+/// frontier, as here, nothing could move the walk past it.
+#[test]
+fn an_empty_header_answer_is_asked_again() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 4, genesis, 100, f.state_root);
+    let mut session = f.session(HeaderVerifier::new());
+
+    let first = session.on_status(&blocks, &tds, 8_000, 0);
+    assert_eq!(session.phase(), Phase::VerifyingHeaders);
+    let asked = first
+        .iter()
+        .find(|a| matches!(a, Action::RequestHeaders { .. }))
+        .cloned()
+        .expect("the walk asks for headers");
+    let Action::RequestHeaders { point, .. } = asked else {
+        unreachable!()
+    };
+
+    let again = session.on_headers(point, &[]);
+    assert!(
+        again.contains(&asked),
+        "the range was not asked for again: {again:?}"
+    );
+}
+
+/// A peer that left a request unanswered sits out while somebody else can be
+/// asked. On mainnet about half the peers never answered a header request,
+/// and each one's turn in the rotation cost the walk thirty seconds.
+#[test]
+fn a_peer_that_left_a_request_unanswered_sits_out() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let server = B512::repeat_byte(1);
+    let silent = B512::repeat_byte(2);
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+
+    let out = driver.poll(&[server]);
+    let (status_id, _) = asked(&out[0]);
+    // At first only `silent` can be asked for headers, and it answers nothing.
+    let only_silent = Peers {
+        snap: &[server],
+        uncles: &[],
+        any: &[silent],
+    };
+    let out = driver.on_status(status_id, server, &blocks, &tds, 5_000, 0, only_silent);
+    assert!(!out.is_empty() && out.iter().all(|request| request.peer == silent));
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(31);
+    assert_eq!(driver.expire(later), out.len());
+
+    let out = driver.poll(Peers {
+        snap: &[server],
+        uncles: &[],
+        any: &[server, silent],
+    });
+    assert!(!out.is_empty(), "the walk's requests were not asked again");
+    assert!(
+        out.iter().all(|request| request.peer == server),
+        "a peer that answered nothing was asked again with another peer to ask"
+    );
+}
+
+/// But a peer sitting out is still asked when nobody else can be: a slow peer
+/// beats none, and a sync left with only such peers must still finish.
+#[test]
+fn a_peer_sitting_out_is_asked_when_nobody_else_can_be() {
+    let f = fixture(20);
+    let peers = vec![B512::repeat_byte(1)];
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+    driver.poll(&peers);
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(31);
+    assert_eq!(driver.expire(later), 1);
+
+    let out = driver.poll(&peers);
+    assert_eq!(out.len(), 1, "the request was not asked again");
+    assert_eq!(out[0].peer, peers[0]);
 }
 
 /// Serves a real chunk for `from` out of the fixture's trie.
@@ -1092,7 +1960,9 @@ fn outstanding_snap_requests_never_exceed_the_budget() {
     assert_eq!(kind, "status");
     driver.on_status(status_id, peers[0], &blocks, &tds, 8_000, 0, &peers);
 
-    let budget = 2usize; // `Fixture::session` sets max_in_flight: 2
+    // The walk's budget: two for each peer it can ask, never less than
+    // `max_in_flight` (which `Fixture::session` sets to 2).
+    let budget = 2usize.max(2 * peers.len());
     // Poll *and* feed responses back, so the response handlers are exercised
     // too -- capping only `poll` left those five paths issuing a fresh
     // budget's worth each.
@@ -1109,6 +1979,179 @@ fn outstanding_snap_requests_never_exceed_the_budget() {
             driver.outstanding_ids().len()
         );
     }
+}
+
+/// The header walk's budget is per peer, since every peer serves headers.
+/// Held to the eight a state download is allowed, forty peers sat mostly
+/// idle on mainnet through a walk of hours.
+#[test]
+fn the_header_walk_asks_more_of_more_peers() {
+    let f = fixture(64);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 4_000, genesis, 100, f.state_root);
+    let peers: Vec<B512> = (1..=10).map(B512::repeat_byte).collect();
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+
+    let out = driver.poll(&peers);
+    let (status_id, _) = asked(&out[0]);
+    let mut out = driver.on_status(status_id, peers[0], &blocks, &tds, 8_000, 0, &peers);
+
+    // Answer the skeletons honestly, so the walk knows more points than any
+    // budget allows, and leave the header requests outstanding.
+    for _ in 0..10 {
+        let mut next = Vec::new();
+        for request in &out {
+            let P2pMessage::RskMessage(m) = &request.message else {
+                continue;
+            };
+            let RskSubMessage::SkeletonRequest(r) = &m.sub_message else {
+                continue;
+            };
+            let ids: Vec<rustock_networking::protocol::BlockIdentifier> = blocks
+                .iter()
+                .map(|b| &b.header)
+                .filter(|h| h.number % 192 == 0)
+                .filter(|h| h.number >= r.start_number && h.number <= r.start_number + 3_840)
+                .map(|h| rustock_networking::protocol::BlockIdentifier {
+                    number: h.number,
+                    hash: h.hash(),
+                })
+                .collect();
+            next.extend(driver.on_skeleton(r.id, request.peer, &ids, &peers));
+        }
+        if next.is_empty() {
+            break;
+        }
+        out = next;
+    }
+
+    let outstanding = driver.outstanding_ids().len();
+    assert!(
+        outstanding > 2,
+        "held to a state download's budget: {outstanding} outstanding"
+    );
+    assert!(
+        outstanding <= 2 * peers.len(),
+        "{outstanding} outstanding, more than two per peer"
+    );
+}
+
+/// **A refused claim leaves nothing behind.** Making the checkpoint this
+/// node's own -- its total difficulty, the canonical index under it, the head
+/// -- waits until the work the walk established bounds the claim. Written
+/// first and refused after, the next session's walk found the checkpoint
+/// already canonical, stopped there at once, and took the claim that had just
+/// been refused: on mainnet a second attempt "verified" the chain in four
+/// seconds.
+#[test]
+fn a_refused_claim_leaves_nothing_behind() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    // A chain that links, with totals that agree with each other, all raised
+    // by the same million: more work than the chain carries.
+    let (blocks, tds) = chain(1, 4, genesis, 1_000_000, f.state_root);
+    let checkpoint = blocks.last().unwrap().header.clone();
+
+    let mut session = f.session(HeaderVerifier::new());
+    let actions = session.on_status(&blocks, &tds, 8_000, 0);
+    assert_eq!(session.phase(), Phase::VerifyingHeaders);
+    let Some(Action::RequestHeaders { point, count, .. }) = actions
+        .into_iter()
+        .find(|a| matches!(a, Action::RequestHeaders { .. }))
+    else {
+        panic!("the walk asks for headers");
+    };
+    session.on_headers(point, &headers_for(&blocks, point, count));
+    assert!(
+        matches!(
+            session.failure(),
+            Some(SnapFailure::OverstatedDifficulty { .. })
+        ),
+        "{:?}",
+        session.failure()
+    );
+
+    assert_eq!(
+        f.store.canonical_hash(checkpoint.number).unwrap(),
+        None,
+        "the refused checkpoint was indexed as canonical"
+    );
+    assert_ne!(
+        f.store.head().unwrap(),
+        Some(checkpoint.hash()),
+        "it became the head"
+    );
+    assert_eq!(
+        f.store.total_difficulty(checkpoint.hash()).unwrap(),
+        None,
+        "the refused claim was recorded as this node's own"
+    );
+}
+
+/// **While a session holds the peer set, the ordinary sync takes no chain
+/// data.** A late answer to one of the session's own header requests, after
+/// it timed out, is a stretch of the very chain being walked. Handed to the
+/// ordinary sync, which writes what it is given, one put canonical pointers a
+/// thousand blocks deep into a mainnet walk, and the walk took them for
+/// ground this node already held.
+#[tokio::test]
+async fn the_ordinary_sync_takes_no_headers_during_a_snapshot_session() {
+    use crate::events::SyncEvent;
+    use crate::manager::SyncManager;
+    use crate::SyncService;
+    use rustock_networking::peers::PeerStore;
+
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    f.store
+        .put_total_difficulty(genesis, U256::from(100u64))
+        .expect("td");
+    f.store.set_head(genesis).expect("head");
+    let (blocks, _) = chain(1, 3, genesis, 100, f.state_root);
+
+    let peers = Arc::new(PeerStore::new());
+    let peer = B512::repeat_byte(9);
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    peers
+        .add_peer_with(
+            peer,
+            tx,
+            rustock_networking::handshake::PeerCapabilities {
+                rsk_version: 62,
+                snap: true,
+            },
+        )
+        .await;
+    let manager = Arc::new(SyncManager::new(
+        f.store.clone(),
+        Arc::new(HeaderVerifier::new()),
+        peers.clone(),
+    ));
+    let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peers, event_rx)
+        .with_trie_store_for_test(f.trie.clone() as Arc<dyn TrieStore>);
+    service.start_snap_sync(SnapConfig::default(), Arc::new(HeaderVerifier::new()));
+    service.on_tick().await;
+
+    // Headers that link to this node's genesis, under an id nobody awaits.
+    service
+        .handle_event(SyncEvent::HeadersResponse {
+            peer,
+            id: 0x5eed,
+            headers: blocks.iter().map(|b| b.header.clone()).collect(),
+        })
+        .await;
+
+    assert_eq!(
+        f.store.head().unwrap(),
+        Some(genesis),
+        "the ordinary sync moved the head"
+    );
+    assert_eq!(
+        f.store.canonical_hash(1).unwrap(),
+        None,
+        "the ordinary sync wrote the canonical index"
+    );
 }
 
 /// With a checkpoint configured, a session bounds the peer's claim before it
@@ -1424,6 +2467,46 @@ fn offered_totals_may_grow_by_more_than_the_header_difficulty() {
     );
 }
 
+/// **An honest claim counts the uncles a header walk never sees.** rskj peers
+/// send no uncles with headers, so the walk counts each block's own
+/// difficulty: on mainnet, a little over half the work. Checked against that
+/// and the checkpoint's own uncles, every honest claim was refused -- mainnet's
+/// #9381160 carries 6.24e28, its headers alone 3.54e28 -- and the peer making
+/// it was charged for a lie it had not told.
+#[test]
+fn an_honest_claim_counts_the_uncles_a_header_walk_never_sees() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    // Each block has an uncle as heavy as itself: half the work is in uncles.
+    let (blocks, tds) = chain_with_uncles(1, 4, genesis, 100, f.state_root);
+    let mut session = f.session(HeaderVerifier::new());
+    let actions = session.on_status(&blocks, &tds, 8_000, 0);
+    answer_header_walk(&mut session, &blocks, actions);
+    assert_eq!(session.failure(), None);
+    assert_eq!(session.phase(), Phase::DownloadingState);
+}
+
+/// And what the walk allows for the uncles it did not see is a bound, not a
+/// pass: a claim beyond what they could add is refused.
+#[test]
+fn a_claim_beyond_what_the_unseen_uncles_could_add_is_refused() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    // Totals far past what four uncles could weigh, even each at the floor.
+    let (blocks, tds) = chain_with_uncles(1, 4, genesis, 1_000_000_000_000_000_000, f.state_root);
+    let mut session = f.session(HeaderVerifier::new());
+    let actions = session.on_status(&blocks, &tds, 8_000, 0);
+    answer_header_walk(&mut session, &blocks, actions);
+    assert!(
+        matches!(
+            session.failure(),
+            Some(SnapFailure::OverstatedDifficulty { .. })
+        ),
+        "{:?}",
+        session.failure()
+    );
+}
+
 /// The check still has teeth: a total that grows by the wrong amount is
 /// refused, so a peer cannot inflate its claimed work.
 #[test]
@@ -1514,6 +2597,41 @@ mod ascent_tests {
             "a peer that could serve the ascent does not by itself select it"
         );
     }
+
+    /// A bare header answer during the ascent hands its range back.
+    ///
+    /// The ascent asks for headers with their uncles, and the driver strikes a
+    /// request off as soon as any header answer to it arrives. Bare headers
+    /// are no use to the ascent, and they were dropped with the range still
+    /// marked as asked: nothing timed it out and nothing asked again, so one
+    /// stray answer stopped the ascent at that height.
+    #[test]
+    fn a_bare_header_answer_during_the_ascent_is_asked_again() {
+        let (mut session, f) = session_with(true, true);
+        let offered = block(header(5_000, B256::ZERO, f.state_root, 100));
+        let asks_for_the_top = |actions: &[Action]| {
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::RequestHeaders { point: 5_000, .. }))
+        };
+        let first = session.on_status(
+            std::slice::from_ref(&offered),
+            &[U256::from(1_000u64)],
+            1024,
+            0,
+        );
+        assert_eq!(session.phase(), Phase::AscendingHeaders);
+        assert!(
+            asks_for_the_top(&first),
+            "the chunk under the target: {first:?}"
+        );
+
+        let again = session.on_headers(5_000, &[]);
+        assert!(
+            asks_for_the_top(&again),
+            "asked for again after a bare answer: {again:?}"
+        );
+    }
 }
 
 /// The gate and the ascent coexist: passing the gate must land in the phase the
@@ -1562,4 +2680,142 @@ fn a_passed_gate_hands_over_to_the_ascent_not_the_walk() {
         Phase::AscendingHeaders,
         "and hands over to the ascent, not the walk"
     );
+}
+
+/// A session that keeps the uncles it is sent: a store with a freezer, and a
+/// body window of `bodies` blocks under the checkpoint it is offered.
+fn archiving_session(forward: bool, bodies: u64) -> (SnapSession, Fixture, B256) {
+    let f = fixture(4);
+    let freezer =
+        rustock_storage::freezer::Freezer::open(f._dir.path().join("freezer")).expect("freezer");
+    f.store.set_freezer(Arc::new(freezer));
+    let genesis = f.with_genesis();
+    f.store.set_head(genesis).expect("head");
+    let mut session = SnapSession::new(
+        SnapConfig {
+            client_enabled: true,
+            forward_headers: forward,
+            blocks_required: bodies,
+            ..SnapConfig::default()
+        },
+        f.store.clone(),
+        Arc::new(MemoryTrieStore::new()) as Arc<dyn TrieStore>,
+        Arc::new(HeaderVerifier::new()),
+    );
+    session.set_peer_serves_uncles(forward);
+    (session, f, genesis)
+}
+
+/// The uncles an `rsk/63` peer sends beside the headers of the blocks under
+/// the body window reach the freezer: by either walk, and not only under the
+/// freeze horizon (#270).
+///
+/// Bodies, and the uncles in them, come only for the window under the
+/// checkpoint; the freeze horizon is 20,000 blocks under it. The uncles of
+/// the blocks between came only beside the headers, and both walks dropped
+/// them, so a synced node could neither re-derive its own chain's work there
+/// nor serve the sync it had just done.
+#[test]
+fn the_uncles_below_the_bodies_reach_the_freezer_by_either_walk() {
+    use rustock_networking::protocol::HeaderWithUncles;
+
+    for forward in [true, false] {
+        let (mut session, f, genesis) = archiving_session(forward, 2);
+        // Five blocks from genesis, each naming one uncle. The bodies come
+        // for #3 up.
+        let (blocks, tds) = chain_with_uncles(1, 5, genesis, 100, f.state_root);
+        let checkpoint = blocks.last().expect("a checkpoint");
+        let _ = session.on_status(std::slice::from_ref(checkpoint), &tds[4..], 1024, 0);
+        let entries: Vec<HeaderWithUncles> = blocks
+            .iter()
+            .rev()
+            .map(|b| HeaderWithUncles {
+                header: b.header.clone(),
+                uncles: b.ommers.clone(),
+            })
+            .collect();
+        let _ = session.on_headers_with_uncles(5, &entries);
+
+        let freezer = f.store.freezer().expect("a freezer");
+        for b in &blocks[..2] {
+            let held = freezer
+                .uncles(b.header.number)
+                .expect("read")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "forward={forward}: #{} is under the bodies",
+                        b.header.number
+                    )
+                });
+            assert_eq!(
+                held.iter().map(Header::hash).collect::<Vec<_>>(),
+                b.ommers.iter().map(Header::hash).collect::<Vec<_>>(),
+                "forward={forward}: the uncles #{} named",
+                b.header.number
+            );
+        }
+        assert_eq!(
+            freezer.uncles(3).expect("read"),
+            None,
+            "forward={forward}: #3 gets its body, and its uncles with it"
+        );
+    }
+}
+
+/// An offered header's proof of work is checked against the difficulty it
+/// states, so a peer can name any height for next to nothing. The gate takes
+/// on a window of [`crate::sampler::MAX_SAMPLED_WINDOW`] above the checkpoint
+/// and refuses one wider, rather than ask for skeletons up to it for ever.
+#[test]
+fn a_state_further_above_the_checkpoint_than_a_chain_can_be_is_refused() {
+    use crate::sampler::MAX_SAMPLED_WINDOW;
+    use rustock_core::checkpoint::MAINNET_CHECKPOINT;
+
+    let cp = MAINNET_CHECKPOINT;
+    for (window, refused) in [
+        (MAX_SAMPLED_WINDOW, false),
+        (MAX_SAMPLED_WINDOW + 1, true),
+        (1 << 62, true),
+    ] {
+        let f = fixture(4);
+        let genesis = f.with_genesis();
+        f.store.set_head(genesis).expect("head");
+        let mut session = SnapSession::new(
+            SnapConfig {
+                client_enabled: true,
+                checkpoint: Some(cp),
+                checkpoint_defence: rustock_core::checkpoint::CheckpointDefence {
+                    verify_hash: false,
+                    bound_work: true,
+                },
+                ..SnapConfig::default()
+            },
+            f.store.clone(),
+            Arc::new(MemoryTrieStore::new()) as Arc<dyn TrieStore>,
+            Arc::new(rustock_core::validation::HeaderVerifier::new()),
+        );
+        let offered = block(header(cp.number + window, B256::ZERO, f.state_root, 100));
+        let _ = session.on_status(
+            std::slice::from_ref(&offered),
+            &[cp.cumulative_difficulty],
+            1024,
+            0,
+        );
+        if refused {
+            assert_eq!(
+                session.failure(),
+                Some(&SnapFailure::ImplausibleHeight {
+                    window,
+                    most: MAX_SAMPLED_WINDOW
+                })
+            );
+        } else {
+            assert_eq!(
+                session.phase(),
+                Phase::SamplingClaim,
+                "{:?}",
+                session.failure()
+            );
+        }
+    }
 }

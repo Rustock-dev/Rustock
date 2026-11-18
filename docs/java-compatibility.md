@@ -95,6 +95,14 @@ implementation quirk, it is cross-referenced below.
 | 73 | EIP-2929 dropped EXTCODECOPY's flat base — re-pin to 700 | [`design-divergences.md`](./design-divergences.md) |
 | 76 | Rejected peg-out refund: full wei vs satoshi-truncated (RSKIP427) | [`consensus-port-log.md`](./consensus-port-log.md) |
 | 88 | Empty Bridge `byte[]` return ABI-encodes to 96 bytes | [`consensus-port-log.md`](./consensus-port-log.md) |
+| 93 | A reverted CREATE/CREATE2 leaves its creator's return data empty | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
+| 94 | Before RSKIP284 a Flyover BTC address's version is read as a signed byte | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
+| 95 | An input spent with testnet's hard-coded ERP script cannot be sized: the build throws | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
+| 96 | A self-destruct in a nested constructor keeps its refund | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
+| 97 | A peg-in rskj can't refund logs unrefundable_pegin, and before RSKIP379 one with no sender is marked processed | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
+| 98 | From RSKIP379 a peg-in is registered without the lock whitelist or the locking cap, and a multisig sender's outputs are read by bitcoinj | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
+| 99 | Two chains of equal total difficulty: rskj's selection rule, not the block held first | [`design-divergences.md`](./design-divergences.md) |
+| 100 | A block is the best only once it is executed, and a reorg runs nothing again | [`design-divergences.md`](./design-divergences.md) |
 | — | Discovery NodeTable eviction (liveness, non-consensus) | [`wire-protocol.md`](./wire-protocol.md) |
 
 ## Quirks logged with their feature (cross-reference to `consensus-port-log.md`)

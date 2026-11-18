@@ -8,8 +8,9 @@
 //! that will later re-execute it on the way in.
 
 use alloy_primitives::{Address, B256, Bloom, Bytes, U256};
+use num_bigint::BigUint;
 use rustock_core::config::ChainConfig;
-use rustock_core::validation::{DifficultyRule, ValidationError};
+use rustock_core::validation::{DifficultyRule, PrevMinGasPriceRule, ValidationError};
 use rustock_core::{Block, Header, Transaction, ordered_tx_trie_root};
 use rustock_trie::{AccountState, TrieKeySlice, TrieNode, TrieStore, account_key};
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ use std::sync::Arc;
 
 use crate::hardfork::RskHardforkConfig;
 use crate::mining::fork_detection;
+use crate::mining::min_gas_price::{FixedMinGasPriceProvider, MinGasPriceProvider};
 use crate::processor::{BlockProcessor, ProcessError, compute_ommers_hash};
 
 /// Knobs an operator sets for the blocks this node builds. None of them are
@@ -28,23 +30,37 @@ pub struct MiningConfig {
     pub coinbase_address: Address,
     /// `extra_data`, capped at 32 bytes by the header rules.
     pub extra_data: Bytes,
-    /// Gas limit to steer towards, one step per block. `None` inherits the
-    /// parent's, which is always valid and never drifts.
-    pub gas_limit_target: Option<U256>,
-    /// Minimum gas price to steer towards, one step per block. `None`
-    /// inherits the parent's.
-    pub min_gas_price_target: Option<U256>,
+    /// rskj `targetgaslimit`: the gas limit to steer towards, one step per
+    /// block. A target under the chain's minimum gas limit is the minimum.
+    pub gas_limit_target: u64,
+    /// rskj `forcegaslimit`: steer towards the target whatever the parent
+    /// used. Off, a block's gas limit follows the gas its parent used, up to
+    /// the target (`GasLimitCalculator`).
+    pub force_gas_limit: bool,
+    /// Where the minimum gas price a block steers toward comes from, rskj's
+    /// `MinGasPriceProvider`: `miner.minGasPrice`, or `miner.stableGasPrice`
+    /// over it.
+    pub min_gas_price: Arc<dyn MinGasPriceProvider>,
     /// How many templates to keep for submissions that arrive late.
     pub work_cache_size: usize,
 }
+
+/// rskj's `targetgaslimit` where its configuration sets none
+/// (`RskSystemProperties.getTargetGasLimit`).
+pub const GAS_LIMIT_TARGET: u64 = 6_800_000;
+
+/// rskj's `targetgaslimit` on its regtest, which `regtest.conf` sets.
+pub const REGTEST_GAS_LIMIT_TARGET: u64 = 7_500_000;
 
 impl Default for MiningConfig {
     fn default() -> Self {
         Self {
             coinbase_address: Address::ZERO,
             extra_data: Bytes::new(),
-            gas_limit_target: None,
-            min_gas_price_target: None,
+            gas_limit_target: GAS_LIMIT_TARGET,
+            force_gas_limit: true,
+            // rskj's `miner.minGasPrice`, 0 in its `reference.conf`.
+            min_gas_price: Arc::new(FixedMinGasPriceProvider::new(0)),
             // rskj MinerServerImpl.CACHE_SIZE.
             work_cache_size: 20,
         }
@@ -68,7 +84,7 @@ pub struct BlockTemplate {
     /// the header's merged-mining hash, then RSKIP110 fork-detection data.
     /// This, not the block hash, is what a submission is looked up by.
     pub hash_for_merged_mining: B256,
-    /// `U256::MAX / difficulty`: the Bitcoin block hash, read little-endian,
+    /// [`difficulty_to_target`]: the Bitcoin block hash, read little-endian,
     /// must not exceed this.
     pub target: U256,
     /// Fees this block would pay its miner, for a pool deciding whether the
@@ -103,6 +119,10 @@ pub enum TemplateError {
     /// alternative is a chain of blocks nobody else accepts.
     #[error("the assembled block fails a block rule: {0}")]
     SelfCheck(ValidationError),
+    /// rskj's `BlockToMineBuilder` throws here too: no block on this parent
+    /// can carry fork-detection data the validator takes.
+    #[error("no block on this parent can be valid: {0}")]
+    ForkDetection(ValidationError),
 }
 
 /// A transaction waiting to be mined, with its sender already recovered.
@@ -171,6 +191,14 @@ impl BlockTemplateBuilder {
         &self.processor
     }
 
+    /// This builder with `processor` in place of its own, for a test whose
+    /// chain the processor's configuration has to match.
+    #[cfg(test)]
+    pub(crate) fn with_processor_for_test(mut self, processor: Arc<BlockProcessor>) -> Self {
+        self.processor = processor;
+        self
+    }
+
     pub fn trie_store(&self) -> Arc<dyn TrieStore> {
         self.trie_store.clone()
     }
@@ -190,19 +218,43 @@ impl BlockTemplateBuilder {
         pending: &dyn PendingTransactionSource,
     ) -> Result<BlockTemplate, TemplateError> {
         let parent = &mainchain[0];
+        // First, as rskj's `BlockToMineBuilder` works it out before executing
+        // anything: on a chain whose uncle counts sum below zero, no block is
+        // valid, and there is no template to build.
+        let fork_data =
+            fork_detection::calculate(mainchain).map_err(TemplateError::ForkDetection)?;
         let parent_state_root = parent.state_root;
         let state_root = self.load_state_root(parent_state_root)?;
 
         let number = parent.number + 1;
+        let ommers = self.admissible_uncles(parent, number, ommers);
         let timestamp = timestamp_for_child(parent.timestamp);
         let difficulty = DifficultyRule { config: self.chain_config.clone() }
             .difficulty_for_child(parent, number, timestamp, ommers.len() as u64);
-        let gas_limit = next_gas_limit(parent, self.mining_config.gas_limit_target);
-        let minimum_gas_price =
-            next_minimum_gas_price(parent.minimum_gas_price, self.mining_config.min_gas_price_target);
+        // rskj `BlockToMineBuilder`, through `GasLimitCalculator`, with the
+        // chain's minimum gas limit and the miner's `GasLimitConfig`.
+        let gas_limit = next_gas_limit(
+            parent,
+            self.chain_config.min_gas_limit,
+            self.mining_config.gas_limit_target,
+            self.mining_config.force_gas_limit,
+            self.chain_config.gas_limit_bound_divisor,
+        );
+        // rskj `MinimumGasPriceCalculator.calculate`: a step from the parent's
+        // toward the provider's price, taken as it stands now.
+        let minimum_gas_price = next_minimum_gas_price(
+            &parent.minimum_gas_price_value(),
+            self.mining_config.min_gas_price.min_gas_price_as_coin(),
+        );
 
-        let (candidates, to_remove) =
-            self.select_transactions(pending, &state_root, minimum_gas_price, number);
+        // Past 256 bits the filter holds transactions to U256::MAX, which no
+        // transaction's price reaches, as none reaches the value.
+        let (candidates, to_remove) = self.select_transactions(
+            pending,
+            &state_root,
+            u256_or_max(&minimum_gas_price),
+            number,
+        );
         // rskj `BlockToMineBuilder.build`: `removePendingTransactions(txsToRemove)`
         // right after the filter, before anything executes.
         if !to_remove.is_empty() {
@@ -225,15 +277,13 @@ impl BlockTemplateBuilder {
         transactions.push(remasc_transaction(number));
 
         let rskip126 = self.hardfork_cfg.has_unitrie_state_root(number);
-        // rskj sets ummRoot to the empty byte array from papyrus200 on (the
-        // UMM contracts were never deployed, so it is never non-empty). Its
-        // mere presence changes both the block hash and the merged-mining
-        // hash, so a header built without it is rejected by every peer.
-        let umm_root = if number >= self.chain_config.activation_heights.papyrus200 {
-            Some(Bytes::new())
-        } else {
-            None
-        };
+        // rskj `BlockHeaderBuilder` sets ummRoot to the empty byte array from
+        // RSKIPUMM on (the UMM contracts were never deployed, so it is never
+        // non-empty). Its mere presence changes both the block hash and the
+        // merged-mining hash, so a header built without it is rejected by
+        // every peer.
+        let heights = &self.chain_config.activation_heights;
+        let umm_root = heights.umm_active(number).then(Bytes::new);
 
         #[allow(unused_mut)]
         let mut header = Header {
@@ -250,12 +300,14 @@ impl BlockTemplateBuilder {
             version_fields: None,
             difficulty,
             number,
-            gas_limit,
+            // Written below, as rskj's miner writes it.
+            gas_limit: U256::ZERO,
             gas_used: 0,
             timestamp,
             extra_data: self.mining_config.extra_data.clone(),
             paid_fees: U256::ZERO,
-            minimum_gas_price,
+            // Written below, as rskj's miner writes it.
+            minimum_gas_price: U256::ZERO,
             uncle_count: ommers.len() as u64,
             umm_root,
             bitcoin_merged_mining_header: None,
@@ -263,7 +315,10 @@ impl BlockTemplateBuilder {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         };
+        header.set_gas_limit(&gas_limit);
+        header.set_minimum_gas_price(&minimum_gas_price);
 
         // The probe: execute the candidates once, in selection order, to
         // learn two things only execution can tell.
@@ -291,7 +346,7 @@ impl BlockTemplateBuilder {
         // to partition, and the final execution below is the one that counts.
         let partitioned = if has_candidates {
             let (kept, partitioned, invalid) =
-                self.probe_and_partition(number, gas_limit, transactions, &header, &state_root)?;
+                self.probe_and_partition(number, transactions, &header, &state_root)?;
             transactions = kept;
             header.transactions_root = ordered_tx_trie_root(&transactions, rskip126);
             // rskj `BlockToMineBuilder.build`: "Evicting {} invalid
@@ -312,14 +367,24 @@ impl BlockTemplateBuilder {
         } else {
             None
         };
-        if let Some(partitioned) = partitioned {
-            transactions = partitioned.transactions;
-            header.transactions_root = ordered_tx_trie_root(&transactions, rskip126);
+        let edges = match partitioned {
+            Some(partitioned) => {
+                transactions = partitioned.transactions;
+                header.transactions_root = ordered_tx_trie_root(&transactions, rskip126);
+                Some(partitioned.edges)
+            }
+            // rskj `BlockHeaderBuilder`: an empty field where RSKIP351 and
+            // RSKIP144 make the edges one, for a block that runs as one list.
+            None => heights.edges_active(number).then(Vec::new),
+        };
+        // rskj `ActivationConfig.getHeaderVersion`: 2 with RSKIP535, 1 with
+        // RSKIP351 alone, and none before RSKIP351, where no block runs as its
+        // sublists either.
+        let version = heights.header_version(number);
+        if version > 0 {
             header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
-                // RSKIP-351 travels with RSKIP-144; the extension is what
-                // carries the edges.
-                version: 1,
-                edges: Some(partitioned.edges),
+                version,
+                edges,
                 base_event: None,
             });
         }
@@ -333,8 +398,21 @@ impl BlockTemplateBuilder {
         header.logs_bloom = executed.logs_bloom;
         header.gas_used = executed.gas_used;
         header.paid_fees = executed.paid_fees;
+        // rskj `BlockExecutor.fill`: a version-2 header carries the base event
+        // the Union Bridge holds once the block has run, which a transaction
+        // in this very block may have set, and an empty one while it holds
+        // none.
+        if let Some(fields) = header
+            .version_fields
+            .as_mut()
+            .filter(|fields| fields.version >= 2)
+        {
+            fields.base_event = Some(stored_base_event(
+                &executed.new_state_root,
+                self.trie_store.as_ref(),
+            ));
+        }
 
-        let fork_data = fork_detection::calculate(mainchain);
         let hash_for_merged_mining =
             fork_detection::apply_to_hash(header.hash_for_merged_mining(), &fork_data);
 
@@ -360,8 +438,47 @@ impl BlockTemplateBuilder {
         })
     }
 
-    /// Execute the candidates once, keep the ones that fit, and under
-    /// RSKIP-144 place the kept ones in sublists, as rskj's miner does.
+    /// `uncles`, if a block at `number` on `parent` may name them, and none
+    /// otherwise: rskj's `BlockToMineBuilder.createBlock` builds a block
+    /// whose uncles fail the uncle rule again without them, rather than hand
+    /// out work on a block every node refuses. The rule is the one a block is
+    /// held to on import ([`BlockProcessor::validate_uncles`]), which the
+    /// mined block meets again before it is stored
+    /// (`MinerServer::complete_and_import`), so no work is offered on a block
+    /// this node would refuse.
+    fn admissible_uncles(&self, parent: &Header, number: u64, uncles: Vec<Header>) -> Vec<Header> {
+        if uncles.is_empty() {
+            return uncles;
+        }
+        // The rule reads the block's number, its parent's hash and its
+        // uncles, and nothing else of its header.
+        let block = Block {
+            header: Header {
+                number,
+                parent_hash: parent.hash(),
+                cached_hash: None,
+                cached_hash_for_merged_mining: None,
+                ..parent.clone()
+            },
+            transactions: Vec::new(),
+            ommers: uncles,
+        };
+        match self.processor.validate_uncles(&block) {
+            Ok(()) => block.ommers,
+            Err(e) => {
+                tracing::warn!(
+                    target: "rustock::mining",
+                    "Building the block at #{number} without its {} uncle(s), which the uncle rule refuses: {e}",
+                    block.ommers.len()
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Execute the candidates once, keep the ones that fit, and where the
+    /// block runs as its sublists place the kept ones in them, as rskj's
+    /// miner does.
     ///
     /// `transactions` is the selection in price order, REMASC last. The
     /// first element of the result is what survived: every candidate the
@@ -369,11 +486,11 @@ impl BlockTemplateBuilder {
     /// being refused by the EVM (see
     /// [`crate::RskExecutor::execute_block_for_mining`]), is gone, in the
     /// order the rest already had. The second is the partition, `None` when
-    /// the block declares none: RSKIP-144 inactive, or the partition came
-    /// out all-sequential, which rskj spells as an empty edges array and we
-    /// spell as no extension at all. The third is the indices, into
-    /// `transactions`, of the candidates the EVM refused: the pool should
-    /// hear about those.
+    /// the block declares none: it does not run as its sublists, or the
+    /// partition came out all-sequential, which rskj spells as an empty
+    /// edges array and we spell as no extension at all. The third is the
+    /// indices, into `transactions`, of the candidates the EVM refused: the
+    /// pool should hear about those.
     ///
     /// The placement is an approximation on purpose: a transaction is placed
     /// from an execution against the accumulating sequential state, while
@@ -383,12 +500,11 @@ impl BlockTemplateBuilder {
     fn probe_and_partition(
         &self,
         number: u64,
-        gas_limit: U256,
         transactions: Vec<Transaction>,
         header: &Header,
         state_root: &TrieNode,
     ) -> Result<(Vec<Transaction>, Option<Partitioned>, Vec<usize>), TemplateError> {
-        let rskip144 = self.hardfork_cfg.has_rskip144(number);
+        let sublists = self.hardfork_cfg.runs_sublists(number);
         let chain_id = self.hardfork_cfg.chain_id;
         let with_senders: Vec<(Transaction, Address)> = transactions
             .iter()
@@ -398,7 +514,7 @@ impl BlockTemplateBuilder {
             })
             .collect();
 
-        if rskip144 {
+        if sublists {
             crate::collision::start_per_transaction(crate::collision::write_semantics(number));
         }
         let executed = self.processor.executor().execute_block_for_mining(
@@ -409,7 +525,11 @@ impl BlockTemplateBuilder {
         );
         // Taken whether or not execution succeeded, so a failure cannot leave
         // this probe's keys behind for the next template.
-        let touched = if rskip144 { crate::collision::finish() } else { None };
+        let touched = if sublists {
+            crate::collision::finish()
+        } else {
+            None
+        };
         let (executed, dropped) = executed?;
         if !dropped.is_empty() {
             tracing::debug!(
@@ -433,14 +553,22 @@ impl BlockTemplateBuilder {
         debug_assert_eq!(kept.len(), executed.tx_results.len(), "one result per executed transaction");
         let kept_transactions: Vec<Transaction> = kept.iter().map(|(_, tx, _)| tx.clone()).collect();
 
-        if !rskip144 {
+        if !sublists {
             return Ok((kept_transactions, None, invalid));
         }
         let touched = touched.unwrap_or_default();
 
+        // The probe has just read the block's gas limit as rskj reads it,
+        // and one it could not read failed the probe.
+        let block_gas = header.gas_limit_as_gas().ok_or_else(|| {
+            crate::executor::ExecutionError::Evm(format!(
+                "the block's gas limit 0x{} is not gas",
+                alloy_primitives::hex::encode(header.gas_limit_bytes())
+            ))
+        })?;
         let mut partitioner = crate::mining::partition::SublistPartitioner::new(
             rustock_core::validation::block_rules::TX_EXECUTION_THREADS,
-            gas_limit.saturating_to::<u64>(),
+            block_gas,
             self.chain_config.min_sequential_set_gas_limit,
         );
 
@@ -453,16 +581,20 @@ impl BlockTemplateBuilder {
             // REMASC closes the sequential sublist and is not placed by the
             // ordinary rule -- it is the block's last transaction by
             // definition.
-            if index + 1 == kept.len() && is_remasc(tx) {
+            if tx.is_remasc(index, kept.len()) {
                 partitioner.add_remasc(index, result.gas_used);
                 placed.push(index);
                 continue;
             }
 
+            // rskj places by the gas limit as gas (`GasCost.toGas`). Every
+            // transaction the probe kept reads as gas: one that does not was
+            // dropped as invalid.
+            let Some(gas_limit) = tx.gas() else { continue };
             let keys = touched.keys(*probe_index);
             let footprint = crate::mining::partition::TxFootprint {
                 sender: *sender,
-                gas_limit: tx.gas_limit.saturating_to::<u64>(),
+                gas_limit,
                 gas_used: result.gas_used,
                 reads: keys.map(|k| k.read().iter().cloned().collect()).unwrap_or_default(),
                 writes: keys.map(|k| k.written().iter().cloned().collect()).unwrap_or_default(),
@@ -660,6 +792,19 @@ fn account_nonce(state_root: &TrieNode, store: &dyn TrieStore, addr: &Address) -
     }
 }
 
+/// The base event the Union Bridge holds in `state` (RSKIP529), empty while
+/// it holds none: rskj `UnionBridgeStorageProviderImpl.getBaseEvent`, which
+/// takes the cell's bytes as they are.
+fn stored_base_event(state: &TrieNode, store: &dyn TrieStore) -> Bytes {
+    use crate::bridge::union::{union_key, BASE_EVENT_KEY};
+    let slot = B256::from(union_key(BASE_EVENT_KEY));
+    let key = rustock_trie::storage_key(&crate::precompiles::BRIDGE_ADDR, &slot);
+    state
+        .get(&TrieKeySlice::from_key(&key), store)
+        .map(Bytes::from)
+        .unwrap_or_default()
+}
+
 /// The REMASC transaction for a block, byte-for-byte as rskj encodes it.
 ///
 /// `cached_rlp` is not an optimisation here. rskj writes the zero gas price
@@ -668,13 +813,6 @@ fn account_nonce(state_root: &TrieNode, store: &dyn TrieStore, addr: &Address) -
 /// transaction would give it a different hash and put a different
 /// transactions root in the header. rskj `RemascTransaction(long blockNumber)`
 /// with `Transaction.encode`.
-/// Whether `tx` is the REMASC system transaction, by shape.
-pub fn is_remasc(tx: &Transaction) -> bool {
-    tx.to.as_ref() == crate::precompiles::REMASC_ADDR.as_slice()
-        && tx.r.is_zero()
-        && tx.s.is_zero()
-}
-
 pub fn remasc_transaction(block_number: u64) -> Transaction {
     let nonce = block_number.saturating_sub(1);
     let to = Bytes::copy_from_slice(crate::precompiles::REMASC_ADDR.as_slice());
@@ -740,48 +878,73 @@ fn timestamp_for_child(parent_timestamp: u64) -> u64 {
     now.max(parent_timestamp + 1)
 }
 
-/// One step towards `target`, bounded by what the parent allows.
+/// rskj `GasLimitCalculator.calculateBlockGasLimit`: the gas limit of a block
+/// on `parent`, which this reads whole, as the parent rule does, and of any
+/// size. A step is a `divisor`th of the parent's gas limit, the most the
+/// parent rule lets a block move it.
 ///
-/// The consensus rule is only that a child's gas limit stays within
-/// `parent / 1024` of the parent's, so inheriting it unchanged -- which is
-/// what `None` does -- is always valid. rskj `GasLimitCalculator`.
-fn next_gas_limit(parent: &Header, target: Option<U256>) -> U256 {
-    let parent_limit = parent.gas_limit;
-    let Some(target) = target else {
-        return parent_limit;
-    };
-    let delta = parent_limit / U256::from(1024);
-    if target > parent_limit {
-        target.min(parent_limit + delta)
-    } else {
-        target.max(parent_limit.saturating_sub(delta))
+/// Forced, the gas limit steps towards `target` whatever the parent used. Not
+/// forced, it falls a step and rises by the parent's gas used times 3/2 over
+/// the divisor: up when the parent used more than two thirds of its gas
+/// limit, down otherwise; never under the minimum or over the target, and
+/// kept at the parent's where that would take it more than a step away.
+pub(super) fn next_gas_limit(
+    parent: &Header,
+    min_gas_limit: u64,
+    target: u64,
+    force_target: bool,
+    divisor: u64,
+) -> BigUint {
+    let parent_limit = parent.gas_limit_value();
+    let delta_max = &parent_limit / divisor;
+    let min_gas_limit = BigUint::from(min_gas_limit);
+    // rskj takes a target under the minimum as the minimum.
+    let target = BigUint::from(target).max(min_gas_limit.clone());
+    let lowest = &parent_limit - &delta_max;
+    let highest = &parent_limit + &delta_max;
+    if force_target {
+        return if target < parent_limit {
+            target.max(lowest)
+        } else {
+            target.min(highest)
+        };
     }
+    let contribution = BigUint::from(parent.gas_used) * 3u8 / 2u8 / divisor;
+    let mut next = &lowest + contribution;
+    if next < min_gas_limit {
+        next = min_gas_limit;
+    }
+    if next > target {
+        next = target;
+    }
+    if next < lowest || next > highest {
+        next = parent_limit;
+    }
+    next
 }
 
 /// One step towards `target`, bounded by what the parent allows.
 ///
 /// rskj `MinimumGasPriceCalculator` (RSKIP-09) with `BlockGasPriceRange`: a
 /// child may move the minimum gas price by at most 1% of the parent's, or by
-/// one wei when 1% rounds to nothing. The parent's own value is always in
-/// range, so `None` -- inherit -- is always valid.
-pub fn next_minimum_gas_price(parent_price: U256, target: Option<U256>) -> U256 {
-    let Some(target) = target else {
-        return parent_price;
-    };
-    let mut delta = parent_price / U256::from(100);
-    if delta.is_zero() {
-        delta = U256::from(1);
-    }
-    let upper = parent_price + delta;
-    let lower = parent_price.saturating_sub(delta);
-    target.clamp(lower, upper)
+/// one wei when 1% rounds to nothing; a target inside that band is taken,
+/// and one outside it the nearer edge. rskj's miner takes the parent's price
+/// whole, a `Coin`, as the rule reads it: of any size.
+pub fn next_minimum_gas_price(parent_price: &BigUint, target: U256) -> BigUint {
+    let (lower, upper) = PrevMinGasPriceRule::range(parent_price);
+    BigUint::from_bytes_be(&target.to_be_bytes::<32>()).clamp(lower, upper)
 }
 
-/// rskj `DifficultyUtils.difficultyToTarget`.
-pub fn difficulty_to_target(difficulty: U256) -> U256 {
-    if difficulty.is_zero() {
+/// `value`, or `U256::MAX` past 256 bits, as a header's typed field holds it.
+pub(super) fn u256_or_max(value: &BigUint) -> U256 {
+    let bytes = value.to_bytes_be();
+    if bytes.len() > 32 {
         U256::MAX
     } else {
-        U256::MAX / difficulty
+        U256::from_be_slice(&bytes)
     }
 }
+
+/// rskj `DifficultyUtils.difficultyToTarget`, the validator's own, so that the
+/// target handed out is the one a submission is judged by.
+pub use rustock_core::validation::merged_mining::difficulty_to_target;

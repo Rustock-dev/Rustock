@@ -38,6 +38,7 @@ fn header(number: u64, parent: B256, difficulty: u64) -> Header {
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     }
 }
 
@@ -157,7 +158,7 @@ impl HeaderValidator for RejectMarked {
 #[test]
 fn an_uncle_without_proof_of_work_is_refused() {
     let anchor = header(0, B256::ZERO, 100);
-    let (mut s, _d) = sync(&anchor, 2, HeaderVerifier::new().with_static_rule(RejectMarked));
+    let (mut s, _d) = sync(&anchor, 2, HeaderVerifier::new().with_uncle_rule(RejectMarked));
 
     let entries = run_of(1, 2, anchor.hash(), 100, |n| {
         if n == 1 { vec![header(0, B256::repeat_byte(5), 666)] } else { Vec::new() }
@@ -292,18 +293,45 @@ fn a_target_off_the_grid_is_still_asked_for() {
     }
 }
 
-/// A target *on* the grid needs no bespoke chunk: the skeleton names it.
+/// A target *on* the grid is asked for by its own hash too: a skeleton names it
+/// only if the peer answering reaches that far.
 #[test]
-fn a_target_on_the_grid_gets_no_bespoke_chunk() {
+fn a_target_on_the_grid_is_asked_for_by_its_own_hash_too() {
     let anchor = header(0, B256::ZERO, 100);
     let target = HEADER_CHUNK * 3;
     let (mut s, _d) = sync(&anchor, target, HeaderVerifier::new());
 
-    let asked_by_hash = s
+    let by_hash: Vec<Want> = s
         .wants(8)
         .into_iter()
-        .any(|w| matches!(w, Want::Headers { from, .. } if from == B256::repeat_byte(0xff)));
-    assert!(!asked_by_hash, "nothing above the grid, so nothing to ask for by hash");
+        .filter(|w| matches!(w, Want::Headers { from, .. } if *from == B256::repeat_byte(0xff)))
+        .collect();
+    assert_eq!(
+        by_hash,
+        vec![Want::Headers {
+            from: B256::repeat_byte(0xff),
+            count: HEADER_CHUNK as u32,
+            point: target,
+        }],
+        "the whole chunk under the target, from the target's own hash"
+    );
+
+    // Once answered it waits for the prefix, and is not asked for again.
+    let top = run_of(
+        HEADER_CHUNK * 2 + 1,
+        HEADER_CHUNK as usize,
+        B256::repeat_byte(0xaa),
+        100,
+        |_| Vec::new(),
+    );
+    s.on_headers_with_uncles(target, &top)
+        .expect("internally valid");
+    assert!(
+        !s.wants(8)
+            .iter()
+            .any(|w| matches!(w, Want::Headers { point, .. } if *point == target)),
+        "an answered chunk is not asked for again while it waits"
+    );
 }
 
 /// A request nobody answers is asked again after it is released.
@@ -317,8 +345,12 @@ fn a_released_request_is_asked_again() {
     let (mut s, _d) = sync(&anchor, HEADER_CHUNK * 4, HeaderVerifier::new());
     s.on_skeleton(&[BlockIdentifier { number: HEADER_CHUNK, hash: B256::repeat_byte(1) }]);
 
+    // The point the skeleton named. The chunk under the target is asked for
+    // too, from the target's own hash, and is not what this is about.
     let headers_in = |ws: Vec<Want>| -> Vec<Want> {
-        ws.into_iter().filter(|w| matches!(w, Want::Headers { .. })).collect()
+        ws.into_iter()
+            .filter(|w| matches!(w, Want::Headers { point, .. } if *point == HEADER_CHUNK))
+            .collect()
     };
 
     let first = headers_in(s.wants(8));
@@ -434,6 +466,65 @@ fn a_consumed_run_is_committed_so_the_next_start_resumes() {
     );
 }
 
+/// Every block of a committed run gets its own total difficulty: its parent's
+/// plus its own difficulty and its uncles', as rskj's
+/// `BlockChainImpl.internalTryToConnect` gives every block it connects. The
+/// BlockHeader contract's `getCumulativeWork` reads it for any of the last
+/// 4,000 blocks and stops the node at a block without one, and the commit used
+/// to write the newest block's alone.
+#[test]
+fn every_committed_block_gets_its_own_total() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(BlockStore::open(dir.path()).expect("open"));
+    let anchor = header(0, B256::ZERO, 100);
+
+    let mut s = ForwardSync::new(
+        0,
+        anchor.hash(),
+        U256::from(1_000),
+        8,
+        B256::repeat_byte(0xff),
+        true,
+        store.clone(),
+        Arc::new(HeaderVerifier::new()),
+    );
+
+    // An uncle worth 50 on #2 and one worth 30 on #6. The upper run arrives
+    // first and waits, so both are consumed in one pass, each from where the
+    // one below it ended.
+    let lower = run_of(1, 4, anchor.hash(), 100, |n| {
+        if n == 2 {
+            vec![header(1, B256::repeat_byte(9), 50)]
+        } else {
+            Vec::new()
+        }
+    });
+    let upper = run_of(5, 4, lower[0].header.hash(), 100, |n| {
+        if n == 6 {
+            vec![header(5, B256::repeat_byte(7), 30)]
+        } else {
+            Vec::new()
+        }
+    });
+    s.on_headers_with_uncles(8, &upper)
+        .expect("internally valid");
+    assert_eq!(s.frontier(), 0, "the upper run waits for the lower one");
+    s.on_headers_with_uncles(4, &lower).expect("honest run");
+    assert_eq!(s.frontier(), 8);
+
+    let mut blocks: Vec<&Header> = lower.iter().chain(&upper).map(|e| &e.header).collect();
+    blocks.sort_by_key(|h| h.number);
+    let totals = [1_100u64, 1_250, 1_350, 1_450, 1_550, 1_680, 1_780, 1_880];
+    for (block, total) in blocks.into_iter().zip(totals) {
+        assert_eq!(
+            store.total_difficulty(block.hash()).unwrap(),
+            Some(U256::from(total)),
+            "#{} carries its parent's total plus its own work",
+            block.number
+        );
+    }
+}
+
 /// A run that has not linked yet is *not* committed.
 ///
 /// Until it links it is only a peer's word, and publishing it would put an
@@ -533,6 +624,68 @@ fn a_gap_the_skeleton_missed_is_bridged_from_the_run_above() {
         HEADER_CHUNK * 2,
         "the bridge links the prefix through both runs"
     );
+}
+
+/// A peer still behind the target does not stop the ascent.
+///
+/// Its skeleton ends at its own best block, below the target, so nothing names
+/// a block above that, and the run asked for from the best block itself lies
+/// across the grid the prefix climbs by. With the target on the grid the ascent
+/// was then left with no point above its prefix, no run to bridge down from,
+/// and nothing to ask for. The chunk under the target is asked for from the
+/// target's own hash, and the ascent bridges down from it.
+#[test]
+fn a_peer_behind_the_target_does_not_stop_the_ascent() {
+    let anchor = header(0, B256::ZERO, 100);
+    // On the grid. The chain is newest first: `chain[k]` is block #target - k.
+    let target = HEADER_CHUNK * 4;
+    let chain = run_of(1, target as usize, anchor.hash(), 100, |_| Vec::new());
+    let at = |number: u64| chain[(target - number) as usize].header.hash();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(BlockStore::open(dir.path()).expect("open"));
+    let mut s = ForwardSync::new(
+        0,
+        anchor.hash(),
+        U256::ZERO,
+        target,
+        at(target),
+        true,
+        store,
+        Arc::new(HeaderVerifier::new()),
+    );
+
+    // The peer's best block is #400: its skeleton names the grid points under
+    // it and then #400 itself, as rskj's `processSkeletonRequest` builds one.
+    let skeleton: Vec<BlockIdentifier> = [HEADER_CHUNK, 2 * HEADER_CHUNK, 400]
+        .into_iter()
+        .map(|number| BlockIdentifier {
+            number,
+            hash: at(number),
+        })
+        .collect();
+
+    for _ in 0..32 {
+        let wants = s.wants(8);
+        if wants.is_empty() {
+            break;
+        }
+        for want in wants {
+            match want {
+                Want::Skeleton { .. } => s.on_skeleton(&skeleton),
+                Want::Headers { from, count, point } => {
+                    let newest = chain
+                        .iter()
+                        .position(|e| e.header.hash() == from)
+                        .expect("a block of the chain");
+                    let end = (newest + count as usize).min(chain.len());
+                    s.on_headers_with_uncles(point, &chain[newest..end])
+                        .expect("honest run");
+                }
+            }
+        }
+    }
+    assert_eq!(s.frontier(), target, "the ascent reaches the target");
+    assert!(s.done());
 }
 
 /// The uncle-reuse ledger is a window, not a ledger.

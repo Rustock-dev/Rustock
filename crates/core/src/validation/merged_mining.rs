@@ -1,4 +1,7 @@
+use super::fork_detection::REQUIRED_BLOCKS;
 use super::{HeaderValidator, ValidationError};
+use crate::btc_block;
+use crate::partial_merkle_tree::{self, PartialMerkleTree};
 use crate::types::header::Header;
 use crate::config::ChainConfig;
 
@@ -25,6 +28,17 @@ pub const MAX_RSK_TAG_POSITION_IN_TAIL: usize = 64;
 /// RSKIP180 (iris300).
 pub const MAX_MERGED_MINING_MERKLE_PROOF_LENGTH: usize = 960;
 
+/// The length of a Bitcoin block header, and from RSKIP98 (orchid) the only
+/// length rskj accepts for the field that carries one, block 0 excepted: rskj
+/// `RskMiningConstants.BTC_HEADER_SIZE`, enforced by `BtcHeaderSizeRule`.
+pub const BTC_HEADER_SIZE: usize = 80;
+
+/// The length of a UMM root when a header has one: rskj
+/// `BlockHeader.UMM_LEAVES_LENGTH`. Any other length but none makes rskj's
+/// `getHashRootForMergedMining` throw, so the header has no merged-mining
+/// hash and its proof of work cannot be checked.
+pub const UMM_ROOT_LENGTH: usize = 20;
+
 pub struct MergedMiningRule {
     pub config: std::sync::Arc<ChainConfig>,
 }
@@ -33,12 +47,16 @@ pub struct MergedMiningRule {
 /// iris300): the Bitcoin block a header was merged-mined in and the header
 /// itself must be timestamped within `max_timestamps_diff` seconds of each
 /// other, strictly. rskj's `Constants.getMaxTimestampsDiffInSecs`: 5 minutes,
-/// or 2 hours on testnet from RSKIP297 (hop400) on.
+/// or 2 hours on testnet and testnet2 from RSKIP297 (hop400) on.
 ///
 /// From the activation on a header without a decodable merged-mining header
 /// is invalid outright, as it is in rskj. The rule does not depend on
 /// `skip_pow_validation`: rskj's `miner.server.skipPowValidation` reaches
 /// `ProofOfWorkRule` only.
+///
+/// It is part of rskj's timestamp rule, and goes with it where the chain's
+/// `max_future_block_time` is zero (regtest): rskj's `isValid` returns
+/// before `isBitcoinTimestampValid` when `validPeriodLength` is zero.
 pub struct BitcoinTimestampRule {
     pub config: std::sync::Arc<ChainConfig>,
 }
@@ -48,14 +66,11 @@ impl BitcoinTimestampRule {
     pub const DEFAULT_MAX_TIMESTAMPS_DIFF_IN_SECS: u64 = 5 * 60;
     /// rskj `Constants.TESTNET_MAX_TIMESTAMPS_DIFF_IN_SECS`.
     pub const TESTNET_MAX_TIMESTAMPS_DIFF_IN_SECS: u64 = 120 * 60;
-    /// rskj `Constants.TESTNET_CHAIN_ID`.
-    const TESTNET_CHAIN_ID: u8 = 31;
-
     /// rskj `Constants.getMaxTimestampsDiffInSecs` for a block at `number`.
     pub fn max_timestamps_diff(&self, number: u64) -> u64 {
-        if self.config.chain_id == Self::TESTNET_CHAIN_ID
-            && number >= self.config.activation_heights.hop400
-        {
+        // rskj's TESTNET_CHAIN_ID and TESTNET2_CHAIN_ID.
+        let testnet = matches!(self.config.chain_id, 31 | 34);
+        if testnet && number >= self.config.activation_heights.hop400 {
             Self::TESTNET_MAX_TIMESTAMPS_DIFF_IN_SECS
         } else {
             Self::DEFAULT_MAX_TIMESTAMPS_DIFF_IN_SECS
@@ -68,7 +83,9 @@ impl HeaderValidator for BitcoinTimestampRule {
         use bitcoin::block::Header as BtcHeader;
         use bitcoin::consensus::Decodable;
 
-        if header.number < self.config.activation_heights.iris300 {
+        if self.config.max_future_block_time == 0
+            || header.number < self.config.activation_heights.iris300
+        {
             return Ok(());
         }
         let btc_header_bytes = header
@@ -89,6 +106,134 @@ impl HeaderValidator for BitcoinTimestampRule {
     }
 }
 
+/// rskj `DifficultyUtils.difficultyToTarget`: 2^256 over the difficulty, or
+/// over 3 where the difficulty is 2 or less, so that the target never needs
+/// bit 255. A merge-mining Bitcoin header's hash, read as a number, must not
+/// exceed it.
+///
+/// 2^256 is past a `U256`. floor(2^256 / d) is floor((2^256 - 1) / d) except
+/// where d divides 2^256, a power of two, where it is one more.
+pub fn difficulty_to_target(difficulty: alloy_primitives::U256) -> alloy_primitives::U256 {
+    use alloy_primitives::U256;
+    let divisor = difficulty.max(U256::from(3));
+    let below = U256::MAX / divisor;
+    if divisor.is_power_of_two() {
+        below + U256::from(1)
+    } else {
+        below
+    }
+}
+
+/// rskj `Constants.FALLBACKMINING_PUBKEY_0` and `_1`, uncompressed: the key
+/// that signs a fallback-mined block at an even height, and the one at an
+/// odd height.
+pub const FALLBACK_MINING_PUBKEYS: [[u8; 65]; 2] = [
+    hex_literal::hex!(
+        "041e2b148c024770e19c4f31db2233cac791583df95b4d14a5e9fd4b38dc8254b3"
+        "048f937f169446b19d2eca40db1dd93fab34c0cd8a310afd6e6211f9a89e4bca"
+    ),
+    hex_literal::hex!(
+        "04b55031870df5de88bdb84f65bd1c6f8331c633e759caa5ac7cad3fa4f8a36791"
+        "e995804bba1558ddcf330a67ff5bfa253fa1d8789735f97a97e849686527976e"
+    ),
+];
+
+/// rskj `ProofOfWorkRule.isFallbackMiningPossibleAndBlockSigned`: below
+/// RSKIP98 (orchid), a block with no coinbase and no Merkle proof, of no
+/// greater difficulty than the network's fallback-mining difficulty,
+/// answers for its proof of work with a signature in the Bitcoin-header
+/// field instead. rskj reads an empty coinbase as none, and an empty proof
+/// counts as none.
+pub fn is_fallback_mined(header: &Header, config: &ChainConfig) -> bool {
+    use alloy_primitives::Bytes;
+    let none = |field: &Option<Bytes>| field.as_ref().is_none_or(|f| f.is_empty());
+    header.number < config.activation_heights.orchid
+        && none(&header.bitcoin_merged_mining_coinbase_transaction)
+        && none(&header.bitcoin_merged_mining_merkle_proof)
+        && header.difficulty <= config.fallback_mining_difficulty
+}
+
+/// rskj `ProofOfWorkRule.validFallbackBlockSignature`: the Bitcoin-header
+/// field holds the RLP list `[v, r, s]`, a signature of the header's
+/// merged-mining hash by `keys[0]` at an even height or `keys[1]` at an odd
+/// one.
+///
+/// Read as rskj reads it: by its lenient RLP, with `r` and `s` exactly as
+/// Java's `BigInteger.toByteArray` writes them, `v` from 27 to 30, `s` below
+/// half the curve order, and the key recovered by libsecp256k1, which is
+/// rskj's default `native` crypto library. Where rskj throws, as where it
+/// answers false, the signature does not stand.
+pub fn fallback_signature_is_valid(header: &Header, keys: &[[u8; 65]; 2]) -> bool {
+    use alloy_primitives::U256;
+    let key = &keys[(header.number % 2) as usize];
+    let field = header
+        .bitcoin_merged_mining_header
+        .as_ref()
+        .map_or(&[][..], |f| f.as_ref());
+    let Ok(elements) = crate::rskj_rlp::decode2(field) else {
+        return false;
+    };
+    let [signature] = elements.as_slice() else {
+        return false;
+    };
+    let Ok(parts) = signature.elements() else {
+        return false;
+    };
+    let [v, r, s] = parts.as_slice() else {
+        return false;
+    };
+    let (Some(v), Some(r), Some(s)) = (v.data(), r.data(), s.data()) else {
+        return false;
+    };
+    let &[v] = v else { return false };
+    if r != java_unsigned(r) || s != java_unsigned(s) {
+        return false;
+    }
+    // `getV` is a Java byte, negative from 0x80. From 31 the recovery id
+    // passes 3, where rskj's `check` throws.
+    let v = v as i8;
+    if !(27..=30).contains(&v) {
+        return false;
+    }
+    let (Some(r), Some(s)) = (magnitude(r), magnitude(s)) else {
+        return false;
+    };
+    if s >= U256::from_be_bytes(secp256k1::constants::CURVE_ORDER) >> 1 {
+        return false;
+    }
+    let mut compact = [0u8; 64];
+    compact[..32].copy_from_slice(&r.to_be_bytes::<32>());
+    compact[32..].copy_from_slice(&s.to_be_bytes::<32>());
+    // `validateComponentsWithoutV` holds r and s to 1 through n - 1, as
+    // libsecp256k1 does in parsing and recovering. The id is 0 to 3 here.
+    let id = secp256k1::ecdsa::RecoveryId::from_u8_masked((v - 27) as u8);
+    let Ok(signature) = secp256k1::ecdsa::RecoverableSignature::from_compact(&compact, id) else {
+        return false;
+    };
+    let message = secp256k1::Message::from_digest(header.hash_for_merged_mining().0);
+    crate::types::transaction::secp_context()
+        .recover_ecdsa(message, &signature)
+        .is_ok_and(|found| found.serialize_uncompressed() == *key)
+}
+
+/// `new BigInteger(1, bytes).toByteArray()`: the magnitude without leading
+/// zeros, with one zero byte back in front where its high bit is set, which
+/// also writes zero as a single zero byte.
+fn java_unsigned(bytes: &[u8]) -> Vec<u8> {
+    let start = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len());
+    let magnitude = &bytes[start..];
+    match magnitude.first() {
+        Some(b) if b & 0x80 == 0 => magnitude.to_vec(),
+        _ => [&[0u8][..], magnitude].concat(),
+    }
+}
+
+/// The unsigned number in `bytes`, if it fits 256 bits.
+fn magnitude(bytes: &[u8]) -> Option<alloy_primitives::U256> {
+    let start = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len());
+    (bytes.len() - start <= 32).then(|| alloy_primitives::U256::from_be_slice(&bytes[start..]))
+}
+
 impl HeaderValidator for MergedMiningRule {
     fn validate(&self, header: &Header) -> Result<(), ValidationError> {
         use bitcoin::consensus::Decodable;
@@ -96,31 +241,45 @@ impl HeaderValidator for MergedMiningRule {
         use bitcoin::hashes::Hash;
         use alloy_primitives::{B256, U256};
 
-        if header.number < self.config.activation_heights.orchid {
-            return Ok(());
+        // rskj `ProofOfWorkRule.isValid` asks first whether the block was
+        // mined without Bitcoin, which RSKIP98 (orchid) ended.
+        if is_fallback_mined(header, &self.config) {
+            if fallback_signature_is_valid(header, &FALLBACK_MINING_PUBKEYS) {
+                return Ok(());
+            }
+            return Err(ValidationError::FallbackMiningSignatureInvalid {
+                number: header.number,
+            });
         }
         // rskj `ProofOfWorkRule` with `miner.server.skipPowValidation`: the
         // whole rule passes, merkle proof and coinbase included.
         if self.config.skip_pow_validation {
             return Ok(());
         }
+        // RSKIP92 and RSKIP98 arrive together, at orchid. Below them the
+        // Bitcoin-header field may carry its block's transactions after the
+        // header, and the merkle proof is a bitcoinj partial merkle tree.
+        let orchid = header.number >= self.config.activation_heights.orchid;
 
         let btc_header_bytes = header.bitcoin_merged_mining_header.as_ref()
             .ok_or(ValidationError::BitcoinHeaderDecodeError)?;
+        // rskj `BtcHeaderSizeRule`: from RSKIP98, exactly a Bitcoin header,
+        // block 0 excepted. Otherwise any bytes bitcoinj makes a block of,
+        // whose header is their first 80. The decoder below reads those 80 alone.
+        let readable = if orchid && header.number != 0 {
+            btc_header_bytes.len() == BTC_HEADER_SIZE
+        } else {
+            btc_block::bitcoinj_reads(btc_header_bytes)
+        };
+        if !readable {
+            return Err(ValidationError::BitcoinHeaderDecodeError);
+        }
         let mut reader = &btc_header_bytes[..];
         let btc_header: BtcHeader = Decodable::consensus_decode(&mut reader)
             .map_err(|_| ValidationError::BitcoinHeaderDecodeError)?;
 
         // 1. Bitcoin PoW vs RSK difficulty
-        let difficulty = header.difficulty;
-        if difficulty.is_zero() {
-             return Err(ValidationError::DifficultyZero);
-        }
-        let target = if difficulty > U256::MAX {
-            U256::ZERO
-        } else {
-            U256::MAX / difficulty
-        };
+        let target = difficulty_to_target(header.difficulty);
         let btc_hash = btc_header.block_hash();
         let btc_hash_u256 = U256::from_le_slice(btc_hash.as_byte_array());
         if btc_hash_u256 > target {
@@ -140,9 +299,25 @@ impl HeaderValidator for MergedMiningRule {
 
         let tail = &compressed[MIDSTATE_SIZE_TRIMMED..];
 
+        // rskj `BlockHeader.getHashRootForMergedMining`: a UMM root is empty or
+        // exactly 20 bytes, and any other length throws before there is a hash
+        // to look for.
+        if let Some(umm_root) = &header.umm_root {
+            if !umm_root.is_empty() && umm_root.len() != UMM_ROOT_LENGTH {
+                return Err(ValidationError::UmmRootInvalid {
+                    len: umm_root.len(),
+                });
+            }
+        }
         let rsk_hash = header.hash_for_merged_mining();
 
-        let include_fork_detection = header.number >= self.config.activation_heights.wasabi100;
+        // rskj `BlockFactory`: the merged-mining hash carries fork-detection
+        // data from RSKIP110 (wasabi100) on, but never below block 449, where
+        // there is not yet the chain to compute it from. Testnet and regtest
+        // have RSKIP110 from genesis, so there it is the second bound that
+        // decides: their first 449 blocks commit to the whole hash.
+        let include_fork_detection = header.number >= self.config.activation_heights.wasabi100
+            && header.number >= REQUIRED_BLOCKS;
         let expected_tag: Vec<u8> = if include_fork_detection {
             [RSK_TAG, &rsk_hash.as_slice()[..HASH_FOR_MERGED_MINING_PREFIX_LENGTH]].concat()
         } else {
@@ -170,11 +345,24 @@ impl HeaderValidator for MergedMiningRule {
             return Err(ValidationError::BitcoinCoinbaseTagInvalid);
         }
 
+        // rskj: the whole coinbase -- the bytes the midstate absorbed, a Java
+        // `long` read from its first eight, and the tail -- must run past 64
+        // bytes. 64 bytes is the shape of an inner node of the Bitcoin merkle
+        // tree, which must not pass for a transaction.
+        let absorbed = i64::from_be_bytes(compressed[..8].try_into().expect("eight bytes"));
+        let length = (tail.len() as i64).wrapping_add(absorbed);
+        if length <= 64 {
+            return Err(ValidationError::CoinbaseTooShort { length });
+        }
+
         // 3. Compute coinbase hash from SHA-256 midstate + tail, verify Merkle proof
         let coinbase_hash = compute_coinbase_hash(compressed);
 
         let merkle_proof_bytes = header.bitcoin_merged_mining_merkle_proof.as_ref()
             .ok_or(ValidationError::BitcoinMerkleProofDecodeError)?;
+        if !orchid {
+            return genesis_merkle_proof(merkle_proof_bytes, &btc_header, &coinbase_hash);
+        }
 
         // RSKIP180 (iris300): rskj `Rskip92MerkleProofValidator` rejects a
         // merged-mining merkle proof longer than
@@ -193,20 +381,43 @@ impl HeaderValidator for MergedMiningRule {
             return Err(ValidationError::BitcoinMerkleProofDecodeError);
         }
 
-        let computed_root = rskip92_merkle_root(&coinbase_hash, merkle_proof_bytes);
-
-        let btc_merkle_root_bytes = btc_header.merkle_root.to_byte_array();
-
-        if computed_root != btc_merkle_root_bytes {
-            let mut reversed = computed_root;
-            reversed.reverse();
-            if reversed != btc_merkle_root_bytes {
-                return Err(ValidationError::BitcoinMerkleProofInvalid);
-            }
+        // rskj compares in bitcoinj's display order, reversed from the wire,
+        // which is the order the computed root is in; the header holds its
+        // root in wire order. Either order matching used to pass, so a proof
+        // folding to the root's byte reversal did too.
+        let mut computed_root = rskip92_merkle_root(&coinbase_hash, merkle_proof_bytes)
+            .ok_or(ValidationError::MerkleNodesFormTransaction)?;
+        computed_root.reverse();
+        if computed_root != btc_header.merkle_root.to_byte_array() {
+            return Err(ValidationError::BitcoinMerkleProofInvalid);
         }
 
         Ok(())
     }
+}
+
+/// rskj `GenesisMerkleProofValidator`, merged mining's proof below RSKIP92: a
+/// bitcoinj partial merkle tree of exactly the size its counts declare, which
+/// walks to the Bitcoin header's merkle root and matches the coinbase, both
+/// compared in bitcoinj's display order.
+fn genesis_merkle_proof(
+    proof: &[u8],
+    btc_header: &bitcoin::block::Header,
+    coinbase_hash: &[u8; 32],
+) -> Result<(), ValidationError> {
+    use bitcoin::hashes::Hash;
+    if !partial_merkle_tree::has_expected_size(proof) {
+        return Err(ValidationError::BitcoinMerkleProofDecodeError);
+    }
+    let (matched, root) = PartialMerkleTree::parse(proof)
+        .and_then(|tree| tree.txn_hashes_and_merkle_root())
+        .map_err(ValidationError::PartialMerkleTreeInvalid)?;
+    let mut header_root = btc_header.merkle_root.to_byte_array();
+    header_root.reverse();
+    if root != header_root || !matched.contains(coinbase_hash) {
+        return Err(ValidationError::BitcoinMerkleProofInvalid);
+    }
+    Ok(())
 }
 
 /// The 12 fork-detection bytes a header commits to, read out of its
@@ -392,15 +603,24 @@ pub fn find_first_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Completes a SHA-256 hash from a midstate.
+/// Completes a SHA-256 hash from a midstate, as BouncyCastle's `SHA256Digest`
+/// does when rskj restores one.
+///
+/// Restoring a state starts BouncyCastle's word and block offsets at zero,
+/// so the tail is absorbed from a block boundary whatever the byte count
+/// says; the count only feeds the length in the padding, which is the count
+/// plus the tail's length, times eight, in a Java `long`. For a coinbase
+/// compressed honestly the count is whole blocks and none of this shows. A
+/// count that is not is the miner's to write, and rskj hashes it this way,
+/// so it is hashed this way here too: laying the padding out from the count
+/// instead left the length block short, and `chunks_exact` dropped it.
 pub fn sha256_from_midstate(state: [u32; 8], byte_count: u64, tail: &[u8]) -> [u8; 32] {
     let mut h = state;
-    let total_len = byte_count + tail.len() as u64;
-    let total_bits = total_len * 8;
+    let total_bits = byte_count.wrapping_add(tail.len() as u64).wrapping_mul(8);
 
     let mut padded = tail.to_vec();
     padded.push(0x80);
-    while (byte_count as usize + padded.len()) % 64 != 56 {
+    while padded.len() % 64 != 56 {
         padded.push(0);
     }
     padded.extend_from_slice(&total_bits.to_be_bytes());
@@ -421,15 +641,73 @@ pub fn sha256_from_midstate(state: [u32; 8], byte_count: u64, tail: &[u8]) -> [u
 /// hashes. Starting from the coinbase hash, combine left-to-right with each
 /// sibling using Bitcoin's double-SHA256 Merkle tree construction, matching
 /// rskj's `combineLeftRight`.
-pub fn rskip92_merkle_root(coinbase_hash: &[u8; 32], proof_bytes: &[u8]) -> [u8; 32] {
+///
+/// `None` when two nodes it would combine parse as a 64-byte Bitcoin
+/// transaction, where rskj's `combineLeftRight` throws instead.
+pub fn rskip92_merkle_root(coinbase_hash: &[u8; 32], proof_bytes: &[u8]) -> Option<[u8; 32]> {
     let mut current = *coinbase_hash;
 
     for chunk in proof_bytes.chunks_exact(32) {
         let sibling: [u8; 32] = chunk.try_into().unwrap();
+        if parses_as_a_64_byte_transaction(&current, &sibling) {
+            return None;
+        }
         current = combine_left_right(&current, &sibling);
     }
 
-    current
+    Some(current)
+}
+
+/// The most a single output can carry, in satoshis: 21 million bitcoin.
+const MAX_SATOSHIS: i64 = 21_000_000 * 100_000_000;
+
+/// rskj `MerkleTreeUtils.checkNotAValid64ByteTransaction`, its guard against
+/// the leaf-node weakness of Bitcoin's merkle tree: an inner node is the hash
+/// of 64 bytes, and 64 bytes that also parse as a transaction would let a
+/// proof stop at a node and present it as a leaf.
+///
+/// True when `left || right` passes every test rskj applies -- one input, an
+/// output index of at most a million or the coinbase's `0xffffffff`, one
+/// output worth between one satoshi and 21 million bitcoin, and scripts of
+/// four bytes between them -- which is when rskj throws. It reads the nodes
+/// in the order it holds them, display order, the reverse of the bytes the
+/// tree hashes. That is rskj's rule, so it is this one.
+pub fn parses_as_a_64_byte_transaction(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut tx = [0u8; 64];
+    tx[..32].copy_from_slice(left);
+    tx[32..].copy_from_slice(right);
+
+    // Four bytes of version, then the input count.
+    if tx[4] != 1 {
+        return false;
+    }
+    // The outpoint's 32-byte hash, then its index: an unsigned little-endian
+    // 32-bit integer.
+    let output_index = u32::from_le_bytes(tx[37..41].try_into().unwrap());
+    if output_index > 1_000_000 && output_index != u32::MAX {
+        return false;
+    }
+    // A Java byte: from 0x80 it is negative, refused with the rest over four.
+    let input_script_length = tx[41];
+    if input_script_length > 4 {
+        return false;
+    }
+    // The script, four bytes of sequence, then the output count.
+    let mut at = 42 + usize::from(input_script_length) + 4;
+    if tx[at] != 1 {
+        return false;
+    }
+    at += 1;
+    let value = i64::from_le_bytes(tx[at..at + 8].try_into().unwrap());
+    if !(1..=MAX_SATOSHIS).contains(&value) {
+        return false;
+    }
+    at += 8;
+    let output_script_length = tx[at];
+    if output_script_length > 4 {
+        return false;
+    }
+    input_script_length + output_script_length == 4
 }
 
 /// Matches rskj's MerkleTreeUtils.combineLeftRight:

@@ -48,6 +48,8 @@ pub fn trace_transaction(id: Value, params: &Value, state: &RpcState) -> JsonRpc
     else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid transaction hash");
     };
+    // On the main chain only, as rskj's `traceTransaction` looks it up
+    // (`receiptStore.getInMainChain`): a block that lost a reorg is no answer.
     let Some((block_hash, index)) =
         crate::helpers::canonical_tx_location(&state.store, tx_hash)
     else {
@@ -114,6 +116,8 @@ pub fn trace_get(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid position");
     };
 
+    // On the main chain only, as rskj's `traceGet` looks it up
+    // (`receiptStore.getInMainChain`).
     let Some((block_hash, _)) =
         crate::helpers::canonical_tx_location(&state.store, tx_hash)
     else {
@@ -202,7 +206,10 @@ pub fn trace_filter(id: Value, params: &Value, state: &RpcState) -> JsonRpcRespo
     let mut seen = 0usize;
     let wanted = after.saturating_add(count);
 
-    for number in from..=to {
+    // rskj walks from `fromBlock` while `getBlockByNumber` finds a block, so it
+    // stops at the head whatever `toBlock` says. Walking every number up to a
+    // `toBlock` of 2^64 - 1 instead would never end.
+    for number in from..=to.min(head) {
         let Some(hash) = state.store.canonical_hash(number).ok().flatten() else {
             continue;
         };
@@ -341,7 +348,7 @@ fn replay(
     };
     let root = rustock_trie::TrieNode::from_message(&root_bytes, trie_store.as_ref());
     let block = rustock_core::Block { header, transactions, ommers };
-    let processor = rustock_execution::BlockProcessor::new(hardfork_cfg, state.store.clone());
+    let processor = state.block_processor(hardfork_cfg);
     let traces = processor
         .trace_block_calls(&block, &root, trie_store)
         .map_err(|e| format!("Replay failed: {e}"))?;
@@ -354,7 +361,7 @@ fn replay(
 
 /// Flatten one transaction's trace into rskj's depth-first `TransactionTrace`
 /// list: the transaction's own frame first, then each subtree in order.
-fn render_transaction(
+pub(crate) fn render_transaction(
     out: &mut Vec<Value>,
     block: &rustock_core::Block,
     block_hash: B256,
@@ -369,7 +376,8 @@ fn render_transaction(
 
     // rskj's top-level trace is built from the receipt, not from a frame: a
     // synthetic `ProgramResult` carrying only `receipt.getGasUsed()` and the
-    // revert flag.
+    // revert flag (`TraceTransformer.addTrace`). So a call's own trace never
+    // shows what the call returned; only its subtraces show their output.
     let error = if trace.reverted {
         Some("Reverted".to_string())
     } else if trace.error.is_empty() {
@@ -407,9 +415,10 @@ fn render_transaction(
             &created,
         )
     } else {
+        // The synthetic result's `getHReturn()` is the empty array.
         json!({
             "gasUsed": quantity(receipt_gas_used),
-            "output": Value::String(format!("0x{}", trace.result)),
+            "output": "0x",
         })
     };
 

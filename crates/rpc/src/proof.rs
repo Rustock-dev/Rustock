@@ -63,7 +63,7 @@
 //! truncated inclusion path would look like one without being one.
 
 use crate::server::RpcState;
-use crate::state::resolve_state_root;
+
 use crate::types::*;
 use alloy_primitives::{Address, B256, U256};
 use rustock_trie::{
@@ -127,17 +127,23 @@ pub async fn eth_get_proof(id: Value, params: &Value, state: &RpcState) -> JsonR
         slots.push((raw.to_string(), slot));
     }
 
-    let block_param = params.get(2).and_then(|v| v.as_str()).unwrap_or("latest");
-
     // A node with no trie of its own -- a light client -- asks a peer and
     // checks the answer against a header it validated itself. The local trie
-    // wins whenever there is one: no round trip, nothing to verify.
+    // wins whenever there is one: no round trip, nothing to verify. Either
+    // way the block is read as the state queries read it: a tag, a number,
+    // or an EIP-1898 object.
     if state.trie_store.is_none() {
-        return light_proof(id, addr, &slots, block_param, state).await;
+        let named = crate::helpers::block_ref(params.get(2), &state.store)
+            .and_then(|(identifier, _)| crate::helpers::information_block(&identifier));
+        return match named {
+            Ok(block) => light_proof(id, addr, &slots, &block, state).await,
+            Err((code, message)) => JsonRpcResponse::error(id, code, message),
+        };
     }
 
-    let Some((root, _header)) = resolve_state_root(block_param, state) else {
-        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
+    let (root, _header) = match crate::state::queried_state(&id, params.get(2), state) {
+        Ok(found) => found,
+        Err(refused) => return refused,
     };
     let Some(trie_store) = state.trie_store.clone() else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "State not available");
@@ -208,6 +214,213 @@ pub async fn eth_get_proof(id: Value, params: &Value, state: &RpcState) -> JsonR
             "storageProof": storage_proof,
         }),
     )
+}
+
+/// `rsk_getStorageNodes(address, [slots], block)`: for each slot, whether the
+/// state holds it, its value, and the unitrie nodes from the slot's key up to
+/// the state root -- for a slot that is absent as much as for one that is not.
+///
+/// `eth_getProof` answers an absent key with an empty array, on purpose (see
+/// the module note), which leaves a caller no way to prove a slot empty. On
+/// Rootstock that is also the only way to prove a slot holds zero, because a
+/// slot set to zero is deleted from the trie (rskj
+/// `MutableRepository.addStorageBytes`). So this answers both cases with the
+/// path toward the key, and says which case it is, so that a path is never
+/// read as inclusion when it is not:
+///
+/// - `present: true`: the deepest node is the slot's own, and holds its value.
+/// - `present: false`: the deepest node is where the key leaves the trie: its
+///   shared path parts from the key's, or the key ends inside it, or the child
+///   the key would take is empty, or the key ends at it and it holds nothing.
+///
+/// A caller checks the nodes as `eth_getProof`'s are checked, walking the key
+/// down from the root, and must reach the same answer as `present`. The block
+/// is named in the answer, so the caller knows which header's state root the
+/// nodes hang from. A node the store cannot produce is an error, never an
+/// absence. A value too long to sit in its node (over 32 bytes, as some of
+/// the Bridge's cells are) is stored apart from it: one of those the store
+/// has lost is answered as absent, though the slot's node still carries its
+/// hash and length, so a caller that walks the nodes, as it must, finds it
+/// held and the answer wrong.
+pub fn rsk_get_storage_nodes(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
+    let Some(addr) = params
+        .get(0)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Address>().ok())
+    else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid address");
+    };
+    let Some(slot_values) = params.get(1).and_then(|v| v.as_array()) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing storage key array");
+    };
+    let mut slots: Vec<(String, B256)> = Vec::with_capacity(slot_values.len());
+    for v in slot_values {
+        let Some(raw) = v.as_str() else {
+            return JsonRpcResponse::error(id, INVALID_PARAMS, "Storage key must be a string");
+        };
+        let Some(slot) = crate::helpers::parse_storage_slot(raw) else {
+            return JsonRpcResponse::error(
+                id,
+                INVALID_PARAMS,
+                format!("Invalid storage key: {raw}"),
+            );
+        };
+        slots.push((raw.to_string(), slot));
+    }
+
+    let (root, header) = match crate::state::queried_state(&id, params.get(2), state) {
+        Ok(found) => found,
+        Err(refused) => return refused,
+    };
+    let Some(trie_store) = state.trie_store.clone() else {
+        return JsonRpcResponse::error(id, INTERNAL_ERROR, "State not available");
+    };
+    let store = &*trie_store;
+
+    let mut storage: Vec<Value> = Vec::with_capacity(slots.len());
+    for (raw, slot) in &slots {
+        let key = TrieKeySlice::from_key(&storage_key(&addr, slot));
+        let incomplete = |missing: B256| {
+            JsonRpcResponse::error(
+                id.clone(),
+                INTERNAL_ERROR,
+                format!("The state is incomplete here: node {missing:#x} is missing"),
+            )
+        };
+        let nodes = match root.try_nodes_toward(&key, store) {
+            Ok(nodes) => nodes,
+            Err(missing) => return incomplete(missing),
+        };
+        let value = match root.try_get(&key, store) {
+            Ok(value) => value.filter(|v| !v.is_empty()),
+            Err(missing) => return incomplete(missing),
+        };
+        // Stored minimally, as `eth_getStorageAt` also finds.
+        let number = value.as_ref().map_or(U256::ZERO, |bytes| {
+            let mut padded = [0u8; 32];
+            let start = 32usize.saturating_sub(bytes.len());
+            padded[start..].copy_from_slice(&bytes[bytes.len().saturating_sub(32)..]);
+            U256::from_be_bytes(padded)
+        });
+        storage.push(json!({
+            "key": raw,
+            "present": value.is_some(),
+            "value": format!("{number:#x}"),
+            "nodes": nodes
+                .iter()
+                .map(|n| format!("0x{}", hex::encode(n.to_message(store))))
+                .collect::<Vec<_>>(),
+        }));
+    }
+
+    JsonRpcResponse::success(
+        id,
+        json!({
+            "address": format!("{addr:#x}"),
+            "blockNumber": format!("{:#x}", header.number),
+            "blockHash": format!("{:#x}", header.hash()),
+            "stateRoot": format!("{:#x}", header.state_root),
+            "storage": storage,
+        }),
+    )
+}
+
+/// The most keys that one `rsk_getStateNodes` call walks along.
+pub const MAX_STATE_KEYS: usize = 64;
+
+/// The longest key that `rsk_getStateNodes` walks along, in bytes: more than
+/// any key the unitrie holds, the longest being a storage key's 74.
+pub const MAX_STATE_KEY: usize = 128;
+
+/// `rsk_getStateNodes(blockHash, [keys])`: for each key, the unitrie nodes of
+/// the walk along it from the state root of the block with hash `blockHash`,
+/// from where the walk ends up to the root, as [`TrieNode::try_nodes_toward`]
+/// gives them; or null if this node doesn't hold the block's header, or the
+/// state at its state root.
+///
+/// A key is the trie's own, raw (`code_key`, `storage_key`, ...), so one call
+/// proves a contract's code and its slots together. The walk hangs from the
+/// header's own state root and no other, as that is what a caller checks it
+/// against, so a header from before wasabi, whose state root is no unitrie's,
+/// has no state here. Whether a key is held is the caller's to read from the
+/// nodes, as `rsk_getStorageNodes` describes. A node the store cannot produce
+/// is an error, never an absence.
+pub fn rsk_get_state_nodes(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
+    let Some(hash) = params
+        .get(0)
+        .and_then(|v| v.as_str())
+        .and_then(crate::helpers::parse_b256)
+    else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block hash");
+    };
+    let Some(listed) = params.get(1).and_then(|v| v.as_array()) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing key array");
+    };
+    if listed.len() > MAX_STATE_KEYS {
+        return JsonRpcResponse::error(
+            id,
+            INVALID_PARAMS,
+            format!("At most {MAX_STATE_KEYS} keys at a time"),
+        );
+    }
+    let mut keys = Vec::with_capacity(listed.len());
+    for key in listed {
+        match key.as_str().and_then(parse_state_key) {
+            Some(key) => keys.push(key),
+            None => {
+                return JsonRpcResponse::error(id, INVALID_PARAMS, format!("Invalid key: {key}"))
+            }
+        }
+    }
+
+    let header = match state.store.header(hash) {
+        Ok(Some(header)) => header,
+        Ok(None) => return JsonRpcResponse::success(id, Value::Null),
+        Err(e) => {
+            return JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                format!("Failed to read the header: {e}"),
+            )
+        }
+    };
+    let Some(trie_store) = state.trie_store.clone() else {
+        return JsonRpcResponse::success(id, Value::Null);
+    };
+    let store = &*trie_store;
+    let Some(message) = store.get(header.state_root.as_slice()) else {
+        return JsonRpcResponse::success(id, Value::Null);
+    };
+    let root = TrieNode::from_message(&message, store);
+
+    let mut walks: Vec<Vec<String>> = Vec::with_capacity(keys.len());
+    for key in &keys {
+        match root.try_nodes_toward(&TrieKeySlice::from_key(key), store) {
+            Ok(nodes) => walks.push(
+                nodes
+                    .iter()
+                    .map(|n| format!("0x{}", hex::encode(n.to_message(store))))
+                    .collect(),
+            ),
+            Err(missing) => {
+                return JsonRpcResponse::error(
+                    id,
+                    INTERNAL_ERROR,
+                    format!("The state is incomplete here: node {missing:#x} is missing"),
+                )
+            }
+        }
+    }
+    JsonRpcResponse::success(id, json!(walks))
+}
+
+/// A trie key as `0x`-prefixed hex, at most [`MAX_STATE_KEY`] bytes.
+fn parse_state_key(text: &str) -> Option<Vec<u8>> {
+    let digits = text.strip_prefix("0x")?;
+    if digits.len() > 2 * MAX_STATE_KEY {
+        return None;
+    }
+    hex::decode(digits).ok()
 }
 
 /// Answer `eth_getProof` on a node that holds no state.

@@ -78,16 +78,54 @@ pub enum WalkError {
     ForeignGenesis,
 }
 
-/// A verified run of headers, remembered by its ends.
+/// The steepest step the retarget rule has ever allowed, as a divisor: a
+/// block's difficulty is its parent's, plus or minus at most this fraction of
+/// it, or the floor (rskj `DifficultyCalculator`, whose `difficultyBoundDivisor`
+/// was 50 until RSKIP156 raised it to 400). Bounding an uncle by its parent
+/// takes the largest step any height could.
+const STEEPEST_RETARGET: u64 = 50;
+
+/// How far below the block that includes it an uncle's parent may sit (rskj
+/// `uncleGenerationLimit`): an uncle of the block at height `h` hangs from the
+/// trunk somewhere in `h-7 ..= h-2` (`BlockUnclesValidationRule
+/// .validateParentNumber`).
+const UNCLE_GENERATIONS: usize = 7;
+
+/// Uncles whose possible parents have not all been walked yet: how many, the
+/// highest trunk difficulty seen among those parents so far, and how many
+/// trunk headers below are still to be seen.
+#[derive(Debug, Clone)]
+struct Reaching {
+    count: u64,
+    highest: U256,
+    below: usize,
+}
+
+/// A verified run of headers, remembered by its ends and by what it is worth.
 ///
 /// The headers themselves go to the store as they are checked; only the two
 /// ends are kept, which is what makes walking nine million of them affordable.
+/// What the run is worth counts only once the run joins the chain: see
+/// [`HeaderWalk::advance`].
 #[derive(Debug, Clone)]
 struct Run {
     newest: B256,
     oldest_number: u64,
     /// The parent of the oldest header: what the run below must produce.
     oldest_parent: B256,
+    /// Each header's difficulty, or its exact contribution where the peer
+    /// sent its uncles.
+    work: U256,
+    /// Uncles the work leaves out, because the peer sent none.
+    uncles_omitted: u64,
+    /// Of those, the ones whose possible parents are all in this run: for each
+    /// block, its uncle count times the highest difficulty among them.
+    uncle_weight: U256,
+    /// The ones whose possible parents reach below the run.
+    reaching: Vec<Reaching>,
+    /// The difficulties of the run's newest headers, newest first: as many as
+    /// the uncles of the run above can hang from.
+    newest_difficulties: Vec<U256>,
 }
 
 pub struct HeaderWalk {
@@ -119,18 +157,26 @@ pub struct HeaderWalk {
     need_hash: B256,
     done: bool,
 
-    /// Difficulty summed over every header the walk has verified.
+    /// Difficulty summed over the headers of every run that has joined the
+    /// chain, each counted once.
     ///
     /// The checkpoint's total difficulty arrives as a claim and is written to
     /// the store as this node's own, so it is worth establishing against the
     /// chain actually walked. The walk reads every header anyway; adding them
-    /// up costs nothing and makes the claim checkable.
+    /// up costs nothing and makes the claim checkable. Where a peer sent no
+    /// uncles it is a floor, which [`Self::work_ceiling`] bounds from above.
     walked_difficulty: U256,
-    /// Uncles seen during the walk whose difficulty could not be added,
-    /// because a header walk never carries bodies. Non-zero means
-    /// `walked_difficulty` understates the chain and the totals derived from
-    /// it need `--repair total-difficulty` once bodies are present.
+    /// Uncles in those runs whose difficulty could not be added, because a
+    /// header walk never carries bodies. Non-zero means `walked_difficulty`
+    /// understates the chain and the totals derived from it need `--repair
+    /// total-difficulty` once bodies are present.
     uncles_omitted: u64,
+    /// For each block with such uncles whose possible parents have all been
+    /// walked, its uncle count times the highest difficulty among them,
+    /// summed. See [`Self::work_ceiling`].
+    uncle_weight: U256,
+    /// The uncles whose possible parents have not all been walked yet.
+    reaching: Vec<Reaching>,
 
     /// Total difficulty this node had already established at the block the
     /// walk anchored on.
@@ -145,6 +191,9 @@ pub struct HeaderWalk {
 
     /// Blocks strictly below this may be frozen: `top - FREEZE_DEPTH`.
     freeze_horizon: u64,
+    /// The blocks under this height have their uncles staged beside the
+    /// headers: see [`Self::with_bodies_from`].
+    uncles_below: u64,
     /// Headers written against a checkpoint that is still only a peer's claim.
     ///
     /// `None` when there is no freezer, or when it already holds something --
@@ -182,9 +231,14 @@ impl HeaderWalk {
             skeleton_todo.push(start);
             start += span;
         }
-        // Asked for from the top down: the walk finishes at the bottom, but it
-        // is the top that unblocks it.
-        skeleton_todo.reverse();
+        // Popped from the back, so the highest start is asked for first: the
+        // walk finishes at the bottom, but it is the top that unblocks it.
+        //
+        // Left ascending for that reason. The ascent reverses its queue
+        // because it wants the low end first; reversed here as well, the walk
+        // asked from genesis up, and its frontier sat at the checkpoint until
+        // all nine million mainnet headers had arrived -- 0.0% for the whole
+        // two hours, with nothing to tell that from a hang.
 
         // A walk feeds the freezer only when there is nothing to lose by
         // doing so: an empty freezer, on a node syncing from scratch. On a
@@ -211,17 +265,36 @@ impl HeaderWalk {
             done: false,
             walked_difficulty: U256::ZERO,
             uncles_omitted: 0,
+            uncle_weight: U256::ZERO,
+            reaching: Vec::new(),
             anchor_difficulty: None,
             freeze_horizon: number.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH),
+            uncles_below: number.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH),
             staging,
         }
     }
 
-    /// Difficulty summed across every header verified so far.
+    /// The lowest block whose body the sync goes on to fetch. The uncles sent
+    /// beside every header under it are staged with the headers: they are the
+    /// only copy this node will get.
     ///
-    /// Once the walk is done this is the work of the whole chain below the
-    /// checkpoint, and a peer's claimed cumulative difficulty may not exceed
-    /// it by more than the checkpoint block's own difficulty.
+    /// Without this they were staged only under the freeze horizon, 20,000
+    /// blocks below the top, on the reasoning that every block above it is
+    /// inside the body window. The window is 6,000 blocks (rskj's
+    /// `BLOCKS_REQUIRED`), so the blocks between got neither, and their uncles
+    /// were lost (#270).
+    pub fn with_bodies_from(mut self, lowest: u64) -> Self {
+        self.uncles_below = lowest;
+        self
+    }
+
+    /// Difficulty summed across the headers of every run that has joined the
+    /// chain.
+    ///
+    /// Once the walk is done this is the work of the whole chain from the
+    /// checkpoint down to the anchor, the checkpoint included -- but of the
+    /// headers only, unless the peers sent the uncles: see
+    /// [`Self::work_ceiling`].
     pub fn walked_difficulty(&self) -> U256 {
         self.walked_difficulty
     }
@@ -240,6 +313,32 @@ impl HeaderWalk {
     pub fn established_difficulty(&self) -> Option<U256> {
         self.anchor_difficulty
             .map(|anchor| anchor.saturating_add(self.walked_difficulty))
+    }
+
+    /// The most cumulative difficulty the walked chain can carry at the
+    /// checkpoint, once the walk has anchored: the work established, plus the
+    /// most that the uncles it did not see can add. Exact when every uncle
+    /// came with its header.
+    ///
+    /// Uncles travel in bodies, which a header walk never fetches, and an rskj
+    /// peer (`rsk/62`) sends none alongside, so on mainnet the headers carry a
+    /// little over half of the work. What the walk does see bounds the rest.
+    /// A header's uncle count is inside what its proof of work commits to, and
+    /// an uncle hangs from the trunk two to seven blocks down, with a
+    /// difficulty the retarget rule ties to its parent's: at most a fiftieth
+    /// more, or the floor. So each uncle unseen is worth at most the highest
+    /// trunk difficulty in that stretch and a fiftieth, or `min_difficulty`;
+    /// this adds both, which is never less.
+    pub fn work_ceiling(&self, min_difficulty: U256) -> Option<U256> {
+        let established = self.established_difficulty()?;
+        let rise = self.uncle_weight / U256::from(STEEPEST_RETARGET);
+        let floor = min_difficulty.saturating_mul(U256::from(self.uncles_omitted));
+        Some(
+            established
+                .saturating_add(self.uncle_weight)
+                .saturating_add(rise)
+                .saturating_add(floor),
+        )
     }
 
     /// The height the walk started from.
@@ -277,51 +376,61 @@ impl HeaderWalk {
     /// Up to `budget` things to ask for, none of them already outstanding.
     pub fn wants(&mut self, budget: usize) -> Vec<Want> {
         let mut out = Vec::new();
-        if self.done {
+        if self.done || budget == 0 || self.need_number == 0 {
             return out;
         }
+        let need = self.need_number;
 
-        // Headers first: a skeleton is only useful once its points are being
-        // turned into headers, and the queue below is what finishes the walk.
-        let points: Vec<u64> = self
-            .points
-            .keys()
-            .rev()
-            .copied()
-            .filter(|p| !self.headers_sent.contains(p) && !self.runs.contains_key(p))
-            .take(budget)
-            .collect();
-        for point in points {
-            let Some(hash) = self.points.get(&point).copied() else { continue };
-            self.headers_sent.insert(point);
-            out.push(Want::Headers { from: hash, count: HEADER_CHUNK as u32, point });
-            if out.len() >= budget {
-                return out;
-            }
-        }
-
-        // The stretch above the grid, which no skeleton point covers. It stops
-        // one *above* the grid top rather than at it: the grid's own run ends
-        // at its point, so a bespoke run reaching that far would overlap it and
-        // the two would not link.
-        let grid_top = (self.top.number / HEADER_CHUNK) * HEADER_CHUNK;
-        if self.top.number > grid_top
-            && !self.headers_sent.contains(&self.top.number)
-            && !self.runs.contains_key(&self.top.number)
-        {
-            self.headers_sent.insert(self.top.number);
+        // The frontier first, asked for from the hash the linked chain names
+        // for it. That hash is this node's own finding, not a peer's claim,
+        // so the request needs no skeleton: it is the serial walk, running
+        // beneath the parallel one. It is also the only way back to the
+        // frontier once its point is gone -- a run there that does not link
+        // takes the point with it, and a short answer leaves the need between
+        // grid points, where no point sits -- and either used to stop the
+        // walk for good.
+        //
+        // It reaches down to the grid point below, so that the run under it
+        // can link: all 192 from a point on the grid, the remainder from the
+        // checkpoint or from wherever a short answer stopped.
+        if !self.headers_sent.contains(&need) && !self.runs.contains_key(&need) {
+            let floor = ((need - 1) / HEADER_CHUNK) * HEADER_CHUNK;
+            self.headers_sent.insert(need);
             out.push(Want::Headers {
-                from: self.top.hash(),
-                count: (self.top.number - grid_top) as u32,
-                point: self.top.number,
+                from: self.need_hash,
+                count: (need - floor) as u32,
+                point: need,
             });
             if out.len() >= budget {
                 return out;
             }
         }
 
+        // Then the points below the frontier, highest first: a skeleton is
+        // only useful once its points are being turned into headers. Only
+        // below, because a point at or above the frontier is linked already,
+        // and asking for it again would fetch that stretch twice.
+        let points: Vec<(u64, B256)> = self
+            .points
+            .range(..need)
+            .rev()
+            .filter(|(p, _)| !self.headers_sent.contains(*p) && !self.runs.contains_key(*p))
+            .take(budget - out.len())
+            .map(|(p, hash)| (*p, *hash))
+            .collect();
+        for (point, hash) in points {
+            self.headers_sent.insert(point);
+            out.push(Want::Headers { from: hash, count: HEADER_CHUNK as u32, point });
+        }
+
+        // Skeletons with whatever is left, the highest first. One that starts
+        // at or above the frontier could name only linked points, and the
+        // frontier never rises, so it is dropped rather than asked.
         while out.len() < budget {
             let Some(start) = self.skeleton_todo.pop() else { break };
+            if start >= need {
+                continue;
+            }
             if self.skeleton_sent.insert(start) {
                 out.push(Want::Skeleton { start });
             }
@@ -346,7 +455,11 @@ impl HeaderWalk {
     /// Skeleton identifiers: where to ask, and nothing more.
     pub fn on_skeleton(&mut self, identifiers: &[BlockIdentifier]) {
         for id in identifiers {
-            if id.number == 0 || id.number > self.top.number {
+            // Only a grid point below the frontier can lead anywhere. Above
+            // it the chain is linked already. Off the grid no run can link,
+            // and one identifier usually is: rskj ends every skeleton with
+            // its best block, wherever that sits.
+            if id.number == 0 || id.number >= self.need_number || id.number % HEADER_CHUNK != 0 {
                 continue;
             }
             // A point already answered for is not replaced: the run that
@@ -396,23 +509,48 @@ impl HeaderWalk {
             reason: e.to_string(),
         })?;
 
-        for header in headers {
-            // Uncle difficulty counts toward the chain's work and uncle headers
-            // travel only in the body, which a backward header walk never
-            // fetches. A peer at `rsk/63` sends them alongside and the figure
-            // is exact; from anyone else `walked_difficulty` is a lower bound,
-            // widened by every block that included an uncle. See
-            // `uncles_omitted`.
+        // What the run is worth, which counts once it joins the chain.
+        //
+        // Uncle difficulty counts toward the chain's work, and uncle headers
+        // travel only in the body, which a backward header walk never fetches.
+        // A peer at `rsk/63` sends them alongside and the figure is exact.
+        // From anyone else -- every rskj node -- they are left out, and what
+        // the run does hold bounds them: see `Self::work_ceiling`.
+        let mut work = U256::ZERO;
+        let mut uncles_omitted = 0u64;
+        let mut uncle_weight = U256::ZERO;
+        let mut reaching = Vec::new();
+        for (i, header) in headers.iter().enumerate() {
             let hash = header.hash();
             match proven.get(&hash) {
-                Some(exact) => {
-                    self.walked_difficulty = self.walked_difficulty.saturating_add(*exact);
-                }
+                Some(exact) => work = work.saturating_add(*exact),
                 None => {
-                    self.walked_difficulty =
-                        self.walked_difficulty.saturating_add(header.difficulty);
+                    work = work.saturating_add(header.difficulty);
                     if header.uncle_count > 0 {
-                        self.uncles_omitted += header.uncle_count;
+                        uncles_omitted += header.uncle_count;
+                        // Its uncles hang from the headers two to seven below
+                        // it: those this run holds, and for the rest, the
+                        // newest of the runs below.
+                        let end = (i + UNCLE_GENERATIONS + 1).min(headers.len());
+                        let highest = headers
+                            .get(i + 2..end)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|parent| parent.difficulty)
+                            .max()
+                            .unwrap_or(U256::ZERO);
+                        let below = (i + UNCLE_GENERATIONS + 1).saturating_sub(headers.len());
+                        if below == 0 {
+                            uncle_weight = uncle_weight.saturating_add(
+                                U256::from(header.uncle_count).saturating_mul(highest),
+                            );
+                        } else {
+                            reaching.push(Reaching {
+                                count: header.uncle_count,
+                                highest,
+                                below,
+                            });
+                        }
                     }
                 }
             }
@@ -437,17 +575,23 @@ impl HeaderWalk {
                 newest: newest.hash(),
                 oldest_number: oldest.number,
                 oldest_parent: oldest.parent_hash,
+                work,
+                uncles_omitted,
+                uncle_weight,
+                reaching,
+                newest_difficulties: headers
+                    .iter()
+                    .take(UNCLE_GENERATIONS)
+                    .map(|header| header.difficulty)
+                    .collect(),
             },
         );
         Ok(())
     }
 
-    /// Writes a verified run to the staging freezer.
-    ///
-    /// Only blocks below the freeze horizon: anything younger can still be
-    /// replaced by a reorg, and a file addressed by height has no way to say
-    /// "this height means something else now".
-    /// Stage the uncles a run of headers referenced, beside the headers.
+    /// Stage the uncles a run of headers referenced, beside the headers: those
+    /// of the blocks below the ones whose bodies the sync fetches
+    /// ([`Self::with_bodies_from`]), which bring their own.
     ///
     /// Same provisional footing as the headers: the chain is a peer's word
     /// until the walk reaches ground, so these go to the staging freezer and
@@ -458,17 +602,22 @@ impl HeaderWalk {
     /// chain's work nor serve `rsk/63` -- the sync it just performed.
     pub fn stage_uncles(&mut self, uncles: &[(u64, Vec<rustock_core::Header>)]) {
         let Some(staging) = self.staging.as_ref() else { return };
-        let horizon = self.freeze_horizon;
-        if horizon == 0 {
+        let below = self.uncles_below;
+        if below == 0 {
             return;
         }
         for (number, list) in uncles {
-            if *number < horizon {
+            if *number < below {
                 let _ = staging.put_uncles(*number, list);
             }
         }
     }
 
+    /// Writes a verified run to the staging freezer.
+    ///
+    /// Only blocks below the freeze horizon: anything younger can still be
+    /// replaced by a reorg, and a file addressed by height has no way to say
+    /// "this height means something else now".
     fn freeze_provisionally(&mut self, headers: &[rustock_core::Header]) {
         let Some(staging) = self.staging.as_ref() else { return };
         let horizon = self.freeze_horizon;
@@ -521,6 +670,7 @@ impl HeaderWalk {
                         .flatten()
                         .unwrap_or_default(),
                 );
+                self.settle_on_own_chain();
                 self.done = true;
                 self.commit_freezer();
                 break;
@@ -547,12 +697,95 @@ impl HeaderWalk {
             }
 
             self.runs.remove(&self.need_number);
+            self.points.remove(&self.need_number);
             // The run covered down to its oldest header, so what is needed
             // next is that header's parent: one lower, and named by it.
             self.need_number = run.oldest_number.saturating_sub(1);
             self.need_hash = run.oldest_parent;
+            // Only now is the run part of the chain, so only now does it
+            // count. Counted as answers arrived, a run that never linked -- an
+            // answer from another chain, a range answered twice, a late answer
+            // to a request asked again -- raised the work established, and
+            // with it the ceiling a claim is checked against.
+            self.count(run);
         }
 
         Ok(started_at.saturating_sub(self.need_number))
+    }
+
+    /// Add a run that has just joined the chain to the work established.
+    fn count(&mut self, run: Run) {
+        // Its newest headers are the trunk that the lowest uncles of the run
+        // above may hang from.
+        self.absorb(&run.newest_difficulties);
+        self.walked_difficulty = self.walked_difficulty.saturating_add(run.work);
+        self.uncles_omitted += run.uncles_omitted;
+        self.uncle_weight = self.uncle_weight.saturating_add(run.uncle_weight);
+        self.reaching.extend(run.reaching);
+    }
+
+    /// Show the uncles still waiting for their possible parents the next trunk
+    /// headers down, newest first, and settle those that have seen them all.
+    fn absorb(&mut self, difficulties: &[U256]) {
+        let mut settled = U256::ZERO;
+        self.reaching.retain_mut(|uncles| {
+            let seen = uncles.below.min(difficulties.len());
+            for difficulty in &difficulties[..seen] {
+                uncles.highest = uncles.highest.max(*difficulty);
+            }
+            uncles.below -= seen;
+            if uncles.below > 0 {
+                return true;
+            }
+            settled =
+                settled.saturating_add(U256::from(uncles.count).saturating_mul(uncles.highest));
+            false
+        });
+        self.uncle_weight = self.uncle_weight.saturating_add(settled);
+    }
+
+    /// Settle the uncles whose possible parents reach below the walk, on this
+    /// node's own chain under the anchor, which the store holds.
+    fn settle_on_own_chain(&mut self) {
+        let wanted = self
+            .reaching
+            .iter()
+            .map(|uncles| uncles.below)
+            .max()
+            .unwrap_or(0);
+        let mut difficulties = Vec::with_capacity(wanted);
+        let mut hash = self.need_hash;
+        let mut whole = true;
+        while difficulties.len() < wanted {
+            let Ok(Some(header)) = self.store.header(hash) else {
+                whole = false;
+                break;
+            };
+            difficulties.push(header.difficulty);
+            // Nothing hangs from below genesis.
+            if header.number == 0 {
+                break;
+            }
+            hash = header.parent_hash;
+        }
+        self.absorb(&difficulties);
+        if self.reaching.is_empty() {
+            return;
+        }
+        if whole {
+            // The chain ended at genesis before their stretches did: what they
+            // have seen is all there is.
+            let settled = self.reaching.drain(..).fold(U256::ZERO, |sum, uncles| {
+                sum.saturating_add(U256::from(uncles.count).saturating_mul(uncles.highest))
+            });
+            self.uncle_weight = self.uncle_weight.saturating_add(settled);
+        } else {
+            warn!(
+                target: "rustock::snap",
+                "a header under the anchor is missing, so the uncles above it cannot be bounded"
+            );
+            self.reaching.clear();
+            self.uncle_weight = U256::MAX;
+        }
     }
 }

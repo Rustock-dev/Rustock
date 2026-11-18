@@ -1,5 +1,6 @@
 use alloy_primitives::{B256, B512};
 use rustock_core::types::header::Header;
+use rustock_core::types::header_extension::BlockHeaderExtension;
 use rustock_core::types::transaction::Transaction;
 use alloy_primitives::U256;
 use rustock_core::types::block::Block;
@@ -42,10 +43,26 @@ pub enum SyncEvent {
         id: u64,
         transactions: Vec<Transaction>,
         uncles: Vec<Header>,
+        /// The RSKIP-351 extension the peer sent beside the body, which a
+        /// header that came compressed needs (`body_check::completed_header`).
+        extension: Option<BlockHeaderExtension>,
     },
     NewBlockHashes {
         peer: B512,
         identifiers: Vec<BlockIdentifier>,
+    },
+    /// A whole block a peer sent unasked, as rskj sends one it mined
+    /// (`BlockMessage`), or in answer to a `GetBlockMessage`.
+    NewBlock {
+        peer: B512,
+        block: Box<Block>,
+    },
+    /// A block this node mined, now stored and, if it won, the head and the
+    /// executed head: rskj connects a mined block through the same
+    /// `blockchain.tryToConnect` as a peer's (`EthereumImpl.addNewMinedBlock`),
+    /// so the node's state is the block's once it is best.
+    MinedBlock {
+        hash: B256,
     },
 
     /// A peer's offer of a state it can serve. The blocks are unverified:

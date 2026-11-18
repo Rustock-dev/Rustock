@@ -18,6 +18,7 @@ anyhow = { workspace = true }
 bitcoin = { workspace = true }
 hex = { workspace = true }
 hex-literal = "0.4.1"
+num-bigint = { workspace = true }
 serde_json = "1"
 secp256k1 = { workspace = true }
 serde = { workspace = true }
@@ -32,3 +33,6 @@ thiserror = { workspace = true }
 # a cross-check between two independent implementations rather than a
 # round trip through one. Production code no longer uses k256 at all.
 k256 = { workspace = true, features = ["ecdsa"] }
+# The merged-mining tests check this crate's own SHA-256 compression, which
+# resumes from a Bitcoin coinbase's midstate, against `sha2`'s.
+sha2 = { workspace = true, features = ["compress"] }

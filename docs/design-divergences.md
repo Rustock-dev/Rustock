@@ -24,19 +24,36 @@ during sync.
 
 | Hardfork | Block | Relevant RSKIPs |
 |----------|-------|-----------------|
-| Orchid | 729,000 | RSKIP92 (merged mining PoW), RSKIP97 (no 10-min reset), RSKIP98 (no fallback mining) |
+| Orchid | 729,000 | RSKIP92 (merged-mining merkle proof), RSKIP97 (no 10-min reset), RSKIP98 (no fallback mining; a Bitcoin header of exactly 80 bytes) |
 | Papyrus200 | 2,392,700 | RSKIP156 (difficulty divisor 50 → 400) |
 
 ### Merged mining (RSKIP92/98)
 
-Before Orchid, RSK allowed "fallback mining" without proper Bitcoin merged
-mining fields. The `MergedMiningRule` in `crates/core/src/validation/merged_mining.rs`
-skips validation for blocks below `activation_heights.orchid`.
+`MergedMiningRule` in `crates/core/src/validation/merged_mining.rs` follows
+rskj's `ProofOfWorkRule`, and checks every block, below orchid too.
 
-After Orchid, the rule validates:
-1. Bitcoin header PoW against RSK difficulty target
-2. Merkle proof linking coinbase to Bitcoin header
-3. RSK tag (`RSKBLOCK:` + hash) in coinbase outputs
+Below orchid a block may be fallback-mined: no coinbase, no merkle proof, a
+difficulty no greater than the network's fallback-mining difficulty, and in
+the Bitcoin-header field a signature of the block's merged-mining hash by
+rskj's fallback-mining key for an even or an odd height, checked as rskj's
+`validFallbackBlockSignature` checks it. RSKIP98 ended fallback mining.
+
+Every other block is merge-mined, and the rule checks:
+1. The Bitcoin header: from orchid exactly 80 bytes (`BtcHeaderSizeRule`).
+   Below orchid, and at block 0, any bytes bitcoinj-thin reads as a block,
+   whose header is their first 80 (`crates/core/src/btc_block.rs`).
+2. Its proof of work against the RSK target, 2^256 / max(difficulty, 3).
+3. The `RSKBLOCK:` tag and the block's merged-mining hash in the coinbase,
+   where rskj requires them, and a coinbase longer than 64 bytes.
+4. The merkle proof that puts the coinbase in the Bitcoin block. From orchid
+   (RSKIP92) it is the coinbase's branch of sibling hashes, at most 960 bytes
+   from iris300 (RSKIP180). Below orchid it is a bitcoinj-thin partial merkle
+   tree, of exactly the size its counts declare, that walks to the header's
+   merkle root and matches the coinbase (rskj's `GenesisMerkleProofValidator`;
+   `crates/core/src/partial_merkle_tree.rs`, shared with the Bridge).
+
+On mainnet all 728,999 blocks below orchid pass: 165,328 fallback-mined and
+563,671 merge-mined.
 
 ### Difficulty calculation
 
@@ -60,9 +77,9 @@ three hardfork-gated behaviors matching `rskj/.../core/DifficultyCalculator.java
 ### Rust implementation
 
 `ChainConfig` in `crates/core/src/config.rs` includes an `ActivationHeights`
-struct with `orchid` and `papyrus200` fields. Both `MergedMiningRule` and
-`DifficultyRule` check `header.number` against these heights before applying
-hardfork-specific logic.
+struct with the heights these rules read, `orchid`, `wasabi100`, `papyrus200`
+and `iris300` among them. Both `MergedMiningRule` and `DifficultyRule` check
+`header.number` against these heights before applying hardfork-specific logic.
 
 ---
 
@@ -793,4 +810,128 @@ was already 700, so this is behavior-preserving there too. Test
 at #7,338,024 = 21,712, isolating the 700 base). Verified: exec-head #7,515,159 →
 replay #7,515,160 + #7,515,161/200, #7,516,000, #7,520,000 match state and receipts
 roots exactly; 558 tests pass.
+
+## §99 Two chains of equal total difficulty: rskj's selection rule, not the block held first
+
+rskj makes a block the best by `SelectionRule.shouldWeAddThisBlock`, which
+`BlockChainImpl.internalTryToConnect` asks of every block it connects, its
+own mined blocks included (VETIVER-9.0.4, `co/rsk/core/bc/SelectionRule.java`;
+`BlockChainImpl.java:290`). The greater total difficulty wins. On a tie the
+newcomer wins if its header's `paidFees` are more than twice the best block's,
+or else if the best block's are less than twice the newcomer's and the
+newcomer's hash is the lower, its bytes compared unsigned
+(`FastByteComparisons.compareTo`). Two blocks that paid nothing keep the one
+held first. It is RSK's design, not Ethereum's first-seen rule, and REMASC
+holds miners to it: when it pays a block whose siblings were included as
+uncles, `SelectionRule.isBrokenSelectionRule` tells whether the rule would
+have taken one of them instead (§12 is the cell that keeps the answer), and if
+so a `punishmentDivisor`th, a tenth, of the miners' share of the next block's
+reward is burned: the block built on the one chosen against the rule.
+
+rustock moved its head only on a strictly greater total difficulty
+(`BlockStore::store_headers_batch`, `StoreChainAccess::commit_mined_block`), so
+on a tie it kept the block it held first. That changes no block's validity or
+state, and a tie lasts only until one of the two chains grows, so a node
+following the tip named a different newest block than rskj's only for that
+long; but a miner on rustock built on a block rskj's miners don't, and it is
+the miner's own block that REMASC docks. Found on 14 November 2026, reading
+rskj after following mainnet's tip, where six times a block arrived that
+didn't build on the node's newest (four reorganizations, and two blocks at the
+newest's own height) and each time the node ended on rskj's chain.
+
+**rustock:** `rustock_core::selection_rule::should_we_add_this_block` states the
+rule, doubling exactly (rskj's `Coin` has no width, so a doubling past 256 bits
+is more than any fees). `store_headers_batch`, which every block from a peer
+passes through, and `commit_mined_block` weigh the head with it, by the hash
+the head is held under (`BlockStore::contender`). The totals weighed are those
+the node holds when a header arrives: exact for a whole block or a header sent
+with its uncles, a lower bound for a bare header until its body settles it
+(`sync::total_difficulty`).
+
+rskj weighs a block once, when it connects it, and answers `EXIST` when it
+comes round again; rustock weighs a header each time it stores it. While the
+head stays the same that comes to the same answer, since the rule never lets
+two blocks each take the head from the other. It can differ only when the head
+has meanwhile passed to a third block of the same weight: with fees of 2.5, 1
+and 1.5 the rule isn't transitive, and the block that paid 1 can lose to the
+first and beat the third. Weighing a held header only once would not fix it:
+a tie whose total `settle` raised, rather than a new weighing, would then
+never be put to the rule.
+
+Tests: `selection_rule::tests` (rskj's `SelectionRuleTest` cases, the bounds
+at twice the fees, no fees, and doubling past 256 bits), and
+`test_store_headers_batch_settles_a_tie_by_rskj_selection_rule`,
+`test_tie_via_headers_response_goes_to_the_lower_hash` and
+`a_mined_block_that_ties_the_head_goes_by_the_selection_rule`, each of which
+fails on the old comparison.
+
+## §100 A block is the best only once it is executed, and a reorg runs nothing again
+
+rskj connects every block it is given: `BlockChainImpl.internalTryToConnect`
+executes it against its own parent's state (`blockExecutor.execute(…, block,
+parent.getHeader(), …)`) and files the result (`stateRootHandler.register`),
+best or not, and only then asks the selection rule (§99) whether it is the new
+best (VETIVER-9.0.4, `co/rsk/core/bc/BlockChainImpl.java`). A block it has not
+connected cannot be the best, so a heavier chain known by its headers alone
+leaves rskj where it is; and a reorg (`blockStore.reBranch`) re-points the
+index over blocks already executed, so it executes nothing.
+
+rustock executed only the block canonical at each height, and moved its head
+on headers. A heavier chain known by its headers took the head, pulled
+execution back to the fork point, and was executed there on a later tick (5 s),
+after a grace period for an executed head off the chain (10 s), once its bodies
+had been fetched. Meanwhile the miner built on the fork point and every query
+was answered from there; and a miner able to produce the heavier chain could
+keep the node there by withholding its bodies. Found on 14 November 2026,
+comparing how the two clients meet a fork.
+
+**rustock:** the store holds a heavier branch back until this node has
+executed it past its executed head (`BlockStore::move_head_to`,
+`adoption_waits_for_execution`), and then takes execution straight to the
+branch's highest executed block (`stage_execution_after_reorg`,
+`executed_climb`). The sync service executes every block whose body it holds
+as it arrives, against its own parent's state -- beside the chain when it is
+not canonical (`service::beside`, `BlockProcessor::process_beside`) -- fetches
+the bodies and missing headers of a branch held back, each of a peer known to
+hold it or else of another, and not again of a peer that let a request lapse
+while another can be asked; gives a branch up after 60 s without progress;
+and takes a switch up in the call that makes it: the in-memory root, the
+miner's best block, subscribers, the transaction pool, the gas price and the
+Bridge index. The store records each switch it makes, from
+the executed head it found (`ExecutionSwitch`), and only those are taken up: a
+batch records its own progress on a thread of its own, which moves the
+executed head with no switch at all. Whether this node executed a block is the
+block's own receipts hashed against its header, with its state root resolving
+in the trie, so nothing durable names a losing branch's state and the epoch
+collector is unchanged ([`follow-mode-rskj-vs-rustock.md`](./follow-mode-rskj-vs-rustock.md)
+§5, §8).
+
+What stays different: rskj keeps what it computed for a block for as long as
+its stores keep it; rustock keeps the state of a branch beside the chain for as
+long as the collector does, and would run such a branch again if the chain
+turned to it after that, tens of thousands of blocks later, past any reorg this
+node follows.
+
+Tests: `service::beside::tests`: eight, each failing with the new behaviour
+switched off, and five failing on its first version: two where it took any
+move of the executed head for a switch
+(`execution_recording_its_progress_is_not_taken_for_a_switch`,
+`a_switch_made_while_a_batch_runs_is_taken_up_from_where_the_batch_had_got`),
+one where it checked a block whose header was held without its RSKIP-351
+extension, and refused it
+(`a_block_held_without_its_extension_is_fetched_again_not_run_or_refused`),
+and two where it asked a peer that never answered for a branch's bodies, or
+the headers below it, every time
+(`a_branch_body_a_peer_never_sends_is_asked_of_another_peer`,
+`headers_below_a_branch_a_peer_never_sends_are_asked_of_another_peer`): on
+testnet on 15 November 2026 the network's branch from #8,296,515 came by
+header sync, which names no peer as holding its blocks, and a first peer that
+never answered held the node off the chain for over an hour;
+and the store's half in `crates/storage/src/position.rs`:
+`a_heavier_branch_waits_until_it_is_executed_past_the_executed_head`,
+`a_switch_takes_execution_to_the_executed_tip_of_the_new_branch`,
+`a_node_without_the_check_adopts_on_headers_as_before`,
+`a_waiting_branch_the_chain_outgrows_is_forgotten`,
+`a_block_weighed_again_takes_the_head_once_it_outweighs_it` and
+`only_a_change_of_head_that_moves_execution_is_a_switch`.
 

@@ -1,3 +1,5 @@
+mod beside;
+
 use crate::events::SyncEvent;
 use crate::manager::{SyncManager, MAX_SKELETON_CHUNKS};
 use crate::progress::SyncProgress;
@@ -60,7 +62,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// reason to abandon the feature -- but trying forever against a hostile
 /// network is not better. Each attempt costs a status round trip and whatever
 /// of the header walk it got through.
-const MAX_SNAP_ATTEMPTS: u32 = 5;
+///
+/// Concluding it will not work *now*, for a node that has executed nothing:
+/// such a node has no other way forward, so it waits [`SNAP_RETRY_FIRST`] and
+/// tries again, one attempt per wait (see `finish_snap_sync`).
+pub(crate) const MAX_SNAP_ATTEMPTS: u32 = 5;
+
+/// The first wait before a node that has executed nothing tries snapshot sync
+/// again, after its attempts are spent. Each wait doubles, to
+/// [`SNAP_RETRY_MAX`].
+pub(crate) const SNAP_RETRY_FIRST: Duration = Duration::from_secs(30 * 60);
+
+/// The longest wait between attempts, so a failure that keeps repeating costs
+/// a day one state download, not five an hour.
+pub(crate) const SNAP_RETRY_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How long a coherence violation must persist before it is worth reporting.
 ///
@@ -225,10 +240,23 @@ pub(crate) fn fast_forward_state(
 /// be logged as `Executed block` one line after the store refused it, on
 /// 2026-09-24 at 14:01:15, and why the coherence check then had to reload the
 /// committed root five seconds later.
+///
+/// That refusal is the reorg being handled, not a failure: the block is not
+/// recorded, and is executed again or re-adopted once the chain settles. So
+/// it is a warning; anything else that stops the record is an error. Testnet
+/// logged #8,274,238's as an error on 9 November.
 pub(crate) fn record_execution(store: &BlockStore, hash: B256, state_root: B256) -> bool {
     match Validated::prove(store, hash) {
         Ok(at) => match store.apply(&Transition::Executed { at, state_root }) {
             Ok(_) => true,
+            Err(e) if no_longer_canonical(store, hash) => {
+                warn!(
+                    target: "rustock::sync",
+                    "Executed {:?}, but a reorg moved the chain while it ran; not recording it: {}",
+                    hash, e
+                );
+                false
+            }
             Err(e) => {
                 error!(target: "rustock::sync", "Recording execution of {:?} failed: {:?}", hash, e);
                 false
@@ -243,6 +271,16 @@ pub(crate) fn record_execution(store: &BlockStore, hash: B256, state_root: B256)
             false
         }
     }
+}
+
+/// Whether `hash` has stopped being the canonical block at its height: what a
+/// reorg landing between executing a block and recording it leaves. A store
+/// that cannot say is not taken for one.
+pub(crate) fn no_longer_canonical(store: &BlockStore, hash: B256) -> bool {
+    let Ok(Some(header)) = store.header(hash) else {
+        return false;
+    };
+    matches!(store.canonical_hash(header.number), Ok(canonical) if canonical != Some(hash))
 }
 
 pub(crate) fn backlog_needs_executing(has_processor: bool, downloaded: u64, executed: u64) -> bool {
@@ -313,6 +351,11 @@ pub(crate) const STATUS_REFRESH: Duration = Duration::from_secs(10);
 /// sync; smaller gaps are handled by fetching individual headers.
 /// Matches RSKj's `longSyncLimit` (default 24).
 const LONG_SYNC_LIMIT: u64 = 24;
+
+/// How far above its best block rskj takes a block a peer names or sends:
+/// `syncConfiguration.getChunkSize() * getMaxSkeletonChunks()`, 192 x 20
+/// (`NodeBlockProcessor.isAdvancedBlock`, `BlockSyncService.preprocessBlock`).
+const SYNC_MAX_DISTANCE: u64 = 192 * MAX_SKELETON_CHUNKS as u64;
 
 /// How far below an orphaned head to retreat when the fork point cannot be
 /// computed, because the branch that replaced us was never downloaded.
@@ -426,6 +469,10 @@ pub(crate) struct ExecOutcome {
     /// `false` when a block failed to execute (or a parent/body was missing);
     /// the sync must not advance past it.
     pub(crate) all_ok: bool,
+    /// The batch stopped because a reorg made a block of it non-canonical
+    /// while it executed, so the block was not recorded: the chain moved,
+    /// nothing failed.
+    pub(crate) superseded: bool,
     /// State root after the last successfully executed block in the batch.
     /// Becomes the starting root for the next batch's execution.
     pub(crate) new_state_root: TrieNode,
@@ -491,6 +538,12 @@ pub struct SyncService {
     snap_attempts: u32,
     /// Peers not worth asking, carried between sessions.
     snap_avoid: std::collections::HashSet<B512>,
+    /// When a node that has executed nothing tries snapshot sync again, its
+    /// attempts spent. Ordinary sync stays suspended until then: it has
+    /// nothing to execute from.
+    snap_retry_at: Option<Instant>,
+    /// How long the next such wait will be.
+    snap_retry_wait: Duration,
     block_processor: Option<Arc<BlockProcessor>>,
     trie_store: Option<Arc<dyn TrieStore>>,
     pub(crate) current_state_root: Option<TrieNode>,
@@ -683,6 +736,28 @@ pub struct SyncService {
     last_prefetch_start: Option<u64>,
     /// Optional local block source (e.g. rskj's LevelDB) tried before peers.
     block_source: Option<Arc<dyn ExternalBlockSource>>,
+    /// Executes a block beside the chain, against its own parent's state. See
+    /// `beside`.
+    beside_fn: Option<beside::BesideFn>,
+    /// The peg decisions the Bridge logs nothing for, made by blocks executed
+    /// beside the chain. See `beside::Unlogged`.
+    beside_unlogged: beside::Unlogged,
+    /// Blocks beside the chain that broke a rule of consensus: not tried
+    /// again, and no branch through one is adopted.
+    invalid_beside: std::collections::HashSet<B256>,
+    /// Body requests for blocks beside the chain, apart from the follow
+    /// path's: that map being empty is how its checks see nothing in flight.
+    pending_branch_bodies: HashMap<u64, (B256, Header, Instant, B512)>,
+    /// Body requests for blocks beside the chain that lapsed, by block, with
+    /// the peer each was out to, so that the block is asked of another peer.
+    branch_body_lapsed: HashMap<B256, B512>,
+    /// Headers asked for below a block beside the chain whose ancestry is not
+    /// held, by the hash they end at, with when they were asked and of whom,
+    /// so that a request that lapses is asked of another peer.
+    branch_headers_asked: HashMap<B256, (Instant, B512)>,
+    /// The branch the store holds back and when it last made progress, so
+    /// that one whose bodies never come is given up. See `beside`.
+    deferred_watch: Option<(B256, Instant)>,
 }
 
 impl SyncService {
@@ -707,6 +782,8 @@ impl SyncService {
             snap_restart: None,
             snap_attempts: 0,
             snap_avoid: std::collections::HashSet::new(),
+            snap_retry_at: None,
+            snap_retry_wait: SNAP_RETRY_FIRST,
             trie_store: None,
             current_state_root: None,
             executing: None,
@@ -745,6 +822,13 @@ impl SyncService {
             scoring: None,
             last_prefetch_start: None,
             block_source: None,
+            beside_fn: None,
+            beside_unlogged: Default::default(),
+            invalid_beside: std::collections::HashSet::new(),
+            pending_branch_bodies: HashMap::new(),
+            branch_body_lapsed: HashMap::new(),
+            branch_headers_asked: HashMap::new(),
+            deferred_watch: None,
         }
     }
 
@@ -767,13 +851,45 @@ impl SyncService {
 
     /// Fill a missing body from the local block source, if available. Returns
     /// true when the body was found and stored (so no peer request is needed).
+    ///
+    /// Not for a header that holds only its RSKIP-351 commitment: the source
+    /// gives transactions and uncles, never the extension such a header needs.
     fn try_fill_body_locally(&self, hash: B256) -> bool {
         let Some(source) = &self.block_source else {
             return false;
         };
+        if matches!(self.manager.store.header(hash), Ok(Some(h)) if h.extension_data.is_some()) {
+            return false;
+        }
         match source.body_by_hash(hash) {
             Some((txs, ommers)) => self.manager.store.put_body(hash, &txs, &ommers).is_ok(),
             None => false,
+        }
+    }
+
+    /// Drop the body stored for the block `hash` if its header, `header`,
+    /// holds only the commitment to its RSKIP-351 extension.
+    ///
+    /// A body is stored beside such a header only once the extension that
+    /// came with it has completed the header, so one found beside it came
+    /// without: derived from the header, before that was refused. Its block
+    /// can't be run, its bloom missing, so it is dropped and asked for again.
+    fn drop_body_without_extension(&self, hash: B256, header: &Header) {
+        if header.extension_data.is_none() || !matches!(self.manager.store.body(hash), Ok(Some(_)))
+        {
+            return;
+        }
+        match self.manager.store.delete_body(hash) {
+            Ok(()) => debug!(
+                target: "rustock::sync",
+                "Dropped the body of #{}, stored without its header's extension; asking for it again",
+                header.number
+            ),
+            Err(e) => warn!(
+                target: "rustock::sync",
+                "Could not drop the body of #{}, stored without its header's extension: {e:?}",
+                header.number
+            ),
         }
     }
 
@@ -828,6 +944,7 @@ impl SyncService {
         self.block_processor = Some(processor.clone());
         self.trie_store = Some(trie_store.clone());
         self.current_state_root = Some(initial_state_root);
+        self.wire_beside(processor.clone(), trie_store.clone());
 
         // Wire the execution step to the real block processor. Cloned handles
         // (Arc<BlockProcessor>, Arc<dyn TrieStore>, Arc<BlockStore>, Arc<pool>)
@@ -837,6 +954,7 @@ impl SyncService {
         let activity = self.chain_activity.clone();
         let gas_price = self.gas_price.clone();
         let flush_every = self.trie_flush_every;
+        let unlogged = self.beside_unlogged.clone();
         self.exec_fn = Some(Arc::new(move |state_root, blocks_since_flush, pending| {
             process_downloaded_blocks(
                 &processor,
@@ -849,6 +967,7 @@ impl SyncService {
                 &pending,
                 &activity,
                 &gas_price,
+                &unlogged,
             )
         }));
         self
@@ -1209,12 +1328,17 @@ impl SyncService {
     ) {
         self.snap_attempts += 1;
         self.suspend_ordinary_sync();
-        let session = crate::snap::session::SnapSession::new(
+        let mut session = crate::snap::session::SnapSession::new(
             config,
             self.manager.store.clone(),
             trie_store,
             verifier,
         );
+        // The blocks a snapshot brings are kept without being run, so the
+        // session holds them to this node's rules for what a block carries.
+        if let Some(processor) = &self.block_processor {
+            session = session.with_block_rules(processor.clone());
+        }
         self.snap = Some(
             crate::snap::driver::SnapDriver::new(session).avoiding(self.snap_avoid.clone()),
         );
@@ -1230,6 +1354,13 @@ impl SyncService {
     #[cfg(test)]
     pub(crate) fn snap_request_id_for_test(&self) -> Option<u64> {
         self.snap.as_ref()?.outstanding_ids().first().copied()
+    }
+
+    /// Whether the snapshot session was given this node's rules for the
+    /// blocks it keeps, for a test of how one is opened.
+    #[cfg(test)]
+    pub(crate) fn snap_holds_blocks_to_rules_for_test(&self) -> Option<bool> {
+        Some(self.snap.as_ref()?.session().holds_blocks_to_rules())
     }
 
     /// Whether ordinary sync is standing down for a snapshot session.
@@ -1256,6 +1387,32 @@ impl SyncService {
         self.snap_restart = None;
     }
 
+    /// End the running session as a failure, through the handover a real
+    /// failure takes.
+    #[cfg(test)]
+    pub(crate) async fn fail_snap_session_for_test(
+        &mut self,
+        why: crate::snap::session::SnapFailure,
+    ) {
+        if let Some(driver) = self.snap.as_mut() {
+            driver.fail_for_test(why);
+        }
+        self.finish_snap_sync().await;
+    }
+
+    /// When snapshot sync is next tried, if a node is waiting to try it again,
+    /// and how long the wait after that will be.
+    #[cfg(test)]
+    pub(crate) fn snap_retry_for_test(&mut self) -> (&mut Option<Instant>, Duration) {
+        (&mut self.snap_retry_at, self.snap_retry_wait)
+    }
+
+    /// Peers snapshot sessions are not asking, carried between them.
+    #[cfg(test)]
+    pub(crate) fn snap_avoid_for_test(&mut self) -> &mut std::collections::HashSet<B512> {
+        &mut self.snap_avoid
+    }
+
     /// Sessions started so far.
     #[cfg(test)]
     pub(crate) fn snap_attempts_for_test(&self) -> u32 {
@@ -1269,28 +1426,36 @@ impl SyncService {
     where
         F: FnOnce(
             &mut crate::snap::driver::SnapDriver,
-            &[B512],
+            crate::snap::driver::Peers<'_>,
         ) -> Vec<crate::snap::driver::Outbound>,
     {
-        // Only peers that announced `snap`. Sending one of the six snapshot
-        // messages to a peer that did not is not a wasted request -- rskj
-        // throws out of `MessageType.valueOfType` on an unknown id and closes
-        // the connection, so an unfiltered round robin sheds every
-        // non-snap-capable peer, which on mainnet is most of them.
-        let peers: Vec<B512> = self.peer_store.peers_serving_snapshots().await;
-        if peers.is_empty() {
-            // Say so rather than falling back to every peer: a snapshot sync
-            // with nobody to ask should stall visibly and let the ordinary
-            // sync take over, not quietly disconnect the peer set.
-            debug!(
-                target: "rustock::snap",
-                "no peer has announced the snap capability; nothing to drive"
-            );
-            return;
+        // Who can be sent what; `Peers` says why. The six snapshot messages go
+        // only to peers that announced `snap`: rskj throws out of
+        // `MessageType.valueOfType` on an unknown id and closes the connection,
+        // so an unfiltered round robin would shed every non-snap-capable peer,
+        // which on mainnet is most of them. The header walk's requests are
+        // ordinary messages that every peer serves, so they go to anyone, and
+        // the walk no longer waits on the few peers that serve snapshots.
+        let snap: Vec<B512> = self.peer_store.peers_serving_snapshots().await;
+        let uncles: Vec<B512> = self.peer_store.peers_sending_header_uncles().await;
+        let any: Vec<B512> = self.peer_store.peers().await;
+        if any.is_empty() {
+            // Say so rather than stall silently. The step still runs, so an
+            // answer that arrived just before its peer left is not thrown away;
+            // whatever the session asks next is handed back until a peer can
+            // take it.
+            debug!(target: "rustock::snap", "no peer connected; nothing can be asked");
         }
         let Some(driver) = self.snap.as_mut() else { return };
 
-        let outbound = step(driver, &peers);
+        let outbound = step(
+            driver,
+            crate::snap::driver::Peers {
+                snap: &snap,
+                uncles: &uncles,
+                any: &any,
+            },
+        );
 
         // Charge whatever the step turned up before anything else: a peer that
         // misbehaved should pay for it even if the session went on to finish
@@ -1396,6 +1561,33 @@ impl SyncService {
         }
     }
 
+    /// Whether this node has executed nothing past genesis: the only node
+    /// `start_snap_sync` starts a session for, and one ordinary sync can do
+    /// nothing for once a session has written its window of headers.
+    fn executed_nothing(&self) -> bool {
+        self.recorded_execution()
+            .is_none_or(|executed| executed.number == 0)
+    }
+
+    /// Try snapshot sync again, after the wait `finish_snap_sync` set.
+    ///
+    /// Every peer gets another chance: one set aside may have been set aside
+    /// through no fault of its own, and it may be the only one that serves
+    /// snapshots. The round is a single attempt, so a failure that repeats
+    /// costs one attempt per wait rather than a round of them.
+    fn retry_snap_sync(&mut self) {
+        let (Some((config, verifier)), Some(trie_store)) =
+            (self.snap_restart.clone(), self.trie_store.clone())
+        else {
+            self.resume_ordinary_sync();
+            return;
+        };
+        info!(target: "rustock::snap", "trying snapshot sync again");
+        self.snap_avoid.clear();
+        self.snap_attempts = MAX_SNAP_ATTEMPTS - 1;
+        self.open_snap_session(config, verifier, trie_store);
+    }
+
     /// Hand a completed snapshot over to ordinary sync, or report the failure.
     async fn finish_snap_sync(&mut self) {
         let Some(driver) = self.snap.take() else { return };
@@ -1445,6 +1637,26 @@ impl SyncService {
                     return;
                 };
                 if self.snap_attempts >= MAX_SNAP_ATTEMPTS {
+                    // A node that has executed nothing has no other way
+                    // forward: ordinary sync has no state to execute from,
+                    // only the headers the sessions wrote. Handing over left
+                    // a mainnet light node halted for good on 6 November
+                    // 2026 ("this node holds headers it has no way to
+                    // execute"). So it waits, and tries again.
+                    if self.executed_nothing() && self.trie_store.is_some() {
+                        let wait = self.snap_retry_wait;
+                        self.snap_retry_wait = (wait * 2).min(SNAP_RETRY_MAX);
+                        self.snap_retry_at = Some(Instant::now() + wait);
+                        warn!(
+                            target: "rustock::snap",
+                            "snapshot sync gave up after {} attempt(s): {why}. This node has \
+                             executed nothing, so ordinary sync has nothing to start from; \
+                             trying again in {} min",
+                            self.snap_attempts,
+                            wait.as_secs() / 60
+                        );
+                        return;
+                    }
                     warn!(
                         target: "rustock::snap",
                         "snapshot sync gave up after {} attempts: {why}", self.snap_attempts
@@ -1498,6 +1710,11 @@ impl SyncService {
             self.refresh_status_to_peers().await;
         }
 
+        if self.snap.is_none() && self.snap_retry_at.is_some_and(|at| Instant::now() >= at) {
+            self.snap_retry_at = None;
+            self.retry_snap_sync();
+        }
+
         if self.snap.is_some() {
             let now = Instant::now();
             if let Some(driver) = self.snap.as_mut() {
@@ -1509,8 +1726,9 @@ impl SyncService {
         // Suspended with no session to wait for is a bug, and the shape of the
         // bug is a node that never syncs again -- the worst failure available
         // here, and a silent one. `finish_snap_sync` resumes on every path it
-        // owns; this catches a path it does not, complains, and recovers.
-        if self.suspended_for_snap && self.snap.is_none() {
+        // owns; this catches a path it does not, complains, and recovers. A
+        // node waiting to try snapshot sync again has a session to wait for.
+        if self.suspended_for_snap && self.snap.is_none() && self.snap_retry_at.is_none() {
             warn!(
                 target: "rustock::snap",
                 "ordinary sync was suspended with no snapshot session running; resuming"
@@ -1528,10 +1746,15 @@ impl SyncService {
         }
 
         self.expire_stale_follow_bodies();
+        self.expire_stale_branch_bodies();
         self.check_execution_progress();
         self.resync_state_root_with_exec_head();
         self.verify_coherence();
         self.check_phi_progress().await;
+        // A heavier branch the store holds back until this node has executed
+        // it: fetch and execute it beside the chain, whatever the sync is
+        // doing. See `beside`.
+        self.advance_deferred_branch().await;
 
         match &self.state {
             SyncState::Idle => {
@@ -1564,6 +1787,10 @@ impl SyncService {
                 if before != after {
                     self.state = SyncState::Idle;
                 } else {
+                    // Blocks stored above the executed head that do not build on
+                    // it: weighed by executing them beside the chain. See
+                    // `beside`.
+                    self.take_up_stored_successors().await;
                     self.fill_follow_body_gap().await;
                     // Canonical blocks whose bodies we already hold but never
                     // executed. See `refill_follow_buffer_from_store`.
@@ -1713,97 +1940,17 @@ impl SyncService {
                     _ => {}
                 }
 
-                // Neither signal above can describe a fork this node never
-                // adopted. Both read the canonical index, and a branch we did
-                // not follow never got a pointer -- so `canonical_hash(N+1)`
-                // is None *and* the head never rose above N+1, because the head
-                // tracks the canonical chain too. That is not an edge case: it
-                // wedged mainnet for three days at #9,251,058, with the network
-                // 7,000 blocks ahead on a sibling branch whose headers this
-                // node had already downloaded.
-                //
-                // The height index does describe it -- that is what it is for.
-                // If blocks are stored at N+1 and *none* of them builds on our
-                // executed head, then nothing extends us and we are on a branch
-                // the network left behind. Adopting the stored lineage gives
-                // N+1 a canonical pointer; when it cannot be adopted the
-                // retreat goes straight to the fork point rather than one
-                // block per round (see `orphan_retreat_target` -- one block per
-                // round does not converge, because after the first step a
-                // stored child of the losing head satisfies `extends_us` and
-                // the condition stops being detected at all).
-                let stored_next = store.hashes_at_height(header.number + 1).unwrap_or_default();
-                if stored_next.is_empty() {
-                    return; // genuinely at the tip: nothing to reconcile
-                }
-                let extends_us = stored_next.iter().any(|h| {
-                    store
-                        .header(*h)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|c| c.parent_hash == exec_hash)
-                });
-                if extends_us {
-                    return; // a successor builds on us; the index just lacks a pointer
-                }
-                // Prefer a successor that is itself extended: with several
-                // siblings the one carrying descendants is the branch that kept
-                // going. Ties break on the hash so two nodes reach the same
-                // answer. Picking wrong is survivable -- the next round
-                // re-evaluates -- but picking arbitrarily is not reproducible.
-                let mut candidates = stored_next.clone();
-                candidates.sort();
-                let successor = candidates
-                    .iter()
-                    .find(|h| {
-                        store
-                            .header(**h)
-                            .ok()
-                            .flatten()
-                            .and_then(|c| store.hashes_at_height(c.number + 1).ok())
-                            .is_some_and(|next| !next.is_empty())
-                    })
-                    .copied()
-                    .unwrap_or(candidates[0]);
-                warn!(
-                    target: "rustock::sync",
-                    "Executed head #{} ({:?}) has no descendant among the {} block(s) stored \
-                     at #{}; treating it as orphaned and adopting {:?}",
-                    header.number, exec_hash, stored_next.len(), header.number + 1, successor
-                );
-                // One transition: the lineage and the head move together, or
-                // neither does. Writing canonical entries and leaving KEY_HEAD
-                // behind is what wedged mainnet for three hours on
-                // 2026-09-22, and `Transition` has no way to express it.
-                match Validated::prove(store, successor) {
-                    Ok(head) => {
-                        if let Err(e) = store.apply(&Transition::Adopt { head }) {
-                            warn!(
-                                target: "rustock::sync",
-                                "Orphan recovery: adopting {:?} failed: {:?}", successor, e
-                            );
-                        }
-                    }
-                    Err(broken) => {
-                        // The only successor we know of hangs off a block we
-                        // never downloaded, so there is nothing to adopt.
-                        //
-                        // Retreat *here*, rather than doing nothing. The code
-                        // this replaced wrote the unprovable pointer anyway and
-                        // relied on a later round to notice it was broken and
-                        // recover -- a deliberate detour through an incoherent
-                        // store. Refusing to write it is right; refusing and
-                        // then standing still is a wedge, so the retreat that
-                        // the later round used to perform happens now.
-                        warn!(
-                            target: "rustock::sync",
-                            "Orphan recovery: cannot adopt {:?} ({}); retreating below the fork \
-                             so the range is downloaded again",
-                            successor, broken
-                        );
-                        self.retreat_below_orphaned_head(&header, successor);
-                    }
-                }
+                // Nor is it a fork this node never adopted: blocks stored at N+1
+                // that do not build on the executed head, the shape that wedged
+                // mainnet for three days at #9,251,058 with the network 7,000
+                // blocks ahead on a sibling branch whose headers this node held.
+                // That used to adopt the stored lineage for being there, pulling
+                // execution back to the fork point, or retreat below the fork
+                // when the lineage could not be proved. Now the branch is
+                // weighed as rskj weighs one: its bodies and any headers it lacks
+                // are fetched, it is executed beside the chain, and the store
+                // adopts it once it outweighs the executed head
+                // (`beside::take_up_stored_successors`, on the tick).
                 return;
             }
         };
@@ -1853,9 +2000,7 @@ impl SyncService {
                      the fork so the range is downloaded again",
                     child.parent_hash, header.number, broken
                 );
-                // The fork point, not our parent -- same rule, and same
-                // reason, as the other orphan path. See
-                // `orphan_retreat_target`.
+                // The fork point, not our parent. See `orphan_retreat_target`.
                 let target = self.orphan_retreat_target(&header, child_hash);
                 match Validated::prove(store, target.hash) {
                     Ok(to) => {
@@ -1961,6 +2106,7 @@ impl SyncService {
             let Ok(Some(header)) = self.manager.store.header(hash) else {
                 break;
             };
+            self.drop_body_without_extension(hash, &header);
             if self.manager.store.body(hash).ok().flatten().is_none() {
                 missing.push(header);
             }
@@ -2164,6 +2310,53 @@ impl SyncService {
         }
     }
 
+    /// A block this node mined, committed by the miner: rskj connects a mined
+    /// block through the same `blockchain.tryToConnect` as a peer's
+    /// (`EthereumImpl.addNewMinedBlock`, L60-68), so once it is best the
+    /// node's state is the block's. The miner executed it and committed its
+    /// state, so the in-memory root takes that state rather than executing
+    /// the block again, as for any block this node has executed
+    /// (`fast_forward_state`).
+    ///
+    /// Without this the root stayed at the block's parent until the tick's
+    /// reconcile reloaded it, with a warning for every block mined, and a
+    /// block from a peer arriving in between met a root behind the executed
+    /// head (#323).
+    pub(crate) fn on_mined_block(&mut self, hash: B256) {
+        let Some(trie_store) = self.trie_store.clone() else {
+            return;
+        };
+        // Only while it is the executed head: a block that lost to a heavier
+        // one, or that a later block has already followed, moves nothing.
+        let Ok(Some((head, committed))) = self.manager.store.exec_head() else {
+            return;
+        };
+        if head != hash {
+            return;
+        }
+        if let Some(data) = trie_store.get(committed.as_slice()) {
+            self.current_state_root = Some(TrieNode::from_message(&data, trie_store.as_ref()));
+            debug!(
+                target: "rustock::sync",
+                "Took mined block {hash:?}'s committed state {committed:?} as the in-memory root"
+            );
+        }
+    }
+
+    /// Whether `hash`, a block this node mined, is beside the chain: stored,
+    /// and not the block the canonical index names at its height. The miner
+    /// keeps a solution whose work's parent is no longer the executed head
+    /// so, executed against its own parent's state
+    /// (`ChainAccess::commit_mined_block_beside`), as rskj connects any block.
+    fn mined_beside_the_chain(&self, hash: B256) -> bool {
+        let store = &self.manager.store;
+        store
+            .header(hash)
+            .ok()
+            .flatten()
+            .is_some_and(|header| store.canonical_hash(header.number).ok().flatten() != Some(hash))
+    }
+
     /// Re-queue canonical blocks this node already holds but has not executed.
     ///
     /// `drain_follow_buffer` is reachable from exactly one place:
@@ -2210,6 +2403,7 @@ impl SyncService {
             let Ok(Some(hash)) = self.manager.store.canonical_hash(number) else { break };
             let Ok(Some(header)) = self.manager.store.header(hash) else { break };
             // No body yet: `fill_follow_body_gap` is the path for that one.
+            self.drop_body_without_extension(hash, &header);
             let Ok(Some((txs, uncles))) = self.manager.store.body(hash) else { break };
             self.follow_buffer.insert(number, (hash, header, txs, uncles));
         }
@@ -2308,6 +2502,15 @@ impl SyncService {
                             "Canonical index does not link at #{at}; repairing lineage"
                         );
                         self.repair_canonical_gap(cursor.validated_head.number, at.saturating_sub(1));
+                    }
+                    // With nothing executed, the executed head the check read
+                    // is the head standing in for it, so what is off the chain
+                    // is the head: I8, and I8's repair. Rolling back from the
+                    // stand-in would walk down to whatever state the store
+                    // holds -- after a snapshot sync that failed its check, a
+                    // state that was never verified.
+                    Violation::ExecutedOffChain { .. } if self.recorded_execution().is_none() => {
+                        self.reverify_head_lineage(0);
                     }
                     Violation::ExecutedOffChain { at, hash, canonical } => {
                         if self.violation_held_for(&v, EXECUTION_OFF_CHAIN_GRACE) {
@@ -2624,6 +2827,20 @@ impl SyncService {
         }
     }
 
+    /// The executed head, if this node has executed anything.
+    ///
+    /// Not `cursor().executed`, which reads as the head when nothing is
+    /// recorded. Rolling back from that stand-in walks the ancestry of a block
+    /// nobody executed, and on a node with no state but genesis -- a light
+    /// node whose snapshot sync gave up -- it reports on every escalation that
+    /// the node needs a resync, about execution that never happened.
+    fn recorded_execution(&self) -> Option<rustock_storage::BlockRef> {
+        let store = &self.manager.store;
+        let (hash, _) = store.exec_head().ok().flatten()?;
+        let header = store.header(hash).ok().flatten()?;
+        Some(rustock_storage::BlockRef::new(header.number, hash))
+    }
+
     /// Move execution to the highest block on the executed head's own ancestry
     /// that is canonical and whose state we still hold.
     ///
@@ -2774,53 +2991,6 @@ impl SyncService {
             header.number.saturating_sub(blind.number), blind, header.number
         );
         blind
-    }
-
-    /// Retreat the head below an orphaned executed head, and roll execution
-    /// back with it.
-    ///
-    /// Both orphan paths use this, so they cannot drift apart: one finds a
-    /// canonical child that does not build on us, the other finds no canonical
-    /// child at all, and the recovery is the same in both cases.
-    ///
-    /// Execution comes back with the head. Retreating one without the other is
-    /// how I4 gets broken by the act of recovering -- which is what the
-    /// watchdog's first deployment did to mainnet within fifteen seconds.
-    fn retreat_below_orphaned_head(&mut self, header: &Header, replaced_by: B256) {
-        let target = self.orphan_retreat_target(header, replaced_by);
-        let store = &self.manager.store;
-
-        let to = match Validated::prove(store, target.hash) {
-            Ok(v) => v,
-            Err(broken) => {
-                warn!(
-                    target: "rustock::sync",
-                    "Orphan recovery: cannot retreat to {} ({}); the chain below is broken",
-                    target, broken
-                );
-                return;
-            }
-        };
-        let dest = to.block();
-        if let Err(e) = store.apply(&Transition::Retreat { to }) {
-            warn!(target: "rustock::sync", "Orphan recovery: retreat failed: {:?}", e);
-            return;
-        }
-
-        // Execution follows the head onto the canonical chain. Targeting the
-        // orphan's own parent here was the 2026-09-23 bug: that parent is on
-        // the branch being abandoned, so recording execution at it is refused
-        // and execution stays stranded. See `roll_execution_back`.
-        let executed = match store.cursor() {
-            Ok(Some(c)) => c.executed,
-            _ => return,
-        };
-        if self.roll_execution_back(executed) {
-            warn!(
-                target: "rustock::sync",
-                "Orphan recovery: head and execution retreated to {}", dest
-            );
-        }
     }
 
     /// Re-establish that the head is the top of the contiguous canonical chain
@@ -3006,13 +3176,14 @@ impl SyncService {
                         );
                         self.last_body_height = self.last_body_height.min(dest.number);
                         // Execution follows the head, exactly as it does in
-                        // orphan recovery. Reading the cursor again rather
+                        // orphan recovery. Reading the store again rather
                         // than reusing `cursor.executed` matters: the retreat
                         // may already have moved execution, and rolling back
                         // from a stale reference would walk the ancestry of a
-                        // block that is no longer the executed head.
-                        if let Ok(Some(after)) = self.manager.store.cursor() {
-                            self.roll_execution_back(after.executed);
+                        // block that is no longer the executed head. And only
+                        // execution that happened is rolled back.
+                        if let Some(executed) = self.recorded_execution() {
+                            self.roll_execution_back(executed);
                         }
                     }
                     Err(e) => warn!(target: "rustock::sync", "Head re-verification: retreat failed: {:?}", e),
@@ -3168,6 +3339,14 @@ impl SyncService {
                 downloaded - head.number, head.number, downloaded
             );
             self.start_body_downloads(metadata.best_number).await;
+            return;
+        }
+
+        // A heavier branch waits for this node to execute it, and is fetched
+        // and executed beside the chain on every tick. A skeleton round toward
+        // it would only download its headers again. See `beside`.
+        if self.beside_fn.is_some() && self.manager.store.deferred_head().is_some() {
+            self.state = SyncState::Following;
             return;
         }
 
@@ -3438,6 +3617,7 @@ impl SyncService {
                 | SyncEvent::SkeletonResponse { .. }
                 | SyncEvent::BlockHashResponse { .. }
                 | SyncEvent::NewBlockHashes { .. }
+                | SyncEvent::NewBlock { .. }
                 | SyncEvent::SnapStatusResponse { .. }
                 | SyncEvent::SnapChunkResponse { .. }
                 | SyncEvent::SnapBlocksResponse { .. } => {
@@ -3448,11 +3628,64 @@ impl SyncService {
                     );
                     return;
                 }
+                // Not from a peer: the node's own miner.
+                SyncEvent::MinedBlock { .. } => {}
                 // Not chain data this node would adopt: it is an answer to
                 // something this node asked for on a caller's behalf, and
                 // dropping it would hang that caller rather than protect
                 // anything.
                 SyncEvent::TrieProofResponse { .. } => {}
+            }
+        }
+
+        // While a snapshot session holds the peer set, chain data it did not
+        // ask for is kept from the ordinary sync, which is standing down for
+        // it. `suspended_for_snap` already stops that sync's rounds; this stops
+        // what arrives without one.
+        //
+        // The ordinary handlers write what they are given -- headers with their
+        // total difficulties, the canonical index, the head -- and the likeliest
+        // such answer is a late one to the session's own request, arriving after
+        // it timed out: a stretch of the very chain the session is walking.
+        // Taken by the ordinary path, one wrote canonical pointers a thousand
+        // blocks deep into the middle of a mainnet walk, which the walk then
+        // took for ground this node already held, and stopped there.
+        if self.suspended_for_snap {
+            let ours =
+                |driver: Option<&crate::snap::driver::SnapDriver>, id: u64, headers: bool| {
+                    driver.is_some_and(|d| {
+                        if headers {
+                            d.awaits_headers(id)
+                        } else {
+                            d.awaits_skeleton(id)
+                        }
+                    })
+                };
+            let claimed = match &event {
+                SyncEvent::SkeletonResponse { id, .. } => ours(self.snap.as_ref(), *id, false),
+                SyncEvent::HeadersResponse { id, .. }
+                | SyncEvent::HeadersWithUnclesResponse { id, .. } => {
+                    ours(self.snap.as_ref(), *id, true)
+                }
+                SyncEvent::SnapStatusResponse { .. }
+                | SyncEvent::SnapChunkResponse { .. }
+                | SyncEvent::SnapBlocksResponse { .. } => true,
+                // Not chain data from a peer: the node's own miner.
+                SyncEvent::MinedBlock { .. } => true,
+                // Nor is the answer to a proof this node asked a peer for on
+                // a caller's behalf; dropping it would only hang the caller.
+                SyncEvent::TrieProofResponse { .. } => true,
+                SyncEvent::BodyResponse { .. }
+                | SyncEvent::BlockHashResponse { .. }
+                | SyncEvent::NewBlockHashes { .. }
+                | SyncEvent::NewBlock { .. } => false,
+            };
+            if !claimed {
+                trace!(
+                    target: "rustock::snap",
+                    "chain data the snapshot session did not ask for; kept from the ordinary sync"
+                );
+                return;
             }
         }
 
@@ -3502,8 +3735,15 @@ impl SyncService {
                 }
                 self.on_headers_with_uncles_response(peer, entries).await;
             }
-            SyncEvent::BodyResponse { peer, id, transactions, uncles } => {
-                self.on_body_response(peer, id, transactions, uncles).await;
+            SyncEvent::BodyResponse {
+                peer,
+                id,
+                transactions,
+                uncles,
+                extension,
+            } => {
+                self.on_body_response(peer, id, transactions, uncles, extension)
+                    .await;
             }
             SyncEvent::SnapStatusResponse {
                 peer,
@@ -3540,6 +3780,20 @@ impl SyncService {
             }
             SyncEvent::NewBlockHashes { peer, identifiers } => {
                 self.on_new_block_hashes(peer, identifiers).await;
+            }
+            SyncEvent::NewBlock { peer, block } => {
+                self.on_new_block(peer, *block).await;
+            }
+            SyncEvent::MinedBlock { hash } => {
+                self.on_mined_block(hash);
+                // A solution whose work's parent was no longer the head is
+                // kept beside the chain by the miner, executed already. It is
+                // weighed against the head here as a peer's block executed
+                // beside the chain is, and switched to if it takes the head:
+                // rskj's `tryToConnect` for a mined block.
+                if self.mined_beside_the_chain(hash) {
+                    self.execute_beside_chain(hash).await;
+                }
             }
         }
     }
@@ -3780,6 +4034,7 @@ impl SyncService {
 
                 // Process all consecutive ready chunks
                 let ready = tracker.drain_ready();
+                let executed_before = self.manager.store.switch_mark();
                 for (_idx, chunk_peer, chunk_headers) in &ready {
                     // A chunk that does not connect is a failure, not
                     // something to carry on past. Chunks are released in
@@ -3834,6 +4089,7 @@ impl SyncService {
                                     rustock_networking::scoring::EventType::UnexpectedMessage,
                                 );
                             }
+                            self.take_up_moved_execution(executed_before);
                             self.state = SyncState::Idle;
                             return;
                         }
@@ -3869,10 +4125,15 @@ impl SyncService {
                                 rustock_networking::scoring::EventType::InvalidHeader,
                             );
                         }
+                        self.take_up_moved_execution(executed_before);
                         self.state = SyncState::Idle;
                         return;
                     }
                 }
+
+                // A chunk can take the chain to a branch this node executed
+                // beside it, and execution with it.
+                self.take_up_moved_execution(executed_before);
 
                 if tracker.is_complete() {
                     self.start_body_downloads(peer_best).await;
@@ -3891,7 +4152,9 @@ impl SyncService {
                 self.state = other;
                 let before_height = self.our_head_number();
                 let before_hash = self.manager.store.head().ok().flatten();
+                let executed_before = self.manager.store.switch_mark();
                 let _ = self.manager.handle_headers_response(headers.clone(), peer);
+                self.take_up_moved_execution(executed_before);
                 if is_following {
                     let after_height = self.our_head_number();
                     let after_hash = self.manager.store.head().ok().flatten();
@@ -3911,6 +4174,12 @@ impl SyncService {
                         }
                         self.request_follow_bodies(&headers).await;
                     }
+                    // Blocks beside the chain near the tip, known by their
+                    // headers alone: their bodies show the uncles that may make
+                    // their branch the heavier, and executing them makes a
+                    // switch to it a pointer's move. See `beside`.
+                    self.take_up_competing(headers.iter().map(|h| h.hash()).collect(), Some(peer))
+                        .await;
                 }
 
                 // Headers we could not link are evidence that this peer has a
@@ -4005,6 +4274,14 @@ impl SyncService {
         let our_height = self.our_head_number();
 
         for id in &identifiers {
+            // rskj `processNewBlockHashesMessage` (L107-119): the announcer
+            // holds each block it names that is not too far ahead and not
+            // held here.
+            if id.number <= self.executed_number().saturating_add(SYNC_MAX_DISTANCE)
+                && !self.holds_block(id.hash)
+            {
+                self.manager.note_block_holder(id.hash, peer);
+            }
             if id.number > our_height {
                 // New block ahead of our tip — request it
                 let metadata = rustock_networking::peers::PeerMetadata {
@@ -4051,6 +4328,182 @@ impl SyncService {
         }
     }
 
+    /// The height of the executed best block: rskj's
+    /// `blockchain.getBestBlock().getNumber()`, which its guards on a block a
+    /// peer names or sends measure from.
+    fn executed_number(&self) -> u64 {
+        let store = &self.manager.store;
+        store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(hash, _)| store.header(hash).ok().flatten())
+            .map_or(0, |header| header.number)
+    }
+
+    /// Whether this node holds the block whole, header and body: rskj's
+    /// `hasBlockInSomeBlockchain`, whose store holds only whole blocks.
+    fn holds_block(&self, hash: B256) -> bool {
+        let store = &self.manager.store;
+        matches!(store.header(hash), Ok(Some(_))) && matches!(store.body(hash), Ok(Some(_)))
+    }
+
+    /// Announces a block taken from a peer to the peers not known to hold it:
+    /// rskj `MessageVisitor.tryRelayBlock` (L258-263), which relays only while
+    /// it has no better block to sync. Called only while following the tip,
+    /// this node's counterpart. See [`crate::announce::relay_block`].
+    async fn relay_block(&self, hash: B256, number: u64) {
+        let holders = self.manager.block_holders(hash);
+        crate::announce::relay_block(&self.peer_store, &holders, hash, number).await;
+    }
+
+    /// A whole block a peer sent: rskj `MessageVisitor.apply(BlockMessage)`
+    /// (L83-122) through `AsyncNodeBlockProcessor.processBlock` (L83-126),
+    /// rskj's default (`peer.fastBlockPropagation`), on this node's follow
+    /// path.
+    ///
+    /// rskj drops a block that is genesis, further above its best block than a
+    /// skeleton reaches, too far below it to be any block's uncle, or held
+    /// already; remembers that the sender holds it; checks its header, against
+    /// its parent too; and then relays it and queues it to be connected, best
+    /// or not. Here the body is held to its header's commitments, the header is
+    /// verified and stored as any header at the tip is (the same rules, the
+    /// extra data's size among them), and held besides to the one rule rskj's
+    /// relay validator adds to them, its time later than its parent's
+    /// (`SyncManager::verify_for_relay`); the block is relayed, and it is executed
+    /// on its own parent's state, best or not: on the chain as the canonical
+    /// block at its height, or beside it (see `beside`). Its uncles are in
+    /// hand, so it is weighed with them, as rskj weighs a block it connects. A
+    /// block whose parent this node lacks is taken as an announcement of it:
+    /// the headers up to it are asked of the sender, where rskj asks it for
+    /// the missing block.
+    pub(crate) async fn on_new_block(&mut self, peer: B512, block: Block) {
+        // rskj processes it while syncing too, but relays nothing then
+        // (`hasBetterBlockToSync`); this node takes nothing unasked at the tip
+        // until it follows it, as with an announcement.
+        if !matches!(self.state, SyncState::Following) {
+            trace!(
+                target: "rustock::sync",
+                "Ignoring block #{} from {:?}: sync in progress",
+                block.header.number,
+                &peer.0[..4]
+            );
+            return;
+        }
+        let number = block.header.number;
+        let best = self.executed_number();
+        // rskj `isGenesis`, `isAdvancedBlock` and `canBeIgnoredForUnclesRewards`
+        // (`blockNumber < best - uncleGenerationLimit`), in that order.
+        if number == 0
+            || number > best.saturating_add(SYNC_MAX_DISTANCE)
+            || number.saturating_add(rustock_core::validation::uncles::UNCLE_GENERATION_LIMIT)
+                < best
+        {
+            return;
+        }
+        let hash = block.hash();
+        if self.holds_block(hash) {
+            return;
+        }
+        // `BlockSyncService.preprocessBlock` (L97-99).
+        self.manager.note_block_holder(hash, peer);
+
+        let Block {
+            header,
+            transactions,
+            ommers,
+        } = block;
+        if let Some(what) = crate::body_check::body_mismatch(&header, &transactions, &ommers) {
+            self.charge_bad_body(peer, number, what);
+            return;
+        }
+        // rskj `AsyncNodeBlockProcessor.processBlock` (`isBlockValid`, the relay
+        // validator): a block that fails it is invalid to rskj, neither queued
+        // to be connected nor relayed, and its sender is scored for it
+        // (`MessageVisitor.apply`). Before the header is stored: rskj keeps
+        // nothing of such a block in its chain. It connects one with a
+        // descendant that arrives or through its sync, whose validator holds
+        // a block's time to the clock alone; this node takes one as the
+        // answer to a request, which a descendant's arrival sends.
+        if let Err(e) = self.manager.verify_for_relay(&header) {
+            debug!(
+                target: "rustock::sync",
+                "Block #{number} from {:?} is not one to relay: {e}",
+                &peer.0[..4]
+            );
+            if let Some(scoring) = &self.scoring {
+                scoring.record_peer(peer, rustock_networking::scoring::EventType::InvalidBlock);
+            }
+            return;
+        }
+        self.manager.note_whole_block_difficulty(&header, &ommers);
+        let before_height = self.our_head_number();
+        let before_hash = self.manager.store.head().ok().flatten();
+        let executed_before = self.manager.store.switch_mark();
+        match self
+            .manager
+            .handle_headers_response(vec![header.clone()], peer)
+        {
+            Ok(ingested) if ingested.rejected > 0 => {
+                if let Some(scoring) = &self.scoring {
+                    scoring.record_peer(peer, rustock_networking::scoring::EventType::InvalidBlock);
+                }
+                return;
+            }
+            Ok(ingested) if ingested.unlinked > 0 => {
+                self.on_new_block_hashes(peer, vec![BlockIdentifier { hash, number }])
+                    .await;
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    target: "rustock::sync",
+                    "Could not store the header of #{number} from {:?}: {e:?}",
+                    &peer.0[..4]
+                );
+                return;
+            }
+        }
+        if let Err(e) = self.manager.store.put_body(hash, &transactions, &ommers) {
+            error!(target: "rustock::sync", "Failed to store the body of #{number}: {e:?}");
+            return;
+        }
+        self.relay_block(hash, number).await;
+
+        // The header may have taken the chain to a branch this node executed
+        // beside it already, and execution with it: take that up now.
+        self.take_up_moved_execution(executed_before);
+
+        // rskj connects every block it is given against its own parent's
+        // state, best or not, so that a switch to it later moves a pointer and
+        // runs nothing again. A block beside the chain is executed as it
+        // arrives, and kept for a miner to name as an uncle besides.
+        if self.manager.store.canonical_hash(number).ok().flatten() != Some(hash) {
+            self.execute_beside_chain(hash).await;
+            return;
+        }
+        let after_height = self.our_head_number();
+        if self.manager.store.head().ok().flatten() != before_hash {
+            if after_height > before_height {
+                info!(target: "rustock::sync", "New tip: #{after_height}");
+            } else {
+                info!(
+                    target: "rustock::sync",
+                    "Reorg: #{before_height} -> #{after_height} (new head {hash:?})"
+                );
+            }
+        }
+        // Buffered as a fetched body is, in place of any request still out
+        // for it, whose answer would buffer the block again after it ran.
+        self.pending_follow_bodies
+            .retain(|_, pending| pending.0 != hash);
+        self.body_providers.insert(number, peer);
+        self.follow_buffer
+            .insert(number, (hash, header, transactions, ommers));
+        self.drain_follow_buffer().await;
+    }
+
     /// In Following state, periodically check if we've fallen too far behind
     /// and need to switch back to skeleton sync.
     pub(crate) async fn check_follow_gap(&mut self) {
@@ -4066,6 +4519,12 @@ impl SyncService {
         }
 
         if metadata.best_number > our_height + LONG_SYNC_LIMIT {
+            // The gap can be a heavier branch waiting for this node to execute
+            // it, which the tick does beside the chain; a skeleton round toward
+            // it would only download its headers again. See `beside`.
+            if self.beside_fn.is_some() && self.manager.store.deferred_head().is_some() {
+                return;
+            }
             // Don't open a fresh round while a batch is parked waiting to
             // execute (that would put a batch beyond the one-ahead cap in
             // flight). A batch merely executing is fine — that's the point of
@@ -4122,6 +4581,7 @@ impl SyncService {
         for num in start..=our_height {
             if let Ok(Some(hash)) = self.manager.store.canonical_hash(num) {
                 if let Ok(Some(header)) = self.manager.store.header(hash) {
+                    self.drop_body_without_extension(hash, &header);
                     if matches!(self.manager.store.body(hash), Ok(None))
                         && !self.try_fill_body_locally(hash)
                     {
@@ -4192,6 +4652,13 @@ impl SyncService {
     /// blocking thread (freeing the event loop to download N+1) or — if a
     /// previous batch is still executing — park this batch until it completes.
     pub(crate) async fn finish_batch(&mut self, pending: &[(B256, Header)], peer_best: u64) {
+        // The batch's bodies are all held, so the totals that header-first
+        // sync could only bound are settled now, oldest first, each with its
+        // block's uncles once they pass the uncle rule. Without this a node
+        // that caught up this way carries every uncle it skipped in every
+        // total above it. See `crate::total_difficulty`.
+        self.manager.settle_total_difficulties(pending);
+
         // The download succeeded: advance the download cursor so the next
         // skeleton round queues the blocks that follow this batch. Execution
         // (the exec_head cursor) advances independently when the spawned job
@@ -4340,7 +4807,7 @@ impl SyncService {
             Ok(o) => o,
             Err(e) => {
                 error!(target: "rustock::sync", "Block execution task panicked: {e}");
-                self.halt_after_exec_failure();
+                self.halt_after_exec_failure(false);
                 return;
             }
         };
@@ -4348,7 +4815,7 @@ impl SyncService {
         self.current_state_root = Some(outcome.new_state_root);
 
         if !outcome.all_ok {
-            self.halt_after_exec_failure();
+            self.halt_after_exec_failure(outcome.superseded);
             return;
         }
 
@@ -4380,7 +4847,11 @@ impl SyncService {
     /// (it must not execute on the wrong parent state — its already-stored
     /// bodies are kept and reused), and go Idle. Mirrors rskj treating such a
     /// block as invalid and stopping there.
-    fn halt_after_exec_failure(&mut self) {
+    ///
+    /// `superseded`: the batch stopped because a reorg made one of its blocks
+    /// non-canonical while it ran. The same retry, but nothing failed, so a
+    /// warning rather than an error.
+    fn halt_after_exec_failure(&mut self, superseded: bool) {
         let exec_number = self
             .manager
             .store
@@ -4397,10 +4868,18 @@ impl SyncService {
         } else {
             self.futile_exec_halts = (exec_number, 1);
         }
-        error!(
-            target: "rustock::sync",
-            "Sync halted: block execution failed; will retry from executed head #{exec_number}"
-        );
+        if superseded {
+            warn!(
+                target: "rustock::sync",
+                "Sync paused: a reorg moved the chain while a block executed; will retry \
+                 from executed head #{exec_number}"
+            );
+        } else {
+            error!(
+                target: "rustock::sync",
+                "Sync halted: block execution failed; will retry from executed head #{exec_number}"
+            );
+        }
         self.state = SyncState::Idle;
     }
 
@@ -4408,6 +4887,18 @@ impl SyncService {
     /// continue syncing headers or enter follow mode.
     async fn continue_after_bodies(&mut self, peer_best: u64) {
         let our_height = self.our_head_number();
+        // A heavier branch waits for this node to execute it beside the chain,
+        // which the tick does from follow mode; a skeleton round toward it
+        // would only download its headers again. See `beside`.
+        if self.beside_fn.is_some() && self.manager.store.deferred_head().is_some() {
+            info!(
+                target: "rustock::sync",
+                "A heavier branch is being executed beside the chain before it is adopted; \
+                 following meanwhile"
+            );
+            self.state = SyncState::Following;
+            return;
+        }
         if our_height < peer_best {
             debug!(
                 target: "rustock::sync",
@@ -4877,13 +5368,21 @@ impl SyncService {
         request_id: u64,
         transactions: Vec<Transaction>,
         uncles: Vec<Header>,
+        extension: Option<rustock_core::types::header_extension::BlockHeaderExtension>,
     ) {
         rustock_core::metrics::BODIES_RECEIVED.inc();
+        // A body asked for a block beside the chain, in whatever state the
+        // sync is in by the time it comes. See `beside`.
+        if self.pending_branch_bodies.contains_key(&request_id) {
+            self.on_branch_body(peer, request_id, transactions, uncles, extension)
+                .await;
+            return;
+        }
         let old = std::mem::take(&mut self.state);
         match old {
             SyncState::DownloadingBodies {
                 peer_best,
-                pending_headers,
+                mut pending_headers,
                 next_request,
                 mut in_flight,
                 mut id_index,
@@ -4941,29 +5440,60 @@ impl SyncService {
                     // strikes it has not earned.
                     self.body_peer_strikes.remove(&peer);
                     let (hash, header) = &pending_headers[idx];
+                    let (hash, number) = (*hash, header.number);
 
                     // Does this body belong to that header? Receipt is the one
                     // moment the sender is unambiguous, and two hashes settle
-                    // it. A mismatch is not stored and the request goes back
-                    // in flight, so the stall path asks somebody else.
-                    if let Some(what) =
-                        crate::body_check::body_mismatch(header, &transactions, &uncles)
-                    {
-                        self.charge_bad_body(peer, header.number, what);
-                        in_flight.insert(idx, req);
-                        id_index.insert(request_id, (idx, peer));
-                        self.state = SyncState::DownloadingBodies {
-                            peer_best,
-                            pending_headers,
-                            next_request,
-                            in_flight,
-                            id_index,
+                    // it. A header that came compressed takes the extension sent
+                    // beside the body, and a body without the one it commits to
+                    // fails the same way. A mismatch is not stored and the
+                    // request goes back in flight, so the stall path asks
+                    // somebody else.
+                    let checked =
+                        match crate::body_check::body_mismatch(header, &transactions, &uncles) {
+                            Some(what) => Err(what),
+                            None => crate::body_check::completed_header(header, extension.as_ref()),
                         };
-                        return;
+                    let completed = match checked {
+                        Ok(completed) => completed,
+                        Err(what) => {
+                            self.charge_bad_body(peer, number, what);
+                            in_flight.insert(idx, req);
+                            id_index.insert(request_id, (idx, peer));
+                            self.state = SyncState::DownloadingBodies {
+                                peer_best,
+                                pending_headers,
+                                next_request,
+                                in_flight,
+                                id_index,
+                            };
+                            return;
+                        }
+                    };
+                    // The header with its extension is stored before the body,
+                    // so that a body never sits beside a header still missing it.
+                    if let Some(completed) = completed {
+                        if let Err(e) = self.manager.store.put_header_with_hash(hash, &completed) {
+                            error!(
+                                target: "rustock::sync",
+                                "Failed to store the header of #{number} with its extension: {e:?}"
+                            );
+                            in_flight.insert(idx, req);
+                            id_index.insert(request_id, (idx, peer));
+                            self.state = SyncState::DownloadingBodies {
+                                peer_best,
+                                pending_headers,
+                                next_request,
+                                in_flight,
+                                id_index,
+                            };
+                            return;
+                        }
+                        pending_headers[idx].1 = completed;
                     }
-                    self.body_providers.insert(header.number, peer);
+                    self.body_providers.insert(number, peer);
 
-                    if let Err(e) = self.manager.store.put_body(*hash, &transactions, &uncles) {
+                    if let Err(e) = self.manager.store.put_body(hash, &transactions, &uncles) {
                         error!(
                             target: "rustock::sync",
                             "Failed to store body for {:?}: {:?}", hash, e
@@ -5028,18 +5558,42 @@ impl SyncService {
                     self.pending_follow_bodies.remove(&request_id)
                 {
                     // Same check as the batch path, same reason.
-                    if let Some(what) =
-                        crate::body_check::body_mismatch(&header, &transactions, &uncles)
-                    {
-                        self.charge_bad_body(peer, header.number, what);
-                        // Put it back so the follow-mode retry re-requests it;
-                        // dropping the entry would strand the block instead.
-                        self.pending_follow_bodies
-                            .insert(request_id, (hash, header, sent, peer));
-                        return;
-                    }
+                    let checked =
+                        match crate::body_check::body_mismatch(&header, &transactions, &uncles) {
+                            Some(what) => Err(what),
+                            None => {
+                                crate::body_check::completed_header(&header, extension.as_ref())
+                            }
+                        };
+                    let header = match checked {
+                        Ok(None) => header,
+                        Ok(Some(completed)) => {
+                            if let Err(e) =
+                                self.manager.store.put_header_with_hash(hash, &completed)
+                            {
+                                error!(
+                                    target: "rustock::sync",
+                                    "Failed to store the header of #{} with its extension: {e:?}",
+                                    completed.number
+                                );
+                                self.pending_follow_bodies
+                                    .insert(request_id, (hash, header, sent, peer));
+                                return;
+                            }
+                            completed
+                        }
+                        Err(what) => {
+                            self.charge_bad_body(peer, header.number, what);
+                            // Put it back so the follow-mode retry re-requests it;
+                            // dropping the entry would strand the block instead.
+                            self.pending_follow_bodies
+                                .insert(request_id, (hash, header, sent, peer));
+                            return;
+                        }
+                    };
                     self.body_providers.insert(header.number, peer);
 
+                    let new_block = !self.holds_block(hash);
                     if let Err(e) = self.manager.store.put_body(hash, &transactions, &uncles) {
                         error!(
                             target: "rustock::sync",
@@ -5047,11 +5601,31 @@ impl SyncService {
                         );
                         return;
                     }
+                    // rskj remembers the peer a block came from
+                    // (`BlockSyncService.preprocessBlock`) and, once the block is
+                    // whole and its header holds against its parent, announces it
+                    // to the peers that lack it (`MessageVisitor.tryRelayBlock`).
+                    self.manager.note_block_holder(hash, peer);
+                    if new_block {
+                        self.relay_block(hash, header.number).await;
+                    }
                     debug!(
                         target: "rustock::sync",
                         "Stored body for block #{} ({} txs) in follow mode",
                         header.number, transactions.len()
                     );
+                    // A reorg can have put the block beside the chain since it
+                    // was asked for -- the chain holds another block at its
+                    // height now -- and then it is executed there, as any block
+                    // beside it is.
+                    let beside = matches!(
+                        self.manager.store.canonical_hash(header.number),
+                        Ok(Some(other)) if other != hash
+                    );
+                    if beside {
+                        self.execute_beside_chain(hash).await;
+                        return;
+                    }
                     // Buffer by number and execute only consecutive,
                     // parent-linked blocks: bodies for a multi-block gap can
                     // arrive out of order, and running one against the wrong
@@ -5096,8 +5670,22 @@ impl SyncService {
             return;
         }
         loop {
+            // A node that runs blocks, on a new database, has no executed head
+            // recorded. The state this path runs on is then block 0's, which
+            // `load_or_build_state` built, and the head is block 0, as
+            // `try_start_sync` takes it. Returning here ran nothing in follow
+            // mode: a node started within reach of its peer's tip, as on a young
+            // chain, stored every block that came and ran none until its
+            // watchdog moved it to a batch, minutes later, where rskj connects
+            // block 1 as it arrives. A node that runs no blocks keeps them.
             let head_hash = match self.manager.store.exec_head().ok().flatten() {
                 Some((hash, _)) => hash,
+                None if self.block_processor.is_some() => {
+                    match self.manager.store.canonical_hash(0).ok().flatten() {
+                        Some(hash) => hash,
+                        None => return,
+                    }
+                }
                 None => return,
             };
             let next_num = match self.follow_buffer.keys().next().copied() {
@@ -5176,6 +5764,11 @@ impl SyncService {
             }
             self.follow_gap_since = None;
             let (hash, header, txs, uncles) = self.follow_buffer.remove(&next_num).unwrap();
+            // The body is in hand and the parent is the executed head, whose
+            // total is settled already, so this block's total can be settled
+            // too, rather than wait for a fork announcement to bring its
+            // header round again. See `crate::total_difficulty`.
+            self.manager.settle_total_difficulty(hash, &header, &uncles);
             if !self.process_single_block(hash, &header, txs, uncles).await {
                 // Real divergence: head didn't advance, so looping would spin.
                 return;
@@ -5302,9 +5895,32 @@ impl SyncService {
 
         // Already executed by this node? Adopt the result instead of redoing it.
         if let Some(node) = fast_forward_state(processor, &trie_store, header, hash) {
-            record_execution(&self.manager.store, hash, header.state_root);
+            // Refused when a reorg moved the chain under it: the same contract
+            // as executing it below, `true` only when the executed head moved.
+            if !record_execution(&self.manager.store, hash, header.state_root) {
+                return false;
+            }
+            // What executing it would have done, now that it is on the chain:
+            // its records kept by height, which a block executed beside the
+            // chain waits for, and the announcements -- subscribers, the gas
+            // price, the miner's next work.
+            let receipts = self
+                .manager
+                .store
+                .receipts(hash)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let unlogged = beside::take_unlogged(&self.beside_unlogged, hash);
+            if let Err(e) = processor.commit_by_height(&block, &receipts, &unlogged) {
+                warn!(target: "rustock::sync", "Indexing #{} failed: {e}", header.number);
+            }
             self.credit_executed_bodies(header.number);
             self.current_state_root = Some(node);
+            self.gas_price.on_block(header, &block.transactions);
+            self.gas_price.on_best_block(header);
+            self.best_block_listeners.notify(header);
+            self.publish_block(hash, header, &block.transactions, false);
             info!(
                 target: "rustock::sync",
                 "Re-adopted block #{} without re-executing it (already executed locally, \
@@ -5425,7 +6041,7 @@ pub(crate) fn identify_chunk_by_content(
 /// missing); the sync must not advance past it (rskj treats such a block as
 /// invalid and stops there). The returned state root and flush counter are
 /// carried back into the service for the next batch.
-fn process_downloaded_blocks(
+pub(crate) fn process_downloaded_blocks(
     processor: &BlockProcessor,
     trie_store: Arc<dyn TrieStore>,
     state_root: TrieNode,
@@ -5436,6 +6052,7 @@ fn process_downloaded_blocks(
     pending_headers: &[(B256, Header)],
     activity: &crate::chain_activity::ChainActivity,
     gas_price: &crate::gas_price::GasPriceTracker,
+    unlogged: &beside::Unlogged,
 ) -> ExecOutcome {
     // Executed state becomes durable here and the head advances only
     // through this, which is what keeps "flush before you claim it" from
@@ -5447,6 +6064,7 @@ fn process_downloaded_blocks(
     // Of `processed`, how many were adopted without re-running the EVM.
     let mut fast_forwarded = 0u64;
     let mut all_ok = true;
+    let mut superseded = false;
     let mut last_executed: Option<(B256, B256)> = None;
 
     // Lineage guard: the first block must extend the executed head and
@@ -5506,18 +6124,32 @@ fn process_downloaded_blocks(
             ommers,
         };
 
-        // Same consensus gate as the single-block path above.
+        // Same consensus gate as the single-block path above, and a failure
+        // here is a failure of the batch like any other below: reported clean,
+        // it let the sync resume past an invalid block until the next batch's
+        // lineage check tripped over the gap it left.
         if let Err(e) = processor.validate_block(&block) {
             warn!(
                 target: "rustock::sync",
                 "Block #{} ({:?}) failed consensus validation: {e}",
                 block.header.number, hash
             );
+            all_ok = false;
             break;
         }
 
         // Already executed by this node? Adopt the result instead of redoing it.
         if let Some(node) = fast_forward_state(processor, &trie_store, header, *hash) {
+            // Its Bridge events are kept by height, and a block executed beside
+            // the chain has none indexed until it is on it: its stored receipts
+            // carry them, and the peg decisions the Bridge did not log wait in
+            // `unlogged`.
+            if let Ok(Some(receipts)) = store.receipts(*hash) {
+                let unlogged = beside::take_unlogged(unlogged, *hash);
+                if let Err(e) = processor.commit_by_height(&block, &receipts, &unlogged) {
+                    warn!(target: "rustock::sync", "Indexing #{} failed: {e}", header.number);
+                }
+            }
             current_root = node;
             last_executed = Some((*hash, header.state_root));
             processed += 1;
@@ -5591,6 +6223,10 @@ fn process_downloaded_blocks(
                 // the only thing that can make this block canonical or replace
                 // it. Reporting the batch as clean would leave the executed
                 // head behind the blocks just written, with nothing to notice.
+                // `finish` records the last executed block again, one
+                // `after_block` was refused included, so whether a reorg left
+                // it behind is read here.
+                superseded = no_longer_canonical(store, hash);
                 all_ok = false;
             }
         }
@@ -5611,6 +6247,7 @@ fn process_downloaded_blocks(
 
     ExecOutcome {
         all_ok,
+        superseded,
         new_state_root: current_root,
         blocks_since_flush: committer.pending(),
     }

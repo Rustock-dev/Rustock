@@ -1,17 +1,19 @@
 use alloy_primitives::{Address, B256, U256};
-use alloy_rlp::{Decodable, Encodable};
+use alloy_rlp::Decodable;
 use rustock_core::{Header, Transaction};
 use rustock_storage::BlockStore;
 use rustock_trie::{account_key, code_key, AccountState, TrieKeySlice, TrieNode, TrieStore};
-use sha3::{Digest, Keccak256};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
 use tracing::debug;
 
 const TRANSACTION_GAS_CAP: u64 = 1u64 << 60;
 const MAX_TX_SIZE: usize = 128 * 1024;
+/// rskj `Constants.getMaxInitCodeSize()`: twice the largest contract, the most
+/// init code a creation may carry once RSKIP438 is active.
+const MAX_INIT_CODE_SIZE: usize = 2 * 0x6000;
 
 /// Ceiling on the total number of transactions held across every account.
 ///
@@ -75,10 +77,22 @@ impl ChainRules {
         let constants = rustock_execution::executor::bridge_constants_for(hardfork_cfg.chain_id);
         Self {
             free_bridge_senders: rustock_execution::executor::free_bridge_senders(&constants),
-            rskip252_height: rustock_execution::processor::rskip252_height_for(hardfork_cfg.chain_id),
+            rskip252_height: hardfork_cfg.rskip252_height(),
             min_sequential_set_gas_limit,
             hardfork_cfg,
         }
+    }
+
+    /// The free senders of `constants`, for a chain whose Bridge constants
+    /// aren't the ones its id names: rskj's regtest, started from a genesis
+    /// file, runs on `BridgeConstants::rskj_regtest`, and the pool must agree
+    /// with the block processor on what costs nothing.
+    pub fn with_bridge_constants(
+        mut self,
+        constants: &rustock_execution::bridge::constants::BridgeConstants,
+    ) -> Self {
+        self.free_bridge_senders = rustock_execution::executor::free_bridge_senders(constants);
+        self
     }
 
     /// rskj `Transaction.transactionCost == 0`: a federator's call to the
@@ -116,6 +130,31 @@ impl ChainRules {
         }
         Some(header.minimum_gas_price.saturating_mul(U256::from(TX_GAS_PRICE_CAP_MULTIPLIER)))
     }
+
+    /// rskj `Transaction.transactionCost` of a transaction that isn't free,
+    /// at block `number`: 21,000, or 53,000 for a creation, plus 4 for every
+    /// zero byte of its data and 68 for every other, 16 from RSKIP400; and
+    /// from RSKIP438 a creation pays 2 more for every 32 bytes of its init
+    /// code, the last ones counted whole (`InitcodeCostCalculator`).
+    fn transaction_cost(&self, tx: &Transaction, number: u64) -> u64 {
+        let creates = tx.to.is_empty();
+        let nonzero = if self.hardfork_cfg.has_reduced_calldata_cost(number) {
+            16
+        } else {
+            68
+        };
+        let init_code = if creates && self.hardfork_cfg.has_initcode_metering(number) {
+            2 * tx.input.len().div_ceil(32) as u64
+        } else {
+            0
+        };
+        let data: u64 = tx
+            .input
+            .iter()
+            .map(|byte| if *byte == 0 { 4 } else { nonzero })
+            .sum();
+        (if creates { 53_000 } else { 21_000 }) + init_code + data
+    }
 }
 
 /// rskj `TxGasPriceCap.FOR_TRANSACTION`.
@@ -134,8 +173,8 @@ pub fn nonce_bytes_are_canonical(nonce: &[u8]) -> bool {
     true
 }
 
-/// The nonce's raw RLP payload, as the sender encoded it: the first item of
-/// the transaction list. `None` if the bytes are not a transaction list.
+/// The nonce's bytes: the payload of the first item of a transaction's
+/// encoding. `None` if the bytes are not a transaction list.
 fn raw_nonce_bytes(raw: &[u8]) -> Option<&[u8]> {
     let mut buf = raw;
     let list = alloy_rlp::Header::decode(&mut buf).ok()?;
@@ -152,53 +191,83 @@ fn raw_nonce_bytes(raw: &[u8]) -> Option<&[u8]> {
 
 #[derive(Debug)]
 pub enum PoolError {
-    AlreadyKnown,
+    /// rskj `internalAddTransaction`: the pending transactions hold one of
+    /// this hash.
+    AlreadyPending,
+    /// The same, of the queued ones.
+    AlreadyQueued,
     NonceTooLow,
     NonceTooHigh,
     InsufficientFunds,
-    GasLimitExceeded,
+    /// rskj `TxValidatorGasLimitValidator`: the transaction's gas limit, and
+    /// the limit it had to fit, which is the block's or, under RSKIP144, the
+    /// larger sublist's. rskj's message calls it the block's either way.
+    GasLimitExceeded {
+        gas_limit: U256,
+        bound: u64,
+    },
     GasPriceTooLow,
     IntrinsicGasTooHigh,
     ReplacementGasPriceTooLow,
-    TxTooLarge,
+    /// rskj `TxPendingValidator.isValid`: the transaction's size, and the
+    /// most it may be.
+    TxTooLarge {
+        size: usize,
+        max: usize,
+    },
     PoolFull,
     InvalidSignature(String),
     InsufficientFundsForPendingAndNew,
-    IsRemascTransaction,
     AccountExceedsQuota,
     RlpDecode(String),
     StoreError(String),
     /// rskj `TxValidatorMaximumGasPriceValidator`: over 80 times the block
     /// minimum once RSKIP252 is active.
     GasPriceAboveCap,
-    /// rskj `TxValidatorNonceEncodingValidator`: a nonce with leading zeros
-    /// or more than eight bytes.
+    /// rskj `TxValidatorNonceEncodingValidator`: a nonce with leading zeros.
     NonCanonicalNonce,
+    /// The same validator: a nonce of more than eight bytes, this many.
+    NonceTooLong(usize),
+    /// rskj `TxPendingValidator.isValid`: the state holds no account for the
+    /// sender of a transaction that costs something.
+    SenderMissing,
+    /// The same: a creation whose init code is past RSKIP438's limit.
+    InitCodeTooLarge,
 }
 
 impl fmt::Display for PoolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AlreadyKnown => write!(f, "transaction with same hash already exists"),
+            Self::AlreadyPending => write!(f, "pending transaction with same hash already exists"),
+            Self::AlreadyQueued => write!(f, "queued transaction with same hash already exists"),
             Self::NonceTooLow => write!(f, "transaction nonce too low"),
             Self::NonceTooHigh => write!(f, "transaction nonce too high"),
             Self::InsufficientFunds => write!(f, "insufficient funds"),
-            Self::GasLimitExceeded => write!(f, "transaction's gas limit exceeds block gas limit"),
+            Self::GasLimitExceeded { gas_limit, bound } => write!(
+                f,
+                "transaction's gas limit of {gas_limit} is higher than the block's gas limit of {bound}"
+            ),
             Self::GasPriceTooLow => write!(f, "transaction's gas price lower than block's minimum"),
             Self::IntrinsicGasTooHigh => write!(f, "transaction's basic cost is above the gas limit"),
             Self::ReplacementGasPriceTooLow => write!(f, "gas price not enough to bump transaction"),
-            Self::TxTooLarge => write!(f, "transaction's size is higher than defined maximum"),
+            Self::TxTooLarge { size, max } => {
+                write!(f, "transaction's size is higher than defined maximum: {size} > {max}")
+            }
             Self::PoolFull => write!(f, "transaction pool is full"),
             Self::InvalidSignature(e) => write!(f, "invalid signature: {e}"),
             Self::InsufficientFundsForPendingAndNew => {
                 write!(f, "insufficient funds to pay for pending and new transactions")
             }
-            Self::IsRemascTransaction => write!(f, "transaction is a remasc transaction"),
             Self::AccountExceedsQuota => write!(f, "account exceeds quota"),
             Self::RlpDecode(e) => write!(f, "RLP decode error: {e}"),
             Self::StoreError(e) => write!(f, "store error: {e}"),
             Self::GasPriceAboveCap => write!(f, "transaction's gas price exceeds cap"),
             Self::NonCanonicalNonce => write!(f, "transaction nonce has non-canonical encoding"),
+            Self::NonceTooLong(length) => {
+                write!(f, "transaction nonce byte length exceeds maximum: {length} > 8")
+            }
+            Self::SenderMissing => write!(f, "the sender account doesn't exist"),
+            Self::InitCodeTooLarge => write!(f, "transaction's init code size is invalid"),
         }
     }
 }
@@ -210,24 +279,25 @@ impl PoolError {
     /// `&'static str` so the counters cannot grow without bound.
     pub fn reason(&self) -> &'static str {
         match self {
-            Self::AlreadyKnown => "already-known",
+            Self::AlreadyPending | Self::AlreadyQueued => "already-known",
             Self::NonceTooLow => "nonce-too-low",
             Self::NonceTooHigh => "nonce-too-high",
             Self::InsufficientFunds => "insufficient-funds",
-            Self::GasLimitExceeded => "gas-limit-exceeded",
+            Self::GasLimitExceeded { .. } => "gas-limit-exceeded",
             Self::GasPriceTooLow => "gas-price-too-low",
             Self::IntrinsicGasTooHigh => "intrinsic-gas-too-high",
             Self::ReplacementGasPriceTooLow => "replacement-underpriced",
-            Self::TxTooLarge => "too-large",
+            Self::TxTooLarge { .. } => "too-large",
             Self::PoolFull => "pool-full",
             Self::InvalidSignature(_) => "invalid-signature",
             Self::InsufficientFundsForPendingAndNew => "insufficient-funds-pending",
-            Self::IsRemascTransaction => "remasc",
             Self::AccountExceedsQuota => "quota",
             Self::RlpDecode(_) => "rlp-decode",
             Self::StoreError(_) => "store-error",
             Self::GasPriceAboveCap => "gas-price-above-cap",
-            Self::NonCanonicalNonce => "non-canonical-nonce",
+            Self::NonCanonicalNonce | Self::NonceTooLong(_) => "non-canonical-nonce",
+            Self::SenderMissing => "sender-missing",
+            Self::InitCodeTooLarge => "init-code-too-large",
         }
     }
 }
@@ -245,6 +315,14 @@ pub struct PooledTx {
 /// Transactions grouped by sender, each sender's ordered by nonce.
 pub type PoolGroups = Vec<(Address, Vec<(u64, Transaction)>)>;
 
+/// Where the pool put a transaction it took: rskj's
+/// `TransactionPoolAddResult.okPendingTransaction` and `okQueuedTransaction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admitted {
+    Pending,
+    Queued,
+}
+
 struct PoolInner {
     pending: HashMap<Address, BTreeMap<u64, PooledTx>>,
     queued: HashMap<Address, BTreeMap<u64, PooledTx>>,
@@ -258,6 +336,32 @@ impl PoolInner {
             queued: HashMap::new(),
             by_hash: HashMap::new(),
         }
+    }
+
+    /// rskj `internalAddTransaction`'s first two questions: refused where
+    /// the pending transactions hold one of this hash, or the queued ones.
+    fn refuse_held(&self, hash: &B256) -> Result<(), PoolError> {
+        let Some(sender) = self.by_hash.get(hash) else {
+            return Ok(());
+        };
+        let pending = self
+            .pending
+            .get(sender)
+            .is_some_and(|by_nonce| by_nonce.values().any(|held| held.hash == *hash));
+        Err(if pending {
+            PoolError::AlreadyPending
+        } else {
+            PoolError::AlreadyQueued
+        })
+    }
+
+    /// rskj `PendingState.getNonce`: the nonce after the sender's last
+    /// pending transaction, or the state's where that is further on.
+    fn next_nonce(&self, sender: &Address, state_nonce: u64) -> u64 {
+        self.pending
+            .get(sender)
+            .and_then(|by_nonce| by_nonce.keys().last())
+            .map_or(state_nonce, |last| last.saturating_add(1).max(state_nonce))
     }
 }
 
@@ -369,7 +473,10 @@ impl TransactionPool {
 
     /// Call `listener` with every transaction admitted from now on.
     pub fn set_on_added(&self, listener: Arc<dyn Fn(&Transaction) + Send + Sync>) {
-        *self.on_added.write().unwrap() = Some(listener);
+        *self
+            .on_added
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(listener);
     }
 
     /// Apply the checks that depend on the chain's activations and
@@ -410,7 +517,7 @@ impl TransactionPool {
     /// Intended for a periodic reporter that stays silent when nothing
     /// happened, so a line in the log always means something did.
     pub fn take_activity(&self) -> PoolActivity {
-        let mut stats = self.stats.write().unwrap();
+        let mut stats = self.stats.write().unwrap_or_else(PoisonError::into_inner);
         let mut rejections: Vec<(&'static str, u64)> =
             stats.rejections.iter().map(|(k, v)| (*k, *v)).collect();
         rejections.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
@@ -437,22 +544,34 @@ impl TransactionPool {
     /// than spawned internally so the caller owns the task; returns how many
     /// accounts were dropped.
     pub fn clean_quotas(&self) -> usize {
-        self.quota.write().unwrap().clean_max_quotas(Instant::now())
+        self.quota
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clean_max_quotas(Instant::now())
     }
 
     /// The cleaner interval, or `None` when the clean is disabled.
     pub fn quota_cleaner_period(&self) -> Option<std::time::Duration> {
-        self.quota.read().unwrap().cleaner_period()
+        self.quota
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cleaner_period()
     }
 
     /// Virtual gas currently available to `address`, for diagnostics and tests.
     pub fn quota_of(&self, address: &Address) -> Option<f64> {
-        self.quota.read().unwrap().quota_of(address)
+        self.quota
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .quota_of(address)
     }
 
     /// An address's quota as `debug_accountTransactionQuota` reports it.
     pub fn quota_report_of(&self, address: &Address) -> Option<(f64, u64)> {
-        self.quota.read().unwrap().quota_report_of(address, Instant::now())
+        self.quota
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .quota_report_of(address, Instant::now())
     }
 
     /// Add a raw RLP-encoded transaction to the pool.
@@ -460,7 +579,7 @@ impl TransactionPool {
     pub fn add_transaction(&self, raw: &[u8]) -> Result<B256, PoolError> {
         let result = self.add_transaction_inner(raw);
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(PoisonError::into_inner);
             stats.offered += 1;
             match &result {
                 Ok(_) => stats.accepted += 1,
@@ -470,32 +589,34 @@ impl TransactionPool {
         result
     }
 
+    /// rskj `TransactionPoolImpl.addTransaction`: the transaction itself
+    /// ([`Self::admit`]) and then, where it went pending, the queued ones
+    /// that were waiting for it ([`Self::promote_successors`]).
     fn add_transaction_inner(&self, raw: &[u8]) -> Result<B256, PoolError> {
         let tx = Transaction::decode(&mut &raw[..])
             .map_err(|e| PoolError::RlpDecode(format!("{e}")))?;
 
-        let hash = tx_hash(raw);
+        // rskj keys a transaction by its hash (`getHash`), of the encoding it
+        // rebuilds rather than of the bytes as sent (`Transaction::from_rskj`),
+        // and measures it by that encoding too (`getSize`).
+        let hash = tx.tx_hash();
+        let encoded_size = tx.rlp_for_trie().len();
 
-        // rskj `TxValidatorNonceEncodingValidator`, on the bytes as sent:
-        // the lenient decoder above has already dropped the leading zeros,
-        // and admitting such a transaction would key it by one hash and
-        // relay it under another.
-        if !raw_nonce_bytes(raw).is_some_and(nonce_bytes_are_canonical) {
-            return Err(PoolError::NonCanonicalNonce);
-        }
-
-        let mut encoded = Vec::new();
-        tx.encode(&mut encoded);
-        let encoded_size = encoded.len();
+        // rskj asks whether it holds the hash before anything else, so a
+        // transaction sent twice is told that, whatever has become of its
+        // sender since.
+        self.inner
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .refuse_held(&hash)?;
 
         // A transaction offered twice -- re-broadcast, or seen by both a peer
         // and the RPC -- is recovered once. The write goes to the pool tier,
         // which is what execution reads when the block carrying it arrives.
-        let tx_hash_for_cache = tx.tx_hash();
         let cached = self
             .sender_cache
             .as_ref()
-            .and_then(|c| c.get_many(&[tx_hash_for_cache]).pop().flatten());
+            .and_then(|c| c.get_many(&[hash]).pop().flatten());
         let sender = match cached {
             Some(sender) => sender,
             None => {
@@ -505,7 +626,7 @@ impl TransactionPool {
                 if let Some(c) = &self.sender_cache {
                     c.put_many(
                         rustock_execution::sender_cache::Origin::Pool,
-                        [(tx_hash_for_cache, recovered)],
+                        [(hash, recovered)],
                     );
                 }
                 recovered
@@ -513,199 +634,326 @@ impl TransactionPool {
         };
 
         let head_header = self.head_header()?;
-        let (state_nonce, balance) = self.account_state(&head_header, &sender);
-
-        self.validate_tx(&tx, &sender, encoded_size, &head_header, state_nonce, balance)?;
-
-        let current_block = head_header.number;
+        let account = self.account_state(&head_header, &sender);
+        let nonce = tx.nonce;
         let pooled = PooledTx {
             tx: tx.clone(),
             hash,
             sender,
-            added_block: current_block,
+            added_block: head_header.number,
             added_time: Instant::now(),
             encoded_size,
         };
 
-        let mut inner = self.inner.write().unwrap();
-
-        if inner.by_hash.contains_key(&hash) {
-            return Err(PoolError::AlreadyKnown);
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        if self.admit(&mut inner, pooled, &head_header, account)? == Admitted::Pending {
+            self.promote_successors(&mut inner, sender, nonce, &head_header, account);
         }
 
-        if inner.by_hash.len() >= self.config.max_pool_transactions {
-            // Try to make room by dropping the furthest-out queued transaction.
-            // Queued entries have future nonces, so they are not executable yet
-            // and are the class an attacker can most cheaply pile up. Pending
-            // transactions are never evicted here.
-            if !Self::evict_one_queued(&mut inner) {
-                return Err(PoolError::PoolFull);
-            }
-        }
-
-        let goes_to_pending = if tx.nonce == state_nonce {
-            true
-        } else if let Some(pending_map) = inner.pending.get(&sender) {
-            pending_map
-                .keys()
-                .last()
-                .is_some_and(|&last| tx.nonce == last + 1)
-        } else {
-            false
-        };
-
-        // Check for replacement (same nonce, different hash)
-        let target_map = if goes_to_pending {
-            &inner.pending
-        } else {
-            &inner.queued
-        };
-        let mut old_hash_to_remove: Option<B256> = None;
-        // The rate limiter prices a replacement by how much it overbids the
-        // transaction it displaces, so it needs the displaced one.
-        let mut replaced_facts: Option<crate::quota::TxFacts> = None;
-        if let Some(nonce_map) = target_map.get(&sender) {
-            if let Some(existing) = nonce_map.get(&tx.nonce) {
-                if existing.hash == hash {
-                    return Err(PoolError::AlreadyKnown);
-                }
-                let bump_threshold = existing.tx.gas_price
-                    * U256::from(100 + self.config.gas_price_bump)
-                    / U256::from(100);
-                if tx.gas_price < bump_threshold {
-                    return Err(PoolError::ReplacementGasPriceTooLow);
-                }
-                old_hash_to_remove = Some(existing.hash);
-                replaced_facts = Some(tx_facts(&existing.tx, existing.encoded_size));
-            }
-        }
-
-        // Aggregate balance check for pending txs
-        if goes_to_pending {
-            // rskj `getTxBaseCost`: the value, plus the gas only when the
-            // transaction costs anything -- a free Bridge transaction carries
-            // its value and nothing else.
-            let base_cost = |t: &Transaction| -> U256 {
-                let free = self
-                    .chain_rules
-                    .as_ref()
-                    .is_some_and(|r| r.is_free_tx(t, &sender, current_block));
-                if free { t.value } else { tx_cost(t) }
-            };
-            let mut total_cost = base_cost(&tx);
-            if let Some(pending_map) = inner.pending.get(&sender) {
-                for (nonce, ptx) in pending_map {
-                    if *nonce != tx.nonce {
-                        total_cost += base_cost(&ptx.tx);
-                    }
-                }
-            }
-            if total_cost > balance {
-                return Err(PoolError::InsufficientFundsForPendingAndNew);
-            }
-        }
-
-        // rskj `TransactionPoolImpl.internalAddTransaction`: the quota check is
-        // the LAST gate, after every cheaper validation and after the
-        // replacement has been resolved. Running it earlier would let an
-        // invalid transaction consume an honest account's virtual gas.
-        {
-            let accounts = TrieAccountView::new(head_header.state_root, &*self.trie_store);
-            let ctx = crate::quota::QuotaContext {
-                block_gas_limit: head_header.gas_limit.try_into().unwrap_or(u64::MAX),
-                block_min_gas_price: head_header
-                    .minimum_gas_price
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-                // rskj supplies the average only when the fee market is
-                // working -- `isFeeMarketWorking()` false takes its
-                // `createSkippingGasPriceFactor` branch, which pins the
-                // low-gas-price factor to 1. On a chain with spare capacity
-                // that is the usual path on rskj too; the difference is that
-                // it recovers when blocks fill up, which this now does.
-                avg_gas_price: self.gas_price.as_ref().and_then(|t| {
-                    t.is_fee_market_working().then(|| t.gas_price().try_into().unwrap_or(u64::MAX))
-                }),
-            };
-            let receiver = (tx.to.len() == 20).then(|| Address::from_slice(tx.to.as_ref()));
-            let accepted = self.quota.write().unwrap().accept_tx(
-                sender,
-                receiver,
-                &tx_facts(&tx, encoded_size),
-                replaced_facts.as_ref(),
-                &ctx,
-                &accounts,
-                Instant::now(),
-            );
-            if !accepted {
-                debug!(
-                    tx_hash = %hash, sender = %sender, nonce = tx.nonce,
-                    "Transaction refused: account exceeds virtual gas quota"
-                );
-                *self.stats.write().unwrap().quota_by_sender.entry(sender).or_insert(0) += 1;
-                return Err(PoolError::AccountExceedsQuota);
-            }
-        }
-
-        // All checks passed — mutate the pool
-        if let Some(old_hash) = old_hash_to_remove {
-            inner.by_hash.remove(&old_hash);
-        }
-
-        let sender_map = if goes_to_pending {
-            inner.pending.entry(sender).or_default()
-        } else {
-            inner.queued.entry(sender).or_default()
-        };
-        sender_map.insert(tx.nonce, pooled);
-        inner.by_hash.insert(hash, sender);
-
-        if goes_to_pending {
-            self.promote_queued(&mut inner, sender, state_nonce);
-        }
-
-        debug!(tx_hash = %hash, sender = %sender, nonce = tx.nonce, "Transaction added to pool");
+        debug!(tx_hash = %hash, sender = %sender, nonce, "Transaction added to pool");
         drop(inner);
-        let listener = self.on_added.read().unwrap().clone();
+        let listener = self
+            .on_added
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         if let Some(listener) = listener {
             listener(&tx);
         }
         Ok(hash)
     }
 
-    /// rskj `TxPendingValidator.isValid`, step by step and in its order.
+    /// rskj `TransactionPoolImpl.internalAddTransaction`, in its order: the
+    /// hash, the validation against the head's state, the pending
+    /// transaction it would replace, and then where it goes. A nonce past the
+    /// sender's next one is queued, in the place of any queued one of that
+    /// nonce, and nothing more is asked of it. Any other is pending, once the
+    /// rate limiter takes it and the sender can pay for it along with their
+    /// other pending transactions.
+    fn admit(
+        &self,
+        inner: &mut PoolInner,
+        pooled: PooledTx,
+        header: &Header,
+        account: Option<(u64, U256)>,
+    ) -> Result<Admitted, PoolError> {
+        inner.refuse_held(&pooled.hash)?;
+        self.validate_tx(
+            &pooled.tx,
+            &pooled.sender,
+            pooled.encoded_size,
+            header,
+            account,
+        )?;
+        let (state_nonce, balance) = account.unwrap_or_default();
+        let (hash, sender, nonce) = (pooled.hash, pooled.sender, pooled.tx.nonce);
+
+        // rskj `isBumpingGasPriceForSameNonceTx`: a higher price, and no less
+        // than the old one raised by the bump, which rskj reckons in whole
+        // numbers (`Coin.multiply`). Where the bump rounds to nothing, the
+        // same price again doesn't replace. The rate limiter prices a
+        // replacement by how much it overbids the transaction it displaces,
+        // so it needs the displaced one.
+        let replaced = inner
+            .pending
+            .get(&sender)
+            .and_then(|by_nonce| by_nonce.get(&nonce))
+            .map(|old| {
+                (
+                    old.hash,
+                    old.tx.gas_price,
+                    tx_facts(&old.tx, old.encoded_size),
+                )
+            });
+        if let Some((_, old_price, _)) = &replaced {
+            let new_price = pooled.tx.gas_price;
+            let bumped = alloy_primitives::U512::from(*old_price)
+                * alloy_primitives::U512::from(100 + self.config.gas_price_bump)
+                / alloy_primitives::U512::from(100);
+            if *old_price >= new_price || bumped > alloy_primitives::U512::from(new_price) {
+                return Err(PoolError::ReplacementGasPriceTooLow);
+            }
+        }
+
+        let queues = nonce > inner.next_nonce(&sender, state_nonce);
+        let displaced = if queues {
+            inner
+                .queued
+                .get(&sender)
+                .and_then(|by_nonce| by_nonce.get(&nonce))
+                .map(|old| old.hash)
+        } else {
+            replaced.as_ref().map(|(old_hash, ..)| *old_hash)
+        };
+
+        // This pool's own ceiling, which rskj's has none of. A transaction
+        // that takes another's place needs no room; any other has the
+        // furthest-out queued transaction make way for it, once everything
+        // else is settled. Queued entries have future nonces, so they are not
+        // executable yet and are the class an attacker can most cheaply pile
+        // up. Pending transactions are never evicted.
+        let needs_room =
+            displaced.is_none() && inner.by_hash.len() >= self.config.max_pool_transactions;
+        if needs_room && inner.queued.is_empty() {
+            return Err(PoolError::PoolFull);
+        }
+
+        if !queues {
+            self.take_quota(&pooled, replaced.as_ref().map(|(.., facts)| facts), header)?;
+
+            // rskj `senderCanPayPendingTransactionsAndNewTx`, after the rate
+            // limiter. `getTxBaseCost`: the value, plus the gas only when the
+            // transaction costs anything -- a free Bridge transaction carries
+            // its value and nothing else.
+            let base_cost = |t: &Transaction| -> Option<U256> {
+                let free = self
+                    .chain_rules
+                    .as_ref()
+                    .is_some_and(|r| r.is_free_tx(t, &sender, header.number));
+                if free {
+                    Some(t.value)
+                } else {
+                    tx_cost(t)
+                }
+            };
+            let mut total_cost = base_cost(&pooled.tx);
+            if let Some(pending_map) = inner.pending.get(&sender) {
+                for (other, ptx) in pending_map {
+                    if *other != nonce {
+                        total_cost = total_cost
+                            .zip(base_cost(&ptx.tx))
+                            .and_then(|(total, cost)| total.checked_add(cost));
+                    }
+                }
+            }
+            // rskj adds these up in whole numbers (`Coin`): a sum past 256
+            // bits is more than any balance.
+            if total_cost.is_none_or(|total| total > balance) {
+                return Err(PoolError::InsufficientFundsForPendingAndNew);
+            }
+        }
+
+        // All checks passed: the pool changes.
+        if needs_room {
+            Self::evict_one_queued(inner);
+        }
+        if let Some(old_hash) = displaced {
+            inner.by_hash.remove(&old_hash);
+        }
+        inner.by_hash.insert(hash, sender);
+        let side = if queues {
+            &mut inner.queued
+        } else {
+            &mut inner.pending
+        };
+        side.entry(sender).or_default().insert(nonce, pooled);
+        Ok(if queues {
+            Admitted::Queued
+        } else {
+            Admitted::Pending
+        })
+    }
+
+    /// rskj `TxQuotaChecker.acceptTx`, where `internalAddTransaction` asks
+    /// it: of a transaction on its way to pending, after every validation
+    /// and after the replacement has been resolved, and before the sender's
+    /// funds are counted. A queued transaction is not asked about until it
+    /// is promoted, and an invalid one never, so neither consumes an honest
+    /// account's virtual gas.
+    fn take_quota(
+        &self,
+        pooled: &PooledTx,
+        replaced: Option<&crate::quota::TxFacts>,
+        header: &Header,
+    ) -> Result<(), PoolError> {
+        let accounts = TrieAccountView::new(header.state_root, &*self.trie_store);
+        // rskj supplies the average only when the fee market is working --
+        // `isFeeMarketWorking()` false takes its
+        // `createSkippingGasPriceFactor` branch, which pins the
+        // low-gas-price factor to 1. On a chain with spare capacity that
+        // is the usual path on rskj too; the difference is that it
+        // recovers when blocks fill up, which this now does.
+        let avg_gas_price = self
+            .gas_price
+            .as_ref()
+            .and_then(|t| t.is_fee_market_working().then(|| t.gas_price()));
+        let ctx = crate::quota::QuotaContext::of(header, avg_gas_price);
+        let tx = &pooled.tx;
+        let receiver = (tx.to.len() == 20).then(|| Address::from_slice(tx.to.as_ref()));
+        let accepted = self
+            .quota
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .accept_tx(
+                pooled.sender,
+                receiver,
+                &tx_facts(tx, pooled.encoded_size),
+                replaced,
+                &ctx,
+                &accounts,
+                Instant::now(),
+            );
+        if accepted {
+            return Ok(());
+        }
+        debug!(
+            tx_hash = %pooled.hash, sender = %pooled.sender, nonce = tx.nonce,
+            "Transaction refused: account exceeds virtual gas quota"
+        );
+        *self
+            .stats
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .quota_by_sender
+            .entry(pooled.sender)
+            .or_insert(0) += 1;
+        Err(PoolError::AccountExceedsQuota)
+    }
+
+    /// rskj `addSuccessors`: the queued transaction next in line after one
+    /// that went pending is taken out of the queue and offered again, as a
+    /// new one would be, and so on until one doesn't go pending. One that is
+    /// refused then is gone.
+    fn promote_successors(
+        &self,
+        inner: &mut PoolInner,
+        sender: Address,
+        after: u64,
+        header: &Header,
+        account: Option<(u64, U256)>,
+    ) {
+        let mut nonce = after;
+        loop {
+            let Some(next) = nonce.checked_add(1) else {
+                return;
+            };
+            nonce = next;
+            let Some(queue) = inner.queued.get_mut(&sender) else {
+                return;
+            };
+            let Some(mut successor) = queue.remove(&nonce) else {
+                return;
+            };
+            if queue.is_empty() {
+                inner.queued.remove(&sender);
+            }
+            inner.by_hash.remove(&successor.hash);
+            // rskj notes the block and the time again, as for a new one.
+            successor.added_block = header.number;
+            successor.added_time = Instant::now();
+            if !matches!(
+                self.admit(inner, successor, header, account),
+                Ok(Admitted::Pending)
+            ) {
+                return;
+            }
+        }
+    }
+
+    /// rskj `TxPendingValidator.isValid`, step by step and in its order, so
+    /// that of two faults the one rskj names is the one named here.
+    /// `account` is the sender's nonce and balance in the head's state, or
+    /// none where the state holds no such account.
     fn validate_tx(
         &self,
         tx: &Transaction,
         sender: &Address,
         encoded_size: usize,
         header: &Header,
-        state_nonce: u64,
-        balance: U256,
+        account: Option<(u64, U256)>,
     ) -> Result<(), PoolError> {
         let rules = self.chain_rules.as_ref();
         // rskj `basicTxCost == 0`: a free Bridge transaction.
         let is_free = rules.is_some_and(|r| r.is_free_tx(tx, sender, header.number));
 
-        // 1. Not REMASC (`TxValidatorNotRemascTxValidator`)
-        if is_remasc_tx(tx) {
-            return Err(PoolError::IsRemascTransaction);
+        // Before the steps: an account to pay for it, unless it costs
+        // nothing; RSKIP438's limit on a creation's init code; and the size
+        // (`TX_MAX_SIZE`).
+        if account.is_none() && !is_free {
+            return Err(PoolError::SenderMissing);
+        }
+        let (state_nonce, balance) = account.unwrap_or_default();
+        let metered = rules.is_some_and(|r| r.hardfork_cfg.has_initcode_metering(header.number));
+        if metered && tx.to.is_empty() && tx.input.len() > MAX_INIT_CODE_SIZE {
+            return Err(PoolError::InitCodeTooLarge);
+        }
+        if encoded_size > self.config.max_tx_size {
+            return Err(PoolError::TxTooLarge {
+                size: encoded_size,
+                max: self.config.max_tx_size,
+            });
         }
 
-        // 2. Size limit (`TX_MAX_SIZE`)
-        if encoded_size > self.config.max_tx_size {
-            return Err(PoolError::TxTooLarge);
-        }
+        // 1. Not null (`TxNotNullValidator`), and 2. not REMASC
+        //    (`TxValidatorNotRemascTxValidator`): rskj refuses a
+        //    `RemascTransaction`, which only a block's last transaction is,
+        //    so never one offered alone.
 
         // 3. Gas limit (`TxValidatorGasLimitValidator`), against the block's
         //    limit or, under RSKIP144, the larger sublist's.
-        let gas_limit = tx.gas_limit.saturating_to::<u64>();
         let bound = rules.map_or(header.gas_limit.saturating_to::<u64>(), |r| r.gas_limit_bound(header));
-        if gas_limit > bound || gas_limit > TRANSACTION_GAS_CAP {
-            return Err(PoolError::GasLimitExceeded);
+        if tx.gas_limit > U256::from(bound) || tx.gas_limit > U256::from(TRANSACTION_GAS_CAP) {
+            return Err(PoolError::GasLimitExceeded {
+                gas_limit: tx.gas_limit,
+                bound,
+            });
         }
 
-        // 4. Nonce range (`TxValidatorNonceRangeValidator`)
+        // 4. The account's state (`TxValidatorAccountStateValidator`): a
+        //    missing one was refused above, and a deleted one is a mark only
+        //    a repository being written to carries.
+
+        // 5. The nonce's encoding (`TxValidatorNonceEncodingValidator`), on
+        //    the nonce's bytes as rskj holds them (`getNonce`), which the
+        //    encoding rskj rebuilds keeps.
+        let encoded = tx.rlp_for_trie();
+        match raw_nonce_bytes(&encoded) {
+            Some(nonce) if nonce.len() > 8 => return Err(PoolError::NonceTooLong(nonce.len())),
+            Some(nonce) if nonce_bytes_are_canonical(nonce) => {}
+            _ => return Err(PoolError::NonCanonicalNonce),
+        }
+
+        // 6. Nonce range (`TxValidatorNonceRangeValidator`)
         if tx.nonce < state_nonce {
             return Err(PoolError::NonceTooLow);
         }
@@ -713,28 +961,34 @@ impl TransactionPool {
             return Err(PoolError::NonceTooHigh);
         }
 
-        // 5. Balance >= gas cost (`TxValidatorAccountBalanceValidator`),
-        //    which a free transaction skips.
+        // 7. Balance >= gas cost (`TxValidatorAccountBalanceValidator`),
+        //    which a free transaction skips. rskj multiplies in whole
+        //    numbers (`Coin.multiply`), so a cost past 256 bits is more
+        //    than any balance.
         if !is_free {
-            let gas_cost = tx.gas_price * tx.gas_limit;
-            if balance < gas_cost {
+            let gas_cost = tx.gas_price.checked_mul(tx.gas_limit);
+            if gas_cost.is_none_or(|gas_cost| balance < gas_cost) {
                 return Err(PoolError::InsufficientFunds);
             }
         }
 
-        // 6. Minimum gas price (`TxValidatorMinimuGasPriceValidator`)
+        // 8. Minimum gas price (`TxValidatorMinimuGasPriceValidator`)
         if tx.gas_price < header.minimum_gas_price {
             return Err(PoolError::GasPriceTooLow);
         }
 
-        // 7. Intrinsic gas (`TxValidatorIntrinsicGasLimitValidator`): a free
+        // 9. Intrinsic gas (`TxValidatorIntrinsicGasLimitValidator`): a free
         //    transaction costs nothing, so any limit, zero included, fits.
-        let intrinsic = if is_free { 0 } else { intrinsic_gas(tx) };
+        let intrinsic = match rules {
+            _ if is_free => 0,
+            Some(rules) => rules.transaction_cost(tx, header.number),
+            None => intrinsic_gas(tx),
+        };
         if U256::from(intrinsic) > tx.gas_limit {
             return Err(PoolError::IntrinsicGasTooHigh);
         }
 
-        // 8. Price cap (`TxValidatorMaximumGasPriceValidator`), RSKIP252.
+        // 10. Price cap (`TxValidatorMaximumGasPriceValidator`), RSKIP252.
         if let Some(cap) = rules.and_then(|r| r.gas_price_cap(header)) {
             if tx.gas_price > cap {
                 return Err(PoolError::GasPriceAboveCap);
@@ -774,18 +1028,19 @@ impl TransactionPool {
 
     pub fn remove_mined(&self, transactions: &[Transaction]) {
         let mut removed = 0u64;
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         for tx in transactions {
-            let mut buf = Vec::new();
-            tx.encode(&mut buf);
-            let hash = tx_hash(&buf);
+            let hash = tx.tx_hash();
             if Self::remove_by_hash(&mut inner, &hash, tx.nonce) {
                 removed += 1;
             }
         }
         drop(inner);
         if removed > 0 {
-            self.stats.write().unwrap().mined += removed;
+            self.stats
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .mined += removed;
         }
     }
 
@@ -793,7 +1048,7 @@ impl TransactionPool {
     /// template: rskj `BlockToMineBuilder.removePendingTransactions` on
     /// `BlockResult.getInvalidTransactions()`. Returns how many were there.
     pub fn remove_by_hashes(&self, hashes: &[B256]) -> usize {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let mut removed = 0;
         for hash in hashes {
             let nonce = inner
@@ -835,7 +1090,7 @@ impl TransactionPool {
 
     /// Evict transactions older than the configured thresholds.
     pub fn evict_outdated(&self, current_block: u64) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let threshold = self.config.outdated_threshold;
         let timeout = std::time::Duration::from_secs(self.config.outdated_timeout_secs);
         let now = Instant::now();
@@ -871,30 +1126,9 @@ impl TransactionPool {
         }
     }
 
-    /// Promote any consecutive queued txs for a sender into pending.
-    fn promote_queued(&self, inner: &mut PoolInner, sender: Address, state_nonce: u64) {
-        let pending_map = inner.pending.entry(sender).or_default();
-        let next_nonce = pending_map
-            .keys()
-            .last()
-            .map(|n| n + 1)
-            .unwrap_or(state_nonce);
-
-        if let Some(queued_map) = inner.queued.get_mut(&sender) {
-            let mut nonce = next_nonce;
-            while let Some(ptx) = queued_map.remove(&nonce) {
-                pending_map.insert(nonce, ptx);
-                nonce += 1;
-            }
-            if queued_map.is_empty() {
-                inner.queued.remove(&sender);
-            }
-        }
-    }
-
     /// Get a transaction from the pool by hash.
     pub fn get(&self, hash: &B256) -> Option<PooledTx> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let sender = inner.by_hash.get(hash)?;
         for map in [&inner.pending, &inner.queued] {
             if let Some(nonce_map) = map.get(sender) {
@@ -910,7 +1144,7 @@ impl TransactionPool {
 
     /// Return all pending transactions ordered by gas price (desc), nonce (asc) per sender.
     pub fn pending_transactions(&self) -> Vec<PooledTx> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let mut result = Vec::new();
         for nonce_map in inner.pending.values() {
             for ptx in nonce_map.values() {
@@ -931,7 +1165,7 @@ impl TransactionPool {
     /// would otherwise appear twice, or vanish.
     #[allow(clippy::type_complexity)]
     pub fn content(&self) -> (PoolGroups, PoolGroups) {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let collect = |side: &HashMap<Address, BTreeMap<u64, PooledTx>>| -> PoolGroups {
             let mut out: Vec<(Address, Vec<(u64, Transaction)>)> = side
                 .iter()
@@ -955,7 +1189,7 @@ impl TransactionPool {
 
     /// Return counts of pending and queued transactions.
     pub fn status(&self) -> (usize, usize) {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let pending: usize = inner.pending.values().map(|m| m.len()).sum();
         let queued: usize = inner.queued.values().map(|m| m.len()).sum();
         (pending, queued)
@@ -963,7 +1197,7 @@ impl TransactionPool {
 
     /// Return the pending nonce for an address (state nonce + pending count).
     pub fn pending_nonce(&self, addr: &Address) -> Option<u64> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         inner
             .pending
             .get(addr)
@@ -982,22 +1216,16 @@ impl TransactionPool {
             .ok_or_else(|| PoolError::StoreError("head header not found".into()))
     }
 
-    fn account_state(&self, header: &Header, addr: &Address) -> (u64, U256) {
-        let root_hash = header.state_root;
-        let root_data = match self.trie_store.get(root_hash.as_slice()) {
-            Some(d) => d,
-            None => return (0, U256::ZERO),
-        };
+    /// The nonce and balance of `addr` in the state `header` names, or none
+    /// where that state holds no such account: rskj's `getAccountState`,
+    /// which is null then.
+    fn account_state(&self, header: &Header, addr: &Address) -> Option<(u64, U256)> {
+        let root_data = self.trie_store.get(header.state_root.as_slice())?;
         let root = TrieNode::from_message(&root_data, &*self.trie_store);
         let key = account_key(addr);
-        let expanded = TrieKeySlice::from_key(&key);
-        match root.get(&expanded, &*self.trie_store) {
-            Some(data) => match AccountState::decode(&data) {
-                Ok(acct) => (acct.nonce.to::<u64>(), acct.balance),
-                Err(_) => (0, U256::ZERO),
-            },
-            None => (0, U256::ZERO),
-        }
+        let data = root.get(&TrieKeySlice::from_key(&key), &*self.trie_store)?;
+        let account = AccountState::decode(&data).ok()?;
+        Some((account.nonce.to::<u64>(), account.balance))
     }
 }
 
@@ -1050,32 +1278,19 @@ impl crate::quota::AccountView for TrieAccountView<'_> {
 fn tx_facts(tx: &Transaction, encoded_size: usize) -> crate::quota::TxFacts {
     crate::quota::TxFacts {
         nonce: tx.nonce,
-        gas_limit: tx.gas_limit.try_into().unwrap_or(u64::MAX),
+        gas_limit: tx.gas_limit,
         gas_price: tx.gas_price,
         size: encoded_size,
     }
 }
 
-/// Compute the cost of a transaction: value + gas_price * gas_limit.
-fn tx_cost(tx: &Transaction) -> U256 {
-    tx.value + tx.gas_price * tx.gas_limit
-}
-
-/// Compute the keccak256 hash of raw transaction bytes.
-pub fn tx_hash(raw: &[u8]) -> B256 {
-    B256::from_slice(&Keccak256::digest(raw))
-}
-
-/// Check if a transaction is a REMASC transaction.
-fn is_remasc_tx(tx: &Transaction) -> bool {
-    if tx.to.len() != 20 {
-        return false;
-    }
-    let remasc_bytes: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 8];
-    tx.to.as_ref() == remasc_bytes
-        && tx.gas_price.is_zero()
-        && tx.gas_limit.is_zero()
-        && tx.value.is_zero()
+/// Compute the cost of a transaction: value + gas_price * gas_limit. `None`
+/// where that is past 256 bits, and so more than any balance: rskj reckons it
+/// in whole numbers (`TransactionPoolImpl.getTxBaseCost`).
+fn tx_cost(tx: &Transaction) -> Option<U256> {
+    tx.gas_price
+        .checked_mul(tx.gas_limit)?
+        .checked_add(tx.value)
 }
 
 /// Compute the intrinsic gas cost of a transaction (matching rskj).
@@ -1095,8 +1310,10 @@ pub fn intrinsic_gas(tx: &Transaction) -> u64 {
 mod tests {
     use super::*;
     use alloy_primitives::{Address, Bloom, Bytes, U256};
+    use alloy_rlp::Encodable;
     use k256::ecdsa::SigningKey;
     use rustock_trie::MemoryTrieStore;
+    use sha3::{Digest, Keccak256};
     use tempfile::tempdir;
 
     fn test_config() -> PoolConfig {
@@ -1139,6 +1356,7 @@ mod tests {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         }
     }
 
@@ -1164,6 +1382,17 @@ mod tests {
         config: PoolConfig,
         rules: Option<ChainRules>,
     ) -> (TransactionPool, SigningKey, Address) {
+        setup_pool_on(test_header(), balance, nonce, config, rules)
+    }
+
+    /// [`setup_pool_with_rules`] on a head of the test's own choosing.
+    fn setup_pool_on(
+        mut header: Header,
+        balance: U256,
+        nonce: u64,
+        config: PoolConfig,
+        rules: Option<ChainRules>,
+    ) -> (TransactionPool, SigningKey, Address) {
         let dir = tempdir().unwrap();
         let store = Arc::new(BlockStore::open(dir.path()).unwrap());
         let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
@@ -1182,7 +1411,6 @@ mod tests {
         let root_data = root.to_message(&*trie_store);
         rustock_trie::TrieStore::put(&*trie_store, state_root.as_slice(), &root_data);
 
-        let mut header = test_header();
         header.state_root = state_root;
         store.update_head(&header, U256::from(100_000)).unwrap();
 
@@ -1199,6 +1427,23 @@ mod tests {
     /// from genesis and a transaction to the Bridge is never free.
     fn regtest_rules() -> ChainRules {
         ChainRules::for_chain(rustock_execution::hardfork::RskHardforkConfig::all_active(33), 6_800_000)
+    }
+
+    /// A node on rskj's regtest (an rskj genesis file) gives the pool rskj's
+    /// regtest Bridge constants, so the pool counts the federators' Bridge
+    /// calls free as the block processor does; rustock's own regtest has none.
+    #[test]
+    fn the_pool_takes_rskj_regtests_free_senders() {
+        let rskj = rustock_execution::bridge::constants::BridgeConstants::rskj_regtest();
+        let expected = rustock_execution::executor::free_bridge_senders(&rskj);
+        let rules = regtest_rules().with_bridge_constants(&rskj);
+        assert_eq!(rules.free_bridge_senders, expected);
+        // rskj's regtest adds its three federators, and the two federation
+        // change authorizers rustock's own regtest leaves out, to its senders.
+        assert_eq!(
+            regtest_rules().free_bridge_senders.len() + 5,
+            expected.len()
+        );
     }
 
     fn sign_tx(tx: &mut Transaction, key: &SigningKey, chain_id: u64) {
@@ -1231,6 +1476,35 @@ mod tests {
         let mut buf = Vec::new();
         tx.encode(&mut buf);
         buf
+    }
+
+    /// A transaction signed for `chain_id` (not 0) over its six fields as
+    /// given, each already an RLP item, as rskj signs and sends what its own
+    /// builder writes: a zero gas limit, for one, is the byte 0x00 there,
+    /// where canonical RLP writes zero empty, and rskj cannot read empty.
+    fn rskj_signed(fields: &[u8], key: &SigningKey, chain_id: u64) -> Vec<u8> {
+        fn list(payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            alloy_rlp::Header {
+                list: true,
+                payload_length: payload.len(),
+            }
+            .encode(&mut out);
+            out.extend_from_slice(payload);
+            out
+        }
+        let mut unsigned = fields.to_vec();
+        chain_id.encode(&mut unsigned);
+        unsigned.extend_from_slice(&[0x80, 0x80]);
+        let hash: [u8; 32] = Keccak256::digest(list(&unsigned)).into();
+        let (signature, recid): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
+            key.sign_prehash_recoverable(&hash).unwrap();
+        let sig_bytes = signature.to_bytes();
+        let mut signed = fields.to_vec();
+        (chain_id * 2 + 35 + u64::from(recid.to_byte())).encode(&mut signed);
+        U256::from_be_slice(&sig_bytes[..32]).encode(&mut signed);
+        U256::from_be_slice(&sig_bytes[32..]).encode(&mut signed);
+        list(&signed)
     }
 
     // ========== Account transaction rate limiting (rskj TxQuotaChecker) ==========
@@ -1490,7 +1764,10 @@ mod tests {
 
         // The same one again: rejected as already known, which is ordinary --
         // several peers relay the same transaction.
-        assert!(matches!(pool.add_transaction(&raw), Err(PoolError::AlreadyKnown)));
+        assert!(matches!(
+            pool.add_transaction(&raw),
+            Err(PoolError::AlreadyPending)
+        ));
 
         // One rejected for an unrelated reason.
         let mut cheap = make_tx(1, 1);
@@ -1557,6 +1834,42 @@ mod tests {
         tx.input = Bytes::from(vec![0x00, 0x01, 0x00, 0xff]);
         // 21000 + 4(zero) + 16(non-zero) + 4(zero) + 16(non-zero)
         assert_eq!(intrinsic_gas(&tx), 21_000 + 4 + 16 + 4 + 16);
+    }
+
+    /// rskj `Transaction.transactionCost` as the pool reads it at its head,
+    /// on mainnet: a byte of call data other than zero costs 68 before
+    /// RSKIP400 (arrowhead600, #6,223,700) and 16 from it, a zero byte 4
+    /// throughout; from RSKIP438 (lovell700, #7,338,024) a creation pays 2
+    /// more for each 32 bytes of its init code, the last ones counted whole
+    /// (`InitcodeCostCalculator`), and a call pays nothing for its data so.
+    #[test]
+    fn the_pool_prices_call_data_and_init_code_by_the_heads_upgrades() {
+        let rules = ChainRules::for_chain(
+            rustock_execution::hardfork::RskHardforkConfig::mainnet(),
+            10_000_000,
+        );
+        let mut call = make_tx(0, 1);
+        call.input = Bytes::from(vec![0x00, 0x01, 0x02]);
+        let mut creation = make_tx(0, 1);
+        creation.to = Bytes::new();
+        creation.input = Bytes::from(vec![0x01; 33]);
+        for (number, call_cost, creation_cost) in [
+            (6_223_699, 21_000 + 4 + 2 * 68, 53_000 + 33 * 68),
+            (6_223_700, 21_000 + 4 + 2 * 16, 53_000 + 33 * 16),
+            (7_338_023, 21_000 + 4 + 2 * 16, 53_000 + 33 * 16),
+            (7_338_024, 21_000 + 4 + 2 * 16, 53_000 + 33 * 16 + 2 * 2),
+        ] {
+            assert_eq!(
+                rules.transaction_cost(&call, number),
+                call_cost,
+                "#{number}"
+            );
+            assert_eq!(
+                rules.transaction_cost(&creation, number),
+                creation_cost,
+                "#{number}"
+            );
+        }
     }
 
     // ========== rskj: addAndGetPendingTransaction ==========
@@ -1678,7 +1991,7 @@ mod tests {
 
         pool.add_transaction(&raw).unwrap();
         let err = pool.add_transaction(&raw).unwrap_err();
-        assert!(matches!(err, PoolError::AlreadyKnown));
+        assert!(matches!(err, PoolError::AlreadyPending));
     }
 
     // ========== rskj: checkTxWithSameNonceIsRejected ==========
@@ -1726,7 +2039,7 @@ mod tests {
         tx.gas_limit = U256::from(9_000_000); // > 8M block gas limit
         sign_tx(&mut tx, &key, 33);
         let err = pool.add_transaction(&encode_tx(&tx)).unwrap_err();
-        assert!(matches!(err, PoolError::GasLimitExceeded));
+        assert!(matches!(err, PoolError::GasLimitExceeded { .. }));
     }
 
     // ========== rskj: checkTxWithHighNonceIsRejected ==========
@@ -1811,25 +2124,37 @@ mod tests {
 
     // ========== rskj: checkRemascTxIsRejected ==========
 
+    /// rskj refuses a `RemascTransaction`, which only a block's last
+    /// transaction is. REMASC's own encoding, offered alone, carries no
+    /// signature, and is refused for that, as rskj refuses it on arrival
+    /// (`acceptTransactionSignature`). A signed transaction of its shape is
+    /// an ordinary transaction to the REMASC contract, and refused as any
+    /// other would be: for its zero gas price, below the block's minimum,
+    /// and at that minimum for a gas limit below a transfer's cost.
     #[test]
     fn test_remasc_tx_rejected() {
         let (pool, key, _addr) = setup_pool_with_account(U256::from(10u64.pow(18)), 0);
-        let remasc_addr: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 8];
-        let mut tx = Transaction {
-            nonce: 0,
-            gas_price: U256::ZERO,
-            gas_limit: U256::ZERO,
-            to: Bytes::from(remasc_addr.to_vec()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
+        let remasc = Transaction::remasc(10);
+        let err = pool.add_transaction(&remasc.rlp_for_trie()).unwrap_err();
+        assert!(matches!(err, PoolError::InvalidSignature(_)), "{err}");
+
+        let remasc_shaped = |gas_price: &[u8]| {
+            let mut fields = vec![0x80]; // nonce 0
+            fields.extend_from_slice(gas_price);
+            fields.push(0x00); // gas limit zero, the byte 0x00 as in REMASC's
+            rustock_execution::precompiles::REMASC_ADDR
+                .as_slice()
+                .encode(&mut fields);
+            fields.extend_from_slice(&[0x80, 0x80]); // value 0, no data
+            rskj_signed(&fields, &key, 33)
         };
-        sign_tx(&mut tx, &key, 33);
-        let err = pool.add_transaction(&encode_tx(&tx)).unwrap_err();
-        assert!(matches!(err, PoolError::IsRemascTransaction));
+        let err = pool.add_transaction(&remasc_shaped(&[0x00])).unwrap_err();
+        assert!(matches!(err, PoolError::GasPriceTooLow), "{err}");
+
+        let mut minimum = Vec::new();
+        U256::from(59_240_000).encode(&mut minimum);
+        let err = pool.add_transaction(&remasc_shaped(&minimum)).unwrap_err();
+        assert!(matches!(err, PoolError::IntrinsicGasTooHigh), "{err}");
     }
 
     // ========== rskj: checkTxWithLowGasPriceIsRejected ==========
@@ -1886,6 +2211,82 @@ mod tests {
         sign_tx(&mut tx2, &key, 33);
         let err = pool.add_transaction(&encode_tx(&tx2)).unwrap_err();
         assert!(matches!(err, PoolError::InsufficientFundsForPendingAndNew));
+    }
+
+    /// rskj reckons what a transaction costs in whole numbers (`Coin`, a
+    /// `BigInteger`), so a cost past 256 bits is more than any balance. In
+    /// 256 bits it wraps: 2^240 a gas for 65,536 gas comes to nothing, and so
+    /// do two transactions of 2^255 each.
+    #[test]
+    fn a_cost_past_256_bits_is_more_than_any_balance() {
+        let (pool, key, _addr) = setup_pool_with_account(U256::from(1), 0);
+        let mut tx = make_tx(0, 0);
+        tx.gas_price = U256::from(1) << 240;
+        tx.gas_limit = U256::from(65_536);
+        tx.value = U256::ZERO;
+        sign_tx(&mut tx, &key, 33);
+        let err = pool.add_transaction(&encode_tx(&tx)).unwrap_err();
+        assert!(matches!(err, PoolError::InsufficientFunds), "{err}");
+
+        let half = U256::from(1) << 255;
+        let gas = U256::from(59_240_000u64 * 21_000);
+        let (pool, key, _addr) = setup_pool_with_account(half, 0);
+        let costing_half = |nonce: u64| {
+            let mut tx = make_tx(nonce, 59_240_000);
+            tx.value = half - gas;
+            sign_tx(&mut tx, &key, 33);
+            pool.add_transaction(&encode_tx(&tx))
+        };
+        costing_half(0).expect("the account holds what the first costs");
+        let err = costing_half(1).unwrap_err();
+        assert!(
+            matches!(err, PoolError::InsufficientFundsForPendingAndNew),
+            "{err}"
+        );
+    }
+
+    /// rskj replaces a pending transaction only with one that pays more
+    /// (`isBumpingGasPriceForSameNonceTx`: `oldGasPrice < newGasPrice`, and
+    /// no less than the old price raised by the bump). Where the bump rounds
+    /// to nothing -- a price of 0, 1 or 2 -- the same price again is not
+    /// enough.
+    #[test]
+    fn a_replacement_has_to_pay_more() {
+        let mut header = test_header();
+        header.minimum_gas_price = U256::ZERO;
+        let (pool, key, _addr) =
+            setup_pool_on(header, U256::from(10u64.pow(18)), 0, test_config(), None);
+        let mut value = 1_000;
+        let mut offer = |gas_price: u64| {
+            // A new value each time: another transaction, of another hash.
+            value += 1;
+            let mut tx = make_tx(0, gas_price);
+            tx.value = U256::from(value);
+            sign_tx(&mut tx, &key, 33);
+            pool.add_transaction(&encode_tx(&tx))
+        };
+        offer(0).expect("the first");
+        for (gas_price, replaces) in [
+            (0, false),
+            (1, true),
+            (1, false),
+            (2, true),
+            (2, false),
+            (3, true),
+            // 3 raised by 40% is 4.
+            (3, false),
+            (4, true),
+        ] {
+            let added = offer(gas_price);
+            if replaces {
+                added.unwrap_or_else(|err| panic!("{gas_price} replaces: {err}"));
+            } else {
+                assert!(
+                    matches!(added, Err(PoolError::ReplacementGasPriceTooLow)),
+                    "{gas_price} does not replace: {added:?}"
+                );
+            }
+        }
     }
 
     // ========== rskj: removeObsoletePendingTransactionsByBlock ==========
@@ -2056,7 +2457,7 @@ mod tests {
             let mut tx = make_tx(nonce, 59_240_000);
             sign_tx(&mut tx, &key, 33);
             let raw = encode_tx(&tx);
-            hashes.push(tx_hash(&raw));
+            hashes.push(tx.tx_hash());
             pool.add_transaction(&raw).expect("admitted");
         }
         assert_eq!(pool.pending_transactions().len(), 3);
@@ -2078,6 +2479,14 @@ mod tests {
     fn validate_when_rskip252_disabled_then_tx_valid_regardless_gas_price() {
         let rules = ChainRules::for_chain(rustock_execution::hardfork::RskHardforkConfig::mainnet(), 10_000_000);
         assert_eq!(rules.rskip252_height, 5_468_000);
+        // It is fingerroot500's height, wherever the chain has that.
+        let (moved, _) = rustock_execution::hardfork::RskHardforkConfig::mainnet()
+            .with_rskj_overrides(&[("fingerroot500".to_string(), Some(6_000_000))], &[])
+            .unwrap();
+        assert_eq!(
+            ChainRules::for_chain(moved, 10_000_000).rskip252_height,
+            6_000_000
+        );
         let (pool, key, _) =
             setup_pool_with_rules(U256::from(10u64).pow(U256::from(20)), 0, test_config(), Some(rules));
         let cap = 59_240_000 * TX_GAS_PRICE_CAP_MULTIPLIER;
@@ -2111,6 +2520,68 @@ mod tests {
         assert!(matches!(err, PoolError::GasPriceAboveCap), "got {err}");
     }
 
+    /// rskj's pool reads RSKIP252 at its best block (`TxPendingValidator.isValid`
+    /// hands the validator `bestBlock.getNumber()`): on mainnet, with the head
+    /// at fingerroot500's first block the cap holds, and with the head a block
+    /// lower it does not.
+    #[test]
+    fn the_pool_caps_prices_from_a_head_at_rskip252() {
+        let cap = 59_240_000 * TX_GAS_PRICE_CAP_MULTIPLIER;
+        for (head, capped) in [(5_467_999, false), (5_468_000, true)] {
+            let rules = ChainRules::for_chain(
+                rustock_execution::hardfork::RskHardforkConfig::mainnet(),
+                10_000_000,
+            );
+            // A mainnet header this high carries a UMM root, empty, as the
+            // store reads it back.
+            let header = Header {
+                number: head,
+                umm_root: Some(Bytes::new()),
+                ..test_header()
+            };
+            let (pool, key, _) = setup_pool_on(
+                header,
+                U256::from(10u64).pow(U256::from(20)),
+                0,
+                test_config(),
+                Some(rules),
+            );
+            let mut tx = make_tx(0, cap + 1);
+            sign_tx(&mut tx, &key, 33);
+            let added = pool.add_transaction(&encode_tx(&tx));
+            if capped {
+                assert!(
+                    matches!(added, Err(PoolError::GasPriceAboveCap)),
+                    "capped with the head at #{head}"
+                );
+            } else {
+                added.expect("no cap with the head below fingerroot500");
+            }
+        }
+    }
+
+    /// `TxGasPriceCap.isSurpassed` answers no where the minimum is zero, so on
+    /// a head whose minimum gas price is zero the pool takes any price, with
+    /// RSKIP252 active.
+    #[test]
+    fn the_pool_caps_no_price_on_a_head_whose_minimum_is_zero() {
+        let header = Header {
+            minimum_gas_price: U256::ZERO,
+            ..test_header()
+        };
+        let (pool, key, _) = setup_pool_on(
+            header,
+            U256::from(10u64).pow(U256::from(20)),
+            0,
+            test_config(),
+            Some(regtest_rules()),
+        );
+        let mut tx = make_tx(0, 1_000_000_000_000);
+        sign_tx(&mut tx, &key, 33);
+        pool.add_transaction(&encode_tx(&tx))
+            .expect("no cap at a zero minimum");
+    }
+
     /// rskj `TxValidatorNonceEncodingValidatorTest.validateNonceEncoding`,
     /// case for case (the null nonce has no Rust counterpart).
     #[test]
@@ -2133,7 +2604,10 @@ mod tests {
 
     /// The same rule on the wire: a transaction whose nonce is sent as
     /// `00 01` is refused by the pool, although it decodes to nonce 1 and its
-    /// signature is good.
+    /// signature is its sender's. rskj signs over the nonce's bytes as they
+    /// came, so the signature is made over them here too: over the canonical
+    /// form it would be another account's, one the state doesn't hold, and
+    /// rskj asks for the account before it looks at the nonce.
     #[test]
     fn a_non_canonical_nonce_is_refused_on_admission() {
         let (pool, key, _) = setup_pool_with_account(U256::from(10u64.pow(18)), 1);
@@ -2141,19 +2615,58 @@ mod tests {
         sign_tx(&mut tx, &key, 33);
         let canonical = encode_tx(&tx);
 
-        // Splice the nonce item: `0x01` becomes `0x82 0x00 0x01`.
-        let mut buf = &canonical[..];
-        let list = alloy_rlp::Header::decode(&mut buf).unwrap();
-        assert_eq!(buf[0], 0x01, "nonce 1 is a single byte");
-        let mut payload = vec![0x82, 0x00, 0x01];
-        payload.extend_from_slice(&buf[1..list.payload_length]);
-        let mut raw = Vec::new();
-        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut raw);
-        raw.extend_from_slice(&payload);
+        // The nonce item `0x01` as `0x82 0x00 0x01`, and the other five
+        // fields as they are.
+        let mut fields = vec![0x82, 0x00, 0x01];
+        tx.gas_price.encode(&mut fields);
+        tx.gas_limit.encode(&mut fields);
+        tx.to.encode(&mut fields);
+        tx.value.encode(&mut fields);
+        tx.input.encode(&mut fields);
+        let raw = rskj_signed(&fields, &key, 33);
 
         let err = pool.add_transaction(&raw).unwrap_err();
         assert!(matches!(err, PoolError::NonCanonicalNonce), "got {err}");
         pool.add_transaction(&canonical).expect("the canonical form is fine");
+    }
+
+    /// rskj keys a transaction by the encoding it rebuilds (`getEncoded`),
+    /// not by the bytes it came in: a gas price sent with a leading zero is
+    /// the same transaction as the one sent minimal, with the same hash, so
+    /// the second is already known.
+    #[test]
+    fn the_pool_keys_a_transaction_by_rskjs_hash() {
+        let (pool, key, _) = setup_pool_with_account(U256::from(10u64.pow(18)), 0);
+        let mut tx = make_tx(0, 59_240_000);
+        sign_tx(&mut tx, &key, 33);
+        let canonical = encode_tx(&tx);
+
+        // Splice the gas price item: `0x84 03 87 ee 40` becomes
+        // `0x85 00 03 87 ee 40`.
+        let mut buf = &canonical[..];
+        let list = alloy_rlp::Header::decode(&mut buf).unwrap();
+        assert_eq!(
+            buf[..6],
+            [0x80, 0x84, 0x03, 0x87, 0xee, 0x40],
+            "nonce 0, then the gas price"
+        );
+        let mut payload = vec![0x80, 0x85, 0x00, 0x03, 0x87, 0xee, 0x40];
+        payload.extend_from_slice(&buf[6..list.payload_length]);
+        let mut raw = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut raw);
+        raw.extend_from_slice(&payload);
+
+        let hash = pool
+            .add_transaction(&raw)
+            .expect("rskj reads the gas price as 59,240,000");
+        assert_eq!(hash, tx.tx_hash(), "rskj's hash, of the minimal encoding");
+        assert_ne!(hash, B256::from_slice(&Keccak256::digest(&raw)));
+        let err = pool.add_transaction(&canonical).unwrap_err();
+        assert!(matches!(err, PoolError::AlreadyPending), "got {err}");
     }
 
     /// A free Bridge transaction, as rskj has them before `areBridgeTxsPaid`:
@@ -2193,24 +2706,63 @@ mod tests {
 
     /// rskj `TxValidatorIntrinsicGasLimitValidatorTest.validIntrinsicGasPrice`,
     /// its `tx4`: a free Bridge transaction declaring no gas at all costs
-    /// nothing, so the zero limit covers it.
+    /// nothing, so the zero limit covers it. rskj's builder writes that zero
+    /// as the byte 0x00 (`BigIntegers.asUnsignedByteArray`), as here.
     #[test]
     fn valid_intrinsic_gas_price_for_a_free_bridge_tx_with_zero_gas_limit() {
+        let zero_gas = |key: &SigningKey| {
+            let mut fields = vec![0x80]; // nonce 0
+            U256::from(59_240_000).encode(&mut fields);
+            fields.push(0x00); // gas limit zero
+            rustock_execution::precompiles::BRIDGE_ADDR
+                .as_slice()
+                .encode(&mut fields);
+            fields.extend_from_slice(&[0x80, 0x80]); // value 0, no data
+            rskj_signed(&fields, key, 33)
+        };
         let (_, _, addr) = setup_pool_with_rules(U256::ZERO, 0, test_config(), None);
         let (pool, key, _) = setup_pool_with_rules(U256::ZERO, 0, test_config(), Some(free_bridge_rules(addr)));
-        let mut tx = bridge_tx(0, 0, &[]);
-        sign_tx(&mut tx, &key, 33);
-        pool.add_transaction(&encode_tx(&tx)).expect("free, zero gas");
+        pool.add_transaction(&zero_gas(&key))
+            .expect("free, zero gas");
 
         // Paid from 370,000 on: the same transaction is then over its own
         // intrinsic cost.
         let mut paid = free_bridge_rules(addr);
         paid.hardfork_cfg = rustock_execution::hardfork::RskHardforkConfig::all_active(33);
         let (pool, key, _) = setup_pool_with_rules(U256::ZERO, 0, test_config(), Some(paid));
-        let mut tx = bridge_tx(0, 0, &[]);
-        sign_tx(&mut tx, &key, 33);
-        let err = pool.add_transaction(&encode_tx(&tx)).unwrap_err();
+        let err = pool.add_transaction(&zero_gas(&key)).unwrap_err();
         assert!(matches!(err, PoolError::IntrinsicGasTooHigh), "got {err}");
+    }
+
+    /// rskj's regtest never reaches `afterBridgeSync`, so a free sender's
+    /// Bridge call costs nothing at any height there, as the block processor
+    /// counts it; on rustock's own regtest the same call is paid from block 0.
+    /// The head is at #100, past every height regtest moves a rule to.
+    #[test]
+    fn on_rskj_regtest_a_free_senders_bridge_call_stays_free() {
+        let (_, _, addr) = setup_pool_with_rules(U256::ZERO, 0, test_config(), None);
+        let rules = |ladder| {
+            let mut rules = ChainRules::for_chain(ladder, 6_800_000);
+            rules.free_bridge_senders = vec![addr];
+            rules
+        };
+        let call = |key: &SigningKey| {
+            let mut tx = bridge_tx(0, 21_071, &[0x00, 0x01]);
+            sign_tx(&mut tx, key, 33);
+            encode_tx(&tx)
+        };
+        let rskj = rules(rustock_execution::hardfork::RskHardforkConfig::rskj_regtest());
+        let (pool, key, _) = setup_pool_with_rules(U256::ZERO, 0, test_config(), Some(rskj));
+        pool.add_transaction(&call(&key))
+            .expect("free on rskj's regtest");
+
+        let own = rules(rustock_execution::hardfork::RskHardforkConfig::regtest());
+        let (pool, key, _) = setup_pool_with_rules(U256::ZERO, 0, test_config(), Some(own));
+        let err = pool.add_transaction(&call(&key)).unwrap_err();
+        assert!(
+            matches!(err, PoolError::InsufficientFunds),
+            "paid on rustock's own: {err}"
+        );
     }
 
     /// rskj `TxValidatorNonceRangeValidatorTest.illegalAccountSlotsValue_Zero`:
@@ -2241,7 +2793,7 @@ mod tests {
         tx.gas_limit = U256::from(7_000_000);
         sign_tx(&mut tx, &key, 33);
         let err = pool.add_transaction(&encode_tx(&tx)).unwrap_err();
-        assert!(matches!(err, PoolError::GasLimitExceeded), "got {err}");
+        assert!(matches!(err, PoolError::GasLimitExceeded { .. }), "got {err}");
         tx.gas_limit = U256::from(6_800_000);
         sign_tx(&mut tx, &key, 33);
         pool.add_transaction(&encode_tx(&tx)).expect("at the sublist limit");
@@ -2249,6 +2801,9 @@ mod tests {
 
     // ========== Invalid signature ==========
 
+    /// A v with r and s left empty cannot be read, as rskj cannot build its
+    /// signature (`ECDSASignature.fromComponents` on no bytes); r and s of
+    /// zero, the byte 0x00 each, are read and refused as no signature.
     #[test]
     fn test_invalid_signature_rejected() {
         let (pool, _key, _addr) = setup_pool_with_account(U256::from(10u64.pow(18)), 0);
@@ -2256,8 +2811,15 @@ mod tests {
         tx.v = 27;
         tx.r = U256::ZERO;
         tx.s = U256::ZERO;
-        let err = pool.add_transaction(&encode_tx(&tx)).unwrap_err();
-        assert!(matches!(err, PoolError::InvalidSignature(_)));
+        let mut raw = encode_tx(&tx);
+        assert_eq!(raw[raw.len() - 3..], [0x1b, 0x80, 0x80]);
+        let err = pool.add_transaction(&raw).unwrap_err();
+        assert!(matches!(err, PoolError::RlpDecode(_)), "got {err}");
+
+        let at = raw.len() - 2;
+        raw[at..].copy_from_slice(&[0x00, 0x00]);
+        let err = pool.add_transaction(&raw).unwrap_err();
+        assert!(matches!(err, PoolError::InvalidSignature(_)), "got {err}");
     }
 
     // ========== Size limit ==========
@@ -2270,7 +2832,7 @@ mod tests {
         tx.gas_limit = U256::from(8_000_000); // high enough for calldata
         sign_tx(&mut tx, &key, 33);
         let err = pool.add_transaction(&encode_tx(&tx)).unwrap_err();
-        assert!(matches!(err, PoolError::TxTooLarge));
+        assert!(matches!(err, PoolError::TxTooLarge { .. }));
     }
 
     // ========== rskj: checkTxMaxSizeAccepted ==========
@@ -2325,8 +2887,9 @@ mod tests {
     // ========== rskj: checkTxFromNullStateIsRejected ==========
 
     #[test]
-    fn test_null_sender_insufficient_funds() {
-        // An account not in the trie has balance=0. Any tx requiring gas should fail.
+    fn a_sender_the_state_does_not_hold_is_refused() {
+        // rskj `TxPendingValidator.isValid`: no account, and the transaction
+        // costs something, so "the sender account doesn't exist".
         let dir = tempdir().unwrap();
         let store = Arc::new(BlockStore::open(dir.path()).unwrap());
         let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
@@ -2348,7 +2911,7 @@ mod tests {
         let mut tx = make_tx(0, 59_240_000);
         sign_tx(&mut tx, &signing_key, 33);
         let err = pool.add_transaction(&encode_tx(&tx)).unwrap_err();
-        assert!(matches!(err, PoolError::InsufficientFunds));
+        assert!(matches!(err, PoolError::SenderMissing), "got {err}");
 
         std::mem::forget(dir);
     }
@@ -2382,7 +2945,7 @@ mod tests {
 
         pool.add_transaction(&raw).unwrap();
         let err = pool.add_transaction(&raw).unwrap_err();
-        assert!(matches!(err, PoolError::AlreadyKnown));
+        assert!(matches!(err, PoolError::AlreadyQueued));
     }
 
     // ========== rskj: pending sorted by nonce ==========
@@ -2553,19 +3116,259 @@ mod tests {
 
     #[test]
     fn test_pool_error_display() {
-        assert_eq!(PoolError::AlreadyKnown.to_string(), "transaction with same hash already exists");
+        assert_eq!(
+            PoolError::AlreadyPending.to_string(),
+            "pending transaction with same hash already exists"
+        );
+        assert_eq!(
+            PoolError::AlreadyQueued.to_string(),
+            "queued transaction with same hash already exists"
+        );
         assert_eq!(PoolError::NonceTooLow.to_string(), "transaction nonce too low");
         assert_eq!(PoolError::NonceTooHigh.to_string(), "transaction nonce too high");
         assert_eq!(PoolError::InsufficientFunds.to_string(), "insufficient funds");
-        assert_eq!(PoolError::GasLimitExceeded.to_string(), "transaction's gas limit exceeds block gas limit");
+        let over = PoolError::GasLimitExceeded {
+            gas_limit: U256::from(9_000_000),
+            bound: 8_000_000,
+        };
+        assert_eq!(
+            over.to_string(),
+            "transaction's gas limit of 9000000 is higher than the block's gas limit of 8000000"
+        );
         assert_eq!(PoolError::GasPriceTooLow.to_string(), "transaction's gas price lower than block's minimum");
         assert_eq!(PoolError::IntrinsicGasTooHigh.to_string(), "transaction's basic cost is above the gas limit");
         assert_eq!(PoolError::ReplacementGasPriceTooLow.to_string(), "gas price not enough to bump transaction");
-        assert_eq!(PoolError::TxTooLarge.to_string(), "transaction's size is higher than defined maximum");
-        assert_eq!(PoolError::IsRemascTransaction.to_string(), "transaction is a remasc transaction");
+        let large = PoolError::TxTooLarge {
+            size: 131_106,
+            max: 131_072,
+        };
+        assert_eq!(
+            large.to_string(),
+            "transaction's size is higher than defined maximum: 131106 > 131072"
+        );
         assert_eq!(
             PoolError::InsufficientFundsForPendingAndNew.to_string(),
             "insufficient funds to pay for pending and new transactions"
         );
+    }
+
+    // ========== rskj's own answers ==========
+
+    /// The bytes a testdata line writes in hex, a run of one byte as
+    /// `(bb*count)`. `None` for anything else.
+    fn written_bytes(text: &str) -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            if let Some(run) = rest.strip_prefix('(') {
+                let (value, after) = run.split_once('*')?;
+                let (count, after) = after.split_once(')')?;
+                let value = u8::from_str_radix(value, 16).ok()?;
+                bytes.extend(std::iter::repeat_n(value, count.parse().ok()?));
+                rest = after;
+            } else {
+                bytes.push(u8::from_str_radix(rest.get(..2)?, 16).ok()?);
+                rest = &rest[2..];
+            }
+        }
+        Some(bytes)
+    }
+
+    /// The one parameter of an `eth_sendRawTransaction` a testdata line
+    /// records, as rskj reads hex: its `0x` optional, blanks passed over.
+    fn sent_bytes(asked: &str) -> Option<Vec<u8>> {
+        let (_, parameter) = asked.split_once(" eth_sendRawTransaction [\"")?;
+        let written = parameter.strip_suffix("\"]")?;
+        let digits: String = written
+            .strip_prefix("0x")
+            .unwrap_or(written)
+            .chars()
+            .filter(|c| *c != ' ')
+            .collect();
+        written_bytes(&digits.to_lowercase())
+    }
+
+    /// A pool on rskj's regtest whose head is block `number`, over a state
+    /// that holds `accounts`.
+    fn rskj_regtest_pool(
+        (number, gas_limit, minimum_gas_price): (u64, u64, U256),
+        accounts: &[(Address, u64, U256)],
+    ) -> TransactionPool {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let mut root = TrieNode::empty();
+        for (address, nonce, balance) in accounts {
+            let account = AccountState::new(U256::from(*nonce), *balance);
+            let key = account_key(address);
+            root = root.put(
+                &TrieKeySlice::from_key(&key),
+                &account.encode(),
+                &*trie_store,
+            );
+        }
+        root.save(&*trie_store, true);
+        let state_root = root.compute_hash(&*trie_store);
+        let root_data = root.to_message(&*trie_store);
+        rustock_trie::TrieStore::put(&*trie_store, state_root.as_slice(), &root_data);
+
+        let mut header = test_header();
+        header.number = number;
+        header.gas_limit = U256::from(gas_limit);
+        header.minimum_gas_price = minimum_gas_price;
+        header.state_root = state_root;
+        store.update_head(&header, U256::from(100_000)).unwrap();
+        std::mem::forget(dir);
+        let rules = ChainRules::for_chain(
+            rustock_execution::hardfork::RskHardforkConfig::rskj_regtest(),
+            6_800_000,
+        );
+        TransactionPool::new(test_config(), 33, store, trie_store).with_chain_rules(rules)
+    }
+
+    /// What a testdata line shows of the transactions one side of the pool
+    /// holds: how many, and the start of each one's hash, in order.
+    fn held(side: &PoolGroups) -> String {
+        let mut hashes: Vec<String> = side
+            .iter()
+            .flat_map(|(_, transactions)| transactions)
+            .map(|(_, tx)| hex_of(&tx.tx_hash()[..4]))
+            .collect();
+        hashes.sort();
+        match hashes.len() {
+            0 => "0".to_string(),
+            count => format!("{count} {}", hashes.join(",")),
+        }
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The text between `before` and the next `after` of a JSON answer.
+    fn between<'a>(answer: &'a str, before: &str, after: &str) -> Option<&'a str> {
+        let (_, rest) = answer.split_once(before)?;
+        Some(rest.split_once(after)?.0)
+    }
+
+    /// rskj `Transaction.transactionCost`, upgrade by upgrade, at mainnet's
+    /// heights: a data byte that isn't zero costs 68 until RSKIP400
+    /// (arrowhead600) and 16 from it, and from RSKIP438 (lovell700) a
+    /// creation pays 2 for every 32 bytes of init code, the last ones
+    /// counted whole.
+    #[test]
+    fn the_basic_cost_follows_the_upgrades() {
+        let rules = ChainRules::for_chain(
+            rustock_execution::hardfork::RskHardforkConfig::mainnet(),
+            6_800_000,
+        );
+        let mut tx = make_tx(0, 1);
+        tx.input = Bytes::from(vec![0x01, 0x00, 0x02]);
+        assert_eq!(rules.transaction_cost(&tx, 6_223_699), 21_000 + 68 + 4 + 68);
+        assert_eq!(rules.transaction_cost(&tx, 6_223_700), 21_000 + 16 + 4 + 16);
+
+        tx.to = Bytes::new();
+        tx.input = Bytes::from(vec![0x01; 33]);
+        assert_eq!(rules.transaction_cost(&tx, 7_338_023), 53_000 + 33 * 16);
+        assert_eq!(
+            rules.transaction_cost(&tx, 7_338_024),
+            53_000 + 33 * 16 + 2 * 2
+        );
+        tx.input = Bytes::new();
+        assert_eq!(
+            rules.transaction_cost(&tx, 7_338_024),
+            53_000,
+            "no init code, nothing more"
+        );
+    }
+
+    /// The pool answers every transaction rskj's release was sent as that
+    /// release's pool answered it, and holds afterwards what that pool held:
+    /// `testdata/rskj_pool_answers.txt` is the release's own run. A pool
+    /// refusal is rskj's error -32010, whose message is the pool's reason; a
+    /// transaction rskj refused before its pool saw it is not given to this
+    /// one either.
+    #[test]
+    fn the_pool_answers_as_rskjs_pool_answers() {
+        let data = include_str!("testdata/rskj_pool_answers.txt");
+        let mut head = None;
+        let mut accounts = Vec::new();
+        let mut pool: Option<TransactionPool> = None;
+        // Set once rskj's pool took a transaction this test has no bytes
+        // for, which its node signed itself: nothing after it can be compared.
+        let mut out_of_step = false;
+        let mut given = 0;
+        for line in data.lines() {
+            let mut words = line.split(' ');
+            let kind = words.next().unwrap_or_default();
+            match kind {
+                "scenario" => {
+                    head = None;
+                    accounts.clear();
+                    pool = None;
+                    out_of_step = false;
+                    continue;
+                }
+                "head" => {
+                    let mut number = || words.next().unwrap().parse::<u64>().unwrap();
+                    let (number, gas_limit) = (number(), number());
+                    let minimum = U256::from_str_radix(words.next().unwrap(), 10).unwrap();
+                    head = Some((number, gas_limit, minimum));
+                    continue;
+                }
+                "account" => {
+                    let address: Address = words.nth(1).unwrap().parse().unwrap();
+                    let nonce = words.next().unwrap();
+                    if nonce != "none" {
+                        let balance = U256::from_str_radix(words.next().unwrap(), 10).unwrap();
+                        accounts.push((address, nonce.parse().unwrap(), balance));
+                    }
+                    continue;
+                }
+                "tx" | "call" => {}
+                _ => continue,
+            }
+            let pool = pool.get_or_insert_with(|| rskj_regtest_pool(head.unwrap(), &accounts));
+            let (asked, rest) = line.split_once(" => ").unwrap();
+            let (answer, rest) = rest.split_once(" | pending ").unwrap();
+            let (pending, queued) = rest.split_once(" | queued ").unwrap();
+            let raw = match kind {
+                "tx" => written_bytes(asked.rsplit(' ').next().unwrap()),
+                _ => sent_bytes(asked),
+            };
+            let refusal =
+                between(answer, "\"code\":", ",").zip(between(answer, "\"message\":\"", "\"}}"));
+            let hash = between(answer, "\"result\":\"", "\"");
+            let answered = |pool: &TransactionPool, raw: &[u8]| {
+                pool.add_transaction(raw)
+                    .map(|hash| format!("{hash:#x}"))
+                    .map_err(|refusal| refusal.to_string())
+            };
+            match (raw, refusal, hash) {
+                // rskj's pool refused it: `transactionError`, with its reason.
+                (Some(raw), Some(("-32010", reason)), _) => {
+                    assert!(!out_of_step, "{asked}: after a transaction the node signed");
+                    assert_eq!(answered(pool, &raw), Err(reason.to_string()), "{asked}");
+                    given += 1;
+                }
+                // rskj's pool took it.
+                (Some(raw), None, Some(hash)) => {
+                    assert!(!out_of_step, "{asked}: after a transaction the node signed");
+                    assert_eq!(answered(pool, &raw), Ok(hash.to_string()), "{asked}");
+                    given += 1;
+                }
+                // rskj refused it before its pool saw it.
+                (_, Some(_), _) => {}
+                // The node signed a transaction itself and its pool took it.
+                (None, None, _) => out_of_step = true,
+                (Some(_), None, None) => panic!("{asked}: no answer read"),
+            }
+            if !out_of_step {
+                let (now_pending, now_queued) = pool.content();
+                assert_eq!(held(&now_pending), pending, "pending after {asked}");
+                assert_eq!(held(&now_queued), queued, "queued after {asked}");
+            }
+        }
+        assert_eq!(given, 66, "transactions given to the pool");
     }
 }

@@ -35,6 +35,22 @@ enabled = false                    # serve the mnr_* namespace
 # coinbase = "0x…"                 # REQUIRED when enabled
 extra_data = ""                    # at most 32 bytes
 refresh_secs = 60
+# gas_limit_target = 6800000      # rskj targetgaslimit; 7,500,000 on a regtest
+force_gas_limit = true             # rskj forcegaslimit
+min_gas_price = 0                  # rskj miner.minGasPrice
+
+[mining.stable_gas_price]          # rskj miner.stableGasPrice; no flag, as in rskj
+enabled = false
+# refresh_rate = "6 hours"
+# min_stable_gas_price = 4265280000000
+
+[mining.stable_gas_price.source]
+# method = "HTTP_GET"              # or ETH_CALL
+
+[mining.stable_gas_price.source.params]
+# url = "https://domain.info/ticker"
+# json_path = "/USD/buy"
+# timeout = "2 seconds"
 ```
 
 `--mining-extra-data` is capped at 32 bytes by the header rules, and the node
@@ -62,8 +78,9 @@ breaks them: `feesPaidToMiner` is a **decimal** string, and
    last 12 are replaced with RSKIP110 fork-detection data (§4).
 3. A miner puts `RSKBLOCK:` followed by those 32 bytes in a Bitcoin coinbase
    and searches for a Bitcoin block whose hash, read little-endian, is at most
-   `U256::MAX / difficulty`. That is **RSK's** difficulty, not Bitcoin's, so a
-   solution is usually not a valid Bitcoin block.
+   rskj's target: 2^256 / difficulty, or 2^256 / 3 where the difficulty is 2 or
+   less (`difficulty_to_target`). That is **RSK's** difficulty, not Bitcoin's,
+   so a solution is usually not a valid Bitcoin block.
 4. The solution comes back and fills in the three `bitcoin_merged_mining_*`
    header fields: the 80-byte Bitcoin header, the compressed coinbase, and the
    merkle proof linking the coinbase to the Bitcoin merkle root.
@@ -239,15 +256,30 @@ executed by exactly the code that will later re-execute it on the way in.
 - **`difficulty`** — `DifficultyRule::difficulty_for_child(parent, number,
   timestamp, uncle_count)`, shared with validation deliberately: two copies of a
   consensus calculation will drift.
-- **`gas_limit`** — one step toward an optional target, bounded by
-  `parent / 1024`; `None` inherits the parent's, which is always valid. rskj
-  `GasLimitCalculator`.
-- **`minimum_gas_price`** — one step toward an optional target, bounded by 1% of
-  the parent's, or one wei when 1% rounds to nothing. rskj
-  `MinimumGasPriceCalculator` (RSKIP-09).
-
-Neither target is exposed on the command line, so a running node inherits both
-from the parent and they never drift.
+- **`gas_limit`** — rskj `GasLimitCalculator`: one step toward the target,
+  bounded by `parent / 1024`. The target is rskj's `targetgaslimit`,
+  6,800,000 unless set and 7,500,000 on a regtest, as rskj's `regtest.conf`
+  sets it (`--mining-gas-limit-target`); a target under the chain's minimum
+  gas limit is the minimum. With rskj's `forcegaslimit` off
+  (`--mining-force-gas-limit false`) the step follows the gas the parent used
+  instead: up when it used more than two thirds of its gas limit, down
+  otherwise, never past the target.
+- **`minimum_gas_price`** — one step toward the miner's minimum gas price,
+  bounded by 1% of the parent's, or one wei when 1% rounds to nothing. rskj
+  `MinimumGasPriceCalculator` (RSKIP-09). The price is rskj's
+  `miner.minGasPrice`, `--mining-min-gas-price`, 0 unless set as in rskj; or,
+  with rskj's `miner.stableGasPrice` on (the config file's
+  `[mining.stable_gas_price]`), one held stable in a currency:
+  `min_stable_gas_price` over the price of a bitcoin, which a web API answers
+  as JSON (`HTTP_GET`, read as rskj's Jackson reads it) or a contract answers
+  to an `eth_call` on this node (`ETH_CALL`). A fetch runs on a thread of its
+  own and its price is kept for `refresh_rate`; a bitcoin priced outside
+  `min_valid_price` to `max_valid_price` is no price, and the fixed price
+  stands in until one is had. Two limits rskj doesn't have: a web answer
+  past 1 MiB is no price, and a redirect to a proxy the server names (305)
+  isn't followed. rskj `StableMinGasPriceProvider` and its two kinds;
+  `crates/cli/src/stable_gas_price.rs` and
+  `crates/execution/src/mining/min_gas_price.rs`.
 
 ### The REMASC transaction
 
@@ -341,23 +373,41 @@ surfaced (§10).
 
 ### The submit path
 
-All three RPC forms converge on `complete_and_import`:
+All three RPC forms converge on `complete_and_import`, which follows rskj's
+`MinerServerImpl.processSolution` and then `BlockChainImpl.tryToConnect`:
 
 1. **Match** — `extract_merged_mining_hash` finds the **last** `RSKBLOCK:` in the
    coinbase and reads the 32 bytes after it. rskj
    `MnrModuleImpl.extractBlockHashForMergedMining`.
-2. **Check the parent still stands** — if the executed head has moved off the
-   template's parent, refuse with `ParentNoLongerHead`.
-3. **Compress the coinbase** — `compress_coinbase`, the same function the
+2. **Compress the coinbase** — `compress_coinbase`, the same function the
    verifier's format is defined by.
-4. **Fill the three fields**, with a `debug_assert` that the merged-mining hash
+3. **Fill the three fields**, with a `debug_assert` that the merged-mining hash
    did not move.
-5. **Self-check** — run `MergedMiningRule`, the same rule every peer will run.
-   Failing here means the node built something it would itself reject, worth
-   catching before it is stored and announced rather than after.
+4. **Check the proof of work** — `MergedMiningRule`, the same rule every peer
+   will run. Failing it is an error, as rskj answers `ERROR`: the node built
+   something it would itself reject.
+5. **Connect, in rskj's order** — a block already stored is `EXIST`; a parent
+   the store lacks is `NO_PARENT`; then every rule a peer's block meets: the
+   RSKIP179 link to the Bitcoin timestamp, the header against its parent, the
+   body, the uncles and fork detection. If the executed head has moved off the
+   template's parent, the block is connected beside the chain (step 6), as
+   rskj's `BlockChainImpl.internalTryToConnect` connects any block.
 6. **Execute and commit** — `process_and_commit` against the parent state root
    the template recorded, so the submission re-executes from the same point.
-7. **Rebuild work** — the chain moved, so whatever is on offer is stale.
+   Beside the chain it is `process_beside`, which keeps what the block keys by
+   hash, and `commit_mined_block_beside`, which stores the block and answers
+   `IMPORTED_BEST` or `IMPORTED_NOT_BEST` by the selection rule without moving
+   the head: the sync service, told of the block, weighs it as it weighs a
+   peer's block executed beside the chain, and makes the switch.
+7. **Rebuild work** — the chain moved, so whatever is on offer is stale. Not
+   for a block beside the chain: if it takes the head, the switch tells the
+   miner of its new best block.
+
+A pool is answered OK with what the connect made of the block, as rskj answers
+it: one a rule refuses is `INVALID_BLOCK`, and so is one whose connecting fails
+in any other way, a store that fails included, since rskj's `tryToConnect`
+catches every exception. Nothing is stored for it. The node's own miner
+(`evm_mine`, the timed miner) reads the error instead.
 
 ### Importing: why not `put_block`
 
@@ -389,9 +439,10 @@ The `flush()` on the winning path matters too: the trie nodes the block wrote ar
 durable only once flushed, and announcing a head whose state cannot be reloaded
 after a restart would leave the node unable to build on its own block.
 
-Miners are told which of `IMPORTED_BEST`, `IMPORTED_NOT_BEST` or `EXIST`
-happened, so they can tell "my block won" from "my block was valid but somebody
-else's arrived first".
+Miners are told which of `IMPORTED_BEST`, `IMPORTED_NOT_BEST`, `EXIST`,
+`NO_PARENT` or `INVALID_BLOCK` happened, so they can tell "my block won" from
+"my block was valid but somebody else's arrived first", and from "my block is
+not on the chain".
 
 ### Error reporting
 
@@ -416,10 +467,11 @@ garbage collector reclaims them (they are unreachable from any canonical
 root), but on a node with collection disabled this grows without bound.
 
 **Running a miner and a sync service at once.** The sync service owns the
-executed state root and does not know the miner exists. The miner refuses a
-submission whose parent is no longer the executed head, so a race is reported
-rather than corrupting state — but a node that is actively syncing will refuse
-most solutions. Mine on a node that has caught up.
+executed state root and the switch between branches. A solution whose work's
+parent is no longer the executed head is run against that parent's own state
+and kept beside the chain, and the sync service takes it up if it is heavier,
+so a race leaves the state as it was. A node that is still catching up hands
+out no work (`SubmitError::Syncing`). Mine on a node that has caught up.
 
 ---
 
@@ -433,8 +485,8 @@ runs on blocks arriving from peers. The search is not decorative: before it
 existed the tests used a fixed nonce, cleared the target only by luck, and that
 is how the `get_work` notify bug surfaced.
 
-The difficulty is 2, so the target is `2^255 - 1` and a nonce is found in a few
-tries. Two heights are used deliberately:
+The difficulty is 2, which rskj takes as 3, so the target is 2^256 / 3 and a
+nonce is found in a few tries. Two heights are used deliberately:
 
 - Most tests mine #21, which is fast but **does not exercise REMASC**:
   `RskExecutor::new` hardcodes `RemascConfig::mainnet()` whatever the chain id,

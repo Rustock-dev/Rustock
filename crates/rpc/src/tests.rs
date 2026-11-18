@@ -1,7 +1,7 @@
 use crate::server::{dispatch_for_test, RpcState};
 use crate::types::*;
 use alloy_primitives::{Address, Bloom, B256, U256, Bytes};
-use rustock_core::config::ChainConfig;
+use rustock_core::config::{ActivationHeights, ChainConfig};
 use rustock_core::types::header::Header;
 use rustock_networking::peers::PeerStore;
 use rustock_storage::BlockStore;
@@ -39,12 +39,326 @@ fn test_header(number: u64) -> Header {
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     }
 }
 
+/// rskj prints a header's gas limit from the bytes it holds
+/// (`HexUtils.toQuantityJsonHex`), so one past 256 bits prints whole, in a
+/// block and in a `newHeads` notification alike.
+#[test]
+fn a_gas_limit_past_256_bits_prints_whole() {
+    let mut past = vec![1];
+    past.extend_from_slice(&[0; 32]);
+    let header = Header {
+        gas_limit: U256::MAX,
+        kept: Some(Box::new(rustock_core::types::header::KeptFields {
+            gas_limit: Some(past.into()),
+            ..Default::default()
+        })),
+        ..test_header(1)
+    };
+    let whole = format!("0x1{}", "0".repeat(64));
+    let block = crate::helpers::BlockResultDto::from_header(&header, B256::ZERO, U256::ZERO);
+    assert_eq!(block.gas_limit, whole);
+    let notified = crate::subscribe::header_dto(&header, B256::ZERO);
+    assert_eq!(notified["gasLimit"], json!(whole));
+}
+
+/// rskj prints a header's minimum gas price from `Coin.getBytes()`, so one
+/// past 256 bits, sign byte and all, prints whole, in a block and in a
+/// `newHeads` notification alike.
+#[test]
+fn a_minimum_gas_price_past_256_bits_prints_whole() {
+    let mut past = vec![0, 0x80];
+    past.extend_from_slice(&[0; 32]);
+    let header = Header {
+        minimum_gas_price: U256::MAX,
+        kept: Some(Box::new(rustock_core::types::header::KeptFields {
+            minimum_gas_price: Some(past.into()),
+            ..Default::default()
+        })),
+        ..test_header(1)
+    };
+    let whole = format!("0x80{}", "0".repeat(64));
+    let block = crate::helpers::BlockResultDto::from_header(&header, B256::ZERO, U256::ZERO);
+    assert_eq!(block.minimum_gas_price, whole);
+    let notified = crate::subscribe::header_dto(&header, B256::ZERO);
+    assert_eq!(notified["minimumGasPrice"], json!(whole));
+}
+
+/// rskj prints the null address, which an empty coinbase reads as, from
+/// its no bytes: `0x` in a block (`toUnformattedJsonHex`) and `0x00` in a
+/// `newHeads` notification (`toJsonHex`). The zero address is 20 bytes.
+#[test]
+fn the_null_address_prints_as_no_bytes() {
+    let null = Header {
+        beneficiary: Address::ZERO,
+        kept: Some(Box::new(rustock_core::types::header::KeptFields {
+            null_coinbase: true,
+            ..Default::default()
+        })),
+        ..test_header(1)
+    };
+    let block = crate::helpers::BlockResultDto::from_header(&null, B256::ZERO, U256::ZERO);
+    assert_eq!(block.miner, "0x");
+    let notified = crate::subscribe::header_dto(&null, B256::ZERO);
+    assert_eq!(notified["miner"], json!("0x00"));
+    let zero = Header {
+        beneficiary: Address::ZERO,
+        ..test_header(1)
+    };
+    let twenty = format!("0x{}", "0".repeat(40));
+    let block = crate::helpers::BlockResultDto::from_header(&zero, B256::ZERO, U256::ZERO);
+    assert_eq!(block.miner, twenty);
+    let notified = crate::subscribe::header_dto(&zero, B256::ZERO);
+    assert_eq!(notified["miner"], json!(twenty));
+}
+
+/// RSK mainnet block #9,257,552, the header `rustock-core` checks its
+/// hashes on, as public-node.rsk.co holds it.
+fn mainnet_block_9257552() -> Header {
+    let bytes = |hex: &str| Bytes::from(hex::decode(hex).unwrap());
+    Header {
+        parent_hash: alloy_primitives::b256!("8b46403b2df22f81f450bd631db76cb47fe104ed48ab9b94a441f64be823c292"),
+        ommers_hash: alloy_primitives::b256!("e4d62e0f38c8a425952f64f56c6897c8fd4d9fdd09faeaddb904ec3a8362ae3b"),
+        beneficiary: alloy_primitives::address!("4e5dabc28e4a0f5e5b19fcb56b28c5a1989352c1"),
+        state_root: alloy_primitives::b256!("1f0d9418721c8a28c019e21a8af2af203ba43f68bfb8fa3b884642a55b5eedaf"),
+        transactions_root: alloy_primitives::b256!("2af4a2f53589d9f78b09adfefe9dd8e34f22143743dd0d3b584af8f6ac4d21ad"),
+        receipts_root: alloy_primitives::b256!("fa059fb22aad8c60ca36bc9d9820ae3c4310dc3d9363bcd2b2624eccb88ed1a6"),
+        logs_bloom: Bloom::from_slice(&hex::decode("00000000000000000000301800100020000100000010000000000200000000100000000000010000000000000000000000000000000000000000800000000000000000000004000000000000400040000000000000000000200200000000000000000000000000000040000000000100000000020000000000000000000000000000400000000001000000000004000000000000000000000000000020000000000000000200000000000000000000000080400000000180000000000000000000000000000800000000040000008000000000000000000000000000000000000000000000000000002000000000000000000400000000000000200000000000").unwrap()),
+        extension_data: None,
+        difficulty: U256::from(0x175cf1ea6738d50d56au128),
+        number: 9_257_552,
+        gas_limit: U256::from(0x989680),
+        gas_used: 0x22f96,
+        timestamp: 0x6ab06c78,
+        extra_data: bytes("d30191564554495645522d643430323166636532"),
+        paid_fees: U256::from(0x3656c63bb76u64),
+        minimum_gas_price: U256::from(0x1699280),
+        uncle_count: 2,
+        umm_root: Some(Bytes::new()),
+        version_fields: None,
+        bitcoin_merged_mining_header: Some(bytes("00e0f327307a19d17c1e20f51c1190b40d9fc53e7f056272a91d02000000000000000000cd81b87bdc182ac40f11daa46886c0b93b7e6497ca0e541ab5775f9c8fdd3d98936cb06ac51e02172a5c3c6e")),
+        bitcoin_merged_mining_merkle_proof: Some(bytes("c91bd5fe20d82da439eba4770fb50b6792cc06f083eb88b6795f0c89fc8ca427df7cc40dc64602e3fb3cf5c267664be19d148552f01cc28b6d3907d472008d15ba45ca54695cb6cbceac33003f9582450081de9ac6de608f0d49a78f2cae66c5c65cc0e8ac0674edfad8b00027c9d26b64ebe2476b5e91a95800b6786d91df004aa35390a8e996bf2cf9cc57555a12fcb76abcc376b20ebb5a441b1f94839653472ac163740f33c5e88a33003c73726de57da577d9e57d305937269421c1b0be94af8aa6a13a431fb5425ad871e9675edff825e8b49dc016ab6903bf63d376386dbb6c55d84d449f6147763855259dc20a09f72adfb25195c692bd8da719d1d8e9b227b874cbec4f58fb88dc6b21d810e995b4531346f37b0a3a7e54b3327d79450fa01b5a3420bd772f4f0605c829facdb88bc9f2945aa897aef9e6585c80fa62d683e84d1b8bd228f8c985a8269e312e7d0b135cf5aeb50132e1f2592a112db15c3e521d92fb7184af28a0adc8008fa3eb839d1b6d9e5d5c802160ffa7522649c18aa20502e09c50804448465889141227a0a82c85a0ce6876163ae60cc3ac")),
+        bitcoin_merged_mining_coinbase_transaction: Some(bytes("000000000000014013a11ba36836286d0115b1c5c58a42ad692d3aeeaedae25686175928146d440f8931d770ea29b3d5f1dd2eabaf3724518831d656f447230000000000000000002b6a2952534b424c4f434b3afe829f5c494b038c03268d18d0e338bb162f06b69ebc2a5e8f871a1d008d425000000000")),
+        cached_hash: None,
+        cached_hash_for_merged_mining: None,
+        kept: None,
+    }
+}
+
+/// A block prints each property rskj's `BlockResultDTO` has, as `fromBlock`
+/// fills them. Mainnet #9,257,552 against what
+/// public-node.rsk.co answered for it: the merged-mining fields as held,
+/// the merged-mining hash with the fork-detection data its coinbase
+/// commits to in its last 12 bytes (RSKIP110), the paid fees, and the
+/// cumulative difficulty of it and its two uncles, each of difficulty
+/// 0x177af6546a47de99bb3 (`Block.getCumulativeDifficulty`).
+#[test]
+fn a_block_prints_each_property_rskj_prints() {
+    let header = mainnet_block_9257552();
+    assert_eq!(
+        header.hash(),
+        alloy_primitives::b256!("0e7f9744b001ec59e68f0d60e8bde08ae6e9b9b57113e9a372b2058cc144c9fa")
+    );
+    let uncle = Header {
+        difficulty: U256::from(0x177af6546a47de99bb3u128),
+        ..test_header(9_257_550)
+    };
+    let body = (vec![], vec![uncle.clone(), uncle]);
+    let block = crate::helpers::BlockResultDto::from_header_with_body(
+        &header,
+        header.hash(),
+        U256::from(7),
+        Some(&body),
+        false,
+        30,
+    );
+    let block = serde_json::to_value(block).unwrap();
+    let printed = |key: &str| block[key].clone();
+    assert_eq!(printed("mixHash"), json!(format!("{:#x}", B256::ZERO)));
+    assert_eq!(printed("nonce"), json!("0x0000000000000000"));
+    assert_eq!(printed("totalDifficulty"), json!("0x7"));
+    assert_eq!(
+        printed("hashForMergedMining"),
+        json!("0xfe829f5c494b038c03268d18d0e338bb162f06b69ebc2a5e8f871a1d008d4250")
+    );
+    assert_eq!(printed("paidFees"), json!("0x3656c63bb76"));
+    assert_eq!(
+        printed("cumulativeDifficulty"),
+        json!("0x4652de933bc89240cd0")
+    );
+    assert_eq!(printed("bitcoinMergedMiningHeader"), json!("0x00e0f327307a19d17c1e20f51c1190b40d9fc53e7f056272a91d02000000000000000000cd81b87bdc182ac40f11daa46886c0b93b7e6497ca0e541ab5775f9c8fdd3d98936cb06ac51e02172a5c3c6e"));
+    assert_eq!(printed("bitcoinMergedMiningCoinbaseTransaction"), json!("0x000000000000014013a11ba36836286d0115b1c5c58a42ad692d3aeeaedae25686175928146d440f8931d770ea29b3d5f1dd2eabaf3724518831d656f447230000000000000000002b6a2952534b424c4f434b3afe829f5c494b038c03268d18d0e338bb162f06b69ebc2a5e8f871a1d008d425000000000"));
+    assert_eq!(printed("bitcoinMergedMiningMerkleProof"), json!("0xc91bd5fe20d82da439eba4770fb50b6792cc06f083eb88b6795f0c89fc8ca427df7cc40dc64602e3fb3cf5c267664be19d148552f01cc28b6d3907d472008d15ba45ca54695cb6cbceac33003f9582450081de9ac6de608f0d49a78f2cae66c5c65cc0e8ac0674edfad8b00027c9d26b64ebe2476b5e91a95800b6786d91df004aa35390a8e996bf2cf9cc57555a12fcb76abcc376b20ebb5a441b1f94839653472ac163740f33c5e88a33003c73726de57da577d9e57d305937269421c1b0be94af8aa6a13a431fb5425ad871e9675edff825e8b49dc016ab6903bf63d376386dbb6c55d84d449f6147763855259dc20a09f72adfb25195c692bd8da719d1d8e9b227b874cbec4f58fb88dc6b21d810e995b4531346f37b0a3a7e54b3327d79450fa01b5a3420bd772f4f0605c829facdb88bc9f2945aa897aef9e6585c80fa62d683e84d1b8bd228f8c985a8269e312e7d0b135cf5aeb50132e1f2592a112db15c3e521d92fb7184af28a0adc8008fa3eb839d1b6d9e5d5c802160ffa7522649c18aa20502e09c50804448465889141227a0a82c85a0ce6876163ae60cc3ac"));
+    assert_eq!(printed("rskPteEdges"), Value::Null);
+    assert_eq!(printed("baseEvent"), Value::Null);
+    let mut keys: Vec<&str> = block
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    let mut rskj = vec![
+        "number",
+        "hash",
+        "parentHash",
+        "mixHash",
+        "nonce",
+        "sha3Uncles",
+        "logsBloom",
+        "transactionsRoot",
+        "stateRoot",
+        "receiptsRoot",
+        "miner",
+        "difficulty",
+        "totalDifficulty",
+        "extraData",
+        "size",
+        "gasLimit",
+        "gasUsed",
+        "timestamp",
+        "transactions",
+        "uncles",
+        "minimumGasPrice",
+        "bitcoinMergedMiningHeader",
+        "bitcoinMergedMiningCoinbaseTransaction",
+        "bitcoinMergedMiningMerkleProof",
+        "hashForMergedMining",
+        "paidFees",
+        "cumulativeDifficulty",
+        "rskPteEdges",
+        "baseEvent",
+    ];
+    rskj.sort_unstable();
+    assert_eq!(keys, rskj, "the getters of rskj's BlockResultDTO");
+
+    // A coinbase that commits to `RSKBLOCK:`, the hash's first 20 bytes and
+    // twelve of 0xfd: those are the data from wasabi100 (mainnet's
+    // #1,591,000) on, and below it the coinbase commits to the whole hash.
+    let committing = |number: u64| {
+        let header = Header {
+            number,
+            ..header.clone()
+        };
+        let mut coinbase = vec![0; 40];
+        coinbase.extend_from_slice(b"RSKBLOCK:");
+        coinbase.extend_from_slice(&header.hash_for_merged_mining()[..20]);
+        coinbase.extend_from_slice(&[0xfd; 12]);
+        Header {
+            bitcoin_merged_mining_coinbase_transaction: Some(coinbase.into()),
+            ..header
+        }
+    };
+    let printed = |header: &Header| {
+        crate::helpers::BlockResultDto::from_header(header, B256::ZERO, U256::ZERO)
+            .hash_for_merged_mining
+    };
+    let mut with_data = committing(1_591_000).hash_for_merged_mining();
+    with_data[20..].copy_from_slice(&[0xfd; 12]);
+    assert_eq!(printed(&committing(1_591_000)), format!("{with_data:#x}"));
+    let below = committing(1_590_999);
+    assert_eq!(
+        printed(&below),
+        format!("{:#x}", below.hash_for_merged_mining())
+    );
+    // Where RSKIP110 is from genesis, as on testnet and regtest, the data
+    // still start at block 449 (`MiningConfig.REQUIRED_NUMBER_OF_BLOCKS_FOR_
+    // FORK_DETECTION_CALCULATION`).
+    let from_genesis = |number: u64| {
+        let header = committing(number);
+        let hash = crate::helpers::hash_for_merged_mining_from(&header, 0);
+        (
+            hash[20..] == [0xfd; 12],
+            hash[..20] == header.hash_for_merged_mining()[..20],
+        )
+    };
+    assert_eq!(from_genesis(448), (false, true));
+    assert_eq!(from_genesis(449), (true, true));
+    // Nor are there data to read without a coinbase.
+    let without = Header {
+        bitcoin_merged_mining_coinbase_transaction: None,
+        ..header.clone()
+    };
+    assert_eq!(
+        printed(&without),
+        format!("{:#x}", without.hash_for_merged_mining())
+    );
+    // Without a body, the cumulative difficulty is the block's own.
+    let block = crate::helpers::BlockResultDto::from_header(&header, B256::ZERO, U256::ZERO);
+    assert_eq!(block.cumulative_difficulty, "0x175cf1ea6738d50d56a");
+    assert_eq!(block.bitcoin_merged_mining_header.len(), 2 + 160);
+}
+
+/// An uncle's hash, roots or bloom kept at another length print as the
+/// bytes rskj holds (`toUnformattedJsonHex`), where rustock's typed field
+/// holds zero, and its paid fees past 256 bits as the quantity of the bytes
+/// kept. A versioned header's sublist edges print as rskj's `short[]`, its
+/// base event as hex, or null where empty; a header without merged-mining
+/// fields prints `0x` for each.
+#[test]
+fn an_uncles_kept_fields_print_as_rskj_holds_them() {
+    use rustock_core::types::header::{HeaderVersionFields, KeptFields};
+    let mut uncle = test_header(5);
+    uncle.kept = Some(Box::new(KeptFields {
+        ommers_hash: Some(Bytes::from_static(&[0xaa; 3])),
+        state_root: Some(Bytes::from_static(&[0xbb; 31])),
+        transactions_root: Some(Bytes::new()),
+        receipts_root: Some(Bytes::from_static(&[0xcc; 33])),
+        logs_bloom: Some(Bytes::from_static(&[0xdd; 2])),
+        paid_fees: Some(Bytes::from(vec![0x01; 33])),
+        ..Default::default()
+    }));
+    uncle.version_fields = Some(HeaderVersionFields {
+        version: 2,
+        edges: Some(vec![2, 5]),
+        base_event: Some(Bytes::from_static(&[0xee])),
+    });
+    let block = crate::helpers::BlockResultDto::from_header(&uncle, B256::ZERO, U256::ZERO);
+    let block = serde_json::to_value(block).unwrap();
+    assert_eq!(block["sha3Uncles"], json!("0xaaaaaa"));
+    assert_eq!(block["stateRoot"], json!(format!("0x{}", "bb".repeat(31))));
+    assert_eq!(block["transactionsRoot"], json!("0x"));
+    assert_eq!(
+        block["receiptsRoot"],
+        json!(format!("0x{}", "cc".repeat(33)))
+    );
+    assert_eq!(block["logsBloom"], json!("0xdddd"));
+    assert_eq!(block["paidFees"], json!(format!("0x1{}", "01".repeat(32))));
+    assert_eq!(block["rskPteEdges"], json!([2, 5]));
+    assert_eq!(block["baseEvent"], json!("0xee"));
+    for field in [
+        "bitcoinMergedMiningHeader",
+        "bitcoinMergedMiningCoinbaseTransaction",
+        "bitcoinMergedMiningMerkleProof",
+    ] {
+        assert_eq!(block[field], json!("0x"), "{field}");
+    }
+
+    uncle.version_fields = Some(HeaderVersionFields {
+        version: 2,
+        edges: None,
+        base_event: Some(Bytes::new()),
+    });
+    let block = crate::helpers::BlockResultDto::from_header(&uncle, B256::ZERO, U256::ZERO);
+    assert_eq!((block.rsk_pte_edges, block.base_event), (None, None));
+}
+
 fn setup_state() -> (RpcState, tempfile::TempDir) {
+    setup_state_with(|store| store)
+}
+
+/// [`setup_state`] over a store that reads headers as a testnet node's does,
+/// under testnet's heights: for a test that holds testnet's headers.
+fn setup_testnet_state() -> (RpcState, tempfile::TempDir) {
+    setup_state_with(|store| store.with_activations(ActivationHeights::testnet()))
+}
+
+fn setup_state_with(store: impl FnOnce(BlockStore) -> BlockStore) -> (RpcState, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let store = Arc::new(store(BlockStore::open(tmp.path()).unwrap()));
 
     let header = test_header(42);
     store.update_head(&header, U256::from(42_000)).unwrap();
@@ -57,6 +371,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -417,12 +732,16 @@ async fn test_rpc_modules() {
 
 // ========== rsk ==========
 
+/// rskj's `rsk_protocolVersion` is the highest `rsk` capability its
+/// configuration offers, 62, and its `eth_protocolVersion` answers the same
+/// (`Web3Impl` L280-303), as rskj's public nodes answer it.
 #[tokio::test]
 async fn test_rsk_protocol_version() {
     let (state, _tmp) = setup_state();
-    let req = make_request("rsk_protocolVersion", json!([]));
-    let resp = dispatch_for_test(&state, req).await;
-    assert_eq!(resp.result.unwrap(), json!("0x1"));
+    for method in ["rsk_protocolVersion", "eth_protocolVersion"] {
+        let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
+        assert_eq!(resp.result.unwrap(), json!("0x3e"), "{method}");
+    }
 }
 
 #[tokio::test]
@@ -449,27 +768,57 @@ async fn test_rsk_get_raw_block_header_by_hash() {
 
 // ========== dispatch / error handling ==========
 
+/// A name rskj's `Web3` service doesn't have is -32601 "method not found",
+/// whatever its parameters and in every namespace (`JsonRpcCustomServer`
+/// L57-60), as rskj's public nodes answer `eth_foo` and `personal_sign`.
 #[tokio::test]
 async fn test_method_not_found() {
     let (state, _tmp) = setup_state();
-    let req = make_request("nonexistent_method", json!([]));
-    let resp = dispatch_for_test(&state, req).await;
-    assert!(resp.error.is_some());
-    assert_eq!(resp.error.unwrap().code, METHOD_NOT_FOUND);
+    for method in [
+        "nonexistent_method",
+        "eth_foo",
+        "debug_foo",
+        "trace_call",
+        "txpool_foo",
+        "evm_foo",
+        "db_foo",
+        "personal_sign",
+    ] {
+        let resp = dispatch_for_test(&state, make_request(method, json!([1, 2]))).await;
+        assert!(resp.result.is_none(), "{method}");
+        let err = resp.error.unwrap();
+        assert_eq!(
+            (err.code, err.message.as_str()),
+            (METHOD_NOT_FOUND, "method not found"),
+            "{method}"
+        );
+    }
 }
 
-/// `eth_sendTransaction` moved out of this list when the node learned to
-/// hold keys -- it is refused for want of a wallet now, not for want of
-/// an execution engine. The compilation methods are what is left.
+/// rskj's `Web3Impl` throws `UnsupportedOperationException` from the
+/// compilers and from `eth_submitWork` and `eth_submitHashrate` (L964-978,
+/// L1112-1120), and `RskErrorResolver` answers it -32601, naming the method
+/// (L51-55), as rskj's public nodes answer `eth_compileSolidity` and
+/// `eth_compileLLL`.
 #[tokio::test]
 async fn test_unsupported_eth_method() {
     let (state, _tmp) = setup_state();
-    let req = make_request("eth_getCompilers", json!([]));
-    let resp = dispatch_for_test(&state, req).await;
-    assert!(resp.error.is_some());
-    let err = resp.error.unwrap();
-    assert_eq!(err.code, METHOD_NOT_FOUND);
-    assert!(err.message.contains("execution engine"));
+    for (method, params) in [
+        ("eth_compileLLL", json!(["(seq)"])),
+        ("eth_compileSerpent", json!(["def f(): return(1)"])),
+        ("eth_compileSolidity", json!(["contract A {}"])),
+        ("eth_submitWork", json!(["0x01", "0x02", "0x03"])),
+        ("eth_submitHashrate", json!(["0x01", "0x02"])),
+    ] {
+        let resp = dispatch_for_test(&state, make_request(method, params)).await;
+        assert!(resp.result.is_none(), "{method}");
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, METHOD_NOT_FOUND, "{method}");
+        assert_eq!(
+            err.message,
+            format!("the method {method} does not exist/is not available")
+        );
+    }
 }
 
 #[tokio::test]
@@ -511,12 +860,53 @@ async fn test_debug_trace_block_without_a_body_is_null() {
     assert_eq!(resp.result.unwrap(), Value::Null);
 }
 
+/// rskj's personal module with its wallet off, which is its default:
+/// `PersonalModuleWalletDisabled` throws `DisabledWalletException` from every
+/// method, -32604 "The local wallet feature is disabled", once `Web3Impl` has
+/// refused a null seed or passphrase (L1130-1144). This node has no personal
+/// module, so the keys `--wallet-file` gives it change nothing here.
 #[tokio::test]
 async fn test_unsupported_personal_method() {
-    let (state, _tmp) = setup_state();
-    let req = make_request("personal_unlockAccount", json!([]));
-    let resp = dispatch_for_test(&state, req).await;
-    assert!(resp.error.is_some());
+    let address = "0x0000000000000000000000000000000000000001";
+    for (state, _tmp) in [setup_state(), setup_state_with_wallet()] {
+        for (method, params) in [
+            ("personal_newAccountWithSeed", json!(["seed"])),
+            ("personal_newAccount", json!(["passphrase"])),
+            ("personal_listAccounts", json!([])),
+            ("personal_importRawKey", json!(["0x0123", "passphrase"])),
+            (
+                "personal_sendTransaction",
+                json!([{"from": address}, "passphrase"]),
+            ),
+            (
+                "personal_unlockAccount",
+                json!([address, "passphrase", "0x3c"]),
+            ),
+            ("personal_lockAccount", json!([address])),
+            ("personal_dumpRawKey", json!([address])),
+        ] {
+            let resp = dispatch_for_test(&state, make_request(method, params)).await;
+            assert!(resp.result.is_none(), "{method}");
+            let err = resp.error.unwrap();
+            assert_eq!(
+                (err.code, err.message.as_str()),
+                (-32604, "The local wallet feature is disabled"),
+                "{method}"
+            );
+        }
+        for (method, message) in [
+            ("personal_newAccountWithSeed", "Seed is null"),
+            ("personal_newAccount", "Passphrase is null"),
+        ] {
+            let resp = dispatch_for_test(&state, make_request(method, json!([null]))).await;
+            let err = resp.error.unwrap();
+            assert_eq!(
+                (err.code, err.message.as_str()),
+                (INVALID_PARAMS, message),
+                "{method}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -628,6 +1018,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -649,13 +1040,19 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         events: None,
     };
 
-    let req = make_request("eth_sendRawTransaction", json!(["0xdeadbeef"]));
+    // A transfer signed for regtest: a relay is handed nothing less than a
+    // transaction rskj would hand its pool.
+    let raw = "f86480830f424082520894bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb8203e88066\
+               a00afb0a237587b9df05d9cc04fac838c19d27e55cb2eb7a7e48d2ed9764d4d339\
+               a019fa1a246958cbe41757aa014972af79d4d844bdf67d06c2b2afaa778dd71b9d";
+    let req = make_request("eth_sendRawTransaction", json!([format!("0x{raw}")]));
     let resp = dispatch_for_test(&state, req).await;
     assert!(resp.error.is_none(), "Should succeed with a submitter");
-    let result = resp.result.unwrap();
-    let hash_str = result.as_str().unwrap();
-    assert!(hash_str.starts_with("0x"));
-    assert_eq!(hash_str.len(), 66);
+    let hash = sha3::Keccak256::digest(hex::decode(raw).unwrap());
+    assert_eq!(
+        resp.result.unwrap(),
+        json!(format!("0x{}", hex::encode(hash)))
+    );
 }
 
 #[tokio::test]
@@ -685,6 +1082,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -709,6 +1107,112 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
     let req = make_request("eth_sendRawTransaction", json!(["0xZZZZ"]));
     let resp = dispatch_for_test(&state, req).await;
     assert!(resp.error.is_some(), "Should error on invalid hex");
+}
+
+/// The bytes a testdata line writes in hex, a run of one byte as
+/// `(bb*count)`.
+fn written_bytes(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(run) = rest.strip_prefix('(') {
+            let (value, after) = run.split_once('*').unwrap();
+            let (count, after) = after.split_once(')').unwrap();
+            let value = u8::from_str_radix(value, 16).unwrap();
+            bytes.extend(std::iter::repeat_n(value, count.parse().unwrap()));
+            rest = after;
+        } else {
+            bytes.push(u8::from_str_radix(&rest[..2], 16).unwrap());
+            rest = &rest[2..];
+        }
+    }
+    bytes
+}
+
+/// A relay that answers a transaction as the testdata line being replayed
+/// says rskj's pool answered it: with the reason it was refused for, or with
+/// the transaction's hash as rskj reckons it.
+#[derive(Default)]
+struct AnswersAsRskjsPool {
+    refusal: std::sync::Mutex<Option<String>>,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::server::TxSubmitter for AnswersAsRskjsPool {
+    async fn submit_transaction(
+        &self,
+        raw: alloy_primitives::Bytes,
+    ) -> Result<alloy_primitives::B256, String> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(reason) = self.refusal.lock().unwrap().clone() {
+            return Err(reason);
+        }
+        rustock_core::Transaction::from_rskj(&raw)
+            .map(|tx| tx.tx_hash())
+            .map_err(|unread| unread.to_string())
+    }
+}
+
+/// `eth_sendRawTransaction` and `eth_sendTransaction` answer as rskj's
+/// release answers them, request by request: the testdata, which the pool's
+/// own test replays too, is that release's server answering over its real
+/// pool. The pool here says what rskj's said, so this is what the methods
+/// make of it, and what they refuse before any pool is asked.
+///
+/// What used to differ: a transaction the pool refused was answered -32602,
+/// where rskj answers -32010; and what rskj refuses first was the pool's to
+/// refuse, in the pool's words: bytes that are no RLP, or no transaction, a
+/// transaction with no gas limit, and a signature for another chain, in the
+/// upper half of the curve's order, or missing.
+#[tokio::test]
+async fn a_sent_transaction_is_answered_as_rskj_answers_it() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let relay = Arc::new(AnswersAsRskjsPool::default());
+    let (mut state, _tmp) = setup_state();
+    // The key of the account `w`, which rskj's node was given too.
+    let key = secp256k1::SecretKey::from_byte_array(alloy_primitives::keccak256("w").0).unwrap();
+    state.wallet = Some(Arc::new(crate::wallet::Wallet::from_keys([key])));
+    state.hardfork_cfg = Some(rustock_execution::hardfork::RskHardforkConfig::rskj_regtest());
+    state.tx_submitter = Some(relay.clone());
+
+    let mut lines = 0;
+    for line in include_str!("../../sync/src/testdata/rskj_pool_answers.txt").lines() {
+        let (kind, rest) = line.split_once(' ').unwrap_or_default();
+        if !matches!(kind, "tx" | "call") {
+            continue;
+        }
+        lines += 1;
+        let (asked, rest) = rest.split_once(" => ").unwrap();
+        let (answer, _held) = rest.split_once(" | pending ").unwrap();
+        let answer: Value = serde_json::from_str(answer).unwrap();
+        let (label, asked) = asked.split_once(' ').unwrap();
+        let (method, params) = match kind {
+            "tx" => {
+                let raw = format!("0x{}", hex::encode(written_bytes(asked)));
+                ("eth_sendRawTransaction", json!([raw]))
+            }
+            _ => {
+                let (method, params) = asked.split_once(' ').unwrap();
+                (method, serde_json::from_str(params).unwrap())
+            }
+        };
+
+        // What rskj's pool said of it, where it got that far.
+        let refused_by_pool = answer["error"]["code"] == json!(TRANSACTION_ERROR);
+        let reason = answer["error"]["message"].as_str().map(str::to_string);
+        *relay.refusal.lock().unwrap() = reason.filter(|_| refused_by_pool);
+        let before = relay.asked.load(SeqCst);
+        let ours = dispatch_for_test(&state, make_request(method, params)).await;
+        assert_eq!(serde_json::to_value(&ours).unwrap(), answer, "{label}");
+        let reached = refused_by_pool || answer.get("result").is_some();
+        assert_eq!(
+            relay.asked.load(SeqCst) - before,
+            usize::from(reached),
+            "{label}: whether the pool was asked"
+        );
+    }
+    assert_eq!(lines, 115, "every request of the file was asked");
 }
 
 // ========== Phase 6: State queries with trie ==========
@@ -775,6 +1279,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         proof_fetcher: None,
         trie_store: Some(trie_store),
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -917,6 +1422,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -944,56 +1450,46 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
 /// can find -- a round trip through the production code, with nothing computed
 /// by hand in the test.
 ///
-/// This broke because three different hash implementations existed: the
-/// canonical `Transaction::tx_hash()` (which hashes the ORIGINAL bytes when
-/// cached at decode time) and two RPC-local helpers that re-encoded instead.
-/// The index is keyed by the canonical hash, so for every transaction whose RLP
-/// does not round-trip byte-for-byte -- about 42% of mainnet transactions when
-/// measured on the production node -- the RPC handed out a hash that it could
-/// not then resolve.
+/// This broke because three different hash implementations existed:
+/// `Transaction::tx_hash()`, which hashes the encoding rskj hashes the
+/// transaction by, kept at decode time, and two RPC-local helpers that
+/// re-encoded canonically instead. The index is keyed by `tx_hash()`, so for
+/// every transaction whose rskj encoding is not canonical RLP -- about 42% of
+/// mainnet transactions when measured on the production node -- the RPC
+/// handed out a hash that it could not then resolve.
 ///
-/// The fixture deliberately uses a transaction whose cached RLP differs from a
-/// re-encoding, and indexes it with `index_block_transactions`, the function the
-/// commit path uses, rather than calling `put_tx_index` by hand.
+/// The fixture deliberately uses a transaction whose rskj encoding differs
+/// from a canonical one, and indexes it with `index_block_transactions`, the
+/// function the commit path uses, rather than calling `put_tx_index` by hand.
 #[tokio::test]
 async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
 
-    let mut tx = rustock_core::Transaction {
-        nonce: 0,
-        gas_price: U256::from(1),
-        gas_limit: U256::from(21_000),
-        to: alloy_primitives::Bytes::from(vec![0x12; 20]),
-        value: U256::from(1_000_000),
-        input: alloy_primitives::Bytes::default(),
-        v: 27,
-        r: U256::from(100),
-        s: U256::from(200),
-        cached_rlp: None,
-    };
-    // Non-canonical but perfectly decodable bytes: `r` carries a leading zero,
-    // which is what Java's BigInteger.toByteArray() produces for a positive
-    // number whose top bit is set. rustock decodes it leniently (see
-    // rlp_compat) to the same value, but re-encoding drops the zero -- so the
-    // stored bytes and a re-encoding hash differently. This is the real shape
-    // of the divergence, not a synthetic one.
+    // A zero gas price written as the byte 0x00, which rskj keeps
+    // (`encodeCoinNonNullZero`) where canonical RLP writes zero empty: the
+    // federators' free bridge transactions are written so.
     let mut payload: Vec<u8> = Vec::new();
     payload.push(0x80);                                   // nonce 0
-    payload.push(0x01);                                   // gas_price 1
+    payload.push(0x00);                                   // gas_price 0, the byte 0x00
     payload.extend_from_slice(&[0x82, 0x52, 0x08]);       // gas_limit 21000
     payload.push(0x94);                                   // to: 20-byte string
     payload.extend_from_slice(&[0x12; 20]);
     payload.extend_from_slice(&[0x83, 0x0f, 0x42, 0x40]); // value 1_000_000
     payload.push(0x80);                                   // input: empty
     payload.push(0x1b);                                   // v 27
-    payload.extend_from_slice(&[0x82, 0x00, 0x80]);       // r 128, WITH a leading zero
+    payload.push(0x64);                                   // r 100
     payload.extend_from_slice(&[0x81, 0xc8]);             // s 200
     let mut original = vec![0xc0 + payload.len() as u8];
     original.extend_from_slice(&payload);
 
-    tx.r = U256::from(128);
-    tx.cached_rlp = Some(original);
+    let tx = <rustock_core::Transaction as alloy_rlp::Decodable>::decode(&mut original.as_slice())
+        .unwrap();
+    assert_eq!(
+        tx.rlp_for_trie(),
+        original,
+        "rskj keeps these bytes as they are"
+    );
 
     let mut reencoded = Vec::new();
     alloy_rlp::Encodable::encode(&tx, &mut reencoded);
@@ -1024,6 +1520,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -1219,6 +1716,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -1287,6 +1785,80 @@ async fn the_get_logs_range_cap_is_configurable() {
     }]));
     let resp = dispatch_for_test(&state, ok).await;
     assert_eq!(resp.result.unwrap().as_array().unwrap().len(), 3);
+}
+
+/// Runs `request` on a thread of its own and fails if no answer comes within a
+/// minute. The regressions the tests below guard against are loops that never
+/// end, and a test that hangs with one says less than a test that fails.
+fn answered_within_a_minute(state: &RpcState, request: JsonRpcRequest) -> JsonRpcResponse {
+    let state = state.clone();
+    let (answer, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let _ = answer.send(runtime.block_on(dispatch_for_test(&state, request)));
+    });
+    answered
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("no answer within a minute: the request walks a range that never ends")
+}
+
+/// **A log range is walked no further than the head.**
+///
+/// A client may name any block up to 2^63 - 1, the most rskj reads in a log
+/// filter (`jsonHexToLong`; past it is `-32603`). `eth_getLogs` measures its span
+/// against the cap, and that measurement must not overflow; an installed
+/// filter's range is never measured at all. Either way nothing above the head
+/// holds a block, and walking those numbers one by one would be a request
+/// that never ends.
+#[tokio::test]
+async fn a_log_range_reaching_the_top_of_the_number_space_stops_at_the_head() {
+    let (state, _tmp) = setup_state_with_logs();
+    let top = "0x7fffffffffffffff";
+
+    let at_the_top = answered_within_a_minute(
+        &state,
+        make_request("eth_getLogs", json!([{"fromBlock": top, "toBlock": top}])),
+    );
+    assert!(at_the_top
+        .result
+        .expect("an answer")
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let to_the_head = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getLogs",
+            json!([{"fromBlock": "0x1", "toBlock": "latest"}]),
+        ),
+    )
+    .await
+    .result
+    .expect("logs to the head");
+    assert!(
+        !to_the_head.as_array().unwrap().is_empty(),
+        "nothing to compare"
+    );
+
+    let installed = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_newFilter",
+            json!([{"fromBlock": "0x1", "toBlock": top}]),
+        ),
+    )
+    .await
+    .result
+    .expect("a filter id");
+    let to_the_top = answered_within_a_minute(
+        &state,
+        make_request("eth_getFilterLogs", json!([installed])),
+    );
+    assert_eq!(to_the_top.result.expect("an answer"), to_the_head);
 }
 
 #[tokio::test]
@@ -1593,6 +2165,7 @@ async fn test_receipt_dto_failed_status() {
         proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -2072,7 +2645,7 @@ async fn test_admin_methods_are_unknown_without_the_flag() {
         let err = resp.error.expect("an error is expected");
         assert_eq!(err.code, -32601, "{method} must report METHOD_NOT_FOUND");
         assert_eq!(
-            err.message, "Method not found",
+            err.message, "method not found",
             "{method} must not disclose that it exists but is disabled"
         );
     }
@@ -2108,7 +2681,7 @@ async fn test_admin_methods_dispatch_when_enabled() {
     let refused_by_gate = resp
         .error
         .as_ref()
-        .is_some_and(|e| e.code == -32601 && e.message == "Method not found");
+        .is_some_and(|e| e.code == -32601 && e.message == "method not found");
     assert!(
         !refused_by_gate,
         "with admin enabled the method must reach its handler, not the gate"
@@ -2127,21 +2700,33 @@ async fn test_admin_methods_dispatch_when_enabled() {
 /// No key-holding method may answer. A node with no wallet must refuse to
 /// sign rather than sign with something it happens to have -- the node
 /// identity key, a miner key -- which would be a signature the operator never
-/// authorised.
+/// authorised. It refuses as rskj does with its wallet off, which is rskj's
+/// default: `eth_sign` and `eth_sendTransaction` are -32602 "Local wallet is
+/// disabled in this node" (`EthModuleWalletDisabled` L49-53,
+/// `EthModuleTransactionDisabled` L38-42), the transaction unread, and
+/// `eth_signTransaction`, which rskj doesn't have, is "method not found".
 #[tokio::test]
 async fn test_the_node_holds_no_keys_and_refuses_to_sign() {
     let (state, _tmp) = setup_state();
+    let from = "0x0000000000000000000000000000000000000001";
+    let disabled = (INVALID_PARAMS, "Local wallet is disabled in this node");
 
-    for (method, params) in [
-        ("eth_sign", json!(["0x0000000000000000000000000000000000000001", "0xdeadbeef"])),
-        ("eth_signTransaction", json!([{"from": "0x0000000000000000000000000000000000000001"}])),
-        ("eth_sendTransaction", json!([{"from": "0x0000000000000000000000000000000000000001"}])),
+    for (method, params, refusal) in [
+        ("eth_sign", json!([from, "0xdeadbeef"]), disabled),
+        ("eth_sendTransaction", json!([{"from": from}]), disabled),
+        ("eth_sendTransaction", json!([null]), disabled),
+        (
+            "eth_signTransaction",
+            json!([{"from": from}]),
+            (METHOD_NOT_FOUND, "method not found"),
+        ),
     ] {
         let resp = dispatch_for_test(&state, make_request(method, params)).await;
         assert!(resp.result.is_none(), "{method} must not return a result");
+        let err = resp.error.expect("an error is expected");
         assert_eq!(
-            resp.error.expect("an error is expected").code,
-            -32601,
+            (err.code, err.message.as_str()),
+            refusal,
             "{method} must be refused"
         );
     }
@@ -2271,16 +2856,104 @@ fn setup_state_with_pending_tx() -> (RpcState, B256, tempfile::TempDir) {
     (state, hash, tmp)
 }
 
-/// The Solidity compiler methods are refused rather than answered with an
-/// empty list. rskj removed these upstream; answering "no compilers" would
-/// invite a caller to treat compilation as supported-but-unavailable.
+/// rskj answers `eth_getCompilers` with `["solidity"]` (`Web3Impl`
+/// L952-962), though it compiles nothing: `eth_compileSolidity` throws
+/// (L974-977), as `test_unsupported_eth_method` checks.
 #[tokio::test]
-async fn test_compiler_methods_are_refused() {
+async fn test_eth_get_compilers_names_solidity_as_rskj_does() {
     let (state, _tmp) = setup_state();
-    for method in ["eth_getCompilers", "eth_compileSolidity"] {
+    let resp = dispatch_for_test(&state, make_request("eth_getCompilers", json!([]))).await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    assert_eq!(resp.result.unwrap(), json!(["solidity"]));
+}
+
+/// `db_putString`, `db_getString`, `db_putHex` and `db_getHex` do nothing in
+/// rskj's `Web3Impl` (L1104-1128), and `db` isn't one of the modules
+/// `reference.conf` turns on (L486-534), so `JsonRpcMethodFilter` refuses
+/// them (L50-58) and `RskErrorResolver` answers -32601, naming the method
+/// (L51-55), as rskj's public nodes answer `db_getString`.
+#[tokio::test]
+async fn the_db_namespace_is_refused_as_rskjs_default_modules_refuse_it() {
+    let (state, _tmp) = setup_state();
+    for method in ["db_putString", "db_getString", "db_putHex", "db_getHex"] {
         let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
-        assert!(resp.result.is_none(), "{method} must not answer");
-        assert_eq!(resp.error.unwrap().code, -32601);
+        assert!(resp.result.is_none(), "{method}");
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, METHOD_NOT_FOUND, "{method}");
+        assert_eq!(
+            err.message,
+            format!("the method {method} does not exist/is not available")
+        );
+    }
+}
+
+/// jsonrpc4j counts a call's parameters before the method runs, and a count
+/// rskj's method of that name doesn't take is -32602 "method parameters
+/// invalid" (`JsonRpcBasicServer.handleObject` L440-443), even where the
+/// method would refuse anyway. No parameters, `null` and an empty object
+/// count as none; an object with fields matches none of rskj's methods.
+/// rskj's public nodes answer `eth_getCompilers` with `[1]`,
+/// `eth_compileSolidity` with `[]` and with `{"contract": ...}`, `db_getHex`
+/// with two parameters and `eth_protocolVersion` with `{"a": 1}` so.
+#[tokio::test]
+async fn a_stubbed_methods_parameters_are_counted_as_jsonrpc4j_counts_them() {
+    let address = "0x0000000000000000000000000000000000000001";
+    for (state, _tmp) in [setup_state(), setup_state_with_wallet()] {
+        for (method, params) in [
+            ("eth_getCompilers", json!([1])),
+            ("eth_getCompilers", json!({"a": 1})),
+            ("eth_compileSolidity", json!([])),
+            ("eth_compileSolidity", json!(["contract A {}", "x"])),
+            ("eth_compileSolidity", json!({"contract": "contract A {}"})),
+            ("eth_submitWork", json!(["0x01", "0x02"])),
+            ("eth_submitHashrate", json!(["0x01", "0x02", "0x03"])),
+            ("db_getHex", json!(["a", "b"])),
+            ("db_putString", json!(["testDB", "key", "value"])),
+            ("eth_protocolVersion", json!({"a": 1})),
+            ("rsk_protocolVersion", json!([1])),
+            ("eth_accounts", json!([1])),
+            ("eth_pendingTransactions", json!([1])),
+            ("eth_sign", json!([address])),
+            ("eth_sign", json!([address, "0xdeadbeef", "x"])),
+            ("eth_sendTransaction", json!([])),
+            ("personal_unlockAccount", json!([address, "passphrase"])),
+            ("personal_listAccounts", json!(["x"])),
+        ] {
+            let resp = dispatch_for_test(&state, make_request(method, params.clone())).await;
+            assert!(resp.result.is_none(), "{method} {params}");
+            let err = resp.error.unwrap();
+            assert_eq!(
+                (err.code, err.message.as_str()),
+                (INVALID_PARAMS, "method parameters invalid"),
+                "{method} {params}"
+            );
+        }
+        for params in [json!([]), Value::Null, json!({})] {
+            let resp =
+                dispatch_for_test(&state, make_request("eth_getCompilers", params.clone())).await;
+            assert_eq!(resp.result, Some(json!(["solidity"])), "{params}");
+        }
+    }
+}
+
+/// rskj's `Web3EthModule.eth_sign` reads both arguments before its wallet
+/// module sees them (L46-48), so a null one is a NullPointerException, which
+/// `RskErrorResolver` answers -32603 "Internal server error" (L56-58), wallet
+/// or no wallet.
+#[tokio::test]
+async fn a_null_argument_to_eth_sign_is_rskjs_internal_error() {
+    let account = format!("{:#x}", test_wallet().accounts()[0]);
+    for (state, _tmp) in [setup_state(), setup_state_with_wallet()] {
+        for params in [json!([null, "0xdeadbeef"]), json!([account, null])] {
+            let resp = dispatch_for_test(&state, make_request("eth_sign", params.clone())).await;
+            assert!(resp.result.is_none(), "{params}");
+            let err = resp.error.unwrap();
+            assert_eq!(
+                (err.code, err.message.as_str()),
+                (INTERNAL_ERROR, "Internal server error"),
+                "{params}"
+            );
+        }
     }
 }
 
@@ -2456,6 +3129,7 @@ fn setup_state_with_receipts(
         proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -2732,6 +3406,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         proof_fetcher: None,
         trie_store: Some(trie_store),
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -3598,9 +4273,8 @@ async fn test_eth_gas_price_ignores_the_tracker_without_a_fee_market() {
 /// walked down to 587 wei; rskj answered 645 and this node answered the
 /// tracker's 26,065,600. 587 x 1.1 is 645.7, and rskj truncates it through
 /// `BigDecimal.toBigInteger()`, so 645 is the answer and 646 would be wrong.
-/// The exact ratio this node uses truncates identically here -- see
-/// `GAS_PRICE_MULTIPLIER_NUM` for where the two forms part company, which is
-/// nowhere a real chain reaches.
+/// The exact ratio this node used to compute truncates identically here; see
+/// `eth::head_minimum_times_multiplier` for where the two part company.
 #[tokio::test]
 async fn test_eth_gas_price_truncates_the_multiplier_like_rskj() {
     let (mut state, tmp) = setup_state();
@@ -3625,6 +4299,70 @@ async fn test_eth_gas_price_falls_back_to_the_block_minimum() {
     let (state, _tmp) = setup_state();
     let r = dispatch_for_test(&state, make_request("eth_gasPrice", json!([]))).await;
     assert_eq!(r.result.unwrap(), json!("0x3e252e0"), "59,240,000 x 1.1");
+}
+
+/// rskj's arithmetic, not an exact 1.1: the minimum as a double,
+/// times 1.1 in doubles, read back through Java 17's `Double.toString`; and
+/// either answer printed as its low 64 bits (`Long.toHexString(longValue())`).
+#[tokio::test]
+async fn test_eth_gas_price_multiplies_in_doubles_like_rskj() {
+    let (mut state, _tmp) = setup_state();
+    let mut header = state
+        .store
+        .header(state.store.head().unwrap().unwrap())
+        .unwrap()
+        .unwrap();
+    let huge = U256::from(1u8) << 80;
+    let huge_price = crate::java::big_decimal_value_of_to_big_integer(
+        crate::java::big_integer_double_value(&huge) * 1.1,
+    )
+    .unwrap();
+    for (minimum, price) in [
+        // x * 11 / 10 is ...315; the double product rounds up to ...316.
+        (U256::from(511_772_684_928_469u64), 562_949_953_421_316u64),
+        // An integer double under 2^58 prints whole on Java 17 (...090 on 19).
+        (
+            U256::from(130_176_850_055_317_349u64),
+            143_194_535_060_849_088,
+        ),
+        // From 2^61 Java 17 drops two digits, rounding half up.
+        (
+            U256::from(7_471_491_572_244_865_272u64),
+            8_218_640_729_469_351_900,
+        ),
+        // Past a long, the low 64 bits.
+        (huge, huge_price.as_limbs()[0]),
+    ] {
+        header.minimum_gas_price = minimum;
+        header.cached_hash = None;
+        let hash = header.hash();
+        state.store.put_header(&header).unwrap();
+        state.store.put_canonical_hash(header.number, hash).unwrap();
+        state.store.set_head(hash).unwrap();
+        let r = dispatch_for_test(&state, make_request("eth_gasPrice", json!([]))).await;
+        assert_eq!(r.result.unwrap(), json!(format!("{price:#x}")), "{minimum}");
+    }
+    assert!(
+        huge_price > alloy_primitives::U512::from(u64::MAX),
+        "{huge_price}"
+    );
+
+    struct HugeGasPrice;
+    impl crate::server::GasPriceSource for HugeGasPrice {
+        fn gas_price(&self) -> U256 {
+            (U256::from(1u8) << 64) + U256::from(5u8)
+        }
+        fn is_fee_market_working(&self) -> bool {
+            true
+        }
+    }
+    state.gas_price = Some(Arc::new(HugeGasPrice));
+    let r = dispatch_for_test(&state, make_request("eth_gasPrice", json!([]))).await;
+    assert_eq!(
+        r.result.unwrap(),
+        json!("0x5"),
+        "2^64 + 5 prints as its low 64 bits"
+    );
 }
 
 // ========== trace_* namespace ==========
@@ -3737,6 +4475,7 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         proof_fetcher: None,
         trie_store: Some(trie_store),
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -3760,6 +4499,1110 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
     (state, tmp, tx_hash, sender, caller, callee)
 }
 
+/// A transaction is looked up on the main chain only, as rskj's
+/// `ReceiptStore.getInMainChain` looks it up (upstream #343). A block that
+/// lost a reorg keeps its body and receipts, and may be the block the index
+/// wrote last, but answers for nothing: a transaction both branches hold is
+/// found in the canonical one, and one no canonical block holds is null to
+/// every method, or pending to `eth_getTransactionByHash` if the pool holds
+/// it. The main chain comes before the pool.
+#[tokio::test]
+async fn a_transaction_is_looked_up_on_the_main_chain_only() {
+    let (mut state, _tmp, tx_hash, sender, _, _) = setup_state_for_tracing();
+    let hash = format!("{tx_hash:#x}");
+    let methods = [
+        ("eth_getTransactionByHash", json!([hash])),
+        ("eth_getTransactionReceipt", json!([hash])),
+        ("debug_traceTransaction", json!([hash])),
+        ("trace_transaction", json!([hash])),
+        ("trace_get", json!([hash, ["0x0"]])),
+        ("rsk_getRawTransactionReceiptByHash", json!([hash])),
+    ];
+    let canonical = state.store.canonical_hash(42).unwrap().unwrap();
+    let parent_hash = state.store.canonical_hash(41).unwrap().unwrap();
+    let (transactions, _) = state.store.body(canonical).unwrap().unwrap();
+    let receipts = state.store.receipts(canonical).unwrap().unwrap();
+    // The block `method` names the transaction in.
+    async fn block_of(state: &RpcState, method: &str, hash: &str) -> Value {
+        let resp = dispatch_for_test(state, make_request(method, json!([hash]))).await;
+        resp.result.unwrap()["blockHash"].clone()
+    }
+
+    // A rival block at #42 holds it too, and the index writes it last.
+    let rival = Header {
+        parent_hash,
+        minimum_gas_price: U256::ZERO,
+        extra_data: Bytes::from_static(b"rival"),
+        ..test_header(42)
+    };
+    let rival_hash = rival.hash();
+    state.store.put_header(&rival).unwrap();
+    state
+        .store
+        .put_body(rival_hash, &transactions, &[])
+        .unwrap();
+    state.store.put_receipts(rival_hash, &receipts).unwrap();
+    state
+        .store
+        .index_block_transactions(rival_hash, &transactions)
+        .unwrap();
+
+    for (method, params) in &methods {
+        let resp = dispatch_for_test(&state, make_request(method, params.clone())).await;
+        assert!(
+            resp.result.as_ref().is_some_and(|result| !result.is_null()),
+            "{method} on the chain: {:?}",
+            resp.error
+        );
+    }
+    for method in ["eth_getTransactionByHash", "eth_getTransactionReceipt"] {
+        let block = block_of(&state, method, &hash).await;
+        assert_eq!(block, json!(format!("{canonical:#x}")), "{method}");
+    }
+
+    // The rival takes #42, and is where it's found.
+    state.store.put_canonical_hash(42, rival_hash).unwrap();
+    for method in ["eth_getTransactionByHash", "eth_getTransactionReceipt"] {
+        let block = block_of(&state, method, &hash).await;
+        assert_eq!(block, json!(format!("{rival_hash:#x}")), "{method}");
+    }
+
+    // A third block takes #42, and no block holding it is canonical.
+    state
+        .store
+        .put_canonical_hash(42, B256::repeat_byte(0x42))
+        .unwrap();
+    for (method, params) in &methods {
+        let resp = dispatch_for_test(&state, make_request(method, params.clone())).await;
+        assert_eq!(
+            resp.result,
+            Some(Value::Null),
+            "{method} off the chain: {:?}",
+            resp.error
+        );
+    }
+
+    // Pending in the pool, it is found there, with no block; back on the
+    // chain, it is the mined one that's found.
+    state.tx_pool = Some(Arc::new(OnePendingTx {
+        tx: transactions[0].clone(),
+        hash: tx_hash,
+        sender,
+    }));
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getTransactionByHash", json!([hash])),
+    )
+    .await;
+    let pending = resp.result.unwrap();
+    assert_eq!(pending["hash"], json!(hash));
+    assert_eq!(pending["blockHash"], Value::Null);
+    state.store.put_canonical_hash(42, canonical).unwrap();
+    assert_eq!(
+        block_of(&state, "eth_getTransactionByHash", &hash).await,
+        json!(format!("{canonical:#x}"))
+    );
+}
+
+/// `eth_call` and `eth_estimateGas` answer where a transaction of a block is
+/// refused, as rskj's local call does (upstream #294): from a sender that
+/// can't pay for its gas, and with more gas than the block holds. At #41,
+/// which holds the fixture's state.
+#[tokio::test]
+async fn eth_call_answers_where_a_transaction_would_be_refused() {
+    let (state, _tmp, _, _, _, callee) = setup_state_for_tracing();
+    let to = format!("{callee:#x}");
+    let stranger = format!("{:#x}", Address::repeat_byte(0x99));
+    for (case, call) in [
+        (
+            "a sender that can't pay for its gas",
+            json!({"from": stranger, "to": to, "gas": "0x186a0", "gasPrice": "0x1"}),
+        ),
+        (
+            "more gas than the block holds",
+            json!({"to": to, "gas": "0x7a1201"}),
+        ),
+    ] {
+        let params = json!([call, "0x29"]);
+        let resp = dispatch_for_test(&state, make_request("eth_call", params.clone())).await;
+        assert_eq!(
+            resp.result,
+            Some(json!(format!("0x{:064x}", 0x2a))),
+            "{case}: {:?}",
+            resp.error
+        );
+        let resp = dispatch_for_test(&state, make_request("eth_estimateGas", params)).await;
+        assert!(
+            resp.result.is_some_and(|gas| gas.is_string()),
+            "{case}: {:?}",
+            resp.error
+        );
+    }
+}
+
+/// Block tags as rskj reads them (upstream #178): as written by every method
+/// but a log filter, which reads them in any case. `LATEST` is `-32602` to
+/// the rest, as is `finalized` -- rskj's `BlockIdentifierParam` lets both
+/// through, but nothing it hands them to resolves them. In a log filter,
+/// `finalized`, `safe` and a decimal reach `jsonHexToLong` and throw,
+/// `-32603`, and what isn't a tag or a number is `-32602`. `eth_call` and
+/// `eth_estimateGas` read a decimal block (`ExecutionBlockRetriever`).
+#[tokio::test]
+async fn block_tags_are_read_as_rskj_reads_them() {
+    let (state, _tmp) = setup_state_with_logs();
+    let ask = |method: &str, params: Value| {
+        let request = make_request(method, params);
+        let state = &state;
+        async move { dispatch_for_test(state, request).await }
+    };
+    let code = |resp: &JsonRpcResponse| resp.error.as_ref().map(|error| error.code);
+    let address = "0x1111111111111111111111111111111111111111";
+
+    let resp = ask("eth_getBlockByNumber", json!(["latest", false])).await;
+    assert_eq!(resp.result.unwrap()["number"], json!("0x3"));
+    for tag in ["LATEST", "Earliest", "finalized", "safe"] {
+        let resp = ask("eth_getBlockByNumber", json!([tag, false])).await;
+        assert_eq!(code(&resp), Some(-32602), "eth_getBlockByNumber {tag}");
+        for method in ["eth_getBalance", "eth_getCode", "eth_getTransactionCount"] {
+            let resp = ask(method, json!([address, tag])).await;
+            assert_eq!(
+                resp.error.map(|error| (error.code, error.message)),
+                Some((-32602, format!("Invalid block identifier '{tag}'"))),
+                "{method} {tag}"
+            );
+        }
+        let resp = ask("eth_call", json!([{"to": address}, tag])).await;
+        assert_eq!(
+            resp.error.map(|error| (error.code, error.message)),
+            Some((-32602, format!("Invalid block identifier '{tag}'"))),
+            "eth_call {tag}"
+        );
+        let resp = ask("eth_estimateGas", json!([{"to": address}, tag])).await;
+        let error = resp.error.expect("eth_estimateGas refuses it");
+        assert_eq!(error.code, -32602, "eth_estimateGas {tag}");
+        assert!(
+            error
+                .message
+                .starts_with(&format!("Unsupported block specifier '{tag}'.")),
+            "eth_estimateGas {tag}: {}",
+            error.message
+        );
+    }
+    let resp = ask("eth_getStorageAt", json!([address, "0x0", "PENDING"])).await;
+    assert_eq!(code(&resp), Some(-32602));
+    let resp = ask("rsk_getStorageBytesAt", json!([address, "0x0", "Latest"])).await;
+    assert_eq!(code(&resp), Some(-32602));
+    let resp = ask("eth_getBalance", json!([address, "3"])).await;
+    assert_eq!(
+        resp.error.map(|error| (error.code, error.message)),
+        Some((-32602, "invalid blocknumber 3".to_string()))
+    );
+
+    let logs = |filter: Value| ask("eth_getLogs", json!([filter]));
+    let resp = logs(json!({"fromBlock": "EARLIEST", "toBlock": "Latest"})).await;
+    assert_eq!(resp.result.unwrap().as_array().unwrap().len(), 3);
+    let resp = ask("eth_newFilter", json!([{"fromBlock": "LATEST"}])).await;
+    assert!(resp.result.is_some(), "{:?}", resp.error);
+    for block in [json!("finalized"), json!("SAFE"), json!("2"), json!(2)] {
+        for key in ["fromBlock", "toBlock"] {
+            let resp = logs(json!({ key: block })).await;
+            assert_eq!(code(&resp), Some(-32603), "eth_getLogs {key} {block}");
+        }
+        let resp = ask("eth_newFilter", json!([{"fromBlock": block}])).await;
+        assert_eq!(code(&resp), Some(-32603), "eth_newFilter {block}");
+    }
+    for block in [json!("foo"), json!(null), json!("0x")] {
+        let resp = logs(json!({"toBlock": block})).await;
+        assert_eq!(code(&resp), Some(-32602), "eth_getLogs {block}");
+    }
+
+    // A decimal block for a call, at the tracing fixture's #41.
+    let (state, _tmp, _, _, _, callee) = setup_state_for_tracing();
+    let call = json!({"to": format!("{callee:#x}")});
+    let resp = dispatch_for_test(&state, make_request("eth_call", json!([call, "41"]))).await;
+    assert_eq!(
+        resp.result,
+        Some(json!(format!("0x{:064x}", 0x2a))),
+        "{:?}",
+        resp.error
+    );
+}
+
+/// A block named by an object, as rskj's `BlockRefParam` reads it (EIP-1898)
+/// for `eth_call`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`,
+/// `eth_getTransactionCount` and `rsk_getStorageBytesAt`: by `blockNumber`,
+/// or by `blockHash`, which rskj turns into that block's number -- so a block
+/// beside the chain answers as the main chain's block of its height, unless
+/// `requireCanonical` is the string "true". What is neither a string nor an
+/// object is refused, where it used to be read as the latest block. A block
+/// the node doesn't have is `-32600` to a state query and `-32602` to a call.
+#[tokio::test]
+async fn a_block_named_by_an_object_is_read_as_rskj_reads_it() {
+    use rustock_trie::{account_key, TrieKeySlice, TrieNode};
+
+    let (state, _tmp) = setup_state_with_trie();
+    let address = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+    let trie_store = state.trie_store.clone().unwrap();
+    let store = state.store.clone();
+
+    // #42 holds the account with 10,000. #43, the new head, holds it with 7,
+    // and so does a second block of height 42, beside the chain.
+    let at_42 = store.canonical_hash(42).unwrap().unwrap();
+    let old_root = store.header(at_42).unwrap().unwrap().state_root;
+    let root = TrieNode::from_message(&trie_store.get(old_root.as_slice()).unwrap(), &*trie_store);
+    let poorer = rustock_trie::AccountState::new(U256::from(2), U256::from(7));
+    let key = account_key(&address.parse::<Address>().unwrap());
+    let mut root = root.put(
+        &TrieKeySlice::from_key(&key),
+        &poorer.encode(),
+        &*trie_store,
+    );
+    root.save(&*trie_store, true);
+    let state_root = root.compute_hash(&*trie_store);
+    rustock_trie::TrieStore::put(
+        &*trie_store,
+        state_root.as_slice(),
+        &root.to_message(&*trie_store),
+    );
+    let head = Header {
+        state_root,
+        parent_hash: at_42,
+        ..test_header(43)
+    };
+    let at_43 = head.hash();
+    store.put_header(&head).unwrap();
+    store.put_canonical_hash(43, at_43).unwrap();
+    store.set_head(at_43).unwrap();
+    let beside = Header {
+        state_root,
+        timestamp: 7,
+        ..test_header(42)
+    };
+    let beside_42 = beside.hash();
+    store.put_header(&beside).unwrap();
+
+    let ask = |method: &str, params: Value| {
+        let request = make_request(method, params);
+        let state = &state;
+        async move { dispatch_for_test(state, request).await }
+    };
+    let error = |resp: JsonRpcResponse| resp.error.map(|error| (error.code, error.message));
+    let balance = |block: Value| ask("eth_getBalance", json!([address, block]));
+    let hex = |hash: B256| format!("{hash:#x}");
+
+    assert_eq!(balance(json!("latest")).await.result, Some(json!("0x7")));
+    for block in [
+        json!({"blockNumber": "0x2a"}),
+        json!({"blockHash": hex(at_42)}),
+        json!({"blockHash": hex(at_42), "requireCanonical": "true"}),
+        // Without its prefix, as `stringHexToByteArray` reads it.
+        json!({"blockHash": hex(at_42)[2..]}),
+        // The block beside the chain: its number is all rskj keeps of it.
+        json!({"blockHash": hex(beside_42)}),
+        json!({"blockHash": hex(beside_42), "requireCanonical": "FALSE"}),
+        // The hash is looked at first.
+        json!({"blockHash": hex(at_42), "blockNumber": "0x2b"}),
+    ] {
+        let resp = balance(block.clone()).await;
+        assert_eq!(
+            resp.result,
+            Some(json!("0x2710")),
+            "{block}: {:?}",
+            resp.error
+        );
+    }
+    let resp = balance(json!({"blockNumber": "0x2b"})).await;
+    assert_eq!(resp.result, Some(json!("0x7")), "{:?}", resp.error);
+    let resp = ask(
+        "eth_getTransactionCount",
+        json!([address, {"blockNumber": "0x2a"}]),
+    )
+    .await;
+    assert_eq!(resp.result, Some(json!("0x1")), "{:?}", resp.error);
+
+    // Each of the state queries, at a block the node doesn't have.
+    let nowhere = json!({"blockNumber": "0x63"});
+    for (method, params) in [
+        ("eth_getBalance", json!([address, nowhere])),
+        ("eth_getTransactionCount", json!([address, nowhere])),
+        ("eth_getCode", json!([address, nowhere])),
+        ("eth_getStorageAt", json!([address, "0x1", nowhere])),
+        ("rsk_getStorageBytesAt", json!([address, "0x1", nowhere])),
+    ] {
+        assert_eq!(
+            error(ask(method, params).await),
+            Some((-32600, "Block 0x63 not found".to_string())),
+            "{method}"
+        );
+    }
+
+    let unknown = hex(B256::repeat_byte(0x77));
+    let (known, beside) = (hex(at_42), hex(beside_42));
+    let canonical = "Invalid input: requireCanonical must be a String \"true\" or \"false\"";
+    let number = "value must be a valid hex or string number.";
+    for (block, code, message) in [
+        (json!("0x63"), -32600, "Block 0x63 not found".to_string()),
+        (json!(unknown), -32600, format!("Block {unknown} not found")),
+        (
+            json!({"blockHash": unknown}),
+            -32600,
+            format!("Block with hash {unknown} not found"),
+        ),
+        (
+            json!({"blockHash": beside, "requireCanonical": "true"}),
+            -32600,
+            format!("Block with hash {beside} is not canonical and it is required"),
+        ),
+        (json!({}), -32602, "Invalid block input".to_string()),
+        (
+            json!({"requireCanonical": "true"}),
+            -32602,
+            "Invalid block input".to_string(),
+        ),
+        (
+            json!({"blockHash": known, "requireCanonical": "yes"}),
+            -32602,
+            canonical.to_string(),
+        ),
+        // The map's values are strings in name only: one that isn't can't
+        // be cast to a string, and nothing catches that.
+        (
+            json!({"blockHash": known, "requireCanonical": true}),
+            -32603,
+            "Internal server error".to_string(),
+        ),
+        (
+            json!({"blockNumber": 42}),
+            -32603,
+            "Internal server error".to_string(),
+        ),
+        (
+            json!({"blockNumber": "0x2a", "other": 7}),
+            -32603,
+            "Internal server error".to_string(),
+        ),
+        (
+            json!({"blockHash": known, "requireCanonical": null}),
+            -32603,
+            "Internal server error".to_string(),
+        ),
+        (
+            json!({"blockNumber": null}),
+            -32602,
+            "Invalid param: null".to_string(),
+        ),
+        (
+            json!({"blockHash": null}),
+            -32602,
+            "Invalid block hash: incorrect length.".to_string(),
+        ),
+        (
+            json!({"blockNumber": "0x-5"}),
+            -32602,
+            format!("Invalid param 0x-5: {number}"),
+        ),
+        (
+            json!({"blockNumber": "0X1"}),
+            -32602,
+            format!("Invalid param 0X1: {number}"),
+        ),
+        // A bare prefix and no digits at all pass the object's check, and
+        // `getBlock` then reads no number in them.
+        (
+            json!({"blockNumber": "0x"}),
+            -32602,
+            "invalid blocknumber 0x".to_string(),
+        ),
+        (
+            json!({"blockNumber": ""}),
+            -32602,
+            "invalid blocknumber ".to_string(),
+        ),
+        (
+            json!({"blockNumber": "+5"}),
+            -32602,
+            "invalid blocknumber +5".to_string(),
+        ),
+        (
+            json!({"blockHash": "0x1234"}),
+            -32602,
+            "Invalid block hash: incorrect length.".to_string(),
+        ),
+        (
+            json!({"blockHash": format!("0x{}", "zz".repeat(32))}),
+            -32602,
+            "Invalid block hash format: invalid hex value".to_string(),
+        ),
+        (
+            json!({"blockNumber": "latest"}),
+            -32602,
+            format!("Invalid param latest: {number}"),
+        ),
+        // Numbers an object may write and `getBlock` then can't read.
+        (
+            json!({"blockNumber": "42"}),
+            -32602,
+            "invalid blocknumber 42".to_string(),
+        ),
+        (
+            json!({"blockNumber": "2a"}),
+            -32602,
+            "invalid blocknumber 2a".to_string(),
+        ),
+        (json!(42), -32602, "Invalid input".to_string()),
+        (json!(true), -32602, "Invalid input".to_string()),
+        (json!(["latest"]), -32602, "Invalid input".to_string()),
+        (json!(null), -32603, "Internal server error".to_string()),
+    ] {
+        assert_eq!(
+            error(balance(block.clone()).await),
+            Some((code, message)),
+            "{block}"
+        );
+    }
+
+    // A call, at the tracing fixture's #41. Its head, #42, has no state.
+    let (state, _tmp, _, _, _, callee) = setup_state_for_tracing();
+    let call = json!({"to": format!("{callee:#x}")});
+    let at_41 = hex(state.store.canonical_hash(41).unwrap().unwrap());
+    let at_42 = state.store.canonical_hash(42).unwrap().unwrap();
+    let ask = |method: &str, block: Value| {
+        let request = make_request(method, json!([call, block]));
+        let state = &state;
+        async move { dispatch_for_test(state, request).await }
+    };
+    for block in [
+        json!({"blockNumber": "0x29"}),
+        json!({"blockNumber": "41"}),
+        json!({"blockHash": at_41}),
+    ] {
+        let resp = ask("eth_call", block.clone()).await;
+        assert_eq!(
+            resp.result,
+            Some(json!(format!("0x{:064x}", 0x2a))),
+            "{block}: {:?}",
+            resp.error
+        );
+    }
+    let stateless = format!("State not found for block with hash {}", &hex(at_42)[2..]);
+    for (block, code, message) in [
+        (json!("0x63"), -32602, "Invalid block number 99".to_string()),
+        (
+            json!({"blockNumber": "0x63"}),
+            -32602,
+            "Invalid block number 99".to_string(),
+        ),
+        (
+            json!({"blockNumber": "2a"}),
+            -32602,
+            "Invalid block identifier '2a'".to_string(),
+        ),
+        (
+            json!({"blockHash": unknown}),
+            -32600,
+            format!("Block with hash {unknown} not found"),
+        ),
+        (json!(41), -32602, "Invalid input".to_string()),
+        (json!("latest"), -32603, stateless.clone()),
+    ] {
+        assert_eq!(
+            error(ask("eth_call", block.clone()).await),
+            Some((code, message)),
+            "{block}"
+        );
+    }
+    // An estimate's block is a `BlockIdentifierParam`, made of the
+    // parameter's text whatever JSON it is: a number is a decimal block, and
+    // an object is its opening brace.
+    let resp = ask("eth_estimateGas", json!(41)).await;
+    assert!(
+        resp.result.is_some_and(|gas| gas.is_string()),
+        "{:?}",
+        resp.error
+    );
+    for (block, code, message) in [
+        (
+            json!({"blockNumber": "0x29"}),
+            -32602,
+            "Invalid block identifier '{'".to_string(),
+        ),
+        (
+            json!(true),
+            -32602,
+            "Invalid block identifier 'true'".to_string(),
+        ),
+        (json!("0x63"), -32602, "Invalid block number 99".to_string()),
+        (json!(99), -32602, "Invalid block number 99".to_string()),
+    ] {
+        assert_eq!(
+            error(ask("eth_estimateGas", block.clone()).await),
+            Some((code, message)),
+            "{block}"
+        );
+    }
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getBalance", json!([format!("{callee:#x}"), "latest"])),
+    )
+    .await;
+    assert_eq!(error(resp), Some((-32600, stateless)));
+}
+
+/// A state for a call's defaults: `reader` returns the GASPRICE and the GAS
+/// it sees, as two words; `burner` loops `count` times at 26 gas a turn, so
+/// running it costs 21,003 + 26 * `count`. The head holds 6,800,000 gas and
+/// asks 59,240,000 a unit of it, neither of them a call's default.
+fn setup_defaults_state(count: u32) -> (RpcState, tempfile::TempDir, Address, Address) {
+    use rustock_trie::{account_key, code_key, MemoryTrieStore, TrieKeySlice, TrieNode};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let trie_store = Arc::new(MemoryTrieStore::new());
+    let mut root = TrieNode::empty();
+    let reader = Address::repeat_byte(0xaa);
+    let burner = Address::repeat_byte(0xbb);
+    // GASPRICE PUSH1 0 MSTORE GAS PUSH1 32 MSTORE PUSH1 64 PUSH1 0 RETURN
+    let read = [
+        0x3a, 0x60, 0x00, 0x52, 0x5a, 0x60, 0x20, 0x52, 0x60, 0x40, 0x60, 0x00, 0xf3,
+    ];
+    // PUSH3 count; JUMPDEST PUSH1 1 SWAP1 SUB DUP1 PUSH1 4 JUMPI; STOP
+    let mut burn = vec![0x62];
+    burn.extend_from_slice(&count.to_be_bytes()[1..]);
+    burn.extend_from_slice(&[0x5b, 0x60, 0x01, 0x90, 0x03, 0x80, 0x60, 0x04, 0x57, 0x00]);
+    for (addr, code) in [(reader, &read[..]), (burner, &burn[..])] {
+        let acct = rustock_trie::AccountState::new(U256::ZERO, U256::ZERO);
+        root = root.put(
+            &TrieKeySlice::from_key(&account_key(&addr)),
+            &acct.encode(),
+            &*trie_store,
+        );
+        root = root.put(
+            &TrieKeySlice::from_key(&code_key(&addr)),
+            code,
+            &*trie_store,
+        );
+    }
+    root.save(&*trie_store, true);
+    let state_root = root.compute_hash(&*trie_store);
+    rustock_trie::TrieStore::put(
+        &*trie_store,
+        state_root.as_slice(),
+        &root.to_message(&*trie_store),
+    );
+
+    let header = Header {
+        state_root,
+        gas_limit: U256::from(6_800_000u64),
+        ..test_header(42)
+    };
+    let hash = header.hash();
+    store.put_header(&header).unwrap();
+    store.put_canonical_hash(42, hash).unwrap();
+    store.set_head(hash).unwrap();
+    store
+        .put_total_difficulty(hash, U256::from(42_000))
+        .unwrap();
+
+    let (mut state, _discard) = setup_state();
+    state.store = store;
+    state.trie_store = Some(trie_store);
+    state.hardfork_cfg = Some(rustock_execution::RskHardforkConfig::mainnet());
+    std::mem::forget(_discard);
+    (state, tmp, reader, burner)
+}
+
+/// A call's defaults are rskj's (`CallArgumentsToByteArray`): a gas
+/// price of 0, not the block's minimum, and `rpc.callGasCap`'s 10,000,000 gas,
+/// not the block's limit -- the cap on the gas a call names, too. An
+/// estimate runs at `rpc.gasEstimationCap`'s 6,800,000, whatever the call
+/// names (`EthModule.estimateGas`).
+#[tokio::test]
+async fn a_calls_defaults_are_rskjs() {
+    let (state, _tmp, reader, burner) = setup_defaults_state(1 << 18);
+    let ask = |method: &str, call: Value| {
+        let request = make_request(method, json!([call, "latest"]));
+        let state = &state;
+        async move { dispatch_for_test(state, request).await }
+    };
+    let words = |resp: JsonRpcResponse| {
+        let out = resp.result.unwrap_or_else(|| panic!("{:?}", resp.error));
+        let out = hex::decode(out.as_str().unwrap().trim_start_matches("0x")).unwrap();
+        (
+            U256::from_be_slice(&out[..32]),
+            U256::from_be_slice(&out[32..]),
+        )
+    };
+    let to = format!("{reader:#x}");
+
+    // GAS reads the call's gas less the 21,000 and the 13 spent before it.
+    let resp = ask("eth_call", json!({"to": to})).await;
+    assert_eq!(words(resp), (U256::ZERO, U256::from(10_000_000 - 21_013)));
+    let resp = ask("eth_call", json!({"to": to, "gas": "0xffffffffffffffff"})).await;
+    assert_eq!(words(resp), (U256::ZERO, U256::from(10_000_000 - 21_013)));
+    let resp = ask(
+        "eth_call",
+        json!({"to": to, "gas": "0x30d40", "gasPrice": "0x2"}),
+    )
+    .await;
+    assert_eq!(words(resp), (U256::from(2), U256::from(200_000 - 21_013)));
+
+    // Not run with the 21,000 the call names.
+    let resp = ask("eth_estimateGas", json!({"to": to, "gas": "0x5208"})).await;
+    assert!(resp.result.is_some(), "{:?}", resp.error);
+    // The burner needs 21,003 + 26 * 2^18 = 6,836,747, over the estimate's cap
+    // whatever the call names: it runs out of gas there, and a program that
+    // fails is estimated at all it was given, the cap.
+    let burn = format!("{burner:#x}");
+    let resp = ask("eth_estimateGas", json!({"to": burn, "gas": "0x7a1200"})).await;
+    assert_eq!(resp.result, Some(json!("0x67c280")), "{:?}", resp.error);
+    let resp = ask("eth_call", json!({"to": burn})).await;
+    assert_eq!(resp.result, Some(json!("0x")), "{:?}", resp.error);
+}
+
+/// A call's arguments as rskj reads them: `CallArgumentsParam` checks each
+/// field, and `CallArgumentsToByteArray` then reads the numbers. An address
+/// that isn't one, a number or data that isn't hex is refused, `-32602`,
+/// where each used to be left out without a word -- a mistyped `to` made the
+/// call a creation. A number without its `0x` is a decimal, where it used to
+/// be read as hex, and so is a JSON number, which used to be left out.
+/// rskj's release answers each so: its `CallArgumentsParam` and its
+/// `CallArgumentsToByteArray` were run on these.
+#[tokio::test]
+async fn a_calls_arguments_are_read_as_rskj_reads_them() {
+    let (state, _tmp, reader, _burner) = setup_defaults_state(1);
+    let ask = |method: &str, params: Value| {
+        let request = make_request(method, params);
+        let state = &state;
+        async move { dispatch_for_test(state, request).await }
+    };
+    let call = |call: Value| ask("eth_call", json!([call, "latest"]));
+    let words = |resp: JsonRpcResponse| {
+        let out = resp.result.unwrap_or_else(|| panic!("{:?}", resp.error));
+        let out = hex::decode(out.as_str().unwrap().trim_start_matches("0x")).unwrap();
+        (
+            U256::from_be_slice(&out[..32]),
+            U256::from_be_slice(&out[32..]),
+        )
+    };
+    let error = |resp: JsonRpcResponse| resp.error.map(|error| (error.code, error.message));
+    let to = format!("{reader:#x}");
+    // A number as the request writes it, which `json!` would write its own way.
+    let written = |field: &str, number: &str| -> Value {
+        serde_json::from_str(&format!(r#"{{"to":"{to}","{field}":{number}}}"#)).unwrap()
+    };
+
+    // The reader answers the gas price and the gas it sees: the call's gas
+    // less the 21,000, what its data costs -- 68 a byte, and 4 a byte of
+    // zero -- and the 13 spent before it.
+    let all = 10_000_000 - 21_013u64;
+    let some = 200_000 - 21_013u64;
+    for (arguments, gas_price, gas) in [
+        (
+            json!({"to": to, "gasPrice": "0x10", "gas": "0x30d40"}),
+            16u64,
+            some,
+        ),
+        (
+            json!({"to": to, "gasPrice": "0x000a", "gas": "0x00030d40"}),
+            10,
+            some,
+        ),
+        // Without the prefix a number is a decimal, and so is a JSON number.
+        (
+            json!({"to": to, "gasPrice": "10", "gas": "200000"}),
+            10,
+            some,
+        ),
+        (json!({"to": to, "gasPrice": 7, "gas": 200000}), 7, some),
+        (json!({"to": to, "gasPrice": "+7"}), 7, all),
+        // `BigInteger.toByteArray` writes -1 as the one byte 0xff.
+        (json!({"to": to, "gasPrice": "-1"}), 255, all),
+        (json!({"to": to, "gasPrice": -1}), 255, all),
+        // Nothing written, an object or an array is no number, and a bare
+        // prefix is zero.
+        (json!({"to": to, "gasPrice": "", "gas": {}}), 0, all),
+        (json!({"to": to, "gasPrice": "0x", "gas": null}), 0, all),
+        // A JSON number of any length is its digits.
+        (written("value", "20000000000000000000"), 0, all),
+        // More gas than the cap is the cap, and so is 2^63, which gets past
+        // rskj's own cap: that isn't followed.
+        (json!({"to": to, "gas": "0x989681"}), 0, all),
+        (json!({"to": to, "gas": "0x8000000000000000"}), 0, all),
+        // An address with no prefix, one in upper case, and one of 40
+        // digits and two spaces, which the decoder passes over.
+        (
+            json!({"to": to[2..], "from": to.to_uppercase().replace('X', "x")}),
+            0,
+            all,
+        ),
+        (json!({"to": format!("{}  ", &to[2..])}), 0, all),
+        // Data of an odd count of digits, with no prefix: 0x0abc.
+        (json!({"to": to, "data": "abc"}), 0, all - 2 * 68),
+        // `input` is read over `data`, written as nothing too.
+        (json!({"to": to, "data": "abc", "input": 5}), 0, all - 68),
+        (json!({"to": to, "data": "0x1234", "input": ""}), 0, all),
+        (
+            json!({"to": to, "input": "0x1234", "data": {}}),
+            0,
+            all - 2 * 68,
+        ),
+        // A space and a line feed in data are passed over: 0x1200.
+        (json!({"to": to, "data": "0x12 00\n"}), 0, all - 68 - 4),
+    ] {
+        let resp = call(arguments.clone()).await;
+        assert_eq!(
+            words(resp),
+            (U256::from(gas_price), U256::from(gas)),
+            "{arguments}"
+        );
+    }
+
+    let address = "Invalid address: null, empty or invalid hex value.";
+    let malformed = "Invalid address format: invalid hex value.";
+    let number = "value must be a valid hex or string number.";
+    let data = "Invalid data format: invalid hex value.";
+    let letters = "Number values should not contain letters or hex values should start with 0x.";
+    let long = "1".repeat(68);
+    for (arguments, message) in [
+        (json!({"to": "0x123"}), address.to_string()),
+        (json!({"to": 5}), address.to_string()),
+        (json!({"to": to, "from": {}}), address.to_string()),
+        (
+            json!({"to": format!("0x{}", "zz".repeat(20))}),
+            malformed.to_string(),
+        ),
+        (
+            json!({"to": format!("0x{}", "11".repeat(19))}),
+            malformed.to_string(),
+        ),
+        (json!({"to": to.replace("0x", "0X")}), malformed.to_string()),
+        // 40 digits and one space are padded to 41 digits.
+        (
+            json!({"to": format!("{} ", &to[2..])}),
+            malformed.to_string(),
+        ),
+        (
+            json!({"to": to, "gas": "zz"}),
+            format!("Invalid param zz: {number}"),
+        ),
+        (
+            json!({"to": to, "gas": "0X10"}),
+            format!("Invalid param 0X10: {number}"),
+        ),
+        (
+            json!({"to": to, "gas": " 5"}),
+            format!("Invalid param  5: {number}"),
+        ),
+        (
+            json!({"to": to, "gas": true}),
+            format!("Invalid param true: {number}"),
+        ),
+        // A JSON number with a fraction or an exponent is the double it
+        // reads as, printed as Java prints one.
+        (
+            written("gas", "5.5"),
+            format!("Invalid param 5.5: {number}"),
+        ),
+        (
+            written("gas", "1e5"),
+            format!("Invalid param 100000.0: {number}"),
+        ),
+        (
+            written("gas", "0.0001"),
+            format!("Invalid param 1.0E-4: {number}"),
+        ),
+        // Checked, though a call reads none of the three.
+        (
+            json!({"to": to, "nonce": "zz"}),
+            format!("Invalid param zz: {number}"),
+        ),
+        (
+            json!({"to": to, "chainId": "zz"}),
+            format!("Invalid param zz: {number}"),
+        ),
+        (
+            json!({"to": to, "gasLimit": "zz"}),
+            format!("Invalid param zz: {number}"),
+        ),
+        (
+            written("nonce", "1e5"),
+            format!("Invalid param 100000.0: {number}"),
+        ),
+        (
+            json!({"to": to, "value": long}),
+            format!("Invalid param: {}...", &long[..66]),
+        ),
+        (json!({"to": to, "data": "0xzz"}), data.to_string()),
+        (json!({"to": to, "input": "zz"}), data.to_string()),
+        // Five characters are padded to six, and five digits are left.
+        (json!({"to": to, "data": "0x12 34"}), data.to_string()),
+        // The sender is checked first, wherever it is written.
+        (json!({"gas": "zz", "from": "0x1"}), address.to_string()),
+        // Hex without its prefix passes the check and is then no decimal.
+        (json!({"to": to, "gas": "ff"}), letters.to_string()),
+        (json!({"to": to, "gasPrice": "ff"}), letters.to_string()),
+        (json!({"to": to, "value": "ff"}), letters.to_string()),
+    ] {
+        assert_eq!(
+            error(call(arguments.clone()).await),
+            Some((-32602, message)),
+            "{arguments}"
+        );
+    }
+    // A gas written in more than eight bytes, and no arguments at all, which
+    // the method reads and finds nothing to read: what rskj throws there
+    // nothing catches.
+    let uncaught = Some((-32603, "Internal server error".to_string()));
+    for arguments in [
+        json!({"to": to, "gas": "0x000000000000989680"}),
+        json!({"to": to, "gas": "18446744073709551616"}),
+        written("gas", "18446744073709551616"),
+        json!(null),
+    ] {
+        assert_eq!(
+            error(call(arguments.clone()).await),
+            uncaught,
+            "{arguments}"
+        );
+    }
+    // What isn't an object has no fields: a creation with no code.
+    let resp = call(json!("x")).await;
+    assert_eq!(resp.result, Some(json!("0x")), "{:?}", resp.error);
+
+    // The fields are checked before the block is looked for, and the
+    // arguments read after it.
+    let nowhere = Some((-32602, "Invalid block number 99".to_string()));
+    let resp = ask("eth_call", json!([{"to": "0x123"}, "0x63"])).await;
+    assert_eq!(error(resp), Some((-32602, address.to_string())));
+    let resp = ask("eth_call", json!([{"to": to, "gas": "ff"}, "0x63"])).await;
+    assert_eq!(error(resp), nowhere);
+    let resp = ask("eth_call", json!([null, "0x63"])).await;
+    assert_eq!(error(resp), nowhere);
+
+    // An estimate reads the same arguments, but for the gas, which it
+    // checks and then doesn't read.
+    let estimate = |call: Value| ask("eth_estimateGas", json!([call, "latest"]));
+    assert_eq!(
+        error(estimate(json!({"to": "0x123"})).await),
+        Some((-32602, address.to_string()))
+    );
+    assert_eq!(
+        error(estimate(json!({"to": to, "value": "ff"})).await),
+        Some((-32602, letters.to_string()))
+    );
+    assert_eq!(
+        error(estimate(json!({"to": to, "gas": "zz"})).await),
+        Some((-32602, format!("Invalid param zz: {number}")))
+    );
+    assert_eq!(error(estimate(json!(null)).await), uncaught);
+    for gas in ["ff", "18446744073709551616"] {
+        let resp = estimate(json!({"to": to, "gas": gas})).await;
+        assert!(resp.result.is_some(), "{gas}: {:?}", resp.error);
+    }
+}
+
+/// The state of one scenario of `testdata/rskj_local_calls.txt`: the accounts
+/// its `account` lines list, under the head its `head` line describes, on
+/// rskj's regtest. An account listed as `none` is one rskj's state didn't
+/// hold, and this one doesn't either. The head stands on a block with the
+/// coinbase of regtest's genesis, as rskj's did. The scenario named
+/// `...-before-rskip136` was run under a schedule without RSKIP136, and is
+/// here too.
+fn setup_state_of_scenario(
+    name: &str,
+    head: &str,
+    accounts: &[&str],
+) -> (RpcState, tempfile::TempDir) {
+    use rustock_execution::hardfork::{ConsensusRule, RskHardforkConfig};
+    use rustock_trie::{account_key, code_key, MemoryTrieStore, TrieKeySlice, TrieNode};
+
+    let (mut state, tmp) = setup_state();
+    let trie_store = Arc::new(MemoryTrieStore::new());
+    let mut root = TrieNode::empty();
+    for account in accounts {
+        // name, address, nonce, balance and, where it has some, code.
+        let words: Vec<&str> = account.split(' ').collect();
+        if words[2] == "none" {
+            continue;
+        }
+        let address = Address::from_slice(&hex::decode(words[1]).unwrap());
+        let held = rustock_trie::AccountState::new(
+            U256::from(words[2].parse::<u64>().unwrap()),
+            words[3].parse().unwrap(),
+        );
+        let key = account_key(&address);
+        root = root.put(&TrieKeySlice::from_key(&key), &held.encode(), &*trie_store);
+        if let Some(code) = words.get(4) {
+            let code = hex::decode(code).unwrap();
+            root = root.put(
+                &TrieKeySlice::from_key(&code_key(&address)),
+                &code,
+                &*trie_store,
+            );
+        }
+    }
+    root.save(&*trie_store, true);
+    let state_root = root.compute_hash(&*trie_store);
+    rustock_trie::TrieStore::put(
+        &*trie_store,
+        state_root.as_slice(),
+        &root.to_message(&*trie_store),
+    );
+
+    // number, gas limit, minimum gas price.
+    let words: Vec<&str> = head.split(' ').collect();
+    let number: u64 = words[0].parse().unwrap();
+    // The block before the head, which the BlockHeader contract reads as the
+    // one at depth 0. rskj's is regtest's genesis, and its coinbase is all
+    // that is asked for.
+    let parent = Header {
+        beneficiary: Address::repeat_byte(0x33),
+        ..test_header(number - 1)
+    };
+    state.store.put_header(&parent).unwrap();
+    let header = Header {
+        parent_hash: parent.hash(),
+        state_root,
+        gas_limit: words[1].parse().unwrap(),
+        minimum_gas_price: words[2].parse().unwrap(),
+        ..test_header(number)
+    };
+    let hash = header.hash();
+    state.store.put_header(&header).unwrap();
+    state.store.put_canonical_hash(header.number, hash).unwrap();
+    state.store.set_head(hash).unwrap();
+    state
+        .store
+        .put_total_difficulty(hash, U256::from(1))
+        .unwrap();
+
+    let mut config = RskHardforkConfig::rskj_regtest();
+    if name.ends_with("-before-rskip136") {
+        config = config.with_consensus_rule(ConsensusRule::Rskip136, None);
+    }
+    state.trie_store = Some(trie_store);
+    state.hardfork_cfg = Some(config);
+    // rskj's regtest has a federation of its own, which the Bridge answers
+    // with.
+    state.bridge_constants =
+        Some(rustock_execution::bridge::constants::BridgeConstants::rskj_regtest());
+    (state, tmp)
+}
+
+/// `eth_call` and `eth_estimateGas` answer as rskj's release answers them,
+/// request by request: `testdata/rskj_local_calls.txt` is that release's own
+/// server answering over a state it was given, and each scenario's state is
+/// rebuilt here.
+///
+/// Where rskj answers `-32603`, an exception nothing caught, the code is
+/// compared and the message is not: rskj's says "Internal server error" of
+/// every one of them, and this node's says what went wrong.
+///
+/// What used to differ, in more than half of these: a program that reverted
+/// was answered with its data as if it had returned it, where rskj answers
+/// an error of its own, with the reason; an estimate of a call that fails
+/// was refused, where rskj answers its cap; a sender short of the value it
+/// sends read as holding nothing, where rskj's holds less than nothing, and
+/// one that sends itself the value was left holding it; a call that names
+/// no sender ran from the zero address in every respect, where rskj's runs
+/// from an account of its own; a gas price of 2^128 or more was refused, and
+/// a value of 2^255 or more ran a program rskj can't start; and before
+/// RSKIP136 a precompile was held to gas rskj doesn't hold it to.
+///
+/// And of the estimates: the most a program had held was counted without the
+/// transaction's own cost, so a call that hands gas back was estimated at
+/// less than rskj estimates it; a refund was added to gas it had not been
+/// taken off; a creation inside a program, a DELEGATECALL of a program that
+/// was sent value, and a call inside a program that then failed each counted
+/// for what rskj doesn't count them for (the scenario `spend`).
+///
+/// And of a sender the value took below zero, called back within the call
+/// (the scenario `below`): it could call and create as if it held nothing,
+/// where rskj's can do neither, not even for a value of nothing, until it is
+/// paid what it lacks; and one that destroyed itself left what it lacked
+/// behind, where rskj's hands its beneficiary a balance below zero, which
+/// that account then lacks.
+#[tokio::test]
+async fn a_local_call_answers_as_rskj_answers_it() {
+    let text = include_str!("testdata/rskj_local_calls.txt");
+    let mut differing = Vec::new();
+    let mut asked = 0;
+    for scenario in text.split("\nscenario ").skip(1) {
+        let mut lines = scenario.lines();
+        let name = lines.next().unwrap();
+        let lines: Vec<&str> = lines.collect();
+        let head = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("head "))
+            .unwrap();
+        let accounts: Vec<&str> = lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("account "))
+            .collect();
+        let (state, _tmp) = setup_state_of_scenario(name, head, &accounts);
+        for call in lines.iter().filter_map(|line| line.strip_prefix("call ")) {
+            asked += 1;
+            let (request, answer) = call.split_once(" => ").unwrap();
+            let mut words = request.splitn(3, ' ');
+            let label = words.next().unwrap();
+            let method = words.next().unwrap();
+            let params: Value = serde_json::from_str(words.next().unwrap()).unwrap();
+            let theirs: Value = serde_json::from_str(answer).unwrap();
+            let ours = dispatch_for_test(&state, make_request(method, params)).await;
+            let mut ours = serde_json::to_value(&ours).unwrap();
+            let uncaught = json!(INTERNAL_ERROR);
+            if theirs["error"]["code"] == uncaught && ours["error"]["code"] == uncaught {
+                ours["error"]["message"] = theirs["error"]["message"].clone();
+            }
+            if ours != theirs {
+                differing.push(format!("{name} {label}:\n  rskj {theirs}\n  here {ours}"));
+            }
+        }
+    }
+    assert!(
+        differing.is_empty(),
+        "{} of {asked} answers differ:\n{}",
+        differing.len(),
+        differing.join("\n")
+    );
+    assert_eq!(asked, 451, "every request of the file was asked");
+}
+
+/// A sent transaction's defaults are rskj's
+/// (`TransactionArgumentsUtil.processArguments`): a gas price of 0, not the
+/// node's price, and the gas named as `gas`, else as `gasLimit`, else 90,000,
+/// not the head's whole gas limit.
+#[tokio::test]
+async fn a_sent_transactions_defaults_are_rskjs() {
+    let (mut state, _tmp) = setup_state_with_wallet();
+    state.gas_price = Some(Arc::new(FixedGasPrice(123_456_789, true)));
+    let from = format!("{:#x}", test_wallet().accounts()[0]);
+    for (fields, gas) in [
+        (json!({}), 90_000u64),
+        (json!({"gasLimit": "0x7530"}), 30_000),
+        (json!({"gas": "0x5208", "gasLimit": "0x7530"}), 21_000),
+    ] {
+        let mut request = json!({"from": from, "to": "0x00000000000000000000000000000000000000aa", "nonce": "0x0"});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let resp = dispatch_for_test(
+            &state,
+            make_request("eth_signTransaction", json!([request])),
+        )
+        .await;
+        let raw = resp
+            .result
+            .unwrap_or_else(|| panic!("{fields}: {:?}", resp.error));
+        let raw = hex::decode(raw.as_str().unwrap().trim_start_matches("0x")).unwrap();
+        use alloy_rlp::Decodable;
+        let tx = rustock_core::Transaction::decode(&mut raw.as_slice()).unwrap();
+        assert_eq!(tx.gas_price, U256::ZERO, "{fields}");
+        assert_eq!(tx.gas_limit, U256::from(gas), "{fields}");
+    }
+}
+
 /// `eth_getBlockBy*` with full transactions must name the real sender.
 ///
 /// It used to hardcode `from` to the zero address, so every transaction in
@@ -3775,13 +5618,24 @@ async fn a_block_with_full_transactions_names_the_real_sender() {
 
     for (method, arg) in [
         ("eth_getBlockByNumber", json!(["0x2a", true])),
-        ("eth_getBlockByHash", json!([format!("{:#x}", state.store.canonical_hash(42).unwrap().unwrap()), true])),
+        (
+            "eth_getBlockByHash",
+            json!([
+                format!("{:#x}", state.store.canonical_hash(42).unwrap().unwrap()),
+                true
+            ]),
+        ),
     ] {
         let resp = dispatch_for_test(&state, make_request(method, arg)).await;
         let block = resp.result.expect("the block must be returned");
-        let txs = block["transactions"].as_array().expect("full transaction objects");
+        let txs = block["transactions"]
+            .as_array()
+            .expect("full transaction objects");
         assert_eq!(txs.len(), 1, "{method}");
-        assert_eq!(txs[0]["from"], expected, "{method} reported the wrong sender");
+        assert_eq!(
+            txs[0]["from"], expected,
+            "{method} reported the wrong sender"
+        );
         assert_ne!(
             txs[0]["from"],
             json!("0x0000000000000000000000000000000000000000"),
@@ -3841,6 +5695,10 @@ async fn trace_transaction_renders_the_call_tree() {
     // The receipt's gas, not the frame's: rskj builds the top-level result
     // from `txInfo.getReceipt().getGasUsed()`.
     assert_eq!(top["result"]["gasUsed"], "0x9c40");
+    // And nothing else from the call: that result is a fresh, empty
+    // `ProgramResult` (`TraceTransformer.addTrace`), so a transaction's own
+    // trace has no output, whatever its call returned.
+    assert_eq!(top["result"]["output"], "0x");
     // A JSON number, because rskj's `blockNumber` is a Java `long`.
     assert_eq!(top["blockNumber"], json!(42));
     assert!(top["blockNumber"].is_number(), "blockNumber must not be a hex string");
@@ -3856,6 +5714,49 @@ async fn trace_transaction_renders_the_call_tree() {
         inner["result"]["output"].as_str().unwrap(),
         "0x000000000000000000000000000000000000000000000000000000000000002a"
     );
+}
+
+/// rskj builds a transaction's own trace from its receipt and a fresh, empty
+/// `ProgramResult` (`TraceTransformer.addTrace`): the gas the receipt names
+/// and no output, whatever the call returned. A creation's result is the
+/// code it left, which rskj takes from the trace (`trace.getResult()`).
+#[test]
+fn a_transactions_own_trace_carries_no_output() {
+    let call = rustock_core::Transaction {
+        nonce: 0,
+        gas_price: U256::ZERO,
+        gas_limit: U256::from(100_000),
+        to: Bytes::copy_from_slice(&[0xCC; 20]),
+        value: U256::ZERO,
+        input: Bytes::new(),
+        v: 0,
+        r: U256::ZERO,
+        s: U256::ZERO,
+        cached_rlp: None,
+    };
+    let creation = rustock_core::Transaction {
+        to: Bytes::new(),
+        ..call.clone()
+    };
+    let block = rustock_core::Block {
+        header: test_header(42),
+        transactions: vec![call, creation],
+        ommers: vec![],
+    };
+    // What the call returned, and what the creation left.
+    let trace = rustock_execution::tracer::ProgramTrace {
+        result: "2a".into(),
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    for index in 0..2 {
+        crate::trace::render_transaction(&mut out, &block, B256::ZERO, index, 21_000, &trace, 30);
+    }
+    assert_eq!(
+        out[0]["result"],
+        json!({"gasUsed": "0x5208", "output": "0x"})
+    );
+    assert_eq!(out[1]["result"]["code"], "0x2a");
 }
 
 /// `trace_block` accepts a hash or a block id, and returns the same traces.
@@ -3971,6 +5872,55 @@ async fn trace_filter_returns_the_range_and_enforces_its_limits() {
     )
     .await;
     assert!(too_many.error.unwrap().message.contains("Count value too big"));
+}
+
+/// **`trace_filter` stops at the head, as rskj's does, whatever `toBlock` says.**
+///
+/// rskj walks while `getBlockByNumber` finds a block. Walking every number up
+/// to a `toBlock` of 2^64 - 1 instead would be a request that never ends.
+#[tokio::test]
+async fn a_trace_range_reaching_the_top_of_the_number_space_stops_at_the_head() {
+    let (state, _tmp, _tx, _sender, _caller, _callee) = setup_state_for_tracing();
+    let top = "0xffffffffffffffff";
+
+    let to_the_head = dispatch_for_test(
+        &state,
+        make_request(
+            "trace_filter",
+            json!([{"fromBlock": "0x2a", "toBlock": "latest"}]),
+        ),
+    )
+    .await
+    .result
+    .expect("traces to the head");
+    assert!(
+        !to_the_head.as_array().unwrap().is_empty(),
+        "nothing to compare"
+    );
+
+    let to_the_top = answered_within_a_minute(
+        &state,
+        make_request(
+            "trace_filter",
+            json!([{"fromBlock": "0x2a", "toBlock": top}]),
+        ),
+    );
+    assert_eq!(to_the_top.result.expect("an answer"), to_the_head);
+
+    // Above the head there is nothing to trace: rskj finds no `fromBlock`.
+    let above = answered_within_a_minute(
+        &state,
+        make_request(
+            "trace_filter",
+            json!([{"fromBlock": "0xfffffffffffffff0", "toBlock": top}]),
+        ),
+    );
+    assert!(above
+        .result
+        .expect("an answer")
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 /// An unknown transaction is `null`, and the `trace_*` methods no longer
@@ -4230,6 +6180,7 @@ fn setup_state_with_varied_logs() -> (RpcState, tempfile::TempDir, Vec<Address>,
         proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -4943,6 +6894,57 @@ async fn hashrate_is_zero_without_a_miner_and_counts_only_our_blocks_with_one() 
     assert_eq!(none.result.unwrap(), json!("0x0"));
 }
 
+/// rskj's ownership test is `RskAddress.equals`: a block whose coinbase is
+/// empty was mined by the null address, which is no miner's, not even that of
+/// a node whose coinbase is the zero address.
+#[tokio::test]
+async fn hashrate_counts_no_block_with_an_empty_coinbase_as_ours() {
+    use alloy_primitives::Address;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Two blocks in the window, both of the zero address as the typed field
+    // reads it: the first's coinbase is empty, the second's twenty zeros.
+    let mut parent = B256::ZERO;
+    for number in 0u64..2 {
+        let header = Header {
+            parent_hash: parent,
+            timestamp: now - 60 + number,
+            difficulty: U256::from(3_600_000u64),
+            beneficiary: Address::ZERO,
+            kept: (number == 0).then(|| {
+                Box::new(rustock_core::types::header::KeptFields {
+                    null_coinbase: true,
+                    ..Default::default()
+                })
+            }),
+            ..test_header(number)
+        };
+        store.put_header(&header).unwrap();
+        store.put_canonical_hash(number, header.hash()).unwrap();
+        store
+            .put_total_difficulty(header.hash(), U256::from(1u64))
+            .unwrap();
+        store.put_body(header.hash(), &[], &[]).unwrap();
+        store.set_head(header.hash()).unwrap();
+        parent = header.hash();
+    }
+
+    // The network figure counts both; the zero address mined only the second.
+    let net = crate::eth::eth_net_hashrate(json!(1), &store);
+    assert_eq!(net.result.unwrap().as_u64().unwrap(), 7_200_000 / 3600);
+    let mine = crate::eth::eth_hashrate_for(json!(1), &store, Some(Address::ZERO));
+    assert_eq!(
+        mine.result.unwrap(),
+        json!(format!("0x{:x}", 3_600_000u64 / 3600))
+    );
+}
+
 /// Administrative methods are reported as unknown rather than forbidden, so a
 /// node without them looks the same as one that never had them.
 #[tokio::test]
@@ -4952,7 +6954,10 @@ async fn flush_and_shutdown_are_invisible_without_rpc_admin() {
     for method in ["rsk_flush", "rsk_shutdown"] {
         let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
         let err = resp.error.expect("must not be served");
-        assert_eq!(err.message, "Method not found", "{method} leaked its existence");
+        assert_eq!(
+            err.message, "method not found",
+            "{method} leaked its existence"
+        );
     }
 }
 
@@ -5168,16 +7173,31 @@ async fn test_signing_is_refused_for_an_account_the_wallet_does_not_hold() {
     let (state, _tmp) = setup_state_with_wallet();
     let stranger = "0x00000000000000000000000000000000000000ff";
 
-    for (method, params) in [
-        ("eth_sign", json!([stranger, "0xdeadbeef"])),
-        ("eth_signTransaction", json!([{"from": stranger}])),
-        ("eth_sendTransaction", json!([{"from": stranger}])),
+    // rskj's words for it: `EthModuleWalletEnabled.sign`, and
+    // `EthModuleTransactionBase.sendTransaction`.
+    let unknown = format!("Could not find account for address: {stranger}");
+    for (method, params, message) in [
+        (
+            "eth_sign",
+            json!([stranger, "0xdeadbeef"]),
+            "Account not found",
+        ),
+        (
+            "eth_signTransaction",
+            json!([{"from": stranger}]),
+            unknown.as_str(),
+        ),
+        (
+            "eth_sendTransaction",
+            json!([{"from": stranger}]),
+            unknown.as_str(),
+        ),
     ] {
         let resp = dispatch_for_test(&state, make_request(method, params)).await;
         assert!(resp.result.is_none(), "{method} must not sign for a stranger");
         let err = resp.error.expect("an error");
         assert_eq!(err.code, INVALID_PARAMS, "{method}");
-        assert!(err.message.contains("No key for"), "{method}: {}", err.message);
+        assert_eq!(err.message, message, "{method}");
     }
 }
 
@@ -5252,6 +7272,121 @@ async fn test_a_null_recipient_is_a_contract_creation() {
     use alloy_rlp::Decodable;
     let tx = rustock_core::Transaction::decode(&mut raw.as_slice()).unwrap();
     assert!(tx.to.is_empty(), "a creation has an empty recipient, not a zero address");
+}
+
+/// A pool in which every sender's next nonce is 7.
+struct SeventhNonce;
+
+impl crate::server::TxPoolReader for SeventhNonce {
+    fn get_pending_tx(
+        &self,
+        _: &alloy_primitives::B256,
+    ) -> Option<(rustock_core::Transaction, Address, alloy_primitives::B256)> {
+        None
+    }
+
+    fn pending_nonce(&self, _: &Address) -> Option<u64> {
+        Some(7)
+    }
+
+    fn pool_status(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
+    fn pool_content(&self) -> crate::server::PoolContent {
+        crate::server::PoolContent::default()
+    }
+
+    fn quota_report(&self, _: &Address) -> Option<(f64, u64)> {
+        None
+    }
+}
+
+/// A relay that takes every transaction, and names it by its hash.
+struct TakesEvery;
+
+#[async_trait::async_trait]
+impl crate::server::TxSubmitter for TakesEvery {
+    async fn submit_transaction(
+        &self,
+        raw: alloy_primitives::Bytes,
+    ) -> Result<alloy_primitives::B256, String> {
+        use sha3::Digest;
+        Ok(alloy_primitives::B256::from_slice(
+            &sha3::Keccak256::digest(&raw),
+        ))
+    }
+}
+
+/// The methods that sign, and the personal module, answer as rskj's release
+/// answers them, request by request: `testdata/rskj_wallet_methods.txt` is
+/// its own server's answers with its wallet off and on, and the transactions
+/// it signs.
+///
+/// What used to differ: a number written without its `0x` was read as hex
+/// where rskj reads a decimal, so that a value of "1000000000000000000" was
+/// signed as some 4,722 times that; a chain the arguments named went unread;
+/// `data` was read over `input`; a gas price of zero was written empty, which
+/// is another transaction than rskj's; and a malformed parameter was answered
+/// by the method, or as the wallet being off, where rskj refuses it first.
+#[tokio::test]
+async fn the_wallet_methods_answer_as_rskjs_release_answers() {
+    let key = secp256k1::SecretKey::from_byte_array([0x11; 32]).unwrap();
+    let wallet = crate::wallet::Wallet::from_keys([key]);
+    let held = format!("{:#x}", wallet.accounts()[0]);
+    let (off, _tmp_off) = setup_state();
+    let (mut on, _tmp_on) = setup_state();
+    on.wallet = Some(Arc::new(wallet));
+    on.hardfork_cfg = Some(rustock_execution::hardfork::RskHardforkConfig::all_active_parallel(33));
+    on.tx_pool = Some(Arc::new(SeventhNonce));
+    on.tx_submitter = Some(Arc::new(TakesEvery));
+
+    let mut lines = 0;
+    for line in include_str!("testdata/rskj_wallet_methods.txt").lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        lines += 1;
+        let line = line.replace("HELD", &held);
+        let (kind, rest) = line.split_once(' ').unwrap();
+        let (asked, answer) = rest.split_once(" => ").unwrap();
+        if kind == "signed" {
+            // `eth_signTransaction` gives the transaction, and
+            // `eth_sendTransaction` its hash.
+            let arguments: Value = serde_json::from_str(asked).unwrap();
+            let request = |method| make_request(method, json!([arguments]));
+            let signed = dispatch_for_test(&on, request("eth_signTransaction")).await;
+            let sent = dispatch_for_test(&on, request("eth_sendTransaction")).await;
+            match answer.split_once(" hash ") {
+                Some((raw, hash)) => {
+                    assert_eq!(signed.result, Some(json!(format!("0x{raw}"))), "{line}");
+                    assert_eq!(sent.result, Some(json!(hash)), "{line}");
+                }
+                None => {
+                    // A code, the message, and what rskj threw in brackets.
+                    let (code, message) = answer.split_once(' ').unwrap();
+                    let message = &message[..message.rfind(" [").unwrap()];
+                    let refusal = Some((code.parse::<i64>().unwrap(), message.to_string()));
+                    for resp in [signed, sent] {
+                        let error = resp.error.map(|error| (error.code, error.message));
+                        assert_eq!(error, refusal, "{line}");
+                    }
+                }
+            }
+            continue;
+        }
+        let state = match kind {
+            "off" => &off,
+            "on" => &on,
+            other => panic!("{other}"),
+        };
+        let (method, params) = asked.split_once(' ').unwrap();
+        let params: Value = serde_json::from_str(params).unwrap();
+        let answer: Value = serde_json::from_str(answer).unwrap();
+        let ours = dispatch_for_test(state, make_request(method, params)).await;
+        assert_eq!(serde_json::to_value(&ours).unwrap(), answer, "{line}");
+    }
+    assert_eq!(lines, 197, "every line of the file was asked");
 }
 
 /// Reading a key file is the only way a key gets in, so the parsing has
@@ -5689,7 +7824,7 @@ async fn estimate(state: &RpcState, from: Address, to: Address) -> u64 {
 /// - the single-pass estimator reports the limit at which it *behaves as it
 ///   did at the cap*.
 ///
-/// They part company over a CALL with a generous fixed allowance. RSK has no
+/// They part company over a CALL with a fixed allowance. RSK has no
 /// EIP-150 retention and `calleeGas = min(remaining, requested + stipend)`,
 /// so a CALL asking for 100,000 with 11,000 left does not fail -- the callee
 /// simply gets 11,000. The transaction therefore still succeeds at a limit
@@ -5699,14 +7834,22 @@ async fn estimate(state: &RpcState, from: Address, to: Address) -> u64 {
 /// else. The peak is the limit that preserves the observed behaviour.
 ///
 /// So what is required here is that the single-pass answer is *sufficient*
-/// and never below the search's, and that the two agree wherever no such
-/// allowance is in play.
+/// and never below the search's, and that it is above it by what the callee
+/// was handed and had no use for, and no more: the allowance, and for a call
+/// with value the 2,300 rskj adds on top of the stipend the peak already
+/// holds. (The callee here is a bare STOP.) rskj's release answers calls of
+/// this shape the same way: `testdata/rskj_local_calls.txt`, the scenario
+/// `spend`, `calls-fixed-plain-estimate` and `forwards-poor-5-estimate`.
 #[tokio::test]
 async fn the_exactimator_never_undercuts_binary_search() {
-    for (stipend, value, agree, what) in [
-        (100_000u64, 0u64, false, "a callee handed far more than it spends"),
-        (3_000, 0, true, "a callee handed roughly what it needs"),
-        (3_000, 1, true, "a value-bearing call, which carries the 2300 stipend"),
+    for (stipend, value, what) in [
+        (100_000u64, 0u64, "a callee handed far more than it spends"),
+        (3_000, 0, "a callee handed roughly what it needs"),
+        (
+            3_000,
+            1,
+            "a value-bearing call, which carries the 2300 stipend",
+        ),
     ] {
         let (fast_state, _t1, from, to) = setup_estimation_state(stipend, value, false);
         let (slow_state, _t2, _, _) = setup_estimation_state(stipend, value, true);
@@ -5719,9 +7862,12 @@ async fn the_exactimator_never_undercuts_binary_search() {
             "{what}: single pass said {fast}, below binary search's {slow} -- \
              an estimate that does not execute"
         );
-        if agree {
-            assert_eq!(fast, slow, "{what}: the two should agree here");
-        }
+        let unused = stipend + if value > 0 { 2_300 } else { 0 };
+        assert_eq!(
+            fast - slow,
+            unused,
+            "{what}: the gap is what the callee was handed and didn't use"
+        );
     }
 }
 
@@ -5734,8 +7880,8 @@ async fn the_exactimator_never_undercuts_binary_search() {
 /// had assumed the answer away and returned 21,001. Found by comparing it
 /// against the single-pass estimator, which answered 21,000.
 ///
-/// Unrelated to the refund overshoot in #334: that one is inherited from
-/// rskj's formula, this one was ours alone and is simply wrong.
+/// Unrelated to the refund overshoot in #334, which was the single pass's
+/// (`the_refund_is_not_added_to_what_was_spent`).
 #[tokio::test]
 async fn binary_search_finds_the_intrinsic_cost_exactly() {
     let (state, _tmp, from, _) = setup_estimation_state(0, 0, true);
@@ -5780,8 +7926,8 @@ async fn the_estimate_covers_the_allowance_a_call_asks_for() {
 /// A contract that clears a storage slot (earning a refund) and then calls
 /// out with `GAS` (handing over everything it has left). That lands on the
 /// `movedRemainingGasToChild` branch *and* has a refund, which is the
-/// combination where the two branches of rskj's formula disagree with each
-/// other about whether a refund belongs in an estimate.
+/// combination where a refund can be counted into an estimate that doesn't
+/// need it.
 fn setup_refund_state(binary_search: bool) -> (RpcState, tempfile::TempDir, Address, Address) {
     use rustock_trie::{account_key, code_key, storage_key, MemoryTrieStore, TrieKeySlice, TrieNode};
 
@@ -5839,38 +7985,28 @@ fn setup_refund_state(binary_search: bool) -> (RpcState, tempfile::TempDir, Addr
     (state, tmp, sender, caller)
 }
 
-/// rskj's formula adds the refund back on the `movedRemainingGasToChild`
-/// branch and not on the other, and this test pins the consequence: the
-/// estimate comes out `deductedRefund` higher than the limit the transaction
-/// actually needs -- here 40,089 against a demonstrated 26,726, which is the
-/// `gasUsed/2` refund cap, so 50% high.
+/// On the `movedRemainingGasToChild` branch rskj answers
+/// `gasUsed + deductedRefund`, and by the time it does, `gasUsed` is less the
+/// refund: `TransactionExecutor.localCallFinalization` sets it to what the
+/// transaction is charged. So the sum is what was spent before the refund,
+/// which is the limit the transaction needs, and binary search finds the
+/// same by executing there.
 ///
-/// Kept as an assertion rather than fixed, because it is rskj's behaviour and
-/// this estimator is meant to agree with rskj. See `docs/gas-estimation.md`
-/// §2 -- if the rskj side ever drops the `+ deductedRefund`, this test is the
-/// thing to update alongside.
-///
-/// Note the contrast with `the_estimate_covers_the_allowance_a_call_asks_for`:
-/// *that* divergence from binary search is a deliberate, minimal answer to a
-/// stricter question. This one buys nothing.
+/// rskj's release answers so: in `testdata/rskj_local_calls.txt`, the
+/// scenario `spend`, `sstores-calls-estimate` is 46,731, what its run spends,
+/// with a refund of 15,000 in it. This node took `gasUsed` for what was spent
+/// before the refund and added the refund to it, and came out half as high
+/// again here: 40,089. See `docs/gas-estimation.md` §2.
 #[tokio::test]
-async fn the_refund_branch_overshoots_by_the_refund() {
+async fn the_refund_is_not_added_to_what_was_spent() {
     let (fast_state, _t1, from, to) = setup_refund_state(false);
     let (slow_state, _t2, _, _) = setup_refund_state(true);
 
     let fast = estimate(&fast_state, from, to).await;
     let slow = estimate(&slow_state, from, to).await;
 
-    assert!(
-        fast > slow,
-        "fixture no longer reaches the refund branch: {fast} vs {slow}"
-    );
-    // The gap is exactly the refund, capped at half the gas used.
-    assert_eq!(
-        fast - slow,
-        slow / 2,
-        "the overshoot should be the capped refund and nothing else"
-    );
+    assert_eq!(fast, slow, "what was spent before the refund, and no more");
+    assert_eq!(fast, 26_726);
 }
 
 // ===== eth_getProof =====
@@ -6051,6 +8187,740 @@ async fn get_proof_rejects_a_missing_slot_array() {
     )
     .await;
     assert!(resp.error.is_some(), "the slot array is required, even when empty");
+}
+
+// ===== rsk_getStorageNodes =====
+
+/// The nodes a slot's answer carries hang from the block's state root, each
+/// a child of the one above it.
+fn assert_hangs_from(nodes: &Value, state_root: B256, trie_store: &dyn rustock_trie::TrieStore) {
+    use rustock_trie::TrieNode;
+
+    let parsed: Vec<TrieNode> = nodes
+        .as_array()
+        .expect("an array of nodes")
+        .iter()
+        .map(|n| hex::decode(n.as_str().unwrap().trim_start_matches("0x")).unwrap())
+        .map(|bytes| TrieNode::from_message(&bytes, trie_store))
+        .collect();
+    assert!(parsed.len() > 1, "the path should span more than one level");
+    assert_eq!(
+        parsed.last().unwrap().compute_hash(trie_store),
+        state_root,
+        "not the block's state root"
+    );
+    for pair in parsed.windows(2) {
+        let (child, parent) = (&pair[0], &pair[1]);
+        let message = child.to_message(trie_store);
+        let linked = [&parent.left, &parent.right].iter().any(|r| {
+            r.resolve(trie_store)
+                .is_some_and(|c| c.to_message(trie_store) == message)
+        });
+        assert!(
+            linked,
+            "a node on the path is not a child of the one above it"
+        );
+    }
+}
+
+/// What a light client makes of one slot's nodes, with nothing else in hand
+/// but the state root of a header it trusts: the nodes, each filed under its
+/// own hash, must start at that root and walk along the slot's key to its
+/// value, or to where the key leaves the trie. A node the answer leaves out
+/// fails the walk rather than reading as "not there".
+fn read_slot_as_a_light_client(
+    nodes: &Value,
+    state_root: B256,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, String> {
+    use rustock_trie::{MemoryTrieStore, TrieKeySlice, TrieNode, TrieStore};
+
+    let nodes: Vec<Vec<u8>> = nodes
+        .as_array()
+        .ok_or("no nodes")?
+        .iter()
+        .map(|n| {
+            hex::decode(n.as_str().unwrap_or_default().trim_start_matches("0x"))
+                .map_err(|e| e.to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let root = nodes.last().ok_or("no nodes")?;
+    if alloy_primitives::keccak256(root) != state_root {
+        return Err("the top node is not the header's state root".into());
+    }
+    let proof = MemoryTrieStore::new();
+    for node in &nodes {
+        TrieStore::put(&proof, alloy_primitives::keccak256(node).as_slice(), node);
+    }
+    let root = TrieNode::try_from_message(root, &proof).ok_or("the root does not parse")?;
+    root.try_get(&TrieKeySlice::from_key(key), &proof)
+        .map_err(|missing| format!("the answer leaves out node {missing:#x}"))
+}
+
+/// **A contract's current storage, read as a light client reads it.** The
+/// client trusts a block's hash and nothing the node says: it decodes the raw
+/// header the node sends, checks that it hashes to that block, takes the
+/// state root from it, and reads each slot from `rsk_getStorageNodes`'s nodes
+/// alone. The storage changes in the next block -- a slot rewritten, one
+/// cleared, one written for the first time -- and each block's answer proves
+/// that block's values. An answer missing a node proves nothing, and the
+/// earlier block's answer does not pass against the later block's root.
+#[tokio::test]
+async fn a_light_client_reads_a_contracts_storage_from_the_answer_alone() {
+    use rustock_trie::{storage_key, TrieKeySlice, TrieNode, TrieStore};
+
+    let (state, _tmp, addr, root_42) = setup_proof_state();
+    let trie_store = state.trie_store.clone().unwrap();
+    let key = |slot: u8| storage_key(&addr, &B256::with_last_byte(slot));
+    let hash_42 = state.store.head().unwrap().unwrap();
+
+    // Block 43: slot 1 rewritten (42 -> 43), slot 2 cleared, slot 3 written.
+    let at_42 = trie_store.get(root_42.as_slice()).unwrap();
+    let mut root = TrieNode::from_message(&at_42, &*trie_store)
+        .put(&TrieKeySlice::from_key(&key(1)), &[43], &*trie_store)
+        .delete(&TrieKeySlice::from_key(&key(2)), &*trie_store)
+        .put(&TrieKeySlice::from_key(&key(3)), &[7], &*trie_store);
+    root.save(&*trie_store, true);
+    let root_43 = root.compute_hash(&*trie_store);
+    TrieStore::put(
+        &*trie_store,
+        root_43.as_slice(),
+        &root.to_message(&*trie_store),
+    );
+    let header = Header {
+        parent_hash: hash_42,
+        state_root: root_43,
+        ..test_header(43)
+    };
+    let hash_43 = header.hash();
+    state.store.put_header(&header).unwrap();
+    state.store.put_canonical_hash(43, hash_43).unwrap();
+    state.store.set_head(hash_43).unwrap();
+
+    let mut answers = Vec::new();
+    for (block, trusted, want) in [
+        ("0x2a", hash_42, [Some(42u8), Some(99), None]),
+        ("0x2b", hash_43, [Some(43), None, Some(7)]),
+    ] {
+        let raw = dispatch_for_test(
+            &state,
+            make_request("rsk_getRawBlockHeaderByNumber", json!([block])),
+        )
+        .await
+        .result
+        .unwrap();
+        let raw = hex::decode(raw.as_str().unwrap().trim_start_matches("0x")).unwrap();
+        let header = Header::decode_with_hash(&mut raw.as_slice()).unwrap();
+        assert_eq!(
+            header.hash(),
+            trusted,
+            "block {block}: the header is the trusted block's"
+        );
+
+        let req = make_request(
+            "rsk_getStorageNodes",
+            json!([format!("{addr:#x}"), ["0x1", "0x2", "0x3"], block]),
+        );
+        let r = dispatch_for_test(&state, req).await.result.unwrap();
+        for (i, want) in want.iter().enumerate() {
+            let slot = i as u8 + 1;
+            assert_eq!(
+                read_slot_as_a_light_client(
+                    &r["storage"][i]["nodes"],
+                    header.state_root,
+                    &key(slot)
+                ),
+                Ok(want.map(|v| vec![v])),
+                "block {block}, slot {slot}"
+            );
+        }
+        answers.push((header.state_root, r));
+    }
+
+    let (root_43, now) = &answers[1];
+    // The node under the root: an interior node, so the root holds its hash
+    // rather than the node itself, as a small leaf's parent may.
+    let mut short = now["storage"][0]["nodes"].clone();
+    let nodes = short.as_array_mut().unwrap();
+    nodes.remove(nodes.len() - 2);
+    let missing = read_slot_as_a_light_client(&short, *root_43, &key(1));
+    assert!(
+        matches!(&missing, Err(why) if why.starts_with("the answer leaves out node")),
+        "an answer missing a node on the slot's path proves nothing, not absence: {missing:?}"
+    );
+    let before = &answers[0].1;
+    let stale = read_slot_as_a_light_client(&before["storage"][0]["nodes"], *root_43, &key(1));
+    assert_eq!(
+        stale,
+        Err("the top node is not the header's state root".to_string()),
+        "block 42's answer is not block 43's state"
+    );
+}
+
+/// A slot the state holds: present, its value, and its path.
+#[tokio::test]
+async fn storage_nodes_prove_a_slot_that_is_there() {
+    let (state, _tmp, addr, state_root) = setup_proof_state();
+    let trie_store = state.trie_store.clone().unwrap();
+    let req = make_request(
+        "rsk_getStorageNodes",
+        json!([format!("{addr:#x}"), ["0x1"], "latest"]),
+    );
+    let r = dispatch_for_test(&state, req).await.result.unwrap();
+
+    assert_eq!(
+        r["blockNumber"],
+        json!("0x2a"),
+        "the block the nodes hang from is named"
+    );
+    assert_eq!(r["stateRoot"], json!(format!("{state_root:#x}")));
+    let slot = &r["storage"][0];
+    assert_eq!(slot["present"], json!(true));
+    assert_eq!(slot["value"], json!("0x2a"), "42");
+    assert_hangs_from(&slot["nodes"], state_root, &*trie_store);
+}
+
+/// **A slot the state does not hold is proved absent**, not answered with
+/// nothing: on Rootstock that is also how a slot holding zero is proved, since
+/// a slot set to zero is deleted. `eth_getProof` keeps its empty array.
+#[tokio::test]
+async fn storage_nodes_prove_a_slot_that_is_not() {
+    let (state, _tmp, addr, state_root) = setup_proof_state();
+    let trie_store = state.trie_store.clone().unwrap();
+    let req = make_request(
+        "rsk_getStorageNodes",
+        json!([format!("{addr:#x}"), ["0x3"], "latest"]),
+    );
+    let r = dispatch_for_test(&state, req).await.result.unwrap();
+
+    let slot = &r["storage"][0];
+    assert_eq!(slot["present"], json!(false));
+    assert_eq!(slot["value"], json!("0x0"));
+    assert_hangs_from(&slot["nodes"], state_root, &*trie_store);
+
+    let req = make_request(
+        "eth_getProof",
+        json!([format!("{addr:#x}"), ["0x3"], "latest"]),
+    );
+    let r = dispatch_for_test(&state, req).await.result.unwrap();
+    assert_eq!(
+        r["storageProof"][0]["proof"].as_array().unwrap().len(),
+        0,
+        "eth_getProof still answers an absent slot with an empty array"
+    );
+}
+
+// ===== rsk_getBlockNumberByHash, rsk_getRawBlocks =====
+
+/// Testnet #8,260,761 in full, as rustock's testnet node took it with its
+/// block, which rskj hashes to 0x9a1cfe09...0d47 (core's `V2_FULL`).
+const TESTNET_FULL: &str = concat!(
+    "f9029ba0285f7c3513c466f54fde5f1b73b2d93b35374515472192250bd3a56396dc649ea01dcc4de8dec75d7aab85b5",
+    "67b6ccd41ad312451b948a7413f0a142fd40d4934794b774aa2876145b2f6f3de27e5e6ac970aa12d771a04aa4b67c3e",
+    "30508692f13e9e10758d907e7d851234cd6cd00d65aa49e5a1ac44a0f40c99e8151d350e30309fa0a74234c365961aa0",
+    "81ad18e51a4281c513ec76d0a066cfdb731f620cd96e2c2cb0f7d3c3a2879c29b40014aa27efbbf3cf9cd3b0f6b90100",
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "00000000000000000000000000000000844edfab4b837e0c998400b71b0080846aec1a5c92d1018f564554495645522d",
+    "3733316239643880835a74cf8080028080b8507111010000000000000000000000000000000000000000000000000000",
+    "00000000000000135534881310aada94b2b5867af37e4e2fc48be028c35beeaa7f1dc4cf501e825d1aec6affff0f1d0d",
+    "16caea80b85800000000000003c09e1ed89b4ab8f092a3dc3a4b852db4552dfd95136f298514ba947d076032a8f20bbe",
+    "a052534b424c4f434b3a6e7fa68f56e3bc6085e7e02e325250f1c72ad9eef1a0d7693e516e10007e0c9900000000",
+);
+
+/// The same header compressed, as rskj sends a chain's headers to its peers
+/// (core's `V2_COMPRESSED`).
+const TESTNET_COMPRESSED: &str = concat!(
+    "f901b9a0285f7c3513c466f54fde5f1b73b2d93b35374515472192250bd3a56396dc649ea01dcc4de8dec75d7aab85b5",
+    "67b6ccd41ad312451b948a7413f0a142fd40d4934794b774aa2876145b2f6f3de27e5e6ac970aa12d771a04aa4b67c3e",
+    "30508692f13e9e10758d907e7d851234cd6cd00d65aa49e5a1ac44a0f40c99e8151d350e30309fa0a74234c365961aa0",
+    "81ad18e51a4281c513ec76d0a066cfdb731f620cd96e2c2cb0f7d3c3a2879c29b40014aa27efbbf3cf9cd3b0f6a3e202",
+    "a09aca8469839f117b1a26abbdea244a32cb0833e387cf6af9dc13eb336094d3c2844edfab4b837e0c998400b71b0080",
+    "846aec1a5c92d1018f564554495645522d3733316239643880835a74cf8080b850711101000000000000000000000000",
+    "000000000000000000000000000000000000000000135534881310aada94b2b5867af37e4e2fc48be028c35beeaa7f1d",
+    "c4cf501e825d1aec6affff0f1d0d16caea80b85800000000000003c09e1ed89b4ab8f092a3dc3a4b852db4552dfd9513",
+    "6f298514ba947d076032a8f20bbea052534b424c4f434b3a6e7fa68f56e3bc6085e7e02e325250f1c72ad9eef1a0d769",
+    "3e516e10007e0c9900000000",
+);
+
+/// Testnet #8,260,720 as rskj's peers sent it to rustock's testnet node,
+/// compressed (core's `V2_FROM_PEERS`).
+const TESTNET_FROM_PEERS: &str = concat!(
+    "f901f9a00bdcd28d517b22bc7b65bf669b05924ac8ba8a862ccb4b17d619fdbd8b9789f8a01dcc4de8dec75d7aab85b5",
+    "67b6ccd41ad312451b948a7413f0a142fd40d4934794ad418c1d48780005f6d847ef0a5e3bd93ea09090a0c545101cc3",
+    "df462f9c369b22f722ec66ade0f031b528512f12fceca574d0ecc8a01db2709b879ae45385439bc35bc1ce8e821de8ae",
+    "b4a4e8ec9c94cf9f3dc55f7ea01ddfe2c6ff70e83e21bc8a905eb71278aab2fc921dd08543c20451a2ccbf286da3e202",
+    "a03c015999cbb7ab1fdb80e23b658a251e424af79a99262579f2fd59bd50fddc78844f476ad3837e0c708400b71b0082",
+    "e8f8846aec16be92d1018f564554495645522d37333162396438855a76a29740835a5a088080b85000000020785e2a8b",
+    "51231a7478b788a2427a2a4c190c0f4e418e25c4ca0c000000000000ba37f569d2f87d917d83e79d50af85497b7d35f0",
+    "ebe4e7c57ddd76e80fb58dfca130ec6af0ff0f1a007dc5fa80b8910000000000000080f880b614920083ca51e27b69b7",
+    "d6dba5262da24a347487e62e8406463eb94d6a6088ac0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999",
+    "dfa36953755c690689799962b48bebd836974e8cf900000000000000002a6a52534b424c4f434b3a3d8461c1058c9db8",
+    "352ad0c0b7e56a1ba4fcac4da0d7693e516ef40a007e0c7000000000",
+);
+
+/// A header as testnet's nodes read one in `form`.
+fn testnet_header_in(hex: &str, form: rustock_core::types::header::HeaderForm) -> Header {
+    let bytes = hex::decode(hex).unwrap();
+    Header::decode_with_hash_in(&mut bytes.as_slice(), &ActivationHeights::testnet(), form).unwrap()
+}
+
+/// A header as testnet's blocks carry one: in full.
+fn testnet_header(hex: &str) -> Header {
+    testnet_header_in(hex, rustock_core::types::header::HeaderForm::Full)
+}
+
+/// A header as rskj's peers send a chain's headers: compressed.
+fn testnet_header_compressed(hex: &str) -> Header {
+    testnet_header_in(hex, rustock_core::types::header::HeaderForm::Compressed)
+}
+
+/// A header in full, as hex.
+fn in_full(header: &Header) -> String {
+    use alloy_rlp::Encodable;
+    let mut out = Vec::new();
+    header.encode(&mut out);
+    hex::encode(out)
+}
+
+/// Puts `header` on the chain this node follows, and gives its hash.
+fn follow(store: &BlockStore, header: &Header) -> B256 {
+    let hash = header.hash();
+    store.put_header(header).unwrap();
+    store.put_canonical_hash(header.number, hash).unwrap();
+    hash
+}
+
+/// Puts `build(number)` for each of `numbers` on the chain this node follows,
+/// each naming the one before, and gives their hashes.
+fn follow_run(
+    store: &BlockStore,
+    numbers: std::ops::RangeInclusive<u64>,
+    build: impl Fn(u64) -> Header,
+) -> Vec<B256> {
+    let mut parent_hash = B256::repeat_byte(0x11);
+    numbers
+        .map(|number| {
+            parent_hash = follow(
+                store,
+                &Header {
+                    parent_hash,
+                    ..build(number)
+                },
+            );
+            parent_hash
+        })
+        .collect()
+}
+
+/// `rsk_getRawBlocks(from, to)`'s answer.
+async fn raw_blocks(state: &RpcState, from: &str, to: &str) -> JsonRpcResponse {
+    dispatch_for_test(state, make_request("rsk_getRawBlocks", json!([from, to]))).await
+}
+
+/// The blocks an answer of `rsk_getRawBlocks` gives: each header and its
+/// uncles, as hex.
+fn blocks_of(response: JsonRpcResponse) -> Vec<(String, Vec<String>)> {
+    let hex = |v: &Value| v.as_str().unwrap().strip_prefix("0x").unwrap().to_string();
+    response
+        .result
+        .expect("an answer")
+        .as_array()
+        .expect("an array of blocks")
+        .iter()
+        .map(|block| {
+            (
+                hex(&block["header"]),
+                block["uncles"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(hex)
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// The code of an error, if the answer is one.
+fn refused(response: JsonRpcResponse) -> Option<i64> {
+    response.error.map(|e| e.code)
+}
+
+/// A block's number on the chain this node follows, and on that chain alone.
+#[tokio::test]
+async fn block_number_by_hash_answers_for_the_chain_followed_alone() {
+    let (state, _tmp) = setup_state();
+    let number = |hash: String| {
+        dispatch_for_test(
+            &state,
+            make_request("rsk_getBlockNumberByHash", json!([hash])),
+        )
+    };
+    let head = state.store.head().unwrap().unwrap();
+    assert_eq!(
+        number(format!("{head:#x}")).await.result,
+        Some(json!("0x2a"))
+    );
+
+    // A block held only on a fork has none, nor has one not held.
+    let fork = Header {
+        extra_data: Bytes::from_static(b"fork"),
+        ..test_header(42)
+    };
+    state.store.put_header(&fork).unwrap();
+    assert_eq!(
+        number(format!("{:#x}", fork.hash())).await.result,
+        Some(Value::Null)
+    );
+    let unheld = B256::repeat_byte(7);
+    assert_eq!(
+        number(format!("{unheld:#x}")).await.result,
+        Some(Value::Null)
+    );
+
+    // A hash is 32 bytes.
+    assert_eq!(refused(number("0x2a".into()).await), Some(INVALID_PARAMS));
+}
+
+/// Blocks `from` to `to` oldest first, or as many from `from` as the chain
+/// holds; a version-0 header has one form.
+#[tokio::test]
+async fn raw_blocks_give_a_run_of_the_chain_oldest_first() {
+    let (state, _tmp) = setup_state();
+    follow_run(&state.store, 100..=104, test_header);
+    let run: Vec<(String, Vec<String>)> = (100..=104)
+        .map(|number| {
+            let hash = state.store.canonical_hash(number).unwrap().unwrap();
+            let header = state.store.header(hash).unwrap().unwrap();
+            assert_eq!(
+                header.encode_compressed(),
+                hex::decode(in_full(&header)).unwrap()
+            );
+            (in_full(&header), Vec::new())
+        })
+        .collect();
+    assert_eq!(blocks_of(raw_blocks(&state, "0x64", "0x68").await), run);
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x65", "0x66").await),
+        run[1..3]
+    );
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x68", "0x68").await),
+        run[4..]
+    );
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x66", "0x70").await),
+        run[2..]
+    );
+    assert!(blocks_of(raw_blocks(&state, "0x69", "0x70").await).is_empty());
+    assert!(blocks_of(raw_blocks(&state, "0x68", "0x67").await).is_empty());
+}
+
+/// **A testnet header comes compressed**, as rskj sends a chain's headers to
+/// its peers: one held in full is compressed, one held compressed comes as
+/// held.
+#[tokio::test]
+async fn a_testnet_block_comes_with_its_header_compressed() {
+    let (state, _tmp) = setup_testnet_state();
+    follow(&state.store, &testnet_header(TESTNET_FULL));
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x7e0c99", "0x7e0c99").await),
+        vec![(TESTNET_COMPRESSED.to_string(), Vec::new())]
+    );
+    follow(&state.store, &testnet_header_compressed(TESTNET_FROM_PEERS));
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x7e0c70", "0x7e0c70").await),
+        vec![(TESTNET_FROM_PEERS.to_string(), Vec::new())]
+    );
+}
+
+/// **Uncles come in full**, the form their block's uncles hash covers, from
+/// the block's body or, once that is gone, from the freezer.
+#[tokio::test]
+async fn raw_blocks_carry_uncles_in_full_from_the_body_or_the_freezer() {
+    use rustock_execution::processor::compute_ommers_hash;
+
+    // A testnet node's store, which reads a testnet uncle as testnet's
+    // nodes do.
+    let (state, _tmp) = setup_testnet_state();
+    let testnet = testnet_header(TESTNET_FULL);
+    let other = Header {
+        extra_data: Bytes::from_static(b"an uncle"),
+        ..test_header(99)
+    };
+    let uncles = |number: u64| match number {
+        101 => vec![testnet.clone()],
+        102 => vec![other.clone()],
+        _ => Vec::new(),
+    };
+    let hashes = follow_run(&state.store, 100..=102, |number| Header {
+        ommers_hash: compute_ommers_hash(&uncles(number)),
+        ..test_header(number)
+    });
+    state.store.put_body(hashes[1], &[], &uncles(101)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let freezer = Arc::new(rustock_storage::freezer::Freezer::open(dir.path()).unwrap());
+    freezer.put_uncles(102, &uncles(102)).unwrap();
+    state.store.set_freezer(freezer);
+
+    let blocks = blocks_of(raw_blocks(&state, "0x64", "0x66").await);
+    let carried: Vec<Vec<String>> = blocks.into_iter().map(|(_, uncles)| uncles).collect();
+    assert_eq!(
+        carried,
+        vec![
+            Vec::new(),
+            vec![TESTNET_FULL.to_string()],
+            vec![in_full(&other)]
+        ]
+    );
+}
+
+/// **What comes is one run of the chain held whole**: the answer stops before
+/// a block whose uncles the node doesn't hold, or holds only compressed, before
+/// a gap, and before a block that doesn't follow the one before it.
+#[tokio::test]
+async fn raw_blocks_stop_before_a_block_not_held_whole_or_not_following() {
+    use rustock_execution::processor::compute_ommers_hash;
+
+    let compressed = testnet_header_compressed(TESTNET_FROM_PEERS);
+    let naming = |at: u64, uncles: Vec<Header>| {
+        move |number: u64| Header {
+            ommers_hash: if number == at {
+                compute_ommers_hash(&uncles)
+            } else {
+                test_header(number).ommers_hash
+            },
+            ..test_header(number)
+        }
+    };
+
+    // #102 names uncles that the node doesn't hold.
+    let (state, _tmp) = setup_state();
+    follow_run(
+        &state.store,
+        100..=104,
+        naming(102, vec![compressed.clone()]),
+    );
+    assert_eq!(blocks_of(raw_blocks(&state, "0x64", "0x68").await).len(), 2);
+    assert!(blocks_of(raw_blocks(&state, "0x66", "0x68").await).is_empty());
+
+    // It holds them only compressed, as no block carries an uncle: a store
+    // reading them as a testnet node's does.
+    let (state, _tmp) = setup_testnet_state();
+    let hashes = follow_run(
+        &state.store,
+        100..=104,
+        naming(102, vec![compressed.clone()]),
+    );
+    state
+        .store
+        .put_body(hashes[2], &[], std::slice::from_ref(&compressed))
+        .unwrap();
+    assert_eq!(blocks_of(raw_blocks(&state, "0x64", "0x68").await).len(), 2);
+
+    // A gap: the node doesn't follow any block at #102.
+    let (state, _tmp) = setup_state();
+    let hashes = follow_run(&state.store, 100..=101, test_header);
+    let gap = Header {
+        parent_hash: hashes[1],
+        ..test_header(102)
+    };
+    state.store.put_header(&gap).unwrap();
+    let after = Header {
+        parent_hash: gap.hash(),
+        ..test_header(103)
+    };
+    follow(&state.store, &after);
+    assert_eq!(blocks_of(raw_blocks(&state, "0x64", "0x67").await).len(), 2);
+
+    // The chain moved at #102 while the answer was read.
+    let (state, _tmp) = setup_state();
+    follow_run(&state.store, 100..=103, test_header);
+    follow(
+        &state.store,
+        &Header {
+            parent_hash: B256::repeat_byte(0x33),
+            ..test_header(102)
+        },
+    );
+    assert_eq!(blocks_of(raw_blocks(&state, "0x64", "0x67").await).len(), 2);
+    assert_eq!(blocks_of(raw_blocks(&state, "0x66", "0x67").await).len(), 1);
+}
+
+/// At most a thousand blocks at a time, named as hex quantities.
+#[tokio::test]
+async fn raw_blocks_take_at_most_a_thousand_blocks_named_in_hex() {
+    let (state, _tmp) = setup_state();
+    follow_run(&state.store, 0..=1000, test_header);
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x0", "0x3e7").await).len(),
+        1000
+    );
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x1", "0x3e8").await).len(),
+        1000
+    );
+    assert_eq!(
+        refused(raw_blocks(&state, "0x0", "0x3e8").await),
+        Some(INVALID_PARAMS)
+    );
+    for (from, to) in [
+        ("100", "0x1"),
+        ("0x", "0x1"),
+        ("0xg", "0x1"),
+        ("0x+1", "0x2"),
+        ("0x1", "2"),
+    ] {
+        assert_eq!(
+            refused(raw_blocks(&state, from, to).await),
+            Some(INVALID_PARAMS),
+            "{from} {to}"
+        );
+    }
+    let alone = make_request("rsk_getRawBlocks", json!(["0x1"]));
+    assert_eq!(
+        refused(dispatch_for_test(&state, alone).await),
+        Some(INVALID_PARAMS)
+    );
+}
+
+// ===== rsk_getStateNodes =====
+
+/// `rsk_getStateNodes(hash, keys)`'s answer.
+async fn state_nodes(state: &RpcState, hash: B256, keys: &[Vec<u8>]) -> JsonRpcResponse {
+    let keys: Vec<String> = keys
+        .iter()
+        .map(|key| format!("0x{}", hex::encode(key)))
+        .collect();
+    dispatch_for_test(
+        state,
+        make_request("rsk_getStateNodes", json!([format!("{hash:#x}"), keys])),
+    )
+    .await
+}
+
+/// For each key, the walk along it from the block's state root: the code's
+/// ends at the code, and a slot's, held or not, is the walk
+/// `rsk_getStorageNodes` gives.
+#[tokio::test]
+async fn state_nodes_walk_each_key_from_the_blocks_state_root() {
+    use rustock_trie::{code_key, storage_key, TrieNode};
+
+    let (state, _tmp, addr, state_root) = setup_proof_state();
+    let trie_store = state.trie_store.clone().unwrap();
+    let head = state.store.head().unwrap().unwrap();
+    let keys = [
+        code_key(&addr),
+        storage_key(&addr, &B256::with_last_byte(1)),
+        storage_key(&addr, &B256::with_last_byte(3)),
+    ];
+    let walks = state_nodes(&state, head, &keys).await.result.unwrap();
+    let walks = walks.as_array().unwrap();
+    assert_eq!(walks.len(), 3);
+    for walk in walks {
+        assert_hangs_from(walk, state_root, &*trie_store);
+    }
+    let deepest = hex::decode(walks[0][0].as_str().unwrap().trim_start_matches("0x")).unwrap();
+    assert_eq!(
+        TrieNode::from_message(&deepest, &*trie_store).value,
+        Some(vec![0x60, 0x00, 0x60, 0x00])
+    );
+    for (walk, slot) in walks[1..].iter().zip(["0x1", "0x3"]) {
+        let req = make_request(
+            "rsk_getStorageNodes",
+            json!([format!("{addr:#x}"), [slot], "latest"]),
+        );
+        let r = dispatch_for_test(&state, req).await.result.unwrap();
+        assert_eq!(walk, &r["storage"][0]["nodes"], "slot {slot}");
+    }
+}
+
+/// Null where the node doesn't hold the block, or the state at its state
+/// root, or any state at all.
+#[tokio::test]
+async fn state_nodes_are_null_where_the_state_isnt_held() {
+    let (mut state, _tmp, addr, _) = setup_proof_state();
+    let keys = [rustock_trie::code_key(&addr)];
+    assert_eq!(
+        state_nodes(&state, B256::repeat_byte(7), &keys)
+            .await
+            .result,
+        Some(Value::Null)
+    );
+    let elsewhere = Header {
+        state_root: B256::repeat_byte(9),
+        ..test_header(43)
+    };
+    state.store.put_header(&elsewhere).unwrap();
+    assert_eq!(
+        state_nodes(&state, elsewhere.hash(), &keys).await.result,
+        Some(Value::Null)
+    );
+    let head = state.store.head().unwrap().unwrap();
+    state.trie_store = None;
+    assert_eq!(
+        state_nodes(&state, head, &keys).await.result,
+        Some(Value::Null)
+    );
+}
+
+/// **An incomplete state is an error, never an absence**: a walk it can't
+/// finish proves nothing either way.
+#[tokio::test]
+async fn state_nodes_are_an_error_where_the_state_is_incomplete() {
+    let (mut state, _tmp, addr, state_root) = setup_proof_state();
+    let whole = state.trie_store.clone().unwrap();
+    let partial = Arc::new(rustock_trie::MemoryTrieStore::new());
+    let root = whole.get(state_root.as_slice()).unwrap();
+    rustock_trie::TrieStore::put(&*partial, state_root.as_slice(), &root);
+    state.trie_store = Some(partial);
+    let head = state.store.head().unwrap().unwrap();
+    let error = state_nodes(&state, head, &[rustock_trie::code_key(&addr)])
+        .await
+        .error
+        .unwrap();
+    assert_eq!(error.code, INTERNAL_ERROR);
+    assert!(error.message.contains("incomplete"), "{}", error.message);
+}
+
+/// At most 64 keys at a time, each of at most 128 bytes, as `0x` hex.
+#[tokio::test]
+async fn state_nodes_take_at_most_64_keys_of_at_most_128_bytes() {
+    let (state, _tmp, _, _) = setup_proof_state();
+    let head = state.store.head().unwrap().unwrap();
+    let most = state_nodes(&state, head, &vec![vec![0xab; 128]; 64]).await;
+    assert_eq!(most.result.unwrap().as_array().unwrap().len(), 64);
+    assert_eq!(
+        refused(state_nodes(&state, head, &vec![vec![0xab]; 65]).await),
+        Some(INVALID_PARAMS)
+    );
+    assert_eq!(
+        refused(state_nodes(&state, head, &[vec![0xab; 129]]).await),
+        Some(INVALID_PARAMS)
+    );
+    for keys in [
+        json!(["0x123"]),
+        json!(["12"]),
+        json!(["0xzz"]),
+        json!([12]),
+        json!("0x12"),
+    ] {
+        let req = make_request("rsk_getStateNodes", json!([format!("{head:#x}"), keys]));
+        assert_eq!(
+            refused(dispatch_for_test(&state, req).await),
+            Some(INVALID_PARAMS),
+            "{keys}"
+        );
+    }
+    let unnamed = make_request("rsk_getStateNodes", json!(["0x12", ["0x12"]]));
+    assert_eq!(
+        refused(dispatch_for_test(&state, unnamed).await),
+        Some(INVALID_PARAMS)
+    );
 }
 
 // ===== A transaction whose block stopped being canonical (#343) =====
@@ -6375,6 +9245,7 @@ mod witness_search_tests {
             proof_fetcher: None,
             trie_store: Some(trie as Arc<dyn TrieStore>),
             hardfork_cfg: None,
+            bridge_constants: None,
             filter_store: Arc::new(crate::logs::FilterStore::new()),
             tx_pool: None,
             wire_queue_depth: None,

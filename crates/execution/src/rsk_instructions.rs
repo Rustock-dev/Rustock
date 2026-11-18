@@ -49,6 +49,13 @@ const BALANCE_GAS: u64 = 400;
 /// is always active for RSK eras). Mirrors revm's TANGERINE+ static gas.
 const SUICIDE_STATIC_GAS: u64 = 5000;
 
+/// rskj `OpCodes.OP_DUPN`, `OP_SWAPN` and `OP_TXINDEX`: RSK's own opcodes,
+/// which RSKIP191 (iris300) removed. Not revm's `DUPN` and `SWAPN` (EIP-8024,
+/// 0xe6 and 0xe7), which rskj doesn't have.
+const RSK_DUPN: u8 = 0xa8;
+const RSK_SWAPN: u8 = 0xa9;
+const RSK_TXINDEX: u8 = 0xaa;
+
 thread_local! {
     /// Addresses for which EXTCODESIZE must report `2^256-1` (rskj RSKIP90:
     /// `VM.doCODESIZE` returns `DataWord.MAX_VALUE` for any active precompile).
@@ -59,26 +66,65 @@ thread_local! {
     /// (rskj `VM.doEXTCODEHASH` precompile branch). Set by `install`.
     static EXTCODEHASH_PRECOMPILES: core::cell::RefCell<Vec<Address>> =
         const { core::cell::RefCell::new(Vec::new()) };
+    /// RSKIP169: whether EXTCODEHASH answers a contract whose code key holds
+    /// nothing with `keccak256("")` (`getCodeHashStandard`), or with 0 as
+    /// before it (`getCodeHashNonStandard`). Set by `install`.
+    static EXTCODEHASH_STANDARD: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+    /// RSKIP150's absence: rskj adds a call's stipend to the gas it asks for
+    /// as a plain `long`, which a request near 2^63 takes below zero (see
+    /// `rsk_callee_gas`). Set by `install`.
+    static STIPEND_SUM_WRAPS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     /// The block's real miner address (`header.getCoinbase()`), pushed by the
     /// COINBASE opcode. rustock sets `block.beneficiary = REMASC_ADDR` so revm
     /// routes gas fees to REMASC; that would make COINBASE return REMASC, but
     /// rskj's `OpCode.COINBASE` returns the actual miner. Set by `install`.
     static REAL_COINBASE: core::cell::Cell<Address> =
         const { core::cell::Cell::new(Address::ZERO) };
+    /// The block's gas limit and minimum gas price, whole, which GASLIMIT and
+    /// BASEFEE push. rskj's program holds each in a `DataWord`
+    /// (`ProgramInvokeImpl`), where revm's block holds a `u64`. Set by
+    /// `install`.
+    static GAS_LIMIT: core::cell::Cell<U256> = const { core::cell::Cell::new(U256::ZERO) };
+    static MINIMUM_GAS_PRICE: core::cell::Cell<U256> =
+        const { core::cell::Cell::new(U256::ZERO) };
     /// Whether [`install`] has run on *this* thread.
     ///
-    /// The three entries above are consensus configuration living in
-    /// thread-local storage, and an unset one reads as a perfectly plausible
-    /// value: no precompile gets RSKIP90's `EXTCODESIZE`, no precompile gets
-    /// the empty-code `EXTCODEHASH`, and `COINBASE` pushes `0x0`. When
-    /// RSKIP-144 sublists began running on worker threads, configuring on one
-    /// thread and executing on another would have produced a state root no
-    /// other node reaches, with nothing failing to compile and no test
-    /// noticing.
+    /// The entries above are consensus configuration living in thread-local
+    /// storage, and an unset one reads as a perfectly plausible value: no
+    /// precompile gets RSKIP90's `EXTCODESIZE`, no precompile gets the
+    /// empty-code `EXTCODEHASH`, and `COINBASE`, `GASLIMIT` and `BASEFEE`
+    /// push `0x0`. When RSKIP-144 sublists began running on worker threads,
+    /// configuring on one thread and executing on another would have
+    /// produced a state root no other node reaches, with nothing failing to
+    /// compile and no test noticing.
     ///
     /// So the rule is that an EVM is configured on the thread that will use
     /// it, and this is what lets the rule be checked instead of trusted.
     static CONFIGURED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// What the block's header gives the opcodes that read it, as rskj's
+/// program holds it (`ProgramInvokeImpl`).
+#[derive(Clone, Copy, Debug)]
+pub struct BlockWords {
+    /// COINBASE's: the block's real miner (see `REAL_COINBASE`).
+    pub coinbase: Address,
+    /// GASLIMIT's: the gas limit's whole value.
+    pub gas_limit: U256,
+    /// BASEFEE's: the minimum gas price's whole value.
+    pub minimum_gas_price: U256,
+}
+
+impl BlockWords {
+    /// The words `header` gives. Past 32 bytes no program runs at all (see
+    /// `env::header_fits_program_invoke`), so none needs more.
+    pub fn of(header: &rustock_core::Header) -> Self {
+        Self {
+            coinbase: header.beneficiary,
+            gas_limit: header.gas_limit,
+            minimum_gas_price: header.minimum_gas_price,
+        }
+    }
 }
 
 /// Whether this thread has had an instruction table installed on it.
@@ -99,27 +145,61 @@ fn assert_configured(what: &str) {
     );
 }
 
+thread_local! {
+    /// The index in its block of the transaction being executed, which
+    /// TXINDEX pushes before RSKIP191. rskj counts a block's transactions
+    /// from 0 (`BlockExecutor.executeInternal`), and a call a transaction
+    /// makes sees the transaction's index (`ProgramInvokeFactoryImpl` passes
+    /// it on). [`install`] sets it to 0, and a block sets each transaction's
+    /// with [`set_transaction_index`].
+    static TX_INDEX: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Sets the index TXINDEX pushes for the transaction about to run on this
+/// thread: its place in its block, counted from 0. See `TX_INDEX`.
+pub fn set_transaction_index(index: u64) {
+    TX_INDEX.with(|i| i.set(index));
+}
+
 /// Install the rskj-semantics CALL family into an instruction table.
 ///
 /// `extcodehash_enabled` reflects RSKIP140 (papyrus): the spec is PETERSBURG
 /// from wasabi on (for the RSKIP120 shift opcodes and RSKIP125 CREATE2), but
 /// EXTCODEHASH only activates at papyrus — so before that it must throw an
 /// invalid-opcode exception (consuming all gas), matching rskj's VM.
+///
+/// `extcodehash_standard` is RSKIP169 (iris300): from it EXTCODEHASH answers a
+/// contract whose code key holds nothing as any account without code.
+///
+/// `dupn_swapn_txindex_enabled` is RSKIP191's absence: before iris300 rskj
+/// runs RSK's own DUPN, SWAPN and TXINDEX.
+///
+/// `staticcall_takes_value` is RSKIP103's absence: before orchid060 rskj's
+/// STATICCALL takes a value as CALL does ([`rsk_static_call_with_value`]).
+///
+/// `stipend_sum_wraps` is RSKIP150's absence: before twoToThree rskj adds a
+/// call's stipend to the gas it asks for as a plain `long` (`rsk_callee_gas`).
+///
+/// `block` is what the block's header gives COINBASE, GASLIMIT and BASEFEE.
 pub fn install<WIRE, HOST>(
     instructions: &mut EthInstructions<WIRE, HOST>,
     extcodehash_enabled: bool,
+    extcodehash_standard: bool,
     istanbul_opcodes_enabled: bool,
     push0_enabled: bool,
     basefee_enabled: bool,
     staticcall_enabled: bool,
+    staticcall_takes_value: bool,
+    stipend_sum_wraps: bool,
     transient_storage_enabled: bool,
     mcopy_enabled: bool,
+    dupn_swapn_txindex_enabled: bool,
     extcodesize_max_precompiles: &[Address],
     extcodehash_precompiles: &[Address],
-    real_coinbase: Address,
+    block: BlockWords,
 ) where
     WIRE: InterpreterTypes,
-    HOST: Host,
+    HOST: Host + ContractMarker + BeneficiaryTouch + LocalCallWords,
 {
     // RSKIP446 (lovell700): transient storage TLOAD/TSTORE (0x5c/0x5d,
     // EIP-1153, rskj `GasCost.TLOAD`/`TSTORE` = 100 each). RSKIP445 (lovell700):
@@ -180,6 +260,7 @@ pub fn install<WIRE, HOST>(
         // active precompiles to `keccak256("")` — see `rsk_extcodehash`.
         EXTCODEHASH_PRECOMPILES
             .with(|p| *p.borrow_mut() = extcodehash_precompiles.to_vec());
+        EXTCODEHASH_STANDARD.set(extcodehash_standard);
         instructions.insert_instruction(
             opcode::EXTCODEHASH,
             Instruction::new(rsk_extcodehash::<WIRE, HOST>, 400),
@@ -199,9 +280,10 @@ pub fn install<WIRE, HOST>(
             Instruction::new(rsk_selfbalance::<WIRE, HOST>, 5),
         );
     } else {
-        // Pre-papyrus rskj throws invalid-opcode (all frame gas consumed);
-        // revm's spec-checked impls would halt NotActivated returning the
-        // remaining gas instead.
+        // Pre-papyrus rskj throws invalid-opcode (all frame gas consumed).
+        // revm's spec-checked impls would halt NotActivated, which spends the
+        // frame's gas too; the invalid-opcode handler halts as for any other
+        // opcode a height doesn't have (OpcodeNotFound).
         instructions.insert_instruction(
             opcode::CHAINID,
             Instruction::new(invalid_opcode::<WIRE, HOST>, 0),
@@ -218,9 +300,11 @@ pub fn install<WIRE, HOST>(
     // charge the bumped Istanbul prices. Pin both back to rskj's `GasCost.SLOAD`
     // (200) and `GasCost.BALANCE` (400). Pre-Istanbul specs already use these
     // values, so the override is a no-op there; at SHANGHAI (lovell700+) it also
-    // corrects the same EIP-1884 over-charge. The instruction bodies are revm's
-    // own pre-Berlin SLOAD/BALANCE (RSK never reaches Berlin), which charge
-    // everything via the static gas we set here. (Mainnet #6,223,700.)
+    // corrects the same EIP-1884 over-charge. SLOAD's body is revm's own, which
+    // before Berlin (RSK never reaches it) charges everything via the static
+    // gas we set here. BALANCE's is `rsk_balance`, which reads the account as
+    // revm's does, at the same static gas, and makes the word rskj makes of the
+    // balance. (Mainnet #6,223,700.)
     instructions.insert_instruction(
         opcode::SLOAD,
         Instruction::new(
@@ -230,10 +314,13 @@ pub fn install<WIRE, HOST>(
     );
     instructions.insert_instruction(
         opcode::BALANCE,
-        Instruction::new(
-            revm::interpreter::instructions::host::balance::<WIRE, HOST>,
-            BALANCE_GAS,
-        ),
+        Instruction::new(rsk_balance::<WIRE, HOST>, BALANCE_GAS),
+    );
+    // GASPRICE at rskj's BASE tier, 2, as revm's: `rsk_gasprice` pushes a
+    // local call's price whole.
+    instructions.insert_instruction(
+        opcode::GASPRICE,
+        Instruction::new(rsk_gasprice::<WIRE, HOST>, 2),
     );
 
     // rskj `VM.doSSTORE` keeps Petersburg metering forever (SET=20000,
@@ -281,18 +368,22 @@ pub fn install<WIRE, HOST>(
         opcode::DELEGATECALL,
         Instruction::new(rsk_delegate_call::<WIRE, HOST>, CALL_STATIC_GAS),
     );
+    STIPEND_SUM_WRAPS.with(|w| w.set(stipend_sum_wraps));
     // RSKIP91 (orchid, mainnet #729,000) introduced STATICCALL. rskj's
     // `VM.java` OP_STATICCALL throws `invalidOpCode` (consuming the frame's
     // gas) while RSKIP91 is inactive; rustock maps Genesis to BYZANTIUM, where
     // revm already provides the opcode, so before orchid it must be replaced
     // with the invalid-opcode handler -- same pattern as EXTCODEHASH before
-    // papyrus.
+    // papyrus. Until RSKIP103 (orchid060, mainnet #1,052,700) it takes a
+    // value.
     instructions.insert_instruction(
         opcode::STATICCALL,
-        if staticcall_enabled {
-            Instruction::new(rsk_static_call::<WIRE, HOST>, CALL_STATIC_GAS)
-        } else {
+        if !staticcall_enabled {
             Instruction::new(invalid_opcode::<WIRE, HOST>, 0)
+        } else if staticcall_takes_value {
+            Instruction::new(rsk_static_call_with_value::<WIRE, HOST>, CALL_STATIC_GAS)
+        } else {
+            Instruction::new(rsk_static_call::<WIRE, HOST>, CALL_STATIC_GAS)
         },
     );
     instructions.insert_instruction(
@@ -303,12 +394,39 @@ pub fn install<WIRE, HOST>(
     // rskj `OpCode.COINBASE` returns the block's real miner; rustock keeps
     // `block.beneficiary = REMASC_ADDR` (for gas-fee routing) so the default
     // COINBASE would return REMASC. Push the real coinbase instead.
-    REAL_COINBASE.with(|c| c.set(real_coinbase));
+    REAL_COINBASE.with(|c| c.set(block.coinbase));
+    // GASLIMIT and BASEFEE push the whole values, which revm's block cuts to
+    // a `u64` (see `GAS_LIMIT`).
+    GAS_LIMIT.with(|c| c.set(block.gas_limit));
+    MINIMUM_GAS_PRICE.with(|c| c.set(block.minimum_gas_price));
     CONFIGURED.with(|c| c.set(true));
     instructions.insert_instruction(
         opcode::COINBASE,
         Instruction::new(rsk_coinbase::<WIRE, HOST>, 2),
     );
+    instructions.insert_instruction(
+        opcode::GASLIMIT,
+        Instruction::new(rsk_gaslimit::<WIRE, HOST>, 2),
+    );
+
+    // RSK's own opcodes, which RSKIP191 (iris300) removed. Before it rskj's VM
+    // runs DUPN (VERY_LOW, 3 gas), SWAPN (3) and TXINDEX (BASE, 2); from it
+    // rskj throws invalid-opcode, as revm does for a byte it has no opcode
+    // for. Installed either way, so that the table says which at every
+    // height. An EVM built for one call runs TXINDEX as rskj runs a call
+    // outside a block, at index 0 (`ReversibleTransactionExecutor`); a block
+    // sets each transaction's with `set_transaction_index`.
+    TX_INDEX.with(|i| i.set(0));
+    if dupn_swapn_txindex_enabled {
+        instructions.insert_instruction(RSK_DUPN, Instruction::new(rsk_dupn::<WIRE, HOST>, 3));
+        instructions.insert_instruction(RSK_SWAPN, Instruction::new(rsk_swapn::<WIRE, HOST>, 3));
+        instructions
+            .insert_instruction(RSK_TXINDEX, Instruction::new(rsk_txindex::<WIRE, HOST>, 2));
+    } else {
+        for op in [RSK_DUPN, RSK_SWAPN, RSK_TXINDEX] {
+            instructions.insert_instruction(op, Instruction::new(invalid_opcode::<WIRE, HOST>, 0));
+        }
+    }
 
     // Divergence-hunt diagnostic (env-gated, temporary): log pc/op/gas for
     // EVERY opcode. The wrapper re-dispatches to the default PETERSBURG
@@ -320,6 +438,8 @@ pub fn install<WIRE, HOST>(
         PUSH0_ENABLED.with(|f| f.set(push0_enabled));
         BASEFEE_ENABLED.with(|f| f.set(basefee_enabled));
         STATICCALL_ENABLED.with(|f| f.set(staticcall_enabled));
+        STATICCALL_TAKES_VALUE.with(|f| f.set(staticcall_takes_value));
+        DUPN_SWAPN_TXINDEX_ENABLED.with(|f| f.set(dupn_swapn_txindex_enabled));
         let default_table = revm::interpreter::instructions::instruction_table_gas_changes_spec::<
             WIRE,
             HOST,
@@ -336,6 +456,8 @@ pub fn install<WIRE, HOST>(
                 opcode::SELFBALANCE if istanbul_opcodes_enabled => 5,
                 opcode::PUSH0 if push0_enabled => 2,
                 opcode::BASEFEE if basefee_enabled => 2,
+                RSK_DUPN | RSK_SWAPN if dupn_swapn_txindex_enabled => 3,
+                RSK_TXINDEX if dupn_swapn_txindex_enabled => 2,
                 _ => default_table[op as usize].static_gas(),
             };
             instructions.insert_instruction(
@@ -384,13 +506,50 @@ pub(crate) const KECCAK_EMPTY: B256 = B256::new([
     0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
 ]);
 
+/// Whether a word that names an address holds more than one: a bit set above
+/// the address's 20 bytes. rskj looks for a precompile with the whole word
+/// (`PrecompiledContracts.getContractForAddress` compares it with each
+/// precompile's, in `VM.doCALL`, `doCODESIZE` and `doEXTCODEHASH`), where all
+/// else it reads of an address takes the word's last 20 bytes
+/// (`RskAddress(DataWord)`). Such a word names the account at those 20 bytes,
+/// never a precompile.
+fn past_an_address(word: U256) -> bool {
+    word.bit_len() > 160
+}
+
+thread_local! {
+    /// Whether the word that named the callee of the call a frame asks for
+    /// was [`past_an_address`]: set by each call opcode as it asks, taken
+    /// by the handler as it opens the frame.
+    static CALLEE_PAST_AN_ADDRESS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// A call opcode asks for its frame, its callee named by a word
+/// [`past_an_address`] or not.
+fn ask_for_call(past_an_address: bool) {
+    CALLEE_PAST_AN_ADDRESS.with(|past| past.set(past_an_address));
+}
+
+/// Whether the call whose frame is about to open had its callee named by a
+/// word [`past_an_address`]; what any other frame reads after it is `false`.
+pub(crate) fn take_callee_past_an_address() -> bool {
+    CALLEE_PAST_AN_ADDRESS.with(|past| past.replace(false))
+}
+
 /// EXTCODEHASH with rskj's `VM.doEXTCODEHASH` / `getCodeHashStandard`
 /// semantics, which key on TRIE EXISTENCE (RSK never adopted EIP-161/1052
 /// emptiness):
-///   - active precompile  -> `keccak256("")` (rskj special-cases precompiles);
+///   - active precompile  -> `keccak256("")` (rskj special-cases precompiles),
+///     named by its address alone: a word [`past_an_address`] names the
+///     account, whatever its last 20 bytes;
 ///   - account absent from the trie -> `0`;
 ///   - account present but not a contract (no code) -> `keccak256("")`;
-///   - contract -> its code hash.
+///   - contract -> its code hash. One whose code key holds nothing answers
+///     `keccak256("")` from RSKIP169 (`getCodeHashStandard`) and `0` before
+///     it (`getCodeHashNonStandard`), which needs [`ContractMarker`]. Before
+///     it too, one whose empty code a creation in the block saved answers
+///     `keccak256("")`, the hash of the empty value the block's cache holds
+///     for the key ([`ContractMarker::code_saved_in_block`]).
 ///
 /// revm's stock EXTCODEHASH instead returns `0` whenever `AccountInfo::is_empty()`
 /// (EIP-161: balance==0 && nonce==0 && no code), so an existing-but-empty
@@ -400,7 +559,7 @@ pub(crate) const KECCAK_EMPTY: B256 = B256::new([
 /// host's flag (`true` only when `Database::basic` returned `None`, i.e. the
 /// trie has no node — see the HOMESTEAD journal pin in `RskHandler`), which is
 /// exactly rskj's `isExist`.
-fn rsk_extcodehash<WIRE: InterpreterTypes, H: Host + ?Sized>(
+fn rsk_extcodehash<WIRE: InterpreterTypes, H: Host + ContractMarker + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
     let Some(([], top)) = context.interpreter.stack.popn_top::<0>() else {
@@ -410,7 +569,7 @@ fn rsk_extcodehash<WIRE: InterpreterTypes, H: Host + ?Sized>(
     let addr = Address::from_word(B256::from(*top));
 
     assert_configured("EXTCODEHASH_PRECOMPILES");
-    if EXTCODEHASH_PRECOMPILES.with(|p| p.borrow().contains(&addr)) {
+    if !past_an_address(*top) && EXTCODEHASH_PRECOMPILES.with(|p| p.borrow().contains(&addr)) {
         *top = KECCAK_EMPTY.into();
         return;
     }
@@ -419,16 +578,275 @@ fn rsk_extcodehash<WIRE: InterpreterTypes, H: Host + ?Sized>(
         context.interpreter.halt_fatal();
         return;
     };
-    // `is_empty` is the host's trie-existence flag (rskj `isExist`): absent ->
-    // 0; present-but-codeless -> keccak256(""); contract -> its code hash.
-    let result = if load.is_empty {
+    // `is_empty` is the host's trie-existence flag (rskj `isExist`).
+    let exists = !load.is_empty;
+    let code_hash = load.account.code_hash;
+    let codeless = load.account.is_empty_code_hash() || code_hash.is_zero();
+    let result = if !exists {
         B256::ZERO
-    } else if load.account.is_empty_code_hash() || load.account.code_hash.is_zero() {
+    } else if !codeless {
+        code_hash
+    } else if EXTCODEHASH_STANDARD.get() || context.host.code_saved_in_block(addr) {
         KECCAK_EMPTY
     } else {
-        load.account.code_hash
+        match context.host.holds_contract_marker(addr) {
+            Some(true) => B256::ZERO,
+            Some(false) => KECCAK_EMPTY,
+            None => {
+                context.interpreter.halt_fatal();
+                return;
+            }
+        }
     };
     *top = result.into();
+}
+
+/// What EXTCODEHASH asks before RSKIP169 that revm's `Host` can't answer:
+/// whether an account is a contract as rskj's `isContract` reads it, by the
+/// storage-prefix marker `setupContract` writes.
+pub trait ContractMarker {
+    /// Whether `address` holds the marker. `None` where the state couldn't be
+    /// read, the error left in the context as revm's own loads leave it.
+    fn holds_contract_marker(&mut self, address: Address) -> Option<bool>;
+
+    /// Whether a creation in this block saved the code of `address`, empty
+    /// or not. rskj's block repository keeps what the block's transactions
+    /// write in a cache until the block ends (`RepositoryLocator
+    /// .startTrackingAt`, `MutableTrieCache`), where the code key of such a
+    /// contract holds the code saved, and an empty value hashes to
+    /// `keccak256("")` (`MutableTrieCache.getValueHash`). A contract whose
+    /// constructor is still running has the marker and no code yet.
+    fn code_saved_in_block(&self, address: Address) -> bool;
+}
+
+type RskDb = revm::database::WrapDatabaseRef<crate::database::RskDatabase>;
+
+/// The executor's context. The marker is a creation's of this transaction
+/// (the journal), of the block's earlier ones (the chain slot, which also
+/// knows what they destroyed, marker and all), or else the parent state's.
+impl<BLOCK, TX, CFG, LOCAL> ContractMarker
+    for revm::Context<
+        BLOCK,
+        TX,
+        CFG,
+        RskDb,
+        revm::context::Journal<RskDb>,
+        crate::raw_storage::RskChainExt,
+        LOCAL,
+    >
+where
+    LOCAL: revm::context_interface::LocalContextTr,
+{
+    fn holds_contract_marker(&mut self, address: Address) -> Option<bool> {
+        let created_now = self
+            .journaled_state
+            .inner
+            .state
+            .get(&address)
+            .is_some_and(|account| account.is_created_locally());
+        if created_now || self.chain.created_in_block.contains(&address) {
+            return Some(true);
+        }
+        if self.chain.deleted_in_block.contains(&address) {
+            return Some(false);
+        }
+        match self
+            .journaled_state
+            .database
+            .0
+            .has_contract_marker(&address)
+        {
+            Ok(holds) => Some(holds),
+            Err(e) => {
+                self.error = Err(revm::context_interface::ContextError::Db(e));
+                None
+            }
+        }
+    }
+
+    fn code_saved_in_block(&self, address: Address) -> bool {
+        self.chain.code_saved.contains(&address)
+    }
+}
+
+/// What SELFDESTRUCT asks that revm's `Host` can't do: leave the beneficiary
+/// as it was. revm's journal touches it whatever the destroyed account held,
+/// and under RSK's frontier account rules a touch creates an account that
+/// wasn't there.
+pub trait BeneficiaryTouch {
+    /// Whether `address` is touched already, so that touching it again changes
+    /// nothing.
+    fn is_touched(&self, address: Address) -> bool;
+
+    /// Takes back the touch that the SELFDESTRUCT which has just run gave
+    /// `beneficiary`: the account's flag, and the journal's entry for it.
+    fn take_back_touch(&mut self, beneficiary: Address);
+}
+
+impl<BLOCK, TX, CFG, LOCAL> BeneficiaryTouch
+    for revm::Context<
+        BLOCK,
+        TX,
+        CFG,
+        RskDb,
+        revm::context::Journal<RskDb>,
+        crate::raw_storage::RskChainExt,
+        LOCAL,
+    >
+where
+    LOCAL: revm::context_interface::LocalContextTr,
+{
+    fn is_touched(&self, address: Address) -> bool {
+        self.journaled_state
+            .inner
+            .state
+            .get(&address)
+            .is_some_and(|account| account.is_touched())
+    }
+
+    fn take_back_touch(&mut self, beneficiary: Address) {
+        let journal = &mut self.journaled_state.inner;
+        if let Some(account) = journal.state.get_mut(&beneficiary) {
+            account.unmark_touch();
+        }
+        // revm's `JournalInner::selfdestruct` journals the touch and then the
+        // destruction, so the touch is the last entry but one. It goes too:
+        // the sublists' write sets are read from these entries, and rskj
+        // only reads this account (`isExist`, for the gas).
+        let touch = journal.journal.len().checked_sub(2).filter(|&at| {
+            matches!(
+                journal.journal[at],
+                revm::context::JournalEntry::AccountTouched { address } if address == beneficiary
+            )
+        });
+        debug_assert!(
+            touch.is_some(),
+            "SELFDESTRUCT journals its touch of {beneficiary}"
+        );
+        if let Some(at) = touch {
+            journal.journal.remove(at);
+        }
+    }
+}
+
+/// What BALANCE, SELFBALANCE, GASPRICE and SELFDESTRUCT ask of a local call
+/// (`eth_call`, `eth_estimateGas`) that revm's `Host` can't tell them: rskj
+/// holds a balance with its sign and a gas price at any width.
+pub trait LocalCallWords {
+    /// What `address` owes: what a local call took its balance below zero by
+    /// (`RskChainExt::debts`), and nothing for any other account.
+    fn owed_by(&self, address: Address) -> U256;
+
+    /// `address` is about to destroy itself, naming `beneficiary`: it pays
+    /// what it owes out of what it holds, and what it still owes becomes the
+    /// beneficiary's ([`hand_on_debt`]). Whether anything was handed on.
+    fn hand_on_debt(&mut self, address: Address, beneficiary: Address) -> bool;
+
+    /// The gas price of a local call, where revm's transaction can't hold it
+    /// (`RskChainExt::whole_gas_price`).
+    fn whole_gas_price(&self) -> Option<U256>;
+}
+
+impl<BLOCK, TX, CFG, LOCAL> LocalCallWords
+    for revm::Context<
+        BLOCK,
+        TX,
+        CFG,
+        RskDb,
+        revm::context::Journal<RskDb>,
+        crate::raw_storage::RskChainExt,
+        LOCAL,
+    >
+where
+    LOCAL: revm::context_interface::LocalContextTr,
+{
+    fn owed_by(&self, address: Address) -> U256 {
+        self.chain.debts.of(address)
+    }
+
+    fn hand_on_debt(&mut self, address: Address, beneficiary: Address) -> bool {
+        let journal = &mut self.journaled_state.inner;
+        hand_on_debt(
+            &mut journal.state,
+            &mut journal.journal,
+            &mut self.chain,
+            address,
+            beneficiary,
+        )
+    }
+
+    fn whole_gas_price(&self) -> Option<U256> {
+        self.chain.whole_gas_price
+    }
+}
+
+/// What rskj's `Program.suicide` does with a balance below zero, which only a
+/// local call can leave an account with (`RskChainExt::debts`). It moves it
+/// to the beneficiary like any balance that isn't zero, so the beneficiary's
+/// falls by it, and makes an internal transaction of it; where the account
+/// names itself, it brings the balance to zero.
+///
+/// So before SELFDESTRUCT moves what `address` holds, the account pays what
+/// it owes out of that. What it still owes is the beneficiary's to owe from
+/// here, nobody's where it names itself, and counts as the internal
+/// transaction, which the nothing it has left to move won't. Whether
+/// anything was handed on: the beneficiary is an account from then on,
+/// whatever it was before.
+pub(crate) fn hand_on_debt(
+    state: &mut revm::state::EvmState,
+    journal: &mut Vec<revm::context::JournalEntry>,
+    chain: &mut crate::raw_storage::RskChainExt,
+    address: Address,
+    beneficiary: Address,
+) -> bool {
+    let Some(account) = state.get_mut(&address) else {
+        return false;
+    };
+    let owed = chain.debts.take(address);
+    let held = account.info.balance;
+    let paid = held.min(owed);
+    if !paid.is_zero() {
+        account.info.balance = held - paid;
+        journal.push(revm::context::JournalEntry::BalanceChange {
+            address,
+            old_balance: held,
+        });
+    }
+    let left = owed - paid;
+    if left.is_zero() {
+        return false;
+    }
+    if beneficiary != address {
+        chain.debts.add(beneficiary, left);
+    }
+    chain.internal_txs.count();
+    true
+}
+
+/// The word rskj's `Program.getBalance` makes of a balance: `DataWord.valueOf`
+/// of `Coin.getBytes()`, which is `BigInteger.toByteArray`, the two's
+/// complement in the fewest bytes, set at the low end of the word. So a
+/// balance below zero reads as those bytes do without their sign: 255 for -1,
+/// 0xff7f for -129. One of 2^255 or more takes a sign byte, a 33rd, and
+/// `valueOf` throws, as it does below -2^255: `None`, and the program fails.
+///
+/// `held` is what the journal holds for the account and `owed` what the
+/// account owes ([`LocalCallWords::owed_by`]); the balance is the one less the
+/// other. On the chain nothing is owed and no account holds 2^255, so the
+/// word is the balance.
+pub(crate) fn balance_word(held: U256, owed: U256) -> Option<U256> {
+    if held >= owed {
+        let balance = held - owed;
+        return (balance.bit_len() < 256).then_some(balance);
+    }
+    let below = owed - held;
+    // The fewest bytes whose two's complement holds `-below`.
+    let bytes = (below - U256::from(1)).bit_len() / 8 + 1;
+    match bytes {
+        33.. => None,
+        32 => Some(below.wrapping_neg()),
+        _ => Some((U256::from(1) << (8 * bytes)) - below),
+    }
 }
 
 /// CHAINID without revm's ISTANBUL spec check (RSKIP152 activates it at
@@ -453,14 +871,15 @@ fn rsk_push0<WIRE: InterpreterTypes, H: Host + ?Sized>(
 }
 
 /// BASEFEE (RSKIP412, arrowhead600) without revm's LONDON spec check: pushes
-/// the block's base fee, which in rustock carries RSK's `minimumGasPrice`
-/// (`env.rs`: `basefee: header.minimum_gas_price`). rskj `VM.doBASEFEE` pushes
-/// `program.getMinimumGasPrice()` verbatim. Static gas (2, BASE_TIER) comes
-/// from the instruction table entry installed in `install`.
+/// the block's minimum gas price, whole. rskj `VM.doBASEFEE` pushes
+/// `program.getMinimumGasPrice()`, a `DataWord`, where revm's block holds a
+/// `u64`. Static gas (2, BASE_TIER) comes from the instruction table entry
+/// installed in `install`.
 fn rsk_basefee<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
-    if !context.interpreter.stack.push(U256::from(context.host.basefee())) {
+    assert_configured("MINIMUM_GAS_PRICE");
+    if !context.interpreter.stack.push(MINIMUM_GAS_PRICE.with(|c| c.get())) {
         context.interpreter.halt_overflow();
     }
 }
@@ -555,15 +974,139 @@ fn rsk_coinbase<WIRE: InterpreterTypes, H: Host + ?Sized>(
     }
 }
 
-/// SELFBALANCE without revm's ISTANBUL spec check (RSKIP151, papyrus200).
-fn rsk_selfbalance<WIRE: InterpreterTypes, H: Host + ?Sized>(
+/// GASLIMIT pushing the block's gas limit whole. rskj `VM.doGASLIMIT` pushes
+/// `program.getGasLimit()`, a `DataWord` of the header's bytes, where
+/// revm's block holds the limit as gas, a `u64`. See `GAS_LIMIT`.
+fn rsk_gaslimit<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
-    let Some(balance) = context.host.balance(context.interpreter.input.target_address()) else {
+    assert_configured("GAS_LIMIT");
+    if !context.interpreter.stack.push(GAS_LIMIT.with(|c| c.get())) {
+        context.interpreter.halt_overflow();
+    }
+}
+
+/// DUPN (before RSKIP191), rskj `VM.doDUPN`: pops a depth `d` and pushes a
+/// copy of the item `d + 1` from the top, so DUPN of 0 is DUP1, then steps
+/// over the next byte. A depth the stack doesn't reach throws
+/// (`Program.verifyStackSize`, or `DataWord.intValueCheck` from 2^31), which
+/// spends all of the frame's gas.
+fn rsk_dupn<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    let Some([depth]) = context.interpreter.stack.popn::<1>() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    // At least 1, which `dup` requires.
+    let item = depth.saturating_to::<usize>().checked_add(1);
+    if !item.is_some_and(|n| context.interpreter.stack.dup(n)) {
+        context.interpreter.halt_underflow();
+        return;
+    }
+    step_over_next_byte(context.interpreter);
+}
+
+/// SWAPN (before RSKIP191), rskj `VM.doSWAPN`: pops a depth `d` and swaps the
+/// top with the item `d + 2` from the top, so SWAPN of 0 is SWAP1. It fails
+/// as DUPN does, and steps over the next byte in the same way.
+fn rsk_swapn<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    let Some([depth]) = context.interpreter.stack.popn::<1>() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    // `exchange(0, m)` swaps the top with the item `m` below it; `m` is at
+    // least 1, which it requires.
+    let below = depth.saturating_to::<usize>().checked_add(1);
+    if !below.is_some_and(|m| context.interpreter.stack.exchange(0, m)) {
+        context.interpreter.halt_underflow();
+        return;
+    }
+    step_over_next_byte(context.interpreter);
+}
+
+/// rskj's second `program.step()` in `doDUPN` and `doSWAPN`: the counter
+/// moves past the byte after the opcode, which never runs, though a jump may
+/// still land on it (`Program.computeJumpDests` skips only PUSH data, as
+/// revm's analysis does). Where that takes the counter past the code,
+/// rskj's `Program.setPC` stops the program. revm pads code with as little
+/// as one STOP and reads the next opcode unchecked, so the stop is made here
+/// rather than by stepping off the end.
+fn step_over_next_byte<WIRE: InterpreterTypes>(
+    interpreter: &mut revm::interpreter::Interpreter<WIRE>,
+) {
+    use revm::interpreter::interpreter_types::{Jumps, LegacyBytecode};
+    // revm stepped past the opcode itself before running it.
+    if interpreter.bytecode.pc() + 1 >= interpreter.bytecode.bytecode_len() {
+        interpreter.halt(InstructionResult::Stop);
+    } else {
+        interpreter.bytecode.relative_jump(1);
+    }
+}
+
+/// TXINDEX (before RSKIP191), rskj `VM.doTXINDEX`: pushes the index in its
+/// block of the transaction being executed. See `TX_INDEX`.
+fn rsk_txindex<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    assert_configured("TX_INDEX");
+    let index = TX_INDEX.with(|i| i.get());
+    if !context.interpreter.stack.push(U256::from(index)) {
+        context.interpreter.halt_overflow();
+    }
+}
+
+/// SELFBALANCE without revm's ISTANBUL spec check (RSKIP151, papyrus200),
+/// pushing the word rskj makes of the balance ([`balance_word`]).
+fn rsk_selfbalance<WIRE: InterpreterTypes, H: Host + LocalCallWords + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    let address = context.interpreter.input.target_address();
+    let Some(balance) = context.host.balance(address) else {
         context.interpreter.halt_fatal();
         return;
     };
-    if !context.interpreter.stack.push(balance.data) {
+    let Some(word) = balance_word(balance.data, context.host.owed_by(address)) else {
+        context.interpreter.halt(InstructionResult::OutOfGas);
+        return;
+    };
+    if !context.interpreter.stack.push(word) {
+        context.interpreter.halt_overflow();
+    }
+}
+
+/// BALANCE, pushing the word rskj makes of the balance ([`balance_word`]).
+/// The account is read as revm's BALANCE reads one before Berlin, and the
+/// instruction's static gas is all it costs (see `install`).
+fn rsk_balance<WIRE: InterpreterTypes, H: Host + LocalCallWords + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    let address = {
+        let Some(([], top)) = context.interpreter.stack.popn_top::<0>() else {
+            context.interpreter.halt_underflow();
+            return;
+        };
+        Address::from_word(B256::from(*top))
+    };
+    let Some(balance) = context.host.balance(address) else {
+        context.interpreter.halt_fatal();
+        return;
+    };
+    let Some(word) = balance_word(balance.data, context.host.owed_by(address)) else {
+        context.interpreter.halt(InstructionResult::OutOfGas);
+        return;
+    };
+    if let Some(([], top)) = context.interpreter.stack.popn_top::<0>() {
+        *top = word;
+    }
+}
+
+/// GASPRICE, pushing a local call's price whole where revm's transaction
+/// can't hold it ([`LocalCallWords`]).
+fn rsk_gasprice<WIRE: InterpreterTypes, H: Host + LocalCallWords + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    let price = context
+        .host
+        .whole_gas_price()
+        .unwrap_or_else(|| context.host.effective_gas_price());
+    if !context.interpreter.stack.push(price) {
         context.interpreter.halt_overflow();
     }
 }
@@ -571,19 +1114,20 @@ fn rsk_selfbalance<WIRE: InterpreterTypes, H: Host + ?Sized>(
 /// EXTCODESIZE with rskj's RSKIP90 quirk: the code size of an active precompile
 /// is reported as `2^256-1` (`VM.doCODESIZE` → `DataWord.MAX_VALUE`), so a proxy
 /// guarding `extcodesize(precompile) != 0` works. All other addresses fall
-/// through to revm's standard EXTCODESIZE.
+/// through to revm's standard EXTCODESIZE, a precompile's among them where
+/// the word that names it is [`past_an_address`].
 fn rsk_extcodesize<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
-    let addr = {
+    let (addr, past) = {
         let Some(([], top)) = context.interpreter.stack.popn_top::<0>() else {
             context.interpreter.halt_underflow();
             return;
         };
-        Address::from_word(B256::from(*top))
+        (Address::from_word(B256::from(*top)), past_an_address(*top))
     };
     assert_configured("EXTCODESIZE_MAX_PRECOMPILES");
-    let is_precompile = EXTCODESIZE_MAX_PRECOMPILES.with(|p| p.borrow().contains(&addr));
+    let is_precompile = !past && EXTCODESIZE_MAX_PRECOMPILES.with(|p| p.borrow().contains(&addr));
     if is_precompile {
         if let Some(([], top)) = context.interpreter.stack.popn_top::<0>() {
             *top = U256::MAX;
@@ -627,11 +1171,18 @@ thread_local! {
     static BASEFEE_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     /// RSKIP91 flag for the all-ops tracer's STATICCALL dispatch.
     static STATICCALL_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+    /// RSKIP103's absence, for the all-ops tracer's STATICCALL dispatch.
+    static STATICCALL_TAKES_VALUE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// RSKIP191 flag for the all-ops tracer's DUPN/SWAPN/TXINDEX dispatch.
+    static DUPN_SWAPN_TXINDEX_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// All-ops tracer: log pc/opcode/gas (post-static-charge), then dispatch to
 /// the real implementation (custom rsk op or default PETERSBURG table).
-fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
+fn traced_all<
+    WIRE: InterpreterTypes,
+    HOST: Host + ContractMarker + BeneficiaryTouch + LocalCallWords,
+>(
     context: InstructionContext<'_, HOST, WIRE>,
 ) {
     use revm::interpreter::interpreter_types::{InputsTr, Jumps, LegacyBytecode};
@@ -654,17 +1205,23 @@ fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
     // NOTE: addr= field added for the per-opcode trace oracle (rskj diff).
     match op {
         opcode::EXTCODESIZE => rsk_extcodesize(context),
+        opcode::BALANCE => rsk_balance(context),
+        opcode::GASPRICE => rsk_gasprice(context),
         opcode::CALL => rsk_call(context),
         opcode::CALLCODE => rsk_call_code(context),
         opcode::DELEGATECALL => rsk_delegate_call(context),
         opcode::STATICCALL => {
-            if STATICCALL_ENABLED.with(|f| f.get()) {
-                rsk_static_call(context)
-            } else {
+            if !STATICCALL_ENABLED.with(|f| f.get()) {
                 invalid_opcode(context)
+            } else if STATICCALL_TAKES_VALUE.with(|f| f.get()) {
+                rsk_static_call_with_value(context)
+            } else {
+                rsk_static_call(context)
             }
         }
         opcode::SELFDESTRUCT => rsk_selfdestruct(context),
+        opcode::COINBASE => rsk_coinbase(context),
+        opcode::GASLIMIT => rsk_gaslimit(context),
         opcode::EXTCODEHASH if !EXTCODEHASH_ENABLED.with(|f| f.get()) => {
             invalid_opcode(context)
         }
@@ -697,6 +1254,12 @@ fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
                 invalid_opcode(context)
             }
         }
+        RSK_DUPN | RSK_SWAPN | RSK_TXINDEX if !DUPN_SWAPN_TXINDEX_ENABLED.with(|f| f.get()) => {
+            invalid_opcode(context)
+        }
+        RSK_DUPN => rsk_dupn(context),
+        RSK_SWAPN => rsk_swapn(context),
+        RSK_TXINDEX => rsk_txindex(context),
         _ => {
             let table = revm::interpreter::instructions::instruction_table_gas_changes_spec::<
                 WIRE,
@@ -763,6 +1326,13 @@ fn rsk_call_memory_range<WIRE: InterpreterTypes>(
     Some(offset..offset.saturating_add(len))
 }
 
+/// Whether a call's stipend and the gas it asks for make a plain `long` sum,
+/// before RSKIP150 (see `STIPEND_SUM_WRAPS`).
+fn stipend_sum_wraps() -> bool {
+    assert_configured("STIPEND_SUM_WRAPS");
+    STIPEND_SUM_WRAPS.with(|w| w.get())
+}
+
 /// rskj `VM.getMessageCall` gas math, shared by the four call opcodes.
 ///
 /// Assumes the base costs (static 700, memory expansion, value transfer,
@@ -787,6 +1357,19 @@ where
     if remaining < stipend {
         context.interpreter.halt_oog();
         return None;
+    }
+    // Before RSKIP150 rskj adds the stipend to the gas asked for, which
+    // `Program.limitToMaxLong` holds at 2^63 - 1, as a plain `long`
+    // (`VM.getMessageCall`): past 2^63 - 1 the sum goes below zero,
+    // `GasCost.add` throws for the negative callee gas, and the frame that
+    // calls fails with all its gas. From RSKIP150 the sum stops at 2^63 - 1,
+    // more than any frame has, so the `min` below gives what rskj gives.
+    if stipend > 0 && stipend_sum_wraps() {
+        let held = requested.min(i64::MAX as u64);
+        if held > i64::MAX as u64 - stipend {
+            context.interpreter.halt_oog();
+            return None;
+        }
     }
     let callee_gas = core::cmp::min(remaining, requested.saturating_add(stipend));
     if !context.interpreter.gas.record_cost(callee_gas) {
@@ -824,8 +1407,9 @@ where
     // rskj charges NEW_ACCT_CALL for op CALL whenever the callee does not
     // exist, regardless of value: passing transfers_value=true makes revm's
     // new_account_cost unconditional on emptiness.
-    // (Approximation: revm reports EIP-161 emptiness, rskj checks trie
-    // existence; they differ only for existing-but-empty accounts.)
+    // The journal keeps HOMESTEAD's account rules (`load_accounts` in
+    // rsk_handler), under which revm's `is_empty` is an account the trie
+    // doesn't hold and the transaction hasn't touched: rskj's `!isExist`.
     let (cost, bytecode, code_hash) =
         load_account_delegated_handle_error(context, to, true, charge_new_account)?;
     if !context.interpreter.gas.record_cost(cost) {
@@ -845,6 +1429,7 @@ pub fn rsk_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         context.interpreter.halt_underflow();
         return;
     };
+    let past = past_an_address(to);
     let to = Address::from_word(B256::from(to));
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
     let has_transfer = !value.is_zero();
@@ -868,6 +1453,7 @@ pub fn rsk_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return;
     };
 
+    ask_for_call(past);
     context
         .interpreter
         .bytecode
@@ -898,7 +1484,19 @@ pub fn rsk_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
 /// the 25,000 charge and diverge. This override drops the value condition,
 /// matching rskj frontier-style suicide gas. Everything else (base 5,000 via
 /// static gas, cold cost, refund) mirrors revm's instruction.
-pub fn rsk_selfdestruct<WIRE: InterpreterTypes, H: Host + ?Sized>(
+///
+/// And with rskj's account semantics: `Program.suicide` transfers only a
+/// balance that is not zero, so with nothing to hand over the beneficiary is
+/// left as it was, and one that did not exist still does not, though the
+/// 25,000 for it was charged. revm's journal touches the beneficiary whatever
+/// the balance, which under RSK's frontier account rules would create it, so
+/// that touch is taken back ([`BeneficiaryTouch`]). A balance below zero,
+/// which a local call can leave, is one to hand over too
+/// ([`LocalCallWords::hand_on_debt`]).
+pub fn rsk_selfdestruct<
+    WIRE: InterpreterTypes,
+    H: Host + BeneficiaryTouch + LocalCallWords + ?Sized,
+>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
     if context.interpreter.runtime_flag.is_static() {
@@ -913,17 +1511,22 @@ pub fn rsk_selfdestruct<WIRE: InterpreterTypes, H: Host + ?Sized>(
     };
     let target = Address::from_word(B256::from(target));
 
+    let address = context.interpreter.input.target_address();
+
     let cold_load_gas = context.host.gas_params().selfdestruct_cold_cost();
     let skip_cold_load = context.interpreter.gas.remaining() < cold_load_gas;
-    let res = match context.host.selfdestruct(
-        context.interpreter.input.target_address(),
-        target,
-        skip_cold_load,
-    ) {
+    // Whether the touch revm is about to give the beneficiary is a new one.
+    let touches = address != target && !context.host.is_touched(target);
+    let hands_on_debt = context.host.hand_on_debt(address, target);
+    let res = match context.host.selfdestruct(address, target, skip_cold_load) {
         Ok(res) => res,
         Err(LoadError::ColdLoadSkipped) => return context.interpreter.halt_oog(),
         Err(LoadError::DBError) => return context.interpreter.halt_fatal(),
     };
+
+    if touches && !res.had_value && !hands_on_debt {
+        context.host.take_back_touch(target);
+    }
 
     // rskj charges NEW_ACCT_SUICIDE on beneficiary non-existence regardless of
     // value (no `had_value &&` gate, unlike revm's EIP-161 path).
@@ -1026,6 +1629,7 @@ pub fn rsk_call_code<WIRE: InterpreterTypes, H: Host + ?Sized>(
         context.interpreter.halt_underflow();
         return;
     };
+    let past = past_an_address(to);
     let to = Address::from_word(B256::from(to));
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
 
@@ -1041,6 +1645,7 @@ pub fn rsk_call_code<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return;
     };
 
+    ask_for_call(past);
     context
         .interpreter
         .bytecode
@@ -1068,6 +1673,7 @@ pub fn rsk_delegate_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         context.interpreter.halt_underflow();
         return;
     };
+    let past = past_an_address(to);
     let to = Address::from_word(B256::from(to));
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
 
@@ -1083,6 +1689,7 @@ pub fn rsk_delegate_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return;
     };
 
+    ask_for_call(past);
     context
         .interpreter
         .bytecode
@@ -1110,6 +1717,7 @@ pub fn rsk_static_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         context.interpreter.halt_underflow();
         return;
     };
+    let past = past_an_address(to);
     let to = Address::from_word(B256::from(to));
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
 
@@ -1130,6 +1738,7 @@ pub fn rsk_static_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return;
     };
 
+    ask_for_call(past);
     context
         .interpreter
         .bytecode
@@ -1142,6 +1751,57 @@ pub fn rsk_static_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
                 bytecode_address: to,
                 known_bytecode: Some((bytecode_hash, bytecode)),
                 value: CallValue::Transfer(U256::ZERO),
+                scheme: CallScheme::StaticCall,
+                is_static: true,
+                return_memory_offset,
+            },
+        ))));
+}
+
+/// STATICCALL as rskj runs it before RSKIP103 (orchid060, mainnet
+/// #1,052,700): `VM.calculateCallValue` takes a value off the stack for every
+/// call but DELEGATECALL, so STATICCALL takes seven arguments, as CALL does.
+/// A value that isn't zero pays `VT_CALL` and brings the stipend
+/// (`computeCallGas`, `calculateGetMinimumTransferGas`), and
+/// `Program.callToAddress` moves it to the callee, which runs static. Only
+/// CALL refuses a value inside a static call, and only CALL pays for an
+/// account it creates.
+pub fn rsk_static_call_with_value<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    mut context: InstructionContext<'_, H, WIRE>,
+) {
+    let Some([local_gas_limit, to, value]) = context.interpreter.stack.popn() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    let past = past_an_address(to);
+    let to = Address::from_word(B256::from(to));
+    let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
+
+    let Some((input, return_memory_offset)) =
+        rsk_memory_input_and_out_ranges(context.interpreter, context.host.gas_params())
+    else {
+        return;
+    };
+
+    let Some((gas_limit, bytecode, bytecode_hash)) =
+        rsk_call_gas_common(&mut context, to, local_gas_limit, value, false)
+    else {
+        return;
+    };
+
+    ask_for_call(past);
+    context
+        .interpreter
+        .bytecode
+        .set_action(InterpreterAction::NewFrame(FrameInput::Call(Box::new(
+            CallInputs {
+                input: CallInput::SharedBuffer(input),
+                gas_limit,
+                target_address: to,
+                caller: context.interpreter.input.target_address(),
+                bytecode_address: to,
+                known_bytecode: Some((bytecode_hash, bytecode)),
+                value: CallValue::Transfer(value),
                 scheme: CallScheme::StaticCall,
                 is_static: true,
                 return_memory_offset,
@@ -1174,6 +1834,129 @@ mod tests {
         assert_eq!(r.start, usize::MAX);
         assert!(r.is_empty());
     }
+
+    /// The word BALANCE pushes is the one rskj makes of the balance: the
+    /// balance itself, the bytes of one below zero without their sign
+    /// (`BigInteger.toByteArray`), and none for one that takes a 33rd byte.
+    /// rskj's release answered each of those below zero here, down to
+    /// -10^18, through `eth_call` (the rpc crate's
+    /// `testdata/rskj_local_calls.txt`).
+    #[test]
+    fn a_balance_reads_as_the_word_rskj_makes_of_it() {
+        let word = |held: u64, owed: u64| balance_word(U256::from(held), U256::from(owed));
+        assert_eq!(word(7, 0), Some(U256::from(7)));
+        assert_eq!(word(7, 7), Some(U256::ZERO));
+        assert_eq!(word(0, 1), Some(U256::from(0xff)));
+        assert_eq!(word(1, 3), Some(U256::from(0xfe)));
+        assert_eq!(word(0, 127), Some(U256::from(0x81)));
+        assert_eq!(word(0, 128), Some(U256::from(0x80)));
+        assert_eq!(word(0, 129), Some(U256::from(0xff7f)));
+        assert_eq!(
+            word(0, 1_000_000_000_000_000_000),
+            Some(U256::from(0xf21f_494c_589c_0000u64))
+        );
+
+        // 32 bytes hold -2^255 to 2^255 - 1.
+        let (one, top) = (U256::from(1), U256::from(1) << 255);
+        assert_eq!(balance_word(top - one, U256::ZERO), Some(top - one));
+        assert_eq!(balance_word(top, U256::ZERO), None);
+        assert_eq!(balance_word(U256::MAX, U256::ZERO), None);
+        assert_eq!(balance_word(U256::ZERO, top - one), Some(top + one));
+        assert_eq!(balance_word(U256::ZERO, top), Some(top));
+        assert_eq!(balance_word(U256::ZERO, top + one), None);
+        assert_eq!(balance_word(U256::ZERO, U256::MAX), None);
+    }
+
+    /// An account that destroys itself pays what it owes out of what it
+    /// holds, and hands the rest of it to its beneficiary, as rskj's
+    /// `Program.suicide` hands on a balance below zero: it makes an internal
+    /// transaction of it, as of any balance that isn't zero. rskj's release
+    /// answered what each account then holds through `eth_call` (the rpc
+    /// crate's `testdata/rskj_local_calls.txt`, the scenario `below`); the
+    /// internal transaction is its source's (`addInternalTx`, in the branch
+    /// that moves the balance).
+    #[test]
+    fn a_self_destruction_hands_on_what_the_account_owes() {
+        use crate::internal_tx::InternalTxs;
+        use crate::raw_storage::RskChainExt;
+        use revm::context::JournalEntry;
+        use revm::state::{Account, EvmState};
+
+        let (debtor, heir, other) = (
+            Address::repeat_byte(0xd1),
+            Address::repeat_byte(0xe1),
+            Address::repeat_byte(0xf1),
+        );
+        // How many internal transactions the running program has made shows
+        // in the hash of the next one it would hand the Bridge.
+        let started = || {
+            let mut txs = InternalTxs::default();
+            txs.begin(U256::from(1), U256::from(6_800_000));
+            txs.enter(None);
+            txs
+        };
+        let next = |txs: &mut InternalTxs| {
+            txs.reach_bridge(B256::repeat_byte(0x77), debtor, 0, heir, U256::ZERO)
+        };
+        let none_made = next(&mut started());
+        let one_made = {
+            let mut txs = started();
+            txs.count();
+            next(&mut txs)
+        };
+        assert_ne!(none_made, one_made);
+
+        // What the account holds and owes, and whom it names: whether it
+        // handed anything on, what it is left holding, what the journal took
+        // down, what it and its beneficiary owe, and whether an internal
+        // transaction was made.
+        let run = |held: u64, owed: u64, beneficiary: Address| {
+            let mut state = EvmState::default();
+            let mut account = Account::default();
+            account.info.balance = U256::from(held);
+            state.insert(debtor, account);
+            let mut journal = Vec::new();
+            let mut chain = RskChainExt {
+                internal_txs: started(),
+                ..Default::default()
+            };
+            chain.debts.add(other, U256::from(9));
+            if owed > 0 {
+                chain.debts.add(debtor, U256::from(owed));
+            }
+            let handed_on = hand_on_debt(&mut state, &mut journal, &mut chain, debtor, beneficiary);
+            assert_eq!(chain.debts.of(other), U256::from(9), "another's is its own");
+            let was_held = match journal.as_slice() {
+                [] => None,
+                [JournalEntry::BalanceChange {
+                    address,
+                    old_balance,
+                }] if *address == debtor => Some(old_balance.to::<u64>()),
+                entries => panic!("{entries:?}"),
+            };
+            (
+                handed_on,
+                state[&debtor].info.balance.to::<u64>(),
+                was_held,
+                chain.debts.of(debtor).to::<u64>(),
+                chain.debts.of(heir).to::<u64>(),
+                next(&mut chain.internal_txs) == one_made,
+            )
+        };
+        // It owes nothing: SELFDESTRUCT is revm's alone.
+        assert_eq!(run(4, 0, heir), (false, 4, None, 0, 0, false));
+        // It holds nothing of what it owes: all of it is handed on.
+        assert_eq!(run(0, 5, heir), (true, 0, None, 0, 5, true));
+        // It holds part of it: that is paid, and the rest handed on.
+        assert_eq!(run(2, 5, heir), (true, 0, Some(2), 0, 3, true));
+        // It holds all of it, or more: it is paid, and what is left is the
+        // account's to move as any balance.
+        assert_eq!(run(5, 5, heir), (false, 0, Some(5), 0, 0, false));
+        assert_eq!(run(8, 5, heir), (false, 3, Some(8), 0, 0, false));
+        // It names itself: rskj brings its balance to zero, and counts it.
+        assert_eq!(run(0, 5, debtor), (true, 0, None, 0, 0, true));
+        assert_eq!(run(2, 5, debtor), (true, 0, Some(2), 0, 0, true));
+    }
 }
 
 #[cfg(test)]
@@ -1198,18 +1981,27 @@ mod thread_affinity_tests {
                 &mut table,
                 true,
                 true,
+                true,
                 false,
                 false,
                 true,
                 false,
                 false,
+                false,
+                false,
+                false,
                 &[Address::new([0x01; 20])],
                 &[Address::new([0x01; 20])],
-                Address::new([0xbb; 20]),
+                BlockWords {
+                    coinbase: Address::new([0xbb; 20]),
+                    gas_limit: U256::from(6_800_000),
+                    minimum_gas_price: U256::from(60_000_000),
+                },
             );
             (
                 is_configured_on_this_thread(),
                 REAL_COINBASE.with(|c| c.get()),
+                GAS_LIMIT.with(|c| c.get()),
                 EXTCODESIZE_MAX_PRECOMPILES.with(|p| p.borrow().len()),
             )
         })
@@ -1218,7 +2010,7 @@ mod thread_affinity_tests {
 
         assert_eq!(
             child_saw,
-            (true, Address::new([0xbb; 20]), 1),
+            (true, Address::new([0xbb; 20]), U256::from(6_800_000), 1),
             "the thread that installed sees its own configuration"
         );
         assert!(
@@ -1229,11 +2021,14 @@ mod thread_affinity_tests {
     }
 
     /// `DummyHost` only needs to exist for the table to be generic over
-    /// something; no instruction runs here.
+    /// something the instructions take, which is the executor's context: it
+    /// answers EXTCODEHASH's `ContractMarker`. No instruction runs here.
     type DummyHost = revm::context::Context<
         revm::context::BlockEnv,
         revm::context::TxEnv,
         revm::context::CfgEnv,
-        revm::database::EmptyDB,
+        RskDb,
+        revm::context::Journal<RskDb>,
+        crate::raw_storage::RskChainExt,
     >;
 }

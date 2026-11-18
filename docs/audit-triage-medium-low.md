@@ -19,14 +19,14 @@ So every finding below was re-checked against the rskj source tree (rskj
 
 | Verdict | Count | Meaning |
 |---|---:|---|
-| **Divergence from rskj** | 13 | rustock differs from deployed rskj. Real. |
-| **Spec is stale** | 13 | rustock matches rskj; the RSKIP text is wrong or outdated. No action. |
+| **Divergence from rskj** | 14 | rustock differs from deployed rskj. Real. |
+| **Spec is stale** | 12 | rustock matches rskj; the RSKIP text is wrong or outdated. No action. |
 | **Prototype gap, no consensus effect** | 6 | Local-only getters / mempool policy. Affects RPC answers, not consensus. |
 | **Matches rskj already** | 8 | The finding's premise does not hold against rskj. |
 
 15 medium + 25 low = 40 findings.
 
-The 13 real ones fall into three groups, and the grouping matters more than the
+The 14 real ones fall into three groups, and the grouping matters more than the
 individual rows — two of the three are single structural gaps that the audit
 saw as several unrelated findings.
 
@@ -142,7 +142,7 @@ checking FRCR-674: **rskj's STATICCALL pops a value word before RSKIP103**
 (orchid060, mainnet #1,052,700). `VM.calculateCallValue` special-cases only
 DELEGATECALL until RSKIP103, so for mainnet blocks #729,000–#1,052,699 a
 STATICCALL consumes *three* stack items, and adds `VT_CALL` (9,000 gas) when the
-popped value is non-zero. rustock pops two, always. See *Not fixed here*.
+popped value is non-zero. rustock popped two, always. See *Fixed since*.
 
 **Are these live on mainnet?** No — and the evidence is good. rustock's
 `processor.rs` validates `gas_used`, `paid_fees`, the transactions root, the
@@ -184,7 +184,7 @@ from block 0.
 
 ---
 
-## Group 4 — Other real divergences (2 findings)
+## Group 4 — Other real divergences (3 findings)
 
 ### FRCR-78 / FRCR-678 — `getEstimatedFeesForNextPegOutEvent` returns a hardcoded 0
 
@@ -239,7 +239,21 @@ builder failure returns an error.
 
 ### FRCR-674 (part two) — STATICCALL value semantics before RSKIP103
 
-Described in Group 2. Not fixed here — see below.
+Described in Group 2. Fixed since — see below.
+
+### FRCR-477 — RSKIP-50's code header
+
+Filed at first under *No action* as stale spec: rskj's `VM` has no case for
+HEADER (0xfc) and throws `invalidOpCode`, so the opcode looked absent from both.
+But rskj reads the code header the RSKIP defines. `Program.precompile` calls
+`processAndSkipCodeHeader` for every program it builds, from genesis and under
+no rule: code of four bytes or more that starts with 0xfc runs from byte
+4 + code[3], and its jump destinations are found from there
+(`VMTest.testVersioning_1` and `_2`, `testScriptVersion0` to `3`). rustock ran
+such code from byte 0 and failed it at the 0xfc with all its gas, so a
+transaction calling such a contract, or creating one with such init code, would
+have split rustock from the chain. No block has reached the difference: every
+block of both networks matches. Fixed since — see below.
 
 ---
 
@@ -251,13 +265,20 @@ Described in Group 2. Not fixed here — see below.
 | FRCR-674 (part one) | STATICCALL gated on RSKIP91 (orchid, #729,000); before it, the invalid-opcode handler, matching `VM.java` |
 | FRCR-673, -675, -680, -681 | testnet activation ladder corrected against rskj `config/testnet.conf`, plus a test transcribing **both** networks' tables as a block |
 
+## Fixed since
+
+| Finding | Fix |
+|---|---|
+| FRCR-274, -275 (DUPN/SWAPN/TXINDEX) | rskj's three opcodes before RSKIP191 (iris300), the doubled `program.step()` included: [audit/evm.md](audit/evm.md#rskip-191--dupn-swapn-and-txindex-removed) |
+| FRCR-674 (part two) | before RSKIP103 (orchid060, #1,052,700) STATICCALL takes a value as CALL does: it pays `VT_CALL`, brings the stipend, and moves the value to a callee that runs static (`rsk_static_call_with_value`): [audit/README.md](audit/README.md#what-sorting-by-status-leaves-out) |
+| FRCR-477 (HEADER) | rskj's code header: code of four bytes or more that starts with 0xfc runs from byte 4 + code[3], its jump destinations found from there, in every frame as it opens (`skip_code_header`; `a_code_header_is_skipped_as_rskj_skips_it`) |
+
 ## Not fixed here, with reasons
 
 | Finding | Why not |
 |---|---|
 | Group 1: RSKIP144 edges, RSKIP351 header checks | Gated on `reed810`, which is `-1` on mainnet. Testnet-only. |
-| FRCR-274, -275 (DUPN/SWAPN/TXINDEX) | Implementable — the semantics are recorded below — but proven unexercised on mainnet and permanently unreachable there. Matters for testnet replay. `doDUPN`/`doSWAPN` also call `program.step()` **twice**, so the PC advances by 2 and the byte after the opcode is skipped; that quirk has to be reproduced, and it is worth doing deliberately rather than in passing. |
-| FRCR-674 (part two) | Needs care: pre-RSKIP103 STATICCALL pops a third stack word and may charge `VT_CALL`, and the downstream static-call write-protection interacts with it. Window is #729,000–#1,052,699, permanently closed, proven unexercised. A wrong "fix" is worse than the documented gap. |
+
 | FRCR-574 | Mempool policy, not consensus. |
 
 ## No action — the RSKIP text is stale, rustock matches rskj
@@ -274,7 +295,6 @@ Each verified against the rskj source:
 | FRCR-874 | simpler `isBrokenSelectionRule` pseudocode | `SelectionRule.isBrokenSelectionRule` — 2× paid-fees criterion both ways, hash tiebreak, `maxUncleCount >` | matches rskj line for line |
 | FRCR-875 | uncle window 10 | **both** exist: `getUncleGenerationLimit() = 7`, `getUncleListLimit() = 10` | has both, 7 and 10 |
 | FRCR-877 | flush when **pool balance** ≥ MPFG × BMGP | `Remasc.payToFederation` compares `payToFederator`, the **per-federator share** | matches rskj |
-| FRCR-477 | HEADER (0xfc) pseudo-opcode | declared but falls through to `invalidOpCode` — never implemented | matches rskj (absent) |
 | FRCR-273 | ROL/ROR (0x1e/0x1f) | absent from `OpCodes.java` entirely | matches rskj (absent) |
 | FRCR-276 | CODEREPLACE | absent from `OpCodes.java` entirely | matches rskj (absent) |
 | FRCR-575 | RSKIP-10 header fields | never adopted | matches rskj |

@@ -66,7 +66,7 @@ impl DifficultyRule {
         if !rskip97_active {
             let delta_ts = header.timestamp.saturating_sub(parent.timestamp);
             if delta_ts >= TEN_MINUTES {
-                return self.config.min_difficulty;
+                return self.config.min_difficulty_at(header.number);
             }
         }
 
@@ -80,7 +80,17 @@ impl DifficultyRule {
             return parent.difficulty;
         }
 
-        let calc_dur = (1 + header.uncle_count) * self.config.duration_limit;
+        // rskj: `int calcDur = (1 + uncleCount) * duration`, in Java `int`
+        // arithmetic, which wraps. Nothing ties a header's uncle count to the
+        // uncles it carries, so the count is the miner's to choose, and one
+        // that wraps the product to zero or below makes any block late: a
+        // lower difficulty, which rskj takes, and so must this. Both
+        // timestamps are Java `long`s, so the gap fits an `i64`.
+        let calc_dur = i64::from(
+            1i32.wrapping_add(header.uncle_count as i32)
+                .wrapping_mul(self.config.duration_limit as i32),
+        );
+        let delta = delta as i64;
 
         let sign = if calc_dur > delta {
             1i8
@@ -94,8 +104,10 @@ impl DifficultyRule {
             return parent.difficulty;
         }
 
-        // RSKIP156 (papyrus200): difficulty divisor changes from 50 to 400.
-        let divisor = if header.number >= activations.papyrus200 {
+        // RSKIP156 (papyrus200): the divisor goes from 50 to 400, except on
+        // regtest, which keeps its 2,048 (`Constants.getDifficultyBoundDivisor`,
+        // `getChainId() != REGTEST_CHAIN_ID`).
+        let divisor = if header.number >= activations.papyrus200 && self.config.chain_id != 33 {
             RSKIP156_DIFFICULTY_DIVISOR
         } else {
             self.config.difficulty_divisor
@@ -111,9 +123,11 @@ impl DifficultyRule {
             U256::ZERO
         };
 
-        // Clamp to minimum difficulty — matches rskj's max(minDifficulty, fromParent).
-        if from_parent < self.config.min_difficulty {
-            self.config.min_difficulty
+        // Clamp to the floor in force at this height: rskj's
+        // max(getMinimumDifficulty(number), fromParent).
+        let floor = self.config.min_difficulty_at(header.number);
+        if from_parent < floor {
+            floor
         } else {
             from_parent
         }
@@ -127,7 +141,7 @@ mod rskip97_tests {
     use alloy_primitives::{Bytes, B256};
     use std::sync::Arc;
 
-    fn header_at(number: u64, timestamp: u64, difficulty: U256) -> Header {
+    pub(super) fn header_at(number: u64, timestamp: u64, difficulty: U256) -> Header {
         let mut h = Header {
             parent_hash: B256::ZERO,
             ommers_hash: B256::ZERO,
@@ -153,6 +167,7 @@ mod rskip97_tests {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         };
         h.cached_hash = None;
         h
@@ -209,5 +224,161 @@ mod rskip97_tests {
         let parent = header_at(100, 1_000_000, U256::from(1_048_576u64));
         let got = rule.difficulty_for_child(&parent, 101, 1_000_000 + 599, 0);
         assert_ne!(got, U256::from(131_072u64), "599s is under the ten-minute threshold");
+    }
+
+    /// rskj works out the expected time in Java `int` arithmetic, and nothing
+    /// ties a header's uncle count to its uncles. A count that wraps the
+    /// product to zero, or below it, makes a block late however soon it came,
+    /// and its difficulty falls.
+    #[test]
+    fn the_expected_time_wraps_as_a_java_int() {
+        let rule = DifficultyRule {
+            config: Arc::new(ChainConfig::mainnet()),
+        };
+        let parent = header_at(5_000_000, 1_000_000, U256::from(10u128.pow(21)));
+        let step = parent.difficulty / U256::from(400);
+        let child =
+            |uncles: u64| rule.difficulty_for_child(&parent, 5_000_001, 1_000_000 + 10, uncles);
+
+        // (1 + 1) * 14: 28 seconds expected, and 10 is sooner.
+        assert_eq!(child(1), parent.difficulty + step);
+        // (1 + 2^31 - 1) * 14 wraps to 0, and 10 is later.
+        assert_eq!(child(i32::MAX as u64), parent.difficulty - step);
+        // (1 + 2^30) * 14 wraps below zero.
+        assert_eq!(child(1 << 30), parent.difficulty - step);
+    }
+}
+
+#[cfg(test)]
+mod rskip290_tests {
+    use super::rskip97_tests::header_at;
+    use super::*;
+    use crate::config::ChainConfig;
+    use std::sync::Arc;
+
+    fn testnet() -> DifficultyRule {
+        DifficultyRule {
+            config: Arc::new(ChainConfig::testnet()),
+        }
+    }
+
+    /// Testnet #6,360,768 and its parent, from the live chain: 120 seconds
+    /// apart, so the block is late and its difficulty falls, but not below
+    /// the 550,000,000 that RSKIP290 holds testnet to, where the parent
+    /// already sat. Held to 131,072, rustock expected 548,625,000, and its
+    /// snapshot sync refused the header after walking 1.9 million others.
+    #[test]
+    fn testnet_block_6360768_stays_on_rskip290s_floor() {
+        let parent = header_at(6_360_767, 1_746_607_067, U256::from(550_000_000u64));
+        let mut block = header_at(6_360_768, 1_746_607_187, U256::from(550_000_000u64));
+        assert_eq!(testnet().validate_with_parent(&block, &parent), Ok(()));
+        block.difficulty = U256::from(548_625_000u64);
+        assert!(testnet().validate_with_parent(&block, &parent).is_err());
+    }
+
+    /// testnet.conf activates RSKIP290 at #2,581,800, not at hop400.
+    #[test]
+    fn testnets_floor_rises_at_2581800() {
+        let late = |number: u64| {
+            let parent = header_at(number - 1, 1_000_000, U256::from(550_000_000u64));
+            testnet().difficulty_for_child(&parent, number, 1_000_000 + 60, 0)
+        };
+        assert_eq!(late(2_581_799), U256::from(548_625_000u64));
+        assert_eq!(late(2_581_800), U256::from(550_000_000u64));
+    }
+
+    /// The ten-minute drop, which testnet never retires, lands on the floor
+    /// in force: RSKIP290's from its height on.
+    #[test]
+    fn testnets_ten_minute_drop_lands_on_the_floor_in_force() {
+        let drop = |number: u64| {
+            let parent = header_at(number - 1, 1_000_000, U256::from(10_000_000_000u64));
+            testnet().difficulty_for_child(&parent, number, 1_000_000 + 600, 0)
+        };
+        assert_eq!(drop(2_581_799), U256::from(131_072u64));
+        assert_eq!(drop(2_581_800), U256::from(550_000_000u64));
+    }
+
+    /// rskj holds testnet alone to it. Mainnet's floor is 7e15, far above
+    /// 550,000,000, so taking RSKIP290 there would lower it; regtest's is 1,
+    /// and taking it would raise it.
+    #[test]
+    fn only_testnet_has_rskip290s_floor() {
+        for config in [ChainConfig::mainnet(), ChainConfig::regtest()] {
+            let floor = config.min_difficulty;
+            let rule = DifficultyRule {
+                config: Arc::new(config),
+            };
+            let parent = header_at(5_000_000, 1_000_000, floor);
+            let late = rule.difficulty_for_child(&parent, 5_000_001, 1_000_000 + 60, 0);
+            assert_eq!(late, floor);
+        }
+    }
+
+    /// rskj's testnet2 (chain 34) has testnet's floor and testnet's
+    /// RSKIP290 one: `getMinimumDifficulty` asks the chain ID for either.
+    #[test]
+    fn testnet2_has_rskip290s_floor_as_testnet_does() {
+        let mut config = ChainConfig::testnet();
+        config.chain_id = 34;
+        let rule = DifficultyRule {
+            config: Arc::new(config),
+        };
+        let parent = header_at(2_581_799, 1_000_000, U256::from(550_000_000u64));
+        let late = rule.difficulty_for_child(&parent, 2_581_800, 1_000_000 + 60, 0);
+        assert_eq!(late, U256::from(550_000_000u64));
+    }
+}
+
+#[cfg(test)]
+mod rskip156_tests {
+    use super::rskip97_tests::header_at;
+    use super::*;
+    use crate::config::ChainConfig;
+    use std::sync::Arc;
+
+    /// rskj moves the difficulty by a 400th from RSKIP156 on mainnet and
+    /// testnet, and by regtest's own 2,048th on regtest, RSKIP156 or not
+    /// (`Constants.getDifficultyBoundDivisor`). Here a block sooner than its
+    /// chain's duration, under each chain's constants with papyrus200 at
+    /// genesis.
+    #[test]
+    fn regtest_keeps_its_divisor_under_rskip156() {
+        for (mut config, divisor) in [
+            (ChainConfig::mainnet(), 400u64),
+            (ChainConfig::testnet(), 400),
+            (ChainConfig::regtest(), 2_048),
+        ] {
+            config
+                .activation_heights
+                .set_rskj_hardfork("papyrus200", Some(0));
+            let chain = config.chain_id;
+            let rule = DifficultyRule {
+                config: Arc::new(config),
+            };
+            let parent = header_at(100, 1_000_000, U256::from(10u64.pow(18)));
+            let got = rule.difficulty_for_child(&parent, 101, 1_000_000 + 1, 0);
+            let step = U256::from(10u64.pow(18) / divisor);
+            assert_eq!(got, parent.difficulty + step, "chain {chain}");
+        }
+    }
+
+    /// Mainnet's divisor is 50 up to the block before papyrus200 and 400 from
+    /// its first block; its ten-minute drop goes with RSKIP97, at orchid: the
+    /// block before still drops to the floor, and orchid's first does not.
+    #[test]
+    fn mainnet_changes_its_divisor_and_its_drop_at_their_first_blocks() {
+        let rule = DifficultyRule {
+            config: Arc::new(ChainConfig::mainnet()),
+        };
+        let d = U256::from(10u64.pow(18));
+        let after = |number: u64, seconds: u64| {
+            let parent = header_at(number - 1, 1_000_000, d);
+            rule.difficulty_for_child(&parent, number, 1_000_000 + seconds, 0)
+        };
+        assert_eq!(after(2_392_699, 1), d + d / U256::from(50));
+        assert_eq!(after(2_392_700, 1), d + d / U256::from(400));
+        assert_eq!(after(728_999, 600), rule.config.min_difficulty);
+        assert_eq!(after(729_000, 600), d - d / U256::from(50));
     }
 }

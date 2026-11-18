@@ -33,13 +33,17 @@ pub(crate) fn dummy_header(number: u64, parent: B256, difficulty: U256) -> Heade
         paid_fees: U256::ZERO,
         minimum_gas_price: U256::ZERO,
         uncle_count: 0,
-        umm_root: None,
+        // A UMM root where the store's heights, this process's, read one.
+        umm_root: rustock_core::config::ActivationHeights::current()
+            .umm_active(number)
+            .then(Bytes::new),
         version_fields: None,
         bitcoin_merged_mining_header: None,
         bitcoin_merged_mining_merkle_proof: None,
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     }
 }
 
@@ -437,6 +441,62 @@ async fn test_follow_buffer_keeps_waiting_on_a_same_height_reorg() {
     assert_eq!(service.follow_buffer.len(), 1, "buffer kept: this is a reorg, not a gap");
     assert_eq!(service.last_body_height, 1, "cursor untouched");
     assert!(matches!(service.state, SyncState::Following), "stays in follow mode");
+}
+
+#[tokio::test]
+async fn test_follow_mode_counts_from_block_0_on_a_new_database() {
+    // A node that runs blocks, on a new database, has no executed head
+    // recorded: its state is block 0's, which `load_or_build_state` builds, and
+    // the sync decision takes block 0 for the head. The follow path returned at
+    // once with no head recorded, so a node started near its peer's tip, as on
+    // a young chain, ran nothing that came until its watchdog moved it to a
+    // batch, minutes later; rskj connects block 1 as it arrives. A node that
+    // runs no blocks keeps them buffered (`tip_node`'s tests).
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    assert!(store.exec_head().unwrap().is_none(), "no executed head is recorded");
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx).with_block_processor(
+        processor,
+        trie,
+        rustock_trie::TrieNode::empty(),
+    );
+    service.state = SyncState::Following;
+
+    // Block 1, on block 0, is taken up to run (a header made for the test, so
+    // its run goes no further).
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    service.follow_buffer.insert(1, (b1.hash(), b1.clone(), vec![], vec![]));
+    service.drain_follow_buffer().await;
+    assert!(
+        service.follow_buffer.is_empty(),
+        "block 1 builds on block 0, the head, and is taken up"
+    );
+
+    // Block 2 with block 1 missing is a gap above block 0, re-fetched once it
+    // has outlived any response still on its way.
+    let b2 = dummy_header(2, b1.hash(), U256::from(1));
+    service.follow_buffer.insert(2, (b2.hash(), b2.clone(), vec![], vec![]));
+    service.last_body_height = 2;
+    service.drain_follow_buffer().await;
+    assert_eq!(service.follow_buffer.len(), 1, "a fresh gap is given time");
+    service.follow_gap_since =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
+    service.drain_follow_buffer().await;
+    assert!(service.follow_buffer.is_empty(), "the buffer is dropped for the missing range");
+    assert_eq!(service.last_body_height, 0, "the body cursor rewinds to block 0");
+    assert!(matches!(service.state, SyncState::Idle), "and a sync round starts");
 }
 
 #[tokio::test]
@@ -1102,7 +1162,9 @@ async fn test_skeleton_round_transitions_to_next_skeleton() {
             Vec::new()
         };
     for (req_id, asked) in pending {
-        service.on_body_response(asked, req_id, vec![], vec![]).await;
+        service
+            .on_body_response(asked, req_id, vec![], vec![], None)
+            .await;
     }
 
     // After all bodies downloaded, should continue to DownloadingSkeleton
@@ -1183,7 +1245,7 @@ async fn a_body_that_does_not_match_its_header_is_charged_and_refetched() {
     // b1's header commits to an empty body. Send an uncle it never had.
     let bogus_uncle = dummy_header(0, B256::repeat_byte(0xEE), U256::from(1));
     service
-        .on_body_response(peer, 7, vec![], vec![bogus_uncle])
+        .on_body_response(peer, 7, vec![], vec![bogus_uncle], None)
         .await;
 
     assert_eq!(
@@ -1238,7 +1300,9 @@ async fn a_matching_body_is_stored_and_its_supplier_remembered() {
         id_index,
     };
 
-    service.on_body_response(peer, 7, vec![], vec![]).await;
+    service
+        .on_body_response(peer, 7, vec![], vec![], None)
+        .await;
 
     assert_eq!(
         scored(&scoring, peer, EventType::InvalidBlock),
@@ -1326,7 +1390,9 @@ async fn test_failed_body_send_stays_tracked_for_retry() {
     // send fails (dead peer). The request must stay tracked so the stalled
     // retry re-attempts it — dropping it would orphan b2 forever and the
     // batch could never complete.
-    service.on_body_response(B512::repeat_byte(9), 7, vec![], vec![]).await;
+    service
+        .on_body_response(B512::repeat_byte(9), 7, vec![], vec![], None)
+        .await;
 
     match &service.state {
         SyncState::DownloadingBodies { in_flight, .. } => {
@@ -1537,7 +1603,9 @@ async fn test_late_body_response_on_superseded_id_still_applies() {
     // Late response on the SUPERSEDED id 7 must still store b1. It comes from
     // the peer id 7 was sent to -- the retry went to a fresh id, and the old
     // id keeps its own peer, which is what lets a late answer still land.
-    service.on_body_response(peer, 7, vec![], vec![]).await;
+    service
+        .on_body_response(peer, 7, vec![], vec![], None)
+        .await;
     assert!(
         store.body(b1.hash()).unwrap().is_some(),
         "late response on a superseded id must still apply its body"
@@ -1552,7 +1620,9 @@ async fn test_late_body_response_on_superseded_id_still_applies() {
 
     // Duplicate: the retried id now arrives too — must be ignored, no panic,
     // batch state unchanged (b2 still the only thing outstanding).
-    service.on_body_response(B512::repeat_byte(9), new_id, vec![], vec![]).await;
+    service
+        .on_body_response(B512::repeat_byte(9), new_id, vec![], vec![], None)
+        .await;
     match &service.state {
         SyncState::DownloadingBodies { in_flight, .. } => {
             assert!(!in_flight.contains_key(&0));
@@ -2241,7 +2311,9 @@ async fn test_follow_mode_buffers_out_of_order_body() {
         req_id,
         (h102_hash, h102, std::time::Instant::now(), B512::repeat_byte(9)),
     );
-    service.on_body_response(B512::repeat_byte(9), req_id, vec![], vec![]).await;
+    service
+        .on_body_response(B512::repeat_byte(9), req_id, vec![], vec![], None)
+        .await;
 
     // #102 must remain buffered (parent #101 is not our head), not executed.
     assert!(service.follow_buffer.contains_key(&102),
@@ -2250,280 +2322,6 @@ async fn test_follow_mode_buffers_out_of_order_body() {
     // exec head must not have advanced past #100.
     assert_eq!(store.exec_head().unwrap().map(|(h, _)| h), Some(h100_hash));
     let _ = h101; // #101 intentionally never delivered in this test
-}
-
-#[tokio::test]
-async fn test_reconcile_recovers_when_the_fork_has_no_canonical_pointer() {
-    // The mainnet wedge of 2026-09-18, reduced. The node executed a2(#2) on a
-    // branch the network left. It HAS the winning branch's headers -- b2(#2),
-    // b3(#3) -- but never adopted them, so canonical_hash(3) is None and the
-    // head never rose above #2. Both of reconcile's signals read the canonical
-    // index, so both are blind here, and the node re-asks peers for headers
-    // after a block they abandoned. It stalled for three days.
-    //
-    // The height index sees what the canonical pointer cannot: something is
-    // stored at #3 and nothing stored at #3 builds on a2.
-    let dir = tempdir().unwrap();
-    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
-
-    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
-    let genesis_hash = genesis.hash();
-    store.update_head(&genesis, U256::from(1)).unwrap();
-    let b1 = dummy_header(1, genesis_hash, U256::from(1));
-    let b1_hash = b1.hash();
-    store.update_head(&b1, U256::from(2)).unwrap();
-
-    // Our branch: a2 on b1, canonical and executed.
-    let mut a2 = dummy_header(2, b1_hash, U256::from(1));
-    a2.extra_data = vec![0xAA].into();
-    let a2_hash = a2.hash();
-    store.update_head(&a2, U256::from(3)).unwrap();
-
-    // The network's branch: b2(#2) <- b3(#3). Headers only, never adopted --
-    // put_header indexes by height without touching the canonical pointers.
-    let mut b2 = dummy_header(2, b1_hash, U256::from(5));
-    b2.extra_data = vec![0xBB].into();
-    let b2_hash = b2.hash();
-    store.put_header(&b2).unwrap();
-    let b3 = dummy_header(3, b2_hash, U256::from(5));
-    let b3_hash = b3.hash();
-    store.put_header(&b3).unwrap();
-
-    // The exact conditions that made the node blind.
-    assert_eq!(store.canonical_hash(3).unwrap(), None, "no pointer at #3");
-    assert_eq!(store.canonical_hash(2).unwrap(), Some(a2_hash), "we hold #2");
-    assert!(store.hashes_at_height(3).unwrap().contains(&b3_hash),
-        "but the height index knows about b3");
-
-    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
-    let empty = rustock_trie::TrieNode::empty();
-    trie.put(b1.state_root.as_slice(), &empty.to_message(trie.as_ref()));
-
-    let verifier = Arc::new(HeaderVerifier::new());
-    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
-    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
-    let (_event_tx, event_rx) = mpsc::unbounded_channel();
-    let processor = rustock_execution::BlockProcessor::new(
-        rustock_execution::RskHardforkConfig::mainnet(),
-        store.clone(),
-    );
-    let mut service = SyncService::new(manager, peer_store, event_rx)
-        .with_block_processor(processor, trie, empty);
-    store.set_exec_head(a2_hash, a2.state_root).unwrap();
-
-    // First round adopts the stored lineage, giving #3 a canonical pointer.
-    service.reconcile_exec_head_with_canonical().await;
-    assert_eq!(store.canonical_hash(3).unwrap(), Some(b3_hash),
-        "the winning branch should now be canonical at #3");
-    assert_eq!(store.canonical_hash(2).unwrap(), Some(b2_hash),
-        "and at #2, down to the fork point");
-
-    // Second round sees an ordinary orphan and rolls execution back.
-    service.reconcile_exec_head_with_canonical().await;
-    let (rolled, _) = store.exec_head().unwrap().unwrap();
-    assert_eq!(rolled, b1_hash,
-        "exec head should roll back to the fork point b1, got {rolled:?}");
-}
-
-#[tokio::test]
-async fn test_reconcile_when_the_forks_parent_was_never_downloaded() {
-    // The mainnet stall of 2026-09-21, which is NOT the shape of the test
-    // above. There the winning sibling was in our store. Here the network's
-    // block at our own height was never downloaded: we hold only its child.
-    //
-    //   #1  b1              common
-    //   #2  a2 canonical, executed      x2 (the network's) NOT IN STORE
-    //   #3  c3 stored, parent = x2      -- so the lineage walk cannot reach
-    //                                      the fork point
-    //
-    // Adopting c3's lineage sets a pointer at #3 whose parent is not the
-    // canonical #2, which is an inconsistent chain. What must happen instead
-    // is that execution retreats to a block the network can extend.
-    let dir = tempdir().unwrap();
-    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
-
-    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
-    let genesis_hash = genesis.hash();
-    store.update_head(&genesis, U256::from(1)).unwrap();
-    let b1 = dummy_header(1, genesis_hash, U256::from(1));
-    let b1_hash = b1.hash();
-    store.update_head(&b1, U256::from(2)).unwrap();
-
-    let mut a2 = dummy_header(2, b1_hash, U256::from(1));
-    a2.extra_data = vec![0xAA].into();
-    let a2_hash = a2.hash();
-    store.update_head(&a2, U256::from(3)).unwrap();
-
-    // x2 is the network's #2. Deliberately NOT stored -- only its hash exists,
-    // as the parent field of a child we did download.
-    let mut x2 = dummy_header(2, b1_hash, U256::from(9));
-    x2.extra_data = vec![0xCC].into();
-    let x2_hash = x2.hash();
-
-    let c3 = dummy_header(3, x2_hash, U256::from(9));
-    store.put_header(&c3).unwrap();
-
-    assert!(store.header(x2_hash).unwrap().is_none(), "the fork's #2 is absent");
-    assert_eq!(store.canonical_hash(3).unwrap(), None);
-
-    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
-    let empty = rustock_trie::TrieNode::empty();
-    trie.put(b1.state_root.as_slice(), &empty.to_message(trie.as_ref()));
-    let verifier = Arc::new(HeaderVerifier::new());
-    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
-    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
-    let (_event_tx, event_rx) = mpsc::unbounded_channel();
-    let processor = rustock_execution::BlockProcessor::new(
-        rustock_execution::RskHardforkConfig::mainnet(),
-        store.clone(),
-    );
-    let mut service = SyncService::new(manager, peer_store, event_rx)
-        .with_block_processor(processor, trie, empty);
-    store.set_exec_head(a2_hash, a2.state_root).unwrap();
-
-    // Drive several rounds, as the live node would.
-    for _ in 0..4 {
-        service.reconcile_exec_head_with_canonical().await;
-    }
-
-    // At or below b1 -- the network's chain builds on b1 and on everything
-    // under it, so any of them lets sync re-request #2 and receive x2.
-    //
-    // This used to assert exactly b1, i.e. a one-block retreat, and that
-    // assertion was the 2026-09-24 stall written down as a requirement. The
-    // node cannot know the fork is only one block deep: x2 is missing, which
-    // is precisely why `fork_point` cannot answer here. It now retreats
-    // `BLIND_RETREAT_DEPTH` blocks instead, which on this three-block fixture
-    // reaches genesis.
-    let (head, _) = store.exec_head().unwrap().unwrap();
-    let exec_number = store.header(head).unwrap().unwrap().number;
-    assert!(exec_number <= 1,
-        "execution must retreat to at least b1 (#1), the deepest block the \
-         network's chain also builds on, so sync can re-request #2 and receive \
-         x2; stopped at #{exec_number} ({head:?})");
-
-    // Rolling execution back is only half of it, and asserting only that is why
-    // this wedge survived a test written for its own shape. `our_head_number()`
-    // -- which chooses where the next skeleton is requested from -- reads
-    // `store.head()`, not the exec head. While that still names a2, every round
-    // asks peers for headers after a block their chain abandoned, stores the
-    // dangling children again, and completes without advancing. Mainnet
-    // #9,258,222 looped there for 15 minutes with peers answering in 1s.
-    let head_number = store
-        .head()
-        .unwrap()
-        .and_then(|h| store.header(h).unwrap())
-        .map(|h| h.number);
-    assert_eq!(head_number, Some(exec_number),
-        "the head pointer must retreat with execution, or the next skeleton is \
-         requested from the orphan and the node re-downloads the same dangling \
-         headers");
-    assert_ne!(store.canonical_hash(2).unwrap(), Some(a2_hash),
-        "the canonical pointer must stop naming the orphan at #2, so the height \
-         is downloaded again");
-}
-
-/// The mainnet stall of 2026-09-24, at the service level.
-///
-/// A **three-deep** reorg whose replacement branch was never downloaded:
-///
-/// ```text
-///   #30  f30                      the fork point (canonical, executed)
-///   #31  a31 ours       x31 the network's -- NOT IN STORE
-///   #32  a32 ours       x32                -- NOT IN STORE
-///   #33  a33 ours, executed head  x33      -- NOT IN STORE
-///   #34                           c34 stored, parent = x33
-/// ```
-///
-/// Retreating to the orphaned head's parent lands on a32 (#32), which is
-/// itself on the abandoned branch. The live node then sat there: a32 is
-/// stored and builds on a31, so the orphan check saw a successor extending
-/// the head and reported everything fine, while no peer would ever extend it.
-/// Twelve minutes, until the network moved 25 blocks ahead and skeleton sync
-/// took over.
-///
-/// The retreat must end up at or below the fork.
-#[tokio::test]
-async fn test_reconcile_retreats_below_a_three_deep_fork() {
-    let dir = tempdir().unwrap();
-    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
-
-    // A common chain up to the fork point.
-    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
-    store.update_head(&genesis, U256::from(1)).unwrap();
-    let mut parent = genesis.hash();
-    let mut fork_hash = parent;
-    for n in 1..=30u64 {
-        let h = dummy_header(n, parent, U256::from(1));
-        store.update_head(&h, U256::from(n + 1)).unwrap();
-        parent = h.hash();
-        fork_hash = parent;
-    }
-
-    // Our branch: three blocks above the fork, all executed.
-    let mut ours = fork_hash;
-    let mut our_tip = None;
-    for n in 31..=33u64 {
-        let mut h = dummy_header(n, ours, U256::from(1));
-        h.extra_data = vec![0xAA].into();
-        store.update_head(&h, U256::from(n + 1)).unwrap();
-        ours = h.hash();
-        our_tip = Some(h);
-    }
-    let our_tip = our_tip.unwrap();
-    let our_tip_hash = our_tip.hash();
-
-    // The network's branch: three blocks the node never downloaded, and one
-    // child of the last of them that it did.
-    let mut theirs = fork_hash;
-    for n in 31..=33u64 {
-        let mut h = dummy_header(n, theirs, U256::from(9));
-        h.extra_data = vec![0xCC].into();
-        theirs = h.hash(); // deliberately NOT stored
-    }
-    let c34 = dummy_header(34, theirs, U256::from(9));
-    store.put_header(&c34).unwrap();
-    assert!(store.header(theirs).unwrap().is_none(), "their #33 is absent");
-
-    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
-    let empty = rustock_trie::TrieNode::empty();
-    trie.put(our_tip.state_root.as_slice(), &empty.to_message(trie.as_ref()));
-    let verifier = Arc::new(HeaderVerifier::new());
-    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
-    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
-    let (_event_tx, event_rx) = mpsc::unbounded_channel();
-    let processor = rustock_execution::BlockProcessor::new(
-        rustock_execution::RskHardforkConfig::mainnet(),
-        store.clone(),
-    );
-    let mut service = SyncService::new(manager, peer_store, event_rx)
-        .with_block_processor(processor, trie, empty);
-    store.set_exec_head(our_tip_hash, our_tip.state_root).unwrap();
-
-    service.reconcile_exec_head_with_canonical().await;
-
-    let (exec, _) = store.exec_head().unwrap().unwrap();
-    let exec_number = store.header(exec).unwrap().unwrap().number;
-    assert!(
-        exec_number <= 30,
-        "the retreat must end at or below the fork (#30); it stopped at #{exec_number}, \
-         which is still on the branch the network abandoned"
-    );
-    assert!(
-        exec_number < 32,
-        "#32 is the orphaned head's own parent -- retreating there is the 2026-09-24 bug"
-    );
-
-    let head_number = store
-        .head()
-        .unwrap()
-        .and_then(|h| store.header(h).unwrap())
-        .map(|h| h.number);
-    assert_eq!(head_number, Some(exec_number),
-        "the head must retreat with execution, or the next skeleton is requested from \
-         a block the network abandoned");
-    assert_ne!(store.canonical_hash(33).unwrap(), Some(our_tip_hash),
-        "the canonical index must stop naming the orphan");
 }
 
 /// Both halves of the fast-forward rule, and neither implies the other.
@@ -2617,6 +2415,199 @@ fn record_execution_reports_whether_the_marker_moved() {
     // And the marker really did not move to the sibling.
     let (exec, _) = store.exec_head().unwrap().unwrap();
     assert_eq!(exec, canonical.hash(), "the executed head stays on the canonical block");
+}
+
+/// What this thread logs on `rustock::sync` while the guard lives, as
+/// `(level, message)`.
+fn record_sync_log() -> (
+    tracing::subscriber::DefaultGuard,
+    Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+) {
+    struct Message(String);
+    impl tracing::field::Visit for Message {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+    struct Recorder(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+    impl tracing::Subscriber for Recorder {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "rustock::sync"
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let guard = tracing::subscriber::set_default(Recorder(log.clone()));
+    (guard, log)
+}
+
+/// Whether `log` holds a message at `level` containing `text`.
+fn logged(log: &[(tracing::Level, String)], level: tracing::Level, text: &str) -> bool {
+    log.iter().any(|(l, m)| *l == level && m.contains(text))
+}
+
+/// A reorg that lands between executing a block and recording it is handled:
+/// the block is not recorded, and is executed again or re-adopted. It is a
+/// warning, not an error, as testnet logged #8,274,238's on 9 November.
+/// Either shape: a sibling took the block's height, or a shorter, heavier
+/// chain took the head below it, leaving its height without a block.
+#[test]
+fn a_reorg_while_a_block_executes_is_a_warning() {
+    for shorter in [false, true] {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        store.update_head(&genesis, U256::from(1)).unwrap();
+        let canonical = dummy_header(1, genesis.hash(), U256::from(2));
+        store.update_head(&canonical, U256::from(3)).unwrap();
+        let executed = if shorter {
+            let above = dummy_header(2, canonical.hash(), U256::from(2));
+            store.update_head(&above, U256::from(5)).unwrap();
+            let heavier = fork_header(1, genesis.hash(), U256::from(9), 0xEE);
+            store.put_header(&heavier).unwrap();
+            let proved = rustock_storage::Validated::prove(&store, heavier.hash()).unwrap();
+            store
+                .apply(&rustock_storage::Transition::Adopt { head: proved })
+                .unwrap();
+            assert_eq!(store.canonical_hash(2).unwrap(), None);
+            above
+        } else {
+            let sibling = fork_header(1, genesis.hash(), U256::from(2), 0xEE);
+            store.put_header(&sibling).unwrap();
+            sibling
+        };
+
+        let (_guard, log) = record_sync_log();
+        let recorded =
+            crate::service::record_execution(&store, executed.hash(), executed.state_root);
+
+        assert!(!recorded);
+        let log = log.lock().unwrap().clone();
+        assert!(
+            logged(&log, tracing::Level::WARN, "a reorg moved the chain"),
+            "shorter {shorter}: {log:?}"
+        );
+        assert!(
+            !logged(&log, tracing::Level::ERROR, ""),
+            "shorter {shorter}: {log:?}"
+        );
+    }
+}
+
+/// A refused record that no reorg explains is still an error: here a block
+/// canonical at its height but above the head, which only a broken index
+/// leaves.
+#[test]
+fn a_refused_record_no_reorg_explains_is_still_an_error() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let above = dummy_header(1, genesis.hash(), U256::from(2));
+    store.put_header(&above).unwrap();
+    store.put_canonical_hash(1, above.hash()).unwrap();
+
+    let (_guard, log) = record_sync_log();
+    let recorded = crate::service::record_execution(&store, above.hash(), above.state_root);
+
+    assert!(!recorded);
+    let log = log.lock().unwrap().clone();
+    assert!(
+        logged(&log, tracing::Level::ERROR, "Recording execution"),
+        "{log:?}"
+    );
+    assert!(!logged(&log, tracing::Level::WARN, ""), "{log:?}");
+    // Nor is a block the store does not hold taken for one a reorg left behind.
+    assert!(!crate::service::no_longer_canonical(
+        &store,
+        B256::repeat_byte(0x99)
+    ));
+}
+
+/// The batch path reports a block a reorg left behind as superseded, so the
+/// halt that follows is a warning. The block was executed by this node
+/// before (its receipts and state are held), so the batch adopts it and
+/// only recording it is refused.
+#[test]
+fn a_batch_reports_a_block_a_reorg_left_behind_as_superseded() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    let root = empty.compute_hash(trie.as_ref());
+    trie.put(root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.set_exec_head(genesis.hash(), root).unwrap();
+    let canonical = dummy_header(1, genesis.hash(), U256::from(2));
+    store.update_head(&canonical, U256::from(3)).unwrap();
+
+    let hardfork = rustock_execution::RskHardforkConfig::mainnet();
+    let receipts = vec![rustock_core::Receipt {
+        post_tx_state: vec![0x01],
+        cumulative_gas_used: 0,
+        gas_used: 0,
+        logs_bloom: alloy_primitives::Bloom::ZERO,
+        logs: vec![],
+        status: true,
+    }];
+    let remasc = rustock_core::Transaction::remasc(1);
+    let mut left_behind = fork_header(1, genesis.hash(), U256::from(1), 0xEE);
+    left_behind.state_root = root;
+    left_behind.receipts_root =
+        rustock_core::ordered_trie_root(&receipts, hardfork.has_unitrie_state_root(1));
+    store.put_header(&left_behind).unwrap();
+    store
+        .put_body(left_behind.hash(), std::slice::from_ref(&remasc), &[])
+        .unwrap();
+    store.put_receipts(left_behind.hash(), &receipts).unwrap();
+
+    let processor = rustock_execution::BlockProcessor::new(hardfork, store.clone());
+    let block = rustock_core::types::block::Block {
+        header: left_behind.clone(),
+        transactions: vec![remasc],
+        ommers: Vec::new(),
+    };
+    assert_eq!(
+        processor.validate_block(&block).map_err(|e| e.to_string()),
+        Ok(())
+    );
+
+    let outcome = crate::service::process_downloaded_blocks(
+        &processor,
+        trie,
+        empty,
+        &store,
+        None,
+        0,
+        1,
+        &[(left_behind.hash(), left_behind)],
+        &crate::chain_activity::ChainActivity::new(),
+        &crate::gas_price::GasPriceTracker::default(),
+        &Default::default(),
+    );
+    assert!(!outcome.all_ok, "the block was not recorded");
+    assert!(
+        outcome.superseded,
+        "and the batch says a reorg left it behind"
+    );
 }
 
 #[tokio::test]
@@ -3205,6 +3196,141 @@ async fn test_serve_skeleton_request() {
     }
 }
 
+/// A node serves `rsk/63` from the uncles its freezer keeps once a block's
+/// body is gone (#270).
+///
+/// A snapshot-synced node holds bodies only for the window under its
+/// checkpoint, and keeps the uncles of the blocks below it in the freezer,
+/// where the sync put them as they arrived beside the headers. Read from
+/// bodies alone, the run it served stopped at the first such block that named
+/// an uncle: it could not serve the sync it had just done.
+#[tokio::test]
+async fn headers_with_uncles_are_served_from_the_freezer_once_the_body_is_gone() {
+    use rustock_networking::protocol::{
+        BlockHeadersQuery, BlockHeadersWithUnclesRequest, P2pHandler, P2pMessage, RskMessage,
+        RskSubMessage,
+    };
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let freezer =
+        Arc::new(rustock_storage::freezer::Freezer::open(dir.path().join("freezer")).unwrap());
+    store.set_freezer(freezer.clone());
+
+    // #0 to #3, of which #2 names an uncle and holds no body.
+    let uncle = dummy_header(1, B256::repeat_byte(0x0c), U256::from(1));
+    let mut parent = B256::ZERO;
+    for number in 0..=3u64 {
+        let mut header = dummy_header(number, parent, U256::from(1));
+        if number == 2 {
+            header.uncle_count = 1;
+            header.ommers_hash =
+                rustock_execution::processor::compute_ommers_hash(std::slice::from_ref(&uncle));
+        }
+        parent = header.hash();
+        store.put_header(&header).unwrap();
+        store.put_canonical_hash(number, parent).unwrap();
+    }
+    store.set_head(parent).unwrap();
+    freezer.put_uncles(2, std::slice::from_ref(&uncle)).unwrap();
+    freezer.sync().unwrap();
+
+    let manager = Arc::new(SyncManager::new(
+        store,
+        Arc::new(HeaderVerifier::new()),
+        Arc::new(rustock_networking::peers::PeerStore::new()),
+    ));
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+    let request = P2pMessage::RskMessage(RskMessage::new(
+        RskSubMessage::BlockHeadersWithUnclesRequest(BlockHeadersWithUnclesRequest {
+            id: 7,
+            query: BlockHeadersQuery {
+                hash: parent,
+                count: 4,
+            },
+        }),
+    ));
+    let Some(P2pMessage::RskMessage(answer)) = handler.handle_message(B512::ZERO, &request) else {
+        panic!("the request is answered");
+    };
+    let RskSubMessage::BlockHeadersWithUnclesResponse(response) = answer.sub_message else {
+        panic!("answered with headers and their uncles");
+    };
+    let numbers: Vec<u64> = response.entries.iter().map(|e| e.header.number).collect();
+    assert_eq!(
+        numbers,
+        vec![3, 2, 1, 0],
+        "the whole run, past the block without a body"
+    );
+    assert_eq!(
+        response.entries[1]
+            .uncles
+            .iter()
+            .map(Header::hash)
+            .collect::<Vec<_>>(),
+        vec![uncle.hash()],
+        "with the uncle the freezer kept"
+    );
+}
+
+/// The uncles held for a block are the ones its header commits to. The
+/// freezer keeps uncles by height alone, so what it holds for a height, or a
+/// body held for a block, is checked against the uncles hash of the block
+/// asked about: a list that doesn't hash to it is not that block's, and the
+/// block counts as one whose uncles aren't held.
+#[test]
+fn the_uncles_held_for_a_block_are_the_ones_its_header_commits_to() {
+    use crate::total_difficulty::held_uncles;
+
+    let dir = tempdir().unwrap();
+    let store = BlockStore::open(dir.path()).unwrap();
+    let freezer =
+        Arc::new(rustock_storage::freezer::Freezer::open(dir.path().join("freezer")).unwrap());
+    store.set_freezer(freezer.clone());
+
+    let uncle = dummy_header(1, B256::repeat_byte(0x0c), U256::from(1));
+    let other = dummy_header(1, B256::repeat_byte(0x0d), U256::from(1));
+    let naming_the_uncle = |number: u64| {
+        let mut header = dummy_header(number, B256::repeat_byte(number as u8), U256::from(1));
+        header.uncle_count = 1;
+        header.ommers_hash =
+            rustock_execution::processor::compute_ommers_hash(std::slice::from_ref(&uncle));
+        header
+    };
+    // #2 to #5 all name `uncle`. The freezer holds it for #2 and another
+    // block's uncle for #3; #4's body holds it, and #5's the other.
+    let blocks: Vec<Header> = (2..=5).map(naming_the_uncle).collect();
+    for header in &blocks {
+        store.put_header(header).unwrap();
+        store
+            .put_canonical_hash(header.number, header.hash())
+            .unwrap();
+    }
+    freezer.put_uncles(2, std::slice::from_ref(&uncle)).unwrap();
+    freezer.put_uncles(3, std::slice::from_ref(&other)).unwrap();
+    freezer.sync().unwrap();
+    store
+        .put_body(blocks[2].hash(), &[], std::slice::from_ref(&uncle))
+        .unwrap();
+    store
+        .put_body(blocks[3].hash(), &[], std::slice::from_ref(&other))
+        .unwrap();
+
+    let held = |header: &Header| {
+        held_uncles(&store, header.hash(), header)
+            .map(|uncles| uncles.iter().map(Header::hash).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        held(&blocks[0]),
+        Some(vec![uncle.hash()]),
+        "the freezer's, its own"
+    );
+    assert_eq!(held(&blocks[1]), None, "the freezer's, another block's");
+    assert_eq!(held(&blocks[2]), Some(vec![uncle.hash()]), "its body's");
+    assert_eq!(held(&blocks[3]), None, "a body with another block's uncles");
+}
+
 #[tokio::test]
 async fn test_serve_skeleton_request_unknown_start() {
     use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
@@ -3395,6 +3521,703 @@ async fn test_new_block_hashes_same_hash_ignored() {
     assert!(rx.try_recv().is_err(), "Should not request headers for same hash");
 }
 
+// -- Announcing and relaying new blocks, as rskj's `MessageVisitor` does ----
+
+/// A node following the tip from genesis, with peers 1 to `peers`
+/// connected, and each peer's inbox, to read what it was sent.
+struct TipNode {
+    service: SyncService,
+    manager: Arc<SyncManager>,
+    store: Arc<BlockStore>,
+    genesis: B256,
+    inboxes: Vec<(
+        B512,
+        mpsc::Receiver<rustock_networking::protocol::P2pMessage>,
+    )>,
+    _dir: tempfile::TempDir,
+}
+
+async fn tip_node(peers: u8) -> TipNode {
+    tip_node_verifying(peers, HeaderVerifier::new()).await
+}
+
+/// [`tip_node`], with the header rules `verifier` holds.
+async fn tip_node_verifying(peers: u8, verifier: HeaderVerifier) -> TipNode {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let mut inboxes = Vec::new();
+    for n in 1..=peers {
+        let (tx, rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+        peer_store.add_peer(B512::repeat_byte(n), tx).await;
+        inboxes.push((B512::repeat_byte(n), rx));
+    }
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        Arc::new(verifier),
+        peer_store.clone(),
+    ));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager.clone(), peer_store, event_rx);
+    service.state = SyncState::Following;
+    TipNode {
+        service,
+        manager,
+        store,
+        genesis: genesis.hash(),
+        inboxes,
+        _dir: dir,
+    }
+}
+
+fn whole(header: Header) -> rustock_core::Block {
+    rustock_core::Block {
+        header,
+        transactions: Vec::new(),
+        ommers: Vec::new(),
+    }
+}
+
+/// Every message a peer was sent, drained.
+fn sent(
+    inbox: &mut mpsc::Receiver<rustock_networking::protocol::P2pMessage>,
+) -> Vec<rustock_networking::protocol::RskSubMessage> {
+    let mut out = Vec::new();
+    while let Ok(message) = inbox.try_recv() {
+        match message {
+            rustock_networking::protocol::P2pMessage::RskMessage(m) => out.push(m.sub_message),
+            other => panic!("sent {other:?}"),
+        }
+    }
+    out
+}
+
+/// The blocks a peer was told of, and nothing else sent to it.
+fn told_of(
+    inbox: &mut mpsc::Receiver<rustock_networking::protocol::P2pMessage>,
+) -> Vec<BlockIdentifier> {
+    let mut out = Vec::new();
+    for message in sent(inbox) {
+        match message {
+            rustock_networking::protocol::RskSubMessage::NewBlockHashes(ids) => out.extend(ids),
+            other => panic!("sent {other:?}"),
+        }
+    }
+    out
+}
+
+/// rskj `MessageVisitor.apply(BlockMessage)`: a whole block a peer sends at
+/// the tip is taken, and announced to the peers not known to hold it -- not to
+/// the peer that sent it, nor to one that said it had it. A request still
+/// out for its body is dropped, so the answer cannot buffer it again.
+#[tokio::test]
+async fn a_whole_block_at_the_tip_is_taken_and_relayed_to_the_peers_that_lack_it() {
+    let mut node = tip_node(3).await;
+    let (sender, other, holder) = (
+        B512::repeat_byte(1),
+        B512::repeat_byte(2),
+        B512::repeat_byte(3),
+    );
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    let hash = b1.hash();
+    node.manager.note_block_holder(hash, holder);
+    node.service
+        .pending_follow_bodies
+        .insert(9, (hash, b1.clone(), Instant::now(), other));
+
+    node.service.on_new_block(sender, whole(b1)).await;
+
+    assert!(
+        !node.service.pending_follow_bodies.contains_key(&9),
+        "the request for its body is dropped"
+    );
+
+    assert!(
+        node.store.header(hash).unwrap().is_some(),
+        "its header is stored"
+    );
+    assert!(node.store.body(hash).unwrap().is_some(), "and its body");
+    assert_eq!(node.store.head().unwrap(), Some(hash), "it is the new head");
+    assert_eq!(
+        node.service.follow_buffer.get(&1).map(|entry| entry.0),
+        Some(hash),
+        "and waits to run"
+    );
+    assert_eq!(
+        node.service.body_providers.get(&1),
+        Some(&sender),
+        "the sender is credited once it runs"
+    );
+    for (id, inbox) in &mut node.inboxes {
+        let told = told_of(inbox);
+        if *id == other {
+            assert_eq!(told, vec![BlockIdentifier { hash, number: 1 }]);
+        } else {
+            assert!(told.is_empty(), "{id:?} holds the block and was told of it");
+        }
+    }
+}
+
+/// rskj relays a block it does not make its best too (`IMPORTED_NOT_BEST`):
+/// a miner may name it as an uncle. It is kept, not run. Sent here as the
+/// sync service receives it, as an event.
+#[tokio::test]
+async fn a_block_beside_the_chain_is_kept_and_relayed_but_not_run() {
+    let mut node = tip_node(3).await;
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    node.service
+        .on_new_block(B512::repeat_byte(1), whole(b1.clone()))
+        .await;
+    for (_, inbox) in &mut node.inboxes {
+        let _ = sent(inbox);
+    }
+
+    let sibling = fork_header(1, node.genesis, U256::from(1), 0xee);
+    let hash = sibling.hash();
+    node.service
+        .handle_event(crate::SyncEvent::NewBlock {
+            peer: B512::repeat_byte(2),
+            block: Box::new(whole(sibling)),
+        })
+        .await;
+
+    assert!(node.store.header(hash).unwrap().is_some());
+    assert!(node.store.body(hash).unwrap().is_some(), "kept whole");
+    assert_eq!(
+        node.store.head().unwrap(),
+        Some(b1.hash()),
+        "the head stays"
+    );
+    assert_eq!(
+        node.service.follow_buffer.get(&1).map(|entry| entry.0),
+        Some(b1.hash()),
+        "the canonical block is the one that runs"
+    );
+    for (id, inbox) in &mut node.inboxes {
+        let told = told_of(inbox);
+        if *id == B512::repeat_byte(2) {
+            assert!(told.is_empty(), "the sender was told of its own block");
+        } else {
+            assert_eq!(told, vec![BlockIdentifier { hash, number: 1 }], "{id:?}");
+        }
+    }
+}
+
+/// rskj's guards on a block a peer sends (`MessageVisitor.apply`): genesis,
+/// further above the best block than a skeleton reaches, so far below it that
+/// it can be no block's uncle, held already, or sent while syncing. None of
+/// them is stored or relayed; nor is a block whose body is not its header's,
+/// or whose header fails its rules. Each case passes every guard but its own.
+#[tokio::test]
+async fn what_a_node_cannot_use_is_neither_taken_nor_relayed() {
+    // The executed head at #10, so a block below #3 can be no block's uncle.
+    let at_ten = || async {
+        let node = tip_node(2).await;
+        let h10 = dummy_header(10, B256::repeat_byte(0x10), U256::from(1));
+        node.store.put_header(&h10).unwrap();
+        node.store.set_exec_head(h10.hash(), B256::ZERO).unwrap();
+        node
+    };
+    let sender = B512::repeat_byte(1);
+    let unseen = |node: &mut TipNode, hash: B256, what: &str| {
+        assert!(node.store.header(hash).unwrap().is_none(), "{what}: stored");
+        for (id, inbox) in &mut node.inboxes {
+            assert!(sent(inbox).is_empty(), "{what}: {id:?} was sent something");
+        }
+    };
+
+    let mut node = tip_node(2).await;
+    let genesis_again = fork_header(0, B256::ZERO, U256::from(1), 0x01);
+    let hash = genesis_again.hash();
+    node.service
+        .on_new_block(sender, whole(genesis_again))
+        .await;
+    unseen(&mut node, hash, "genesis");
+
+    let mut node = at_ten().await;
+    let too_far = dummy_header(10 + 3_841, B256::repeat_byte(0x22), U256::from(1));
+    let hash = too_far.hash();
+    node.service.on_new_block(sender, whole(too_far)).await;
+    unseen(&mut node, hash, "too far ahead");
+
+    let mut node = at_ten().await;
+    let too_old = dummy_header(2, B256::repeat_byte(0x33), U256::from(1));
+    let hash = too_old.hash();
+    node.service.on_new_block(sender, whole(too_old)).await;
+    unseen(&mut node, hash, "too old for an uncle");
+
+    let mut node = tip_node(2).await;
+    node.service.state = SyncState::DownloadingSkeleton {
+        peer: sender,
+        peer_best: 99,
+        connection_point: 0,
+    };
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    let hash = b1.hash();
+    node.service.on_new_block(sender, whole(b1)).await;
+    unseen(&mut node, hash, "while syncing");
+
+    let mut node = tip_node(2).await;
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    let hash = b1.hash();
+    let mut not_its_body = whole(b1);
+    not_its_body
+        .ommers
+        .push(dummy_header(0, B256::repeat_byte(0x44), U256::from(1)));
+    node.service.on_new_block(sender, not_its_body).await;
+    unseen(&mut node, hash, "a body that is not the header's");
+
+    // On genesis, but numbered #5: `BlockNumberRule` refuses it.
+    let mut node = tip_node_verifying(
+        2,
+        HeaderVerifier::new().with_parent_rule(rustock_core::validation::BlockNumberRule),
+    )
+    .await;
+    let misnumbered = dummy_header(5, node.genesis, U256::from(1));
+    let hash = misnumbered.hash();
+    node.service.on_new_block(sender, whole(misnumbered)).await;
+    unseen(&mut node, hash, "a header its rules refuse");
+
+    let mut node = tip_node(3).await;
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    node.service.on_new_block(sender, whole(b1.clone())).await;
+    for (_, inbox) in &mut node.inboxes {
+        let _ = sent(inbox);
+    }
+    node.service
+        .on_new_block(B512::repeat_byte(2), whole(b1))
+        .await;
+    for (id, inbox) in &mut node.inboxes {
+        assert!(
+            sent(inbox).is_empty(),
+            "held already: {id:?} was sent something"
+        );
+    }
+}
+
+/// rskj's relay validator (`RskContext.getBlockRelayValidator`) holds a block
+/// a peer sends whole to one rule a trunk header doesn't meet: its time later
+/// than its parent's. One that is no later is neither taken nor relayed
+/// (`AsyncNodeBlockProcessor.processBlock`), where its header is still stored
+/// as the answer to a request, as rskj connects such a block then
+/// (`BlockValidatorImpl` doesn't run the rule). A second later than its
+/// parent, the block is taken and relayed; and on a parent this node lacks
+/// the rule has nothing to judge by, and the block's headers are asked for.
+#[tokio::test]
+async fn a_whole_block_no_later_than_its_parent_is_neither_taken_nor_relayed() {
+    let relay_rule = || {
+        HeaderVerifier::new()
+            .with_relay_parent_rule(rustock_core::validation::TimestampRule::new(60))
+    };
+    let sender = B512::repeat_byte(1);
+    let at = |parent: B256, timestamp: u64| Header {
+        timestamp,
+        ..dummy_header(1, parent, U256::from(1))
+    };
+
+    let mut node = tip_node_verifying(2, relay_rule()).await;
+    let same_time = at(node.genesis, 0);
+    let hash = same_time.hash();
+    node.service
+        .on_new_block(sender, whole(same_time.clone()))
+        .await;
+    assert!(node.store.header(hash).unwrap().is_none(), "stored");
+    assert!(node.store.body(hash).unwrap().is_none(), "its body stored");
+    for (id, inbox) in &mut node.inboxes {
+        assert!(sent(inbox).is_empty(), "{id:?} was sent something");
+    }
+    let ingested = node
+        .manager
+        .handle_headers_response(vec![same_time], sender)
+        .unwrap();
+    assert_eq!(
+        (ingested.stored, ingested.rejected),
+        (1, 0),
+        "as the answer to a request"
+    );
+
+    let mut node = tip_node_verifying(2, relay_rule()).await;
+    let later = at(node.genesis, 1);
+    let hash = later.hash();
+    node.service.on_new_block(sender, whole(later)).await;
+    assert!(node.store.header(hash).unwrap().is_some());
+    assert!(node.store.body(hash).unwrap().is_some());
+    for (id, inbox) in &mut node.inboxes {
+        let told = told_of(inbox);
+        if *id == sender {
+            assert!(told.is_empty(), "the sender was told of its own block");
+        } else {
+            assert_eq!(told, vec![BlockIdentifier { hash, number: 1 }], "{id:?}");
+        }
+    }
+
+    let mut node = tip_node_verifying(2, relay_rule()).await;
+    let orphan = at(B256::repeat_byte(0x55), 0);
+    node.service.on_new_block(sender, whole(orphan)).await;
+    let (_, inbox) = &mut node.inboxes[0];
+    assert!(
+        matches!(
+            sent(inbox).as_slice(),
+            [rustock_networking::protocol::RskSubMessage::BlockHeadersRequest(_)]
+        ),
+        "its headers are asked of the sender"
+    );
+}
+
+/// A block that builds on the executed head goes on to execution, as a
+/// fetched body does (`drain_follow_buffer`).
+#[tokio::test]
+async fn a_whole_block_on_the_executed_head_is_handed_to_execution() {
+    let mut node = tip_node(1).await;
+    node.store.set_exec_head(node.genesis, B256::ZERO).unwrap();
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    node.service
+        .on_new_block(B512::repeat_byte(1), whole(b1))
+        .await;
+    assert!(node.service.follow_buffer.is_empty(), "left waiting");
+}
+
+/// rskj `NodeBlockProcessor.processNewBlockHashesMessage`: the peer that
+/// announces a block is remembered as holding it, so the block is not
+/// relayed back to it; not for a block further ahead than a skeleton
+/// reaches, nor for one held here already.
+#[tokio::test]
+async fn an_announcer_is_remembered_for_the_blocks_it_could_be_asked_for() {
+    let mut node = tip_node(1).await;
+    let h10 = dummy_header(10, B256::repeat_byte(0x10), U256::from(1));
+    node.store.put_header(&h10).unwrap();
+    node.store.put_body(h10.hash(), &[], &[]).unwrap();
+    node.store.set_exec_head(h10.hash(), B256::ZERO).unwrap();
+    let announcer = B512::repeat_byte(1);
+    let (edge, beyond) = (B256::repeat_byte(0x61), B256::repeat_byte(0x62));
+    node.service
+        .on_new_block_hashes(
+            announcer,
+            vec![
+                BlockIdentifier {
+                    hash: edge,
+                    number: 10 + 3_840,
+                },
+                BlockIdentifier {
+                    hash: beyond,
+                    number: 10 + 3_841,
+                },
+                BlockIdentifier {
+                    hash: h10.hash(),
+                    number: 10,
+                },
+            ],
+        )
+        .await;
+    assert!(
+        node.manager.block_holders(edge).contains(&announcer),
+        "a skeleton ahead"
+    );
+    assert!(
+        node.manager.block_holders(beyond).is_empty(),
+        "beyond a skeleton"
+    );
+    assert!(
+        node.manager.block_holders(h10.hash()).is_empty(),
+        "held here"
+    );
+}
+
+/// A `BlockMessage` is handed whole to the sync service, with its sender,
+/// and nothing is sent back.
+#[tokio::test]
+async fn a_block_a_peer_sends_is_handed_to_the_sync_service() {
+    use rustock_networking::protocol::{P2pHandler, P2pMessage, RskMessage, RskSubMessage};
+
+    let dir = tempdir().unwrap();
+    let manager = Arc::new(SyncManager::new(
+        Arc::new(BlockStore::open(dir.path()).unwrap()),
+        Arc::new(HeaderVerifier::new()),
+        Arc::new(rustock_networking::peers::PeerStore::new()),
+    ));
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+    let sender = B512::repeat_byte(4);
+    let block = whole(dummy_header(1, B256::repeat_byte(1), U256::from(1)));
+    let message = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::Block(Box::new(
+        block.clone(),
+    ))));
+    assert!(handler.handle_message(sender, &message).is_none());
+    let Ok(crate::SyncEvent::NewBlock { peer, block: got }) = event_rx.try_recv() else {
+        panic!("not handed on as a new block");
+    };
+    assert_eq!(peer, sender);
+    assert_eq!(got.hash(), block.hash());
+}
+
+// -- rskj's peer.bannedMiners -----------------------------------------------
+
+/// A handler refusing blocks mined by `banned`, and its event channel.
+fn handler_banning(
+    banned: Address,
+) -> (
+    SyncHandler,
+    mpsc::UnboundedReceiver<crate::SyncEvent>,
+    tempfile::TempDir,
+) {
+    let dir = tempdir().unwrap();
+    let manager = Arc::new(SyncManager::new(
+        Arc::new(BlockStore::open(dir.path()).unwrap()),
+        Arc::new(HeaderVerifier::new()),
+        Arc::new(rustock_networking::peers::PeerStore::new()),
+    ));
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx)
+        .with_banned_miners(std::collections::HashSet::from([banned]));
+    (handler, event_rx, dir)
+}
+
+/// A `BlockMessage` carrying `header`'s block.
+fn block_message(header: Header) -> rustock_networking::protocol::P2pMessage {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    P2pMessage::RskMessage(RskMessage::new(RskSubMessage::Block(Box::new(whole(
+        header,
+    )))))
+}
+
+/// rskj `NodeMessageHandler.allowByMinerNotBanned`: a block a peer sends
+/// whole is not taken when its coinbase is on `peer.bannedMiners`, and one
+/// mined by anyone else is.
+#[tokio::test]
+async fn a_block_from_a_banned_miner_is_not_taken() {
+    use rustock_networking::protocol::P2pHandler;
+
+    let banned = Address::repeat_byte(0xBA);
+    let (handler, mut event_rx, _dir) = handler_banning(banned);
+    let mined_by = |coinbase: Address| {
+        let mut header = dummy_header(1, B256::repeat_byte(1), U256::from(1));
+        header.beneficiary = coinbase;
+        block_message(header)
+    };
+
+    let sender = B512::repeat_byte(4);
+    assert!(handler.handle_message(sender, &mined_by(banned)).is_none());
+    let taken = event_rx.try_recv().is_ok();
+    assert!(!taken, "a banned miner's block was taken");
+
+    handler.handle_message(sender, &mined_by(Address::repeat_byte(0x0C)));
+    assert!(matches!(
+        event_rx.try_recv(),
+        Ok(crate::SyncEvent::NewBlock { .. })
+    ));
+}
+
+/// The coinbase compared is the one rskj reads (`Header::coinbase`): an
+/// empty one is its null address, which a banned zero address doesn't match.
+/// The zero address written out is banned like any other.
+#[tokio::test]
+async fn an_empty_coinbase_is_not_a_banned_zero_address() {
+    use rustock_networking::protocol::P2pHandler;
+
+    let (handler, mut event_rx, _dir) = handler_banning(Address::ZERO);
+    let mut empty = dummy_header(1, B256::repeat_byte(1), U256::from(1));
+    empty.kept = Some(Box::new(rustock_core::types::header::KeptFields {
+        null_coinbase: true,
+        ..Default::default()
+    }));
+    assert_eq!(empty.beneficiary, Address::ZERO);
+
+    handler.handle_message(B512::repeat_byte(4), &block_message(empty));
+    assert!(
+        matches!(event_rx.try_recv(), Ok(crate::SyncEvent::NewBlock { .. })),
+        "a block with an empty coinbase was refused"
+    );
+
+    let zero = dummy_header(2, B256::repeat_byte(1), U256::from(1));
+    handler.handle_message(B512::repeat_byte(4), &block_message(zero));
+    let taken = event_rx.try_recv().is_ok();
+    assert!(!taken, "the zero address's block was taken");
+}
+
+/// `peer.bannedMiners` entries read as rskj reads them, `new
+/// RskAddress(String)` (`HexUtils.stringHexToByteArray`, then exactly 20
+/// bytes); one that doesn't read stops the node starting, as rskj's does.
+#[test]
+fn banned_miners_are_read_as_rskj_reads_them() {
+    let read = |entries: &[&str]| {
+        let entries: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
+        crate::parse_banned_miners(&entries)
+    };
+    let ones = Address::repeat_byte(0x11);
+    let set = |a: Address| Ok(std::collections::HashSet::from([a]));
+    for entry in [
+        "0x1111111111111111111111111111111111111111",
+        "1111111111111111111111111111111111111111",
+    ] {
+        assert_eq!(read(&[entry]), set(ones), "{entry:?}");
+    }
+    // An odd number of digits is read with a leading zero.
+    let mut padded = [0x11u8; 20];
+    padded[0] = 0x01;
+    assert_eq!(
+        read(&["0x111111111111111111111111111111111111111"]),
+        set(Address::from(padded))
+    );
+    // A lowercase prefix, once; hex; twenty bytes, no more and no fewer.
+    for bad in [
+        "0X1111111111111111111111111111111111111111",
+        "0x0x1111111111111111111111111111111111111111",
+        "0xzz11111111111111111111111111111111111111",
+        "0x11111111111111111111111111111111111111",
+        "0x111111111111111111111111111111111111111111",
+        "0x",
+        "",
+    ] {
+        assert!(read(&[bad]).is_err(), "{bad:?} was read as an address");
+    }
+}
+
+/// The edges of rskj's two distance guards are taken: a block a whole
+/// skeleton above the best one, and one just young enough to be an uncle. Each
+/// has no parent here, so each is taken as an announcement of itself: its
+/// headers are asked of the sender, and nothing is relayed.
+#[tokio::test]
+async fn a_block_at_the_edge_of_either_guard_is_taken() {
+    for number in [10 + 3_840, 3] {
+        let mut node = tip_node(2).await;
+        let h10 = dummy_header(10, B256::repeat_byte(0x10), U256::from(1));
+        node.store.put_header(&h10).unwrap();
+        node.store.set_exec_head(h10.hash(), B256::ZERO).unwrap();
+        let orphan = dummy_header(number, B256::repeat_byte(0x55), U256::from(1));
+        node.service
+            .on_new_block(B512::repeat_byte(1), whole(orphan))
+            .await;
+        let (_, inbox) = &mut node.inboxes[0];
+        assert!(
+            matches!(
+                sent(inbox).as_slice(),
+                [rustock_networking::protocol::RskSubMessage::BlockHeadersRequest(_)]
+            ),
+            "#{number}: its headers are asked of the sender"
+        );
+        let (_, other) = &mut node.inboxes[1];
+        assert!(
+            sent(other).is_empty(),
+            "#{number}: relayed without its parent"
+        );
+    }
+}
+
+/// A block fetched at the tip, header then body, is announced once it is
+/// whole, to the peers not known to hold it: not to the peer that sent the
+/// body, nor to the one that announced it. Once, however often it arrives.
+#[tokio::test]
+async fn a_body_fetched_at_the_tip_is_relayed_once_to_the_peers_that_lack_it() {
+    let mut node = tip_node(3).await;
+    let (provider, announcer, other) = (
+        B512::repeat_byte(1),
+        B512::repeat_byte(2),
+        B512::repeat_byte(3),
+    );
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    let hash = b1.hash();
+    node.manager
+        .handle_headers_response(vec![b1.clone()], provider)
+        .unwrap();
+    node.service
+        .on_new_block_hashes(announcer, vec![BlockIdentifier { hash, number: 1 }])
+        .await;
+    for request in [7u64, 8] {
+        node.service
+            .pending_follow_bodies
+            .insert(request, (hash, b1.clone(), Instant::now(), provider));
+        node.service
+            .on_body_response(provider, request, Vec::new(), Vec::new(), None)
+            .await;
+    }
+
+    assert!(node.store.body(hash).unwrap().is_some());
+    for (id, inbox) in &mut node.inboxes {
+        let told = told_of(inbox);
+        if *id == other {
+            assert_eq!(told, vec![BlockIdentifier { hash, number: 1 }], "told once");
+        } else {
+            assert!(told.is_empty(), "{id:?} holds the block and was told of it");
+        }
+    }
+}
+
+/// rskj `NodeBlockProcessor.processGetBlock`: a block asked for by hash is
+/// sent whole, and its asker is remembered as holding it. Nothing for a block
+/// not held whole, or held only compressed, which has no full form to send.
+#[tokio::test]
+async fn a_block_asked_for_by_hash_is_sent_whole_and_its_asker_remembered() {
+    use rustock_networking::protocol::{P2pHandler, P2pMessage, RskMessage, RskSubMessage};
+
+    let handler_over = |store: Arc<BlockStore>| {
+        let manager = Arc::new(SyncManager::new(
+            store,
+            Arc::new(HeaderVerifier::new()),
+            Arc::new(rustock_networking::peers::PeerStore::new()),
+        ));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        (SyncHandler::new(manager.clone(), event_tx), manager)
+    };
+    let ask = |hash| P2pMessage::RskMessage(RskMessage::new(RskSubMessage::GetBlock(hash)));
+    let asker = B512::repeat_byte(5);
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    let hash = b1.hash();
+    let headless = dummy_header(2, hash, U256::from(1));
+    store.put_header(&b1).unwrap();
+    store.put_header(&headless).unwrap();
+    store.put_body(hash, &[], &[]).unwrap();
+    let (handler, manager) = handler_over(store);
+
+    let Some(P2pMessage::RskMessage(answer)) = handler.handle_message(asker, &ask(hash)) else {
+        panic!("a block held whole is sent");
+    };
+    let RskSubMessage::Block(block) = answer.sub_message else {
+        panic!("sent as a block");
+    };
+    assert_eq!(block.hash(), hash);
+    assert!(
+        manager.block_holders(hash).contains(&asker),
+        "the asker holds it now"
+    );
+    for (missing, what) in [
+        (B256::repeat_byte(0x77), "not held"),
+        (headless.hash(), "held without its body"),
+    ] {
+        assert!(
+            handler.handle_message(asker, &ask(missing)).is_none(),
+            "{what}"
+        );
+        assert!(
+            manager.block_holders(missing).is_empty(),
+            "{what}: the asker remembered"
+        );
+    }
+
+    let store = rskip351_store();
+    let held_compressed = compressed(
+        dummy_header(1, genesis.hash(), U256::from(1)),
+        &an_extension(3),
+    );
+    let hash = held_compressed.hash();
+    store.put_header(&held_compressed).unwrap();
+    store.put_body(hash, &[], &[]).unwrap();
+    let (handler, manager) = handler_over(store);
+    assert!(
+        handler.handle_message(asker, &ask(hash)).is_none(),
+        "held compressed"
+    );
+    assert!(
+        manager.block_holders(hash).is_empty(),
+        "held compressed: the asker remembered"
+    );
+}
+
 #[tokio::test]
 async fn test_reorg_via_headers_response_higher_td() {
     let dir = tempdir().unwrap();
@@ -3409,15 +4232,23 @@ async fn test_reorg_via_headers_response_higher_td() {
     let a2 = dummy_header(2, a1.hash(), U256::from(10));
     store.put_header(&a1).unwrap();
     store.put_canonical_hash(1, a1.hash()).unwrap();
-    store.put_total_difficulty(a1.hash(), U256::from(20)).unwrap();
+    store
+        .put_total_difficulty(a1.hash(), U256::from(20))
+        .unwrap();
     store.put_header(&a2).unwrap();
     store.put_canonical_hash(2, a2.hash()).unwrap();
-    store.put_total_difficulty(a2.hash(), U256::from(30)).unwrap();
+    store
+        .put_total_difficulty(a2.hash(), U256::from(30))
+        .unwrap();
     store.update_head(&a2, U256::from(30)).unwrap();
 
     let verifier = Arc::new(HeaderVerifier::new());
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
-    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        verifier,
+        peer_store.clone(),
+    ));
 
     let (_event_tx, event_rx) = mpsc::unbounded_channel();
     let mut service = SyncService::new(manager, peer_store, event_rx);
@@ -3429,7 +4260,9 @@ async fn test_reorg_via_headers_response_higher_td() {
 
     // Receive fork headers (descending order, like real peers send)
     let peer = B512::repeat_byte(0x01);
-    service.on_headers_response(peer, vec![b2.clone(), b1.clone()]).await;
+    service
+        .on_headers_response(peer, vec![b2.clone(), b1.clone()])
+        .await;
 
     // Fork B has TD = 10 + 20 + 20 = 50 vs chain A's TD = 30
     // Head should switch to fork B
@@ -3452,15 +4285,23 @@ async fn test_no_reorg_via_headers_response_lower_td() {
     let a2 = dummy_header(2, a1.hash(), U256::from(20));
     store.put_header(&a1).unwrap();
     store.put_canonical_hash(1, a1.hash()).unwrap();
-    store.put_total_difficulty(a1.hash(), U256::from(30)).unwrap();
+    store
+        .put_total_difficulty(a1.hash(), U256::from(30))
+        .unwrap();
     store.put_header(&a2).unwrap();
     store.put_canonical_hash(2, a2.hash()).unwrap();
-    store.put_total_difficulty(a2.hash(), U256::from(50)).unwrap();
+    store
+        .put_total_difficulty(a2.hash(), U256::from(50))
+        .unwrap();
     store.update_head(&a2, U256::from(50)).unwrap();
 
     let verifier = Arc::new(HeaderVerifier::new());
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
-    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        verifier,
+        peer_store.clone(),
+    ));
 
     let (_event_tx, event_rx) = mpsc::unbounded_channel();
     let mut service = SyncService::new(manager, peer_store, event_rx);
@@ -3471,7 +4312,9 @@ async fn test_no_reorg_via_headers_response_lower_td() {
     let b2 = fork_header(2, b1.hash(), U256::from(5), 0xBB);
 
     let peer = B512::repeat_byte(0x01);
-    service.on_headers_response(peer, vec![b2.clone(), b1.clone()]).await;
+    service
+        .on_headers_response(peer, vec![b2.clone(), b1.clone()])
+        .await;
 
     // Fork B has TD = 10 + 5 + 5 = 20 vs chain A's TD = 50
     // Head should NOT change
@@ -3484,14 +4327,67 @@ async fn test_no_reorg_via_headers_response_lower_td() {
     assert!(store.header(b2.hash()).unwrap().is_some());
 }
 
+/// A tie at the tip, settled as rskj's `SelectionRule.shouldWeAddThisBlock`
+/// settles it: a sibling of the head with the same total difficulty, fees
+/// like the head's and the lower hash takes the head, though the head was
+/// held first.
+#[tokio::test]
+async fn test_tie_via_headers_response_goes_to_the_lower_hash() {
+    use rustock_core::selection_rule::is_this_block_hash_smaller;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(10));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(10)).unwrap();
+
+    // Blocks at #1 on genesis, alike but for their extra data.
+    let at_one = |branch: u8| {
+        let mut h = fork_header(1, genesis_hash, U256::from(10), branch);
+        h.paid_fees = U256::from(1_000);
+        h
+    };
+    let a1 = at_one(0xAA);
+    store.update_head(&a1, U256::from(20)).unwrap();
+    let b1 = (0..=u8::MAX)
+        .filter(|branch| *branch != 0xAA)
+        .map(at_one)
+        .find(|h| is_this_block_hash_smaller(&h.hash(), &a1.hash()))
+        .expect("a branch that hashes below the head");
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        verifier,
+        peer_store.clone(),
+    ));
+
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+
+    let peer = B512::repeat_byte(0x01);
+    service.on_headers_response(peer, vec![b1.clone()]).await;
+
+    // B1 weighs genesis's 10 and its own 10, as A1 does.
+    assert_eq!(
+        store.total_difficulty(b1.hash()).unwrap(),
+        Some(U256::from(20))
+    );
+    assert_eq!(store.head().unwrap(), Some(b1.hash()));
+    assert_eq!(store.canonical_hash(1).unwrap(), Some(b1.hash()));
+}
+
 // ========== Body download tests ==========
 
 #[tokio::test]
 async fn test_sync_handler_serves_body_request() {
-    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
-    use rustock_networking::protocol::P2pHandler;
-    use rustock_networking::protocol::rsk::BodyRequest;
     use rustock_core::Transaction;
+    use rustock_networking::protocol::rsk::BodyRequest;
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
 
     let dir = tempdir().unwrap();
     let store = Arc::new(BlockStore::open(dir.path()).unwrap());
@@ -3584,6 +4480,7 @@ async fn test_sync_handler_forwards_body_response() {
         id: 42,
         transactions: vec![],
         uncles: vec![],
+        extension: Some(an_extension(1)),
     };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BodyResponse(resp)));
 
@@ -3591,10 +4488,21 @@ async fn test_sync_handler_forwards_body_response() {
     assert!(handler_resp.is_none());
 
     match event_rx.try_recv().unwrap() {
-        SyncEvent::BodyResponse { id, transactions, uncles, .. } => {
+        SyncEvent::BodyResponse {
+            id,
+            transactions,
+            uncles,
+            extension,
+            ..
+        } => {
             assert_eq!(id, 42);
             assert!(transactions.is_empty());
             assert!(uncles.is_empty());
+            assert_eq!(
+                extension,
+                Some(an_extension(1)),
+                "the extension goes on with the body"
+            );
         }
         other => panic!("Expected BodyResponse event, got {:?}", other),
     }
@@ -3645,7 +4553,9 @@ async fn test_body_download_state_machine() {
         None
     };
     if let Some((req_id, asked)) = pending {
-        service.on_body_response(asked, req_id, vec![], vec![]).await;
+        service
+            .on_body_response(asked, req_id, vec![], vec![], None)
+            .await;
     }
 
     assert!(matches!(service.state, SyncState::Following),
@@ -3736,10 +4646,33 @@ async fn test_tx_relay_submit_transaction() {
     peer_store.add_peer(peer_a, tx_a).await;
 
     let relay = TxRelay::new(peer_store);
-    let raw = Bytes::from(vec![0xca, 0xfe]);
-    let hash = relay.submit_transaction(raw).await.unwrap();
 
-    assert_ne!(hash, alloy_primitives::B256::ZERO);
+    // With no pool the relay still reads the transaction, to report the hash
+    // rskj gives it: one rskj cannot read is refused, and never broadcast.
+    let junk = Bytes::from(vec![0xca, 0xfe]);
+    assert!(relay.submit_transaction(junk).await.is_err());
+    assert!(
+        rx_a.try_recv().is_err(),
+        "what cannot be read is not broadcast"
+    );
+
+    let tx = rustock_core::Transaction {
+        nonce: 0,
+        gas_price: U256::from(1),
+        gas_limit: U256::from(21_000),
+        to: Bytes::from(vec![0x12; 20]),
+        value: U256::from(1),
+        input: Bytes::new(),
+        v: 27,
+        r: U256::from(1),
+        s: U256::from(1),
+        cached_rlp: None,
+    };
+    let mut raw = Vec::new();
+    alloy_rlp::Encodable::encode(&tx, &mut raw);
+    let hash = relay.submit_transaction(Bytes::from(raw)).await.unwrap();
+
+    assert_eq!(hash, tx.tx_hash());
     assert!(rx_a.try_recv().is_ok(), "peer should receive broadcast");
 }
 
@@ -3798,6 +4731,7 @@ impl ExecController {
             this.cv.notify_all();
             crate::service::ExecOutcome {
                 all_ok,
+                superseded: false,
                 new_state_root: state_root,
                 blocks_since_flush,
             }
@@ -4035,7 +4969,12 @@ async fn test_pipeline_two_batches_advance_exec_head() {
         if let Some((hash, h)) = pending.last() {
             let _ = store_for_exec.set_exec_head(*hash, B256::from_slice(&[h.number as u8; 32]));
         }
-        crate::service::ExecOutcome { all_ok: true, new_state_root: state_root, blocks_since_flush: bsf }
+        crate::service::ExecOutcome {
+            all_ok: true,
+            superseded: false,
+            new_state_root: state_root,
+            blocks_since_flush: bsf,
+        }
     });
 
     let mut service = make_service(store.clone());
@@ -4064,6 +5003,45 @@ async fn test_pipeline_two_batches_advance_exec_head() {
     assert_eq!(exec_head_number(&store), 6, "exec head should reach #6 after batch 2");
 
     assert_eq!(service.last_body_height_for_test(), 6, "download cursor at #6");
+}
+
+/// A batch a reorg stopped halts as a failed one does, but says why at the
+/// level it merits: nothing failed, the chain moved. A batch whose task
+/// panicked failed.
+#[tokio::test]
+async fn a_batch_a_reorg_stopped_halts_with_a_warning_and_a_failed_one_with_an_error() {
+    for (superseded, panics) in [(true, false), (false, false), (false, true)] {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let headers = store_chain(&store, 3);
+        let exec_fn: crate::service::ExecFn =
+            Arc::new(move |state_root, bsf, _pending: Vec<(B256, Header)>| {
+                assert!(!panics, "the execution task panicked, as the test asks");
+                crate::service::ExecOutcome {
+                    all_ok: false,
+                    superseded,
+                    new_state_root: state_root,
+                    blocks_since_flush: bsf,
+                }
+            });
+        let mut service = make_service(store.clone());
+        service.set_test_exec(exec_fn);
+
+        let (_guard, log) = record_sync_log();
+        service
+            .finish_batch(&pending_of(&headers[0..3]), 1000)
+            .await;
+        drain_executions(&mut service).await;
+
+        let log = log.lock().unwrap().clone();
+        let paused = logged(&log, tracing::Level::WARN, "a reorg moved the chain");
+        let halted = logged(&log, tracing::Level::ERROR, "Sync halted");
+        assert_eq!(
+            (paused, halted),
+            (superseded, !superseded),
+            "superseded {superseded}: {log:?}"
+        );
+    }
 }
 
 /// Poll on_tick until no background execution remains in flight.
@@ -4973,6 +5951,191 @@ async fn a_matching_state_root_is_left_alone() {
     assert_eq!(service.follow_buffer.len(), 1, "cleared the buffer when nothing was wrong");
 }
 
+// -- #323: a block this node mined reaches the in-memory state root ---------
+
+/// A service whose in-memory root is genesis's state, over a store whose
+/// head is `mined`, genesis's child, with a state of its own in the trie.
+struct MinedNode {
+    store: Arc<BlockStore>,
+    trie: Arc<dyn rustock_trie::TrieStore>,
+    service: SyncService,
+    mined: Header,
+    mined_root: B256,
+    _dir: tempfile::TempDir,
+}
+
+fn mined_on_genesis() -> MinedNode {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mined = dummy_header(1, genesis.hash(), U256::from(1));
+    store.update_head(&mined, U256::from(2)).unwrap();
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let before = rustock_trie::TrieNode::empty();
+    let before_root = before.compute_hash(trie.as_ref());
+    trie.put(before_root.as_slice(), &before.to_message(trie.as_ref()));
+    let mut after = rustock_trie::TrieNode::empty().put(
+        &rustock_trie::TrieKeySlice::from_key(&[1u8, 2, 3]),
+        &[9u8; 8],
+        trie.as_ref(),
+    );
+    after.save(trie.as_ref(), true);
+    let mined_root = after.compute_hash(trie.as_ref());
+    assert_ne!(mined_root, before_root, "fixture did not create two states");
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        Arc::new(HeaderVerifier::new()),
+        peer_store.clone(),
+    ));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let service = SyncService::new(manager, peer_store, event_rx).with_block_processor(
+        processor,
+        trie.clone(),
+        before,
+    );
+    MinedNode {
+        store,
+        trie,
+        service,
+        mined,
+        mined_root,
+        _dir: dir,
+    }
+}
+
+/// #323. The miner commits the blocks it mines, not this service, so the
+/// service is told: rskj connects a mined block through the same
+/// `tryToConnect` as a block from a peer. The in-memory root takes the mined
+/// block's committed state, quietly: nothing queued is dropped, and the tick's
+/// reconcile, which reloaded the root with a warning for every block mined,
+/// finds nothing to do.
+#[tokio::test]
+async fn a_mined_block_becomes_the_in_memory_state_root() {
+    let MinedNode {
+        store,
+        trie,
+        mut service,
+        mined,
+        mined_root,
+        _dir,
+    } = mined_on_genesis();
+    store.set_exec_head(mined.hash(), mined_root).unwrap();
+    service.follow_buffer.insert(
+        2,
+        (
+            B256::repeat_byte(2),
+            dummy_header(2, mined.hash(), U256::from(1)),
+            vec![],
+            vec![],
+        ),
+    );
+
+    service
+        .handle_event(crate::SyncEvent::MinedBlock { hash: mined.hash() })
+        .await;
+
+    assert_eq!(
+        service
+            .current_state_root
+            .as_ref()
+            .map(|r| r.compute_hash(trie.as_ref())),
+        Some(mined_root),
+        "the mined block's state is the in-memory root"
+    );
+    service.resync_state_root_with_exec_head();
+    assert_eq!(
+        service.follow_buffer.len(),
+        1,
+        "the reconcile still found the two apart"
+    );
+}
+
+/// Only while the mined block is the executed head: one that lost to a
+/// heavier block leaves the in-memory root to the block that won.
+#[tokio::test]
+async fn a_mined_block_that_is_not_the_executed_head_moves_nothing() {
+    let MinedNode {
+        store,
+        trie,
+        mut service,
+        mined,
+        mined_root,
+        _dir,
+    } = mined_on_genesis();
+    let held = |service: &SyncService| {
+        service
+            .current_state_root
+            .as_ref()
+            .map(|r| r.compute_hash(trie.as_ref()))
+    };
+    let before = held(&service);
+    // A heavier sibling is the executed head, with a state of its own.
+    let heavier = fork_header(1, mined.parent_hash, U256::from(5), 0xbb);
+    store.update_head(&heavier, U256::from(6)).unwrap();
+    store.set_exec_head(heavier.hash(), mined_root).unwrap();
+
+    service
+        .handle_event(crate::SyncEvent::MinedBlock { hash: mined.hash() })
+        .await;
+
+    assert_eq!(
+        held(&service),
+        before,
+        "the root moved for a block that is not the head"
+    );
+}
+
+/// `--follow-up false` drops chain data from peers, and a snapshot session
+/// keeps it from the ordinary sync, but a block this node mined is not that:
+/// its state is still the node's either way.
+#[tokio::test]
+async fn a_serving_or_snapshotting_node_still_takes_the_state_of_a_block_it_mined() {
+    for snapshotting in [false, true] {
+        let MinedNode {
+            store,
+            trie,
+            mut service,
+            mined,
+            mined_root,
+            _dir,
+        } = mined_on_genesis();
+        if snapshotting {
+            service.start_snap_sync(
+                crate::snap::SnapConfig {
+                    client_enabled: true,
+                    ..Default::default()
+                },
+                Arc::new(HeaderVerifier::new()),
+            );
+            assert!(service.is_suspended_for_snap_for_test());
+        } else {
+            service.follow_up = false;
+        }
+        store.set_exec_head(mined.hash(), mined_root).unwrap();
+
+        service
+            .handle_event(crate::SyncEvent::MinedBlock { hash: mined.hash() })
+            .await;
+
+        assert_eq!(
+            service
+                .current_state_root
+                .as_ref()
+                .map(|r| r.compute_hash(trie.as_ref())),
+            Some(mined_root),
+            "snapshotting {snapshotting}"
+        );
+    }
+}
+
 /// The 2026-09-24 15:41 stall: follow mode holding canonical headers above the
 /// executed head with no bodies, and nothing in flight.
 ///
@@ -5004,7 +6167,9 @@ async fn test_follow_mode_re_requests_bodies_it_is_missing() {
     }
 
     // Executed up to #1; #2..#5 are canonical, header-only, no body.
-    store.set_exec_head(headers[0].hash(), headers[0].state_root).unwrap();
+    store
+        .set_exec_head(headers[0].hash(), headers[0].state_root)
+        .unwrap();
 
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
     let peer = B512::repeat_byte(0x01);
@@ -5012,7 +6177,11 @@ async fn test_follow_mode_re_requests_bodies_it_is_missing() {
     peer_store.add_peer(peer, tx).await;
 
     let verifier = Arc::new(HeaderVerifier::new());
-    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        verifier,
+        peer_store.clone(),
+    ));
     let (_event_tx, event_rx) = mpsc::unbounded_channel();
     let mut service = SyncService::new(manager, peer_store, event_rx);
     service.state = SyncState::Following;
@@ -5357,6 +6526,200 @@ async fn the_watchdog_retreat_stops_at_genesis() {
     assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
 }
 
+/// A failed snapshot sync stays recoverable through the watchdog's retreat.
+///
+/// Mainnet, 6 November 2026. A light node's snapshot sync gave up after five
+/// attempts, leaving genesis, headers from #9,372,260 up that link to nothing
+/// below them, and no executed head. The watchdog's first escalation retreated
+/// the head one block, and the retreat recorded #9,388,799 as executed: a
+/// block nothing had executed, with no state under it. From then on every
+/// check found execution stranded, and a restart could not help, because
+/// snapshot sync starts only on a node that has executed nothing; it declined,
+/// saying ordinary sync was the shorter path. Only a wiped data folder got the
+/// node going again.
+#[tokio::test]
+async fn a_retreat_after_a_failed_snapshot_sync_leaves_it_free_to_try_again() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    // The checkpoint's window: linked to itself and to nothing below, its
+    // state roots nowhere in the trie store.
+    let mut parent = B256::repeat_byte(0x9a);
+    for n in 1_000..=1_010u64 {
+        let mut h = dummy_header(n, parent, U256::from(1));
+        h.state_root = B256::repeat_byte(0x5a);
+        store.update_head(&h, U256::from(n)).unwrap();
+        parent = h.hash();
+    }
+    assert_eq!(
+        store.exec_head().unwrap(),
+        None,
+        "precondition: nothing executed"
+    );
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let mut service = service_over(store.clone()).with_trie_store_for_test(trie);
+
+    // The watchdog's first escalation.
+    service.reverify_head_lineage(1);
+
+    let head = store
+        .header(store.head().unwrap().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.number, 1_009, "precondition: the retreat happened");
+    assert_eq!(
+        store.exec_head().unwrap(),
+        None,
+        "the retreat recorded as executed a block nothing executed"
+    );
+
+    // And the node can still do the one thing that gets it going: try the
+    // snapshot again.
+    service.start_snap_sync(
+        crate::snap::SnapConfig::default(),
+        Arc::new(HeaderVerifier::new()),
+    );
+    assert!(
+        service.snap_phase().is_some(),
+        "snapshot sync declined to start on a node that has executed nothing"
+    );
+}
+
+/// A snapshot's blocks are kept without being run, so the session that takes
+/// them is given the node's rules for what a block carries
+/// (`SnapSession::with_block_rules`), as rskj gives its snapshot client its
+/// two block validators (`RskContext.getSnapshotProcessor`). A node with no
+/// block processor has none to give.
+#[tokio::test]
+async fn a_snapshot_session_is_given_the_nodes_rules_for_the_blocks_it_keeps() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let started = |mut service: SyncService| {
+        service.start_snap_sync(
+            crate::snap::SnapConfig::default(),
+            Arc::new(HeaderVerifier::new()),
+        );
+        service.snap_holds_blocks_to_rules_for_test()
+    };
+
+    assert_eq!(started(service_with_state(store.clone())), Some(true));
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    assert_eq!(
+        started(service_over(store).with_trie_store_for_test(trie)),
+        Some(false)
+    );
+}
+
+/// What a node holds when its snapshot sync failed the final check: a linked
+/// chain, nothing executed, and in the trie store the root of the checkpoint's
+/// state -- downloaded, never verified, perhaps full of holes. No other block's
+/// state is there.
+fn chain_with_an_unverified_state(
+    len: u64,
+    checkpoint: u64,
+) -> (
+    Arc<BlockStore>,
+    tempfile::TempDir,
+    Vec<Header>,
+    Arc<dyn rustock_trie::TrieStore>,
+) {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let unverified = B256::repeat_byte(0x77);
+    let mut headers = Vec::new();
+    let mut parent = B256::ZERO;
+    for n in 0..=len {
+        let mut h = dummy_header(n, parent, U256::from(1));
+        h.state_root = if n == checkpoint {
+            unverified
+        } else {
+            B256::repeat_byte(0x5a)
+        };
+        store.update_head(&h, U256::from(n + 1)).unwrap();
+        parent = h.hash();
+        headers.push(h);
+    }
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let root = rustock_trie::TrieNode::empty();
+    trie.put(unverified.as_slice(), &root.to_message(trie.as_ref()));
+    assert_eq!(
+        store.exec_head().unwrap(),
+        None,
+        "precondition: nothing executed"
+    );
+    (store, dir, headers, trie)
+}
+
+/// A retreat on a node that has executed nothing rolls nothing back.
+///
+/// Rolling back from the head that stands in for execution walks down to the
+/// first block whose state root the trie store holds, and records it as
+/// executed. After a snapshot sync that failed its check, that block is the
+/// checkpoint, and its state is the one the check refused.
+#[tokio::test]
+async fn a_retreat_does_not_take_up_a_state_that_failed_its_check() {
+    let (store, _dir, headers, trie) = chain_with_an_unverified_state(10, 5);
+    let mut service = service_over(store.clone()).with_trie_store_for_test(trie);
+
+    service.reverify_head_lineage(1);
+
+    assert_eq!(
+        store.head().unwrap(),
+        Some(headers[9].hash()),
+        "precondition: the retreat happened"
+    );
+    assert_eq!(
+        store.exec_head().unwrap(),
+        None,
+        "execution was recorded at a state nothing verified"
+    );
+}
+
+/// With nothing executed, I5 is the head off the chain, and gets the head's
+/// repair rather than execution's.
+///
+/// The check reads execution as the head when nothing is recorded, so a head
+/// that is not canonical reads as execution off the chain. Rolling execution
+/// back from there walks down to the unverified state, as above; re-seating
+/// the head is what the state calls for.
+#[tokio::test]
+async fn with_nothing_executed_a_head_off_the_chain_is_reseated_not_rolled_back() {
+    let (store, _dir, headers, trie) = chain_with_an_unverified_state(10, 5);
+    // The head names a sibling of #10, held but not canonical.
+    let mut sibling = dummy_header(10, headers[9].hash(), U256::from(1));
+    sibling.extra_data = vec![0xEE].into();
+    store.put_header(&sibling).unwrap();
+    store.set_head(sibling.hash()).unwrap();
+    let violation = crate::invariant::check(&store, None, crate::Scope::Full).unwrap_err();
+    assert_eq!(violation.relation(), "I5", "precondition: {violation}");
+
+    let mut service = service_over(store.clone()).with_trie_store_for_test(trie);
+    service.verify_coherence();
+    age_violation(
+        &mut service,
+        EXECUTION_OFF_CHAIN_GRACE + Duration::from_secs(1),
+    );
+    service.verify_coherence();
+
+    assert_eq!(
+        store.exec_head().unwrap(),
+        None,
+        "execution was recorded at a state nothing verified"
+    );
+    assert_eq!(
+        store.head().unwrap(),
+        Some(headers[10].hash()),
+        "the head should be back on the canonical chain"
+    );
+    assert_eq!(
+        crate::invariant::check(&store, None, crate::Scope::Full),
+        Ok(())
+    );
+}
+
 // ── snapshot sync owns the peer set while it runs (#185) ─────────────────────
 
 /// **Header sync first, then state — never the reverse.**
@@ -5432,6 +6795,201 @@ async fn the_ordinary_sync_resumes_when_the_snapshot_session_gives_up() {
     assert!(
         !service.is_suspended_for_snap_for_test(),
         "a session that gives up must return the peer set, or the node never syncs again"
+    );
+}
+
+/// A node with genesis and nothing executed, a snapshot sync started on it.
+fn snapshot_syncing_node() -> (SyncService, Arc<BlockStore>, tempfile::TempDir) {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mut service = make_service(store.clone())
+        .with_trie_store_for_test(Arc::new(rustock_trie::MemoryTrieStore::new()));
+    service.start_snap_sync(
+        crate::snap::SnapConfig {
+            client_enabled: true,
+            ..Default::default()
+        },
+        Arc::new(HeaderVerifier::new()),
+    );
+    assert!(
+        service.snap_phase().is_some(),
+        "precondition: a session is running"
+    );
+    (service, store, dir)
+}
+
+/// What failed every attempt on mainnet on 6 November 2026.
+fn state_not_whole() -> crate::snap::session::SnapFailure {
+    crate::snap::session::SnapFailure::IncompleteState(
+        "trie node 0x751b is not in the store".into(),
+    )
+}
+
+/// Fail sessions until no further one opens, and say how many that took.
+async fn fail_until_spent(service: &mut SyncService) -> u32 {
+    let mut failed = 0;
+    while service.snap_phase().is_some() {
+        assert!(
+            failed <= crate::service::MAX_SNAP_ATTEMPTS,
+            "sessions kept opening"
+        );
+        service.fail_snap_session_for_test(state_not_whole()).await;
+        failed += 1;
+    }
+    failed
+}
+
+/// Make the waiting try due now.
+fn make_the_next_try_due(service: &mut SyncService) {
+    let (at, _) = service.snap_retry_for_test();
+    assert!(at.is_some(), "no try is waiting");
+    *at = Some(Instant::now());
+}
+
+/// A node that has executed nothing waits and tries snapshot sync again when
+/// its attempts are spent, rather than handing over to an ordinary sync that
+/// has nothing to execute from.
+///
+/// Mainnet, 6 November 2026: after five failed attempts a light node handed
+/// over, ordinary sync tried three times to execute #9,372,260 on genesis,
+/// said "this node holds headers it has no way to execute", and stopped for
+/// good: nothing more would happen until someone restarted it.
+#[tokio::test]
+async fn a_node_that_executed_nothing_tries_snapshot_sync_again_rather_than_halting() {
+    use crate::service::{MAX_SNAP_ATTEMPTS, SNAP_RETRY_FIRST};
+    use crate::snap::session::Phase;
+
+    let (mut service, _store, _dir) = snapshot_syncing_node();
+    let gate = service.prune_gate();
+
+    assert_eq!(fail_until_spent(&mut service).await, MAX_SNAP_ATTEMPTS);
+
+    // Spent: no session, still standing aside, and another try set.
+    assert!(
+        service.is_suspended_for_snap_for_test(),
+        "handed over to an ordinary sync with nothing to execute from"
+    );
+    assert!(
+        !gate.load(std::sync::atomic::Ordering::Relaxed),
+        "pruning was released while the node still waits on a snapshot"
+    );
+    let (at, next_wait) = service.snap_retry_for_test();
+    assert!(at.is_some(), "no further try was set");
+    assert_eq!(
+        next_wait,
+        SNAP_RETRY_FIRST * 2,
+        "the wait after this one doubles"
+    );
+
+    // A tick before it is due changes nothing. In particular the guard for a
+    // node suspended with no session must not take the wait for one.
+    service.on_tick().await;
+    assert_eq!(service.snap_phase(), None);
+    assert!(
+        service.is_suspended_for_snap_for_test(),
+        "the wait was taken for a lost session"
+    );
+
+    // Once due, a session opens, and it is a single attempt.
+    make_the_next_try_due(&mut service);
+    service.on_tick().await;
+    assert_eq!(
+        service.snap_phase(),
+        Some(Phase::AwaitingStatus),
+        "the try that was set did not happen"
+    );
+    assert_eq!(
+        fail_until_spent(&mut service).await,
+        1,
+        "a later round is one attempt"
+    );
+    let (at, next_wait) = service.snap_retry_for_test();
+    assert!(at.is_some(), "no try was set after the second round");
+    assert_eq!(next_wait, SNAP_RETRY_FIRST * 4);
+    assert!(service.is_suspended_for_snap_for_test());
+}
+
+/// The wait between tries stops growing at a day, so a node keeps trying.
+#[tokio::test]
+async fn the_wait_between_snapshot_tries_stops_growing_at_a_day() {
+    let (mut service, _store, _dir) = snapshot_syncing_node();
+    fail_until_spent(&mut service).await;
+    for _ in 0..12 {
+        make_the_next_try_due(&mut service);
+        service.on_tick().await;
+        fail_until_spent(&mut service).await;
+    }
+    let (at, next_wait) = service.snap_retry_for_test();
+    assert!(at.is_some(), "the node stopped trying");
+    assert_eq!(next_wait, crate::service::SNAP_RETRY_MAX);
+}
+
+/// A new try asks every peer again: one set aside may have been set aside
+/// through no fault of its own -- the attempts on mainnet failed on a bug in
+/// this client -- and it may be the only one serving snapshots.
+#[tokio::test]
+async fn a_new_snapshot_try_asks_every_peer_again() {
+    let (mut service, _store, _dir) = snapshot_syncing_node();
+    fail_until_spent(&mut service).await;
+    service.snap_avoid_for_test().insert(B512::repeat_byte(7));
+
+    make_the_next_try_due(&mut service);
+    service.on_tick().await;
+
+    assert!(
+        service.snap_phase().is_some(),
+        "precondition: the try happened"
+    );
+    assert!(
+        service.snap_avoid_for_test().is_empty(),
+        "a peer is still set aside"
+    );
+}
+
+/// A node that has executed something hands over to ordinary sync as before:
+/// executing the blocks it is missing is its way forward.
+#[tokio::test]
+async fn a_node_that_has_executed_still_hands_over_to_ordinary_sync() {
+    let (mut service, store, _dir) = snapshot_syncing_node();
+    // Execution recorded beyond genesis, as though it had happened meanwhile.
+    let one = dummy_header(1, store.head().unwrap().unwrap(), U256::from(1));
+    store.update_head(&one, U256::from(2)).unwrap();
+    store.set_exec_head(one.hash(), one.state_root).unwrap();
+
+    assert_eq!(
+        fail_until_spent(&mut service).await,
+        crate::service::MAX_SNAP_ATTEMPTS
+    );
+
+    assert!(
+        !service.is_suspended_for_snap_for_test(),
+        "the peer set was not handed back"
+    );
+    assert!(
+        service.snap_retry_for_test().0.is_none(),
+        "a try was set for a node with a way forward"
+    );
+}
+
+/// Execution recorded at genesis is execution of nothing, as `start_snap_sync`
+/// already reads it: such a node waits and tries again too.
+#[tokio::test]
+async fn a_node_executed_only_to_genesis_tries_snapshot_sync_again_too() {
+    let (mut service, store, _dir) = snapshot_syncing_node();
+    let genesis = store.head().unwrap().unwrap();
+    store.set_exec_head(genesis, B256::ZERO).unwrap();
+
+    fail_until_spent(&mut service).await;
+
+    assert!(
+        service.is_suspended_for_snap_for_test(),
+        "handed over with nothing to execute from"
+    );
+    assert!(
+        service.snap_retry_for_test().0.is_some(),
+        "no further try was set"
     );
 }
 
@@ -6540,7 +8098,8 @@ async fn forged_uncles_do_not_prove_a_difficulty() {
     );
 }
 
-/// An uncle the header *does* commit to still has to have done the work.
+/// An uncle the header *does* commit to still has to have done the work, and
+/// to follow its parent as rskj's uncle rule requires.
 ///
 /// A matching commitment only proves the block's miner chose this list. The
 /// uncle's own merged-mining proof of work is what makes the difficulty it
@@ -6549,56 +8108,590 @@ async fn forged_uncles_do_not_prove_a_difficulty() {
 #[tokio::test]
 async fn a_committed_uncle_without_proof_of_work_proves_nothing() {
     use rustock_networking::protocol::HeaderWithUncles;
-    let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
-    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
-    let genesis_hash = genesis.hash();
-    store.update_head(&genesis, U256::from(1)).unwrap();
 
-    /// Rejects the marked header, standing in for a failed merged-mining check.
-    struct RejectMarked;
-    impl rustock_core::validation::HeaderValidator for RejectMarked {
-        fn validate(
-            &self,
-            h: &rustock_core::Header,
-        ) -> Result<(), rustock_core::validation::ValidationError> {
-            if h.difficulty == U256::from(999u64) {
-                return Err(rustock_core::validation::ValidationError::BitcoinPowInvalid {
+    let verifiers = [
+        (HeaderVerifier::new(), 1_020u64),
+        (HeaderVerifier::new().with_uncle_rule(NoWorkAt999), 21),
+        (
+            HeaderVerifier::new().with_uncle_parent_rule(OffItsParentAt999),
+            21,
+        ),
+    ];
+    for (verifier, total) in verifiers {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        let genesis_hash = genesis.hash();
+        store.update_head(&genesis, U256::from(1)).unwrap();
+        let verifier = verifier
+            .with_parent_rule(rustock_core::validation::BlockNumberRule)
+            .with_parent_rule(rustock_core::validation::ParentHashRule);
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+        let manager = SyncManager::new(store.clone(), Arc::new(verifier), peer_store);
+
+        // #1 on the trunk, then #2 naming a genuine sibling of #1 worth 999:
+        // its parent is an ancestor, so with no rule against it, it counts.
+        let commit = |h: &Header, us: &[Header]| -> Header {
+            let mut h = h.clone();
+            h.uncle_count = us.len() as u64;
+            h.ommers_hash = alloy_primitives::keccak256(
+                HeaderWithUncles {
+                    header: h.clone(),
+                    uncles: us.to_vec(),
+                }
+                .encoded_uncles(),
+            );
+            h.cached_hash = None;
+            h
+        };
+        let b1 = commit(&dummy_header(1, genesis_hash, U256::from(10)), &[]);
+        let mut uncle = dummy_header(1, genesis_hash, U256::from(999));
+        uncle.gas_used = 1;
+        uncle.cached_hash = None;
+        let b2 = commit(
+            &dummy_header(2, b1.hash(), U256::from(10)),
+            std::slice::from_ref(&uncle),
+        );
+        let hash = b2.hash();
+        let entry = HeaderWithUncles {
+            header: b2,
+            uncles: vec![uncle],
+        };
+        assert!(
+            entry.commitment_matches(),
+            "the commitment is honest; the work is not"
+        );
+
+        let headers = manager.note_proven_difficulties(vec![
+            HeaderWithUncles {
+                header: b1,
+                uncles: Vec::new(),
+            },
+            entry,
+        ]);
+        manager
+            .handle_headers_response(headers, test_peer())
+            .unwrap();
+
+        assert_eq!(
+            store.total_difficulty(hash).unwrap(),
+            Some(U256::from(total)),
+            "an uncle is credited exactly when it passes the uncle rules"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Total difficulty once the body is held. Header-first sync can only bound a
+// block's total, because its uncles travel in the body; `total_difficulty`
+// settles it once the body is in, crediting the uncles only once they pass
+// the whole uncle rule.
+// ---------------------------------------------------------------------------
+
+/// A header naming `uncles`: its uncle count and its uncles hash commit to
+/// them, as the body check on receipt requires.
+fn naming_uncles(mut header: Header, uncles: &[Header]) -> Header {
+    header.uncle_count = uncles.len() as u64;
+    header.ommers_hash = rustock_execution::processor::compute_ommers_hash(uncles);
+    header.cached_hash = None;
+    header
+}
+
+/// Fails the header whose difficulty is 999, standing in for an uncle whose
+/// merged-mining proof of work does not hold.
+struct NoWorkAt999;
+
+impl rustock_core::validation::HeaderValidator for NoWorkAt999 {
+    fn validate(&self, h: &Header) -> Result<(), rustock_core::validation::ValidationError> {
+        if h.difficulty == U256::from(999u64) {
+            return Err(
+                rustock_core::validation::ValidationError::BitcoinPowInvalid {
                     hash: h.hash(),
                     target: U256::ZERO,
-                });
-            }
-            Ok(())
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Fails the header whose difficulty is 999 against its parent, standing in
+/// for an uncle whose difficulty is not the one its parent calls for.
+struct OffItsParentAt999;
+
+impl rustock_core::validation::ParentHeaderValidator for OffItsParentAt999 {
+    fn validate_with_parent(
+        &self,
+        h: &Header,
+        _parent: &Header,
+    ) -> Result<(), rustock_core::validation::ValidationError> {
+        if h.difficulty == U256::from(999u64) {
+            return Err(
+                rustock_core::validation::ValidationError::DifficultyMismatch {
+                    expected: U256::from(10u64),
+                    got: h.difficulty,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Genesis held whole with a total of 1; #1 on it, worth 10; and two siblings
+/// of #1 for a later block to name as uncles, worth `first` and `second`.
+fn genesis_and_siblings(store: &BlockStore, first: u64, second: u64) -> (Header, Vec<Header>) {
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.put_body(genesis.hash(), &[], &[]).unwrap();
+    let b1 = dummy_header(1, genesis.hash(), U256::from(10));
+    let uncles = vec![
+        dummy_header(1, genesis.hash(), U256::from(first)),
+        dummy_header(1, genesis.hash(), U256::from(second)),
+    ];
+    (b1, uncles)
+}
+
+/// Answer each body request the service makes until it makes no more, with no
+/// transactions and the uncles `uncles_of` gives the block asked for.
+async fn answer_body_requests(service: &mut SyncService, uncles_of: impl Fn(B256) -> Vec<Header>) {
+    for _ in 0..16 {
+        let asked: Vec<(u64, B256, B512)> = match &service.state {
+            SyncState::DownloadingBodies {
+                pending_headers,
+                id_index,
+                ..
+            } => id_index
+                .iter()
+                .map(|(id, (i, peer))| (*id, pending_headers[*i].0, *peer))
+                .collect(),
+            _ => return,
+        };
+        for (id, hash, peer) in asked {
+            service
+                .on_body_response(peer, id, vec![], uncles_of(hash), None)
+                .await;
         }
     }
+    panic!("the service kept asking for bodies: {:?}", service.state);
+}
 
-    let verifier = Arc::new(
-        HeaderVerifier::new()
-            .with_static_rule(RejectMarked)
-            .with_parent_rule(rustock_core::validation::BlockNumberRule)
-            .with_parent_rule(rustock_core::validation::ParentHashRule),
-    );
+/// Catch up #1 to #3 header-first, from a peer that cannot send uncles, then
+/// download their bodies, #2's naming `uncles`. Returns the three headers.
+async fn caught_up(
+    store: &Arc<BlockStore>,
+    verifier: HeaderVerifier,
+    b1: Header,
+    uncles: &[Header],
+) -> [Header; 3] {
+    let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), uncles);
+    let b3 = dummy_header(3, b2.hash(), U256::from(10));
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
-    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    peer_store.add_peer(B512::repeat_byte(0x01), tx).await;
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        Arc::new(verifier),
+        peer_store.clone(),
+    ));
+    manager
+        .handle_headers_response(vec![b3.clone(), b2.clone(), b1.clone()], test_peer())
+        .unwrap();
+    assert_eq!(
+        store.total_difficulty(b3.hash()).unwrap(),
+        Some(U256::from(31)),
+        "each total is a bound until the bodies come"
+    );
 
-    let uncle = dummy_header(0, B256::ZERO, U256::from(999));
-    let mut b1 = dummy_header(1, genesis_hash, U256::from(10));
-    b1.uncle_count = 1;
-    let entry = HeaderWithUncles { header: b1, uncles: vec![uncle] };
-    let mut header = entry.header.clone();
-    header.ommers_hash = alloy_primitives::keccak256(entry.encoded_uncles());
-    header.cached_hash = None;
-    let entry = HeaderWithUncles { header, uncles: entry.uncles };
-    assert!(entry.commitment_matches(), "the commitment is honest; the work is not");
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.start_body_downloads(3).await;
+    let named = b2.hash();
+    answer_body_requests(&mut service, |hash| {
+        if hash == named {
+            uncles.to_vec()
+        } else {
+            Vec::new()
+        }
+    })
+    .await;
+    assert!(
+        matches!(service.state, SyncState::Following),
+        "{:?}",
+        service.state
+    );
+    [b1, b2, b3]
+}
 
-    let hash = entry.header.hash();
-    let headers = manager.note_proven_difficulties(vec![entry]);
-    manager.handle_headers_response(headers, test_peer()).unwrap();
+/// Once a caught-up batch's bodies are in, each total is made exact, oldest
+/// first, and every total above an uncle carries it, as rskj's do. A node that
+/// never did this ran 6.9 x 10^25 short of rskj after 8,000 mainnet blocks.
+#[tokio::test]
+async fn a_caught_up_batch_counts_the_uncles_its_bodies_bring() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (b1, uncles) = genesis_and_siblings(&store, 7, 5);
+    let [b1, b2, b3] = caught_up(&store, HeaderVerifier::new(), b1, &uncles).await;
+
+    // 1 + 10; then + 10 + 7 + 5; then + 10.
+    assert_eq!(
+        store.total_difficulty(b1.hash()).unwrap(),
+        Some(U256::from(11))
+    );
+    assert_eq!(
+        store.total_difficulty(b2.hash()).unwrap(),
+        Some(U256::from(33))
+    );
+    assert_eq!(
+        store.total_difficulty(b3.hash()).unwrap(),
+        Some(U256::from(43))
+    );
+}
+
+/// A body's uncles count only once they pass the whole uncle rule: the rules
+/// an uncle faces on its own, proof of work among them, and those it faces
+/// against its parent. The body check on receipt shows only that the block's
+/// miner chose them, and an uncle that never did its work would otherwise add
+/// what it claims to every total above it.
+#[tokio::test]
+async fn a_caught_up_body_whose_uncle_did_no_work_adds_no_uncle() {
+    let verifiers = [
+        HeaderVerifier::new().with_uncle_rule(NoWorkAt999),
+        HeaderVerifier::new().with_uncle_parent_rule(OffItsParentAt999),
+    ];
+    for verifier in verifiers {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let (b1, uncles) = genesis_and_siblings(&store, 7, 999);
+        let [_, b2, b3] = caught_up(&store, verifier, b1, &uncles).await;
+
+        // Neither uncle: rskj refuses the whole block over one.
+        assert_eq!(
+            store.total_difficulty(b2.hash()).unwrap(),
+            Some(U256::from(21))
+        );
+        assert_eq!(
+            store.total_difficulty(b3.hash()).unwrap(),
+            Some(U256::from(31))
+        );
+    }
+}
+
+/// In follow mode a block's total is settled from the executed head's when its
+/// body comes, rather than when a fork announcement next brings its header
+/// round again.
+#[tokio::test]
+async fn a_followed_block_counts_its_uncles_when_its_body_comes() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (b1, uncles) = genesis_and_siblings(&store, 7, 5);
+    let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), &uncles);
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let verifier = Arc::new(HeaderVerifier::new());
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        verifier,
+        peer_store.clone(),
+    ));
+    manager
+        .handle_headers_response(vec![b1.clone()], test_peer())
+        .unwrap();
+    store.put_body(b1.hash(), &[], &[]).unwrap();
+    store.set_exec_head(b1.hash(), B256::ZERO).unwrap();
+    manager
+        .handle_headers_response(vec![b2.clone()], test_peer())
+        .unwrap();
+    assert_eq!(
+        store.total_difficulty(b2.hash()).unwrap(),
+        Some(U256::from(21)),
+        "a bound until the body comes"
+    );
+
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+    let peer = B512::repeat_byte(9);
+    service
+        .pending_follow_bodies
+        .insert(7, (b2.hash(), b2.clone(), std::time::Instant::now(), peer));
+    service
+        .on_body_response(peer, 7, vec![], uncles, None)
+        .await;
 
     assert_eq!(
-        store.total_difficulty(hash).unwrap(),
-        Some(U256::from(11)),
-        "a committed uncle with no proof of work must not be credited"
+        store.total_difficulty(b2.hash()).unwrap(),
+        Some(U256::from(33))
+    );
+}
+
+/// rskj gives a block it is sent whole its parent's total and its cumulative
+/// difficulty, uncles included (`BlockChainImpl.internalTryToConnect`), and
+/// picks its best block by that. A block beside the head whose own
+/// difficulty is below the head's, and whose uncles carry it past, is the
+/// new head.
+#[tokio::test]
+async fn a_whole_block_is_weighed_with_the_uncles_it_brings() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (b1, uncles) = genesis_and_siblings(&store, 7, 5);
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        Arc::new(HeaderVerifier::new()),
+        peer_store.clone(),
+    ));
+    manager
+        .handle_headers_response(vec![b1.clone()], test_peer())
+        .unwrap();
+    store.put_body(b1.hash(), &[], &[]).unwrap();
+    store.set_exec_head(b1.hash(), B256::ZERO).unwrap();
+    // The head: #2, worth 10, for a total of 21.
+    let head = dummy_header(2, b1.hash(), U256::from(10));
+    manager
+        .handle_headers_response(vec![head.clone()], test_peer())
+        .unwrap();
+    store.put_body(head.hash(), &[], &[]).unwrap();
+    assert_eq!(store.head().unwrap(), Some(head.hash()));
+
+    // Its rival: worth 9 itself, and 12 more through the two uncles it names.
+    let rival = naming_uncles(fork_header(2, b1.hash(), U256::from(9), 0xee), &uncles);
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+    service
+        .on_new_block(
+            B512::repeat_byte(9),
+            rustock_core::Block {
+                header: rival.clone(),
+                transactions: Vec::new(),
+                ommers: uncles,
+            },
+        )
+        .await;
+
+    assert_eq!(
+        store.total_difficulty(rival.hash()).unwrap(),
+        Some(U256::from(32)),
+        "its parent's 11, its own 9 and its uncles' 12"
+    );
+    assert_eq!(
+        store.head().unwrap(),
+        Some(rival.hash()),
+        "the heavier block is the head"
+    );
+}
+
+/// A header ingested again with its body held, as a fork announcement does to
+/// the last few hundred, is credited the body's uncles only once they pass the
+/// whole uncle rule, as settling does.
+#[tokio::test]
+async fn a_header_ingested_again_credits_only_uncles_that_did_their_work() {
+    for (second, total) in [(5u64, 33u64), (999, 21)] {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let (b1, uncles) = genesis_and_siblings(&store, 7, second);
+        let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), &uncles);
+        let verifier = Arc::new(HeaderVerifier::new().with_uncle_rule(NoWorkAt999));
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+        let manager = SyncManager::new(store.clone(), verifier, peer_store);
+        manager
+            .handle_headers_response(vec![b2.clone(), b1.clone()], test_peer())
+            .unwrap();
+        store.put_body(b1.hash(), &[], &[]).unwrap();
+        store.put_body(b2.hash(), &[], &uncles).unwrap();
+
+        manager
+            .handle_headers_response(vec![b2.clone(), b1.clone()], test_peer())
+            .unwrap();
+        assert_eq!(
+            store.total_difficulty(b2.hash()).unwrap(),
+            Some(U256::from(total)),
+            "uncles worth 7 and {second}"
+        );
+    }
+}
+
+/// A held header whose parent is not held keeps the total it has. What the
+/// block adds is taken off and added back, so taking off its own difficulty
+/// alone counted its uncles twice once its total held them.
+#[tokio::test]
+async fn a_held_header_without_its_parent_keeps_its_total() {
+    use rustock_networking::protocol::HeaderWithUncles;
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (b1, uncles) = genesis_and_siblings(&store, 7, 5);
+    let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), &uncles);
+    // #2 held with the total that counts its uncles; #1 not held at all.
+    store.put_header(&b2).unwrap();
+    store
+        .put_total_difficulty(b2.hash(), U256::from(33))
+        .unwrap();
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), Arc::new(HeaderVerifier::new()), peer_store);
+    // A peer at `rsk/63` proves what #2 adds, its uncles with it.
+    let entries = vec![
+        HeaderWithUncles {
+            header: b1,
+            uncles: Vec::new(),
+        },
+        HeaderWithUncles {
+            header: b2.clone(),
+            uncles,
+        },
+    ];
+    assert!(entries.iter().all(HeaderWithUncles::commitment_matches));
+    manager.note_proven_difficulties(entries);
+
+    manager
+        .handle_headers_response(vec![b2.clone()], test_peer())
+        .unwrap();
+    assert_eq!(
+        store.total_difficulty(b2.hash()).unwrap(),
+        Some(U256::from(33))
+    );
+}
+
+/// An uncle is judged against the uncles its block's ancestors named, so it is
+/// not credited while an ancestor's are not held: the rule would read that
+/// ancestor as naming none, and pass an uncle it had named already.
+#[tokio::test]
+async fn an_uncle_is_not_credited_while_an_ancestors_uncles_are_not_held() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (b1, uncles) = genesis_and_siblings(&store, 7, 5);
+    let reused = &uncles[..1];
+    // #2 names the uncle and #3 names it again, which the rule refuses -- but
+    // only a node holding #2's uncles can see it.
+    let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), reused);
+    let b3 = naming_uncles(dummy_header(3, b2.hash(), U256::from(10)), reused);
+    for (header, total) in [(&b1, 11u64), (&b2, 28)] {
+        store.put_header(header).unwrap();
+        store
+            .put_total_difficulty(header.hash(), U256::from(total))
+            .unwrap();
+    }
+    store.put_body(b1.hash(), &[], &[]).unwrap();
+    store.put_header(&b3).unwrap();
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), Arc::new(HeaderVerifier::new()), peer_store);
+    assert!(manager.settle_total_difficulty(b3.hash(), &b3, reused));
+    assert_eq!(
+        store.total_difficulty(b3.hash()).unwrap(),
+        Some(U256::from(38)),
+        "#2's uncles are not held, so #3's are not credited"
+    );
+
+    // With #2's uncles held, the rule sees the reuse and refuses it.
+    store.put_body(b2.hash(), &[], reused).unwrap();
+    assert!(manager.settle_total_difficulty(b3.hash(), &b3, reused));
+    assert_eq!(
+        store.total_difficulty(b3.hash()).unwrap(),
+        Some(U256::from(38))
+    );
+
+    // And an uncle that no ancestor named is credited: 28 + 10 + 5.
+    let fresh = &uncles[1..];
+    let b3 = naming_uncles(dummy_header(3, b2.hash(), U256::from(10)), fresh);
+    store.put_header(&b3).unwrap();
+    assert!(manager.settle_total_difficulty(b3.hash(), &b3, fresh));
+    assert_eq!(
+        store.total_difficulty(b3.hash()).unwrap(),
+        Some(U256::from(43))
+    );
+}
+
+/// The oldest ancestor the rule walks, seven generations back or genesis, must
+/// have its uncles held as much as the nearest.
+#[tokio::test]
+async fn the_oldest_ancestor_the_uncle_rule_walks_must_be_held_too() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis.hash(), U256::from(10));
+    store.put_header(&b1).unwrap();
+    store
+        .put_total_difficulty(b1.hash(), U256::from(11))
+        .unwrap();
+    store.put_body(b1.hash(), &[], &[]).unwrap();
+    let uncles = vec![dummy_header(1, genesis.hash(), U256::from(7))];
+    let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), &uncles);
+    store.put_header(&b2).unwrap();
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), Arc::new(HeaderVerifier::new()), peer_store);
+    assert!(manager.settle_total_difficulty(b2.hash(), &b2, &uncles));
+    assert_eq!(
+        store.total_difficulty(b2.hash()).unwrap(),
+        Some(U256::from(21)),
+        "genesis is within the rule's reach and its uncles are not held"
+    );
+
+    store.put_body(genesis.hash(), &[], &[]).unwrap();
+    assert!(manager.settle_total_difficulty(b2.hash(), &b2, &uncles));
+    assert_eq!(
+        store.total_difficulty(b2.hash()).unwrap(),
+        Some(U256::from(28))
+    );
+}
+
+/// A batch stopped by a block that fails consensus validation is not clean,
+/// any more than one stopped by a block that fails to execute: rskj treats the
+/// block as invalid and stops there.
+#[test]
+fn a_batch_stopped_by_a_block_that_fails_validation_is_not_clean() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    let root = empty.compute_hash(trie.as_ref());
+    trie.put(root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.set_exec_head(genesis.hash(), root).unwrap();
+    // A block with no REMASC transaction, which every block but genesis needs.
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    store.put_header(&b1).unwrap();
+    store.put_body(b1.hash(), &[], &[]).unwrap();
+
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let block = rustock_core::types::block::Block {
+        header: b1.clone(),
+        transactions: Vec::new(),
+        ommers: Vec::new(),
+    };
+    assert!(
+        processor.validate_block(&block).is_err(),
+        "the block must fail validation"
+    );
+
+    let outcome = crate::service::process_downloaded_blocks(
+        &processor,
+        trie,
+        empty,
+        &store,
+        None,
+        0,
+        1,
+        &[(b1.hash(), b1)],
+        &crate::chain_activity::ChainActivity::new(),
+        &crate::gas_price::GasPriceTracker::default(),
+        &Default::default(),
+    );
+    assert!(
+        !outcome.all_ok,
+        "a batch stopped by an invalid block reported itself clean"
+    );
+    assert_eq!(
+        store.exec_head().unwrap().map(|(hash, _)| hash),
+        Some(genesis.hash()),
+        "and nothing past the invalid block's parent executed"
     );
 }
 
@@ -6864,7 +8957,9 @@ async fn a_body_from_a_peer_that_was_not_asked_is_ignored() {
     // b1's header commits to an empty body, so this payload is the correct
     // one. It is still refused, because of who sent it.
     let stranger = B512::repeat_byte(0x09);
-    service.on_body_response(stranger, 7, vec![], vec![]).await;
+    service
+        .on_body_response(stranger, 7, vec![], vec![], None)
+        .await;
 
     assert!(
         store.body(b1.hash()).unwrap().is_none(),
@@ -6879,10 +8974,377 @@ async fn a_body_from_a_peer_that_was_not_asked_is_ignored() {
     }
 
     // The peer that was asked is still able to answer it.
-    service.on_body_response(asked, 7, vec![], vec![]).await;
+    service
+        .on_body_response(asked, 7, vec![], vec![], None)
+        .await;
     assert!(
         store.body(b1.hash()).unwrap().is_some(),
         "the genuine answer must still be accepted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A header that came compressed takes the extension sent beside its body.
+//
+// From RSKIP-351 rskj sends a chain's headers compressed: a version-1 or
+// version-2 header holds only a commitment to its extension -- the block's
+// logs bloom, execution edges and base event -- and the extension comes beside
+// the block's body (`BodyResponseMessage`), which rskj sets on the header
+// before the block runs (`DownloadingBodiesSyncState.newBody`). While it was
+// dropped, testnet's first block after a snapshot whose bloom wasn't empty
+// failed `logs bloom mismatch`, its receipts all rskj's.
+// ---------------------------------------------------------------------------
+
+/// A version-2 extension whose bloom has one bit set: bit `bit`. Its edges
+/// are empty, as rskj emits them on every versioned header while RSKIP144 is
+/// active and the block has no sublists: a header given it has the fields
+/// rskj reads at regtest's heights.
+pub(crate) fn an_extension(
+    bit: usize,
+) -> rustock_core::types::header_extension::BlockHeaderExtension {
+    let mut logs_bloom = vec![0u8; 256];
+    logs_bloom[bit / 8] |= 0x80 >> (bit % 8);
+    rustock_core::types::header_extension::BlockHeaderExtension::V2 {
+        logs_bloom,
+        edges: Some(Vec::new()),
+        base_event: Some(Vec::new()),
+    }
+}
+
+/// `header` as rskj's regtest sends it to its peers, holding only the
+/// commitment to `extension` in its bloom's slot, with the UMM root rskj
+/// reads at regtest's heights and the merged-mining fields every versioned
+/// header has, and hashed as regtest's heights say: without the
+/// merged-mining proof and coinbase (RSKIP-92).
+pub(crate) fn compressed(
+    header: Header,
+    extension: &rustock_core::types::header_extension::BlockHeaderExtension,
+) -> Header {
+    let mut slot = Vec::new();
+    alloy_rlp::Encodable::encode(&extension.create_extension_data().as_slice(), &mut slot);
+    Header {
+        logs_bloom: Default::default(),
+        extension_data: Some(Bytes::from(slot)),
+        version_fields: None,
+        umm_root: Some(Bytes::new()),
+        bitcoin_merged_mining_header: Some(Bytes::from(vec![0u8; 80])),
+        bitcoin_merged_mining_merkle_proof: Some(Bytes::new()),
+        bitcoin_merged_mining_coinbase_transaction: Some(Bytes::new()),
+        cached_hash: None,
+        cached_hash_for_merged_mining: None,
+        kept: None,
+        ..header
+    }
+    .with_activations(&rustock_core::config::ActivationHeights::regtest())
+}
+
+/// A store that reads headers as a node of a chain with RSKIP-351 from block
+/// 1 does, rskj's regtest: there a header sent compressed holds the
+/// commitment to its extension in its logs bloom's slot.
+fn rskip351_store() -> Arc<BlockStore> {
+    Arc::new(
+        BlockStore::open(tempfile::tempdir().unwrap().path())
+            .unwrap()
+            .with_activations(rustock_core::config::ActivationHeights::regtest()),
+    )
+}
+
+/// A service over `store` with one peer, `asked`, connected.
+async fn service_with_a_peer(store: Arc<BlockStore>, asked: B512) -> SyncService {
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let service = SyncService::new(manager, peer_store.clone(), event_rx);
+    let (tx, rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    // Kept open, so that what is sent to the peer has somewhere to go.
+    std::mem::forget(rx);
+    peer_store.add_peer(asked, tx).await;
+    service
+}
+
+/// The batch path. A body without the extension its header commits to, or
+/// with another, is refused, and the request stays outstanding. With it, the
+/// header is stored with its bloom, edges and base event, under the same hash,
+/// and the batch carries the completed header to execution.
+#[tokio::test]
+async fn a_compressed_header_is_stored_with_the_extension_that_came_beside_its_body() {
+    let store = rskip351_store();
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let extension = an_extension(77);
+    let b1 = compressed(dummy_header(1, genesis.hash(), U256::from(1)), &extension);
+    let b2 = dummy_header(2, b1.hash(), U256::from(1));
+    let hash = b1.hash();
+    for h in [&b1, &b2] {
+        store.put_header(h).unwrap();
+    }
+    assert_eq!(
+        store.header(hash).unwrap(),
+        Some(b1.clone()),
+        "stored as it came"
+    );
+
+    let asked = B512::repeat_byte(0x01);
+    let mut service = service_with_a_peer(store.clone(), asked).await;
+    let mut in_flight = std::collections::HashMap::new();
+    in_flight.insert(
+        0usize,
+        InFlightBody {
+            req_id: 7,
+            sent: Instant::now(),
+            peer: asked,
+        },
+    );
+    let mut id_index = std::collections::HashMap::new();
+    id_index.insert(7u64, (0usize, asked));
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 2,
+        pending_headers: vec![(hash, b1.clone()), (b2.hash(), b2.clone())],
+        next_request: 1,
+        in_flight,
+        id_index,
+    };
+
+    for (sent, why) in [
+        (None, "no extension"),
+        (Some(an_extension(78)), "another extension"),
+    ] {
+        service
+            .on_body_response(asked, 7, vec![], vec![], sent)
+            .await;
+        assert!(
+            store.body(hash).unwrap().is_none(),
+            "{why}: no body is stored"
+        );
+        assert_eq!(
+            store.header(hash).unwrap(),
+            Some(b1.clone()),
+            "{why}: nor the header changed"
+        );
+        match &service.state {
+            SyncState::DownloadingBodies {
+                in_flight,
+                id_index,
+                ..
+            } => {
+                assert!(
+                    in_flight.contains_key(&0),
+                    "{why}: the request stays outstanding"
+                );
+                assert!(id_index.contains_key(&7), "{why}: and keeps its id");
+            }
+            other => panic!("expected DownloadingBodies, got {other:?}"),
+        }
+    }
+
+    service
+        .on_body_response(asked, 7, vec![], vec![], Some(extension.clone()))
+        .await;
+    assert!(store.body(hash).unwrap().is_some(), "the body is stored");
+    let stored = store.header(hash).unwrap().expect("the header");
+    assert_eq!(stored.extension(), Some(extension.clone()));
+    assert_eq!(stored.logs_bloom.as_slice(), extension.logs_bloom());
+    assert_eq!(
+        stored.hash(),
+        hash,
+        "the same hash, derived from the fields"
+    );
+    match &service.state {
+        SyncState::DownloadingBodies {
+            pending_headers, ..
+        } => {
+            assert_eq!(
+                pending_headers[0].1.extension(),
+                Some(extension),
+                "the batch runs it"
+            );
+        }
+        other => panic!("expected DownloadingBodies, got {other:?}"),
+    }
+}
+
+/// Follow mode takes the extension the same way, and buffers the completed
+/// header for execution.
+#[tokio::test]
+async fn a_followed_compressed_header_takes_the_extension_that_came_beside_its_body() {
+    let store = rskip351_store();
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let extension = an_extension(3);
+    let b1 = compressed(dummy_header(1, genesis.hash(), U256::from(1)), &extension);
+    let hash = b1.hash();
+    store.put_header(&b1).unwrap();
+
+    let asked = B512::repeat_byte(0x01);
+    let mut service = service_with_a_peer(store.clone(), asked).await;
+    service.state = SyncState::Following;
+    service
+        .pending_follow_bodies
+        .insert(7, (hash, b1.clone(), Instant::now(), asked));
+
+    service
+        .on_body_response(asked, 7, vec![], vec![], None)
+        .await;
+    assert!(store.body(hash).unwrap().is_none(), "no body is stored");
+    assert!(
+        service.pending_follow_bodies.contains_key(&7),
+        "it is asked for again"
+    );
+    assert!(service.follow_buffer.is_empty());
+
+    service
+        .on_body_response(asked, 7, vec![], vec![], Some(extension.clone()))
+        .await;
+    assert!(store.body(hash).unwrap().is_some(), "the body is stored");
+    assert_eq!(
+        store.header(hash).unwrap().and_then(|h| h.extension()),
+        Some(extension.clone())
+    );
+    assert!(!service.pending_follow_bodies.contains_key(&7));
+    // No block has run, so nothing drains the buffer.
+    let (buffered, header, ..) = service.follow_buffer.get(&1).expect("buffered");
+    assert_eq!((*buffered, header.extension()), (hash, Some(extension)));
+}
+
+/// A local block source that has every body, empty.
+struct EveryBody;
+
+impl ExternalBlockSource for EveryBody {
+    fn body_by_hash(&self, _: B256) -> Option<(Vec<rustock_core::Transaction>, Vec<Header>)> {
+        Some((Vec::new(), Vec::new()))
+    }
+}
+
+/// A body stored beside a header that holds only its commitment -- derived
+/// from the header, before that was refused -- is dropped when its batch
+/// starts, and asked of a peer, neither derived again nor filled from a local
+/// source, which has no extension to give. A header that holds its own fields
+/// keeps its body.
+#[tokio::test]
+async fn a_body_stored_without_its_header_extension_is_asked_for_again() {
+    let store = rskip351_store();
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = compressed(derivable_header(1, genesis.hash()), &an_extension(5));
+    // A header that holds its own fields, as one does once given the
+    // extension its commitment names.
+    let b2 = compressed(dummy_header(2, b1.hash(), U256::from(1)), &an_extension(6))
+        .with_extension(&an_extension(6))
+        .unwrap();
+    let hash = b1.hash();
+    for (number, h) in [(1, &b1), (2, &b2)] {
+        store.put_header(h).unwrap();
+        store.put_canonical_hash(number, h.hash()).unwrap();
+        store
+            .put_total_difficulty(h.hash(), U256::from(number + 1))
+            .unwrap();
+    }
+    store.update_head(&b2, U256::from(3)).unwrap();
+    store
+        .put_body(hash, &[rustock_core::Transaction::remasc(1)], &[])
+        .unwrap();
+    store.put_body(b2.hash(), &[], &[]).unwrap();
+
+    let service = service_with_a_peer(store.clone(), B512::repeat_byte(0x01)).await;
+    let mut service = service.with_block_source(Arc::new(EveryBody));
+    service.start_body_downloads(2).await;
+
+    assert!(store.body(hash).unwrap().is_none(), "the body is dropped");
+    assert!(
+        store.body(b2.hash()).unwrap().is_some(),
+        "a whole header keeps its body"
+    );
+    assert_eq!(service.derived_bodies, 0, "and not derived again");
+    match &service.state {
+        SyncState::DownloadingBodies {
+            pending_headers,
+            in_flight,
+            ..
+        } => {
+            assert_eq!(pending_headers.len(), 2);
+            assert_eq!(in_flight.len(), 1, "it is asked of the peer");
+        }
+        other => panic!("expected DownloadingBodies, got {other:?}"),
+    }
+}
+
+/// Follow mode drops such a body too, rather than run the block without its
+/// bloom, and asks for it again.
+#[tokio::test]
+async fn follow_mode_asks_again_for_a_body_stored_without_its_header_extension() {
+    let store = rskip351_store();
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.put_body(genesis.hash(), &[], &[]).unwrap();
+    store.set_exec_head(genesis.hash(), B256::ZERO).unwrap();
+    let b1 = compressed(derivable_header(1, genesis.hash()), &an_extension(6));
+    let hash = b1.hash();
+    store.put_header(&b1).unwrap();
+    store.put_canonical_hash(1, hash).unwrap();
+    let stale = [rustock_core::Transaction::remasc(1)];
+    store.put_body(hash, &stale, &[]).unwrap();
+
+    let mut service = service_with_a_peer(store.clone(), B512::repeat_byte(0x01)).await;
+    service.state = SyncState::Following;
+    service.refill_follow_buffer_from_store();
+    assert!(
+        service.follow_buffer.is_empty(),
+        "not run without its bloom"
+    );
+    assert!(store.body(hash).unwrap().is_none(), "the body is dropped");
+
+    store.put_body(hash, &stale, &[]).unwrap();
+    service.fill_follow_body_gap().await;
+    assert!(store.body(hash).unwrap().is_none(), "dropped again");
+    assert_eq!(
+        service.pending_follow_bodies.len(),
+        1,
+        "and asked of the peer"
+    );
+}
+
+/// A body is served with its header's extension, as rskj's
+/// `NodeBlockProcessor.processBodyRequest` sends it; for a header that holds
+/// only the commitment, which has none to send, no body is served.
+#[tokio::test]
+async fn a_served_body_carries_its_header_extension() {
+    use rustock_networking::protocol::rsk::BodyRequest;
+    use rustock_networking::protocol::{P2pHandler, P2pMessage, RskMessage, RskSubMessage};
+
+    let store = rskip351_store();
+    let extension = an_extension(9);
+    let whole = compressed(dummy_header(1, B256::ZERO, U256::from(1)), &extension)
+        .with_extension(&extension)
+        .expect("its own extension");
+    let only_committed = compressed(
+        dummy_header(2, whole.hash(), U256::from(1)),
+        &an_extension(10),
+    );
+    for h in [&whole, &only_committed] {
+        store.put_header(h).unwrap();
+        store.put_body(h.hash(), &[], &[]).unwrap();
+    }
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+    let ask = |hash| {
+        let req = BodyRequest { id: 33, hash };
+        let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BodyRequest(req)));
+        handler.handle_message(B512::repeat_byte(0x01), &msg)
+    };
+    match ask(whole.hash()) {
+        Some(P2pMessage::RskMessage(RskMessage {
+            sub_message: RskSubMessage::BodyResponse(r),
+        })) => assert_eq!(r.extension, Some(extension)),
+        other => panic!("expected a body, got {other:?}"),
+    }
+    assert!(
+        ask(only_committed.hash()).is_none(),
+        "no extension to send beside it"
     );
 }
 

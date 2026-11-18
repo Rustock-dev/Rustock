@@ -172,7 +172,12 @@ pub struct TimedMiner {
     server: Arc<MinerServer>,
     median: Duration,
     pow: Pow,
-    running: Arc<AtomicBool>,
+    /// The flag of the thread started last. Each start gives its thread a
+    /// flag of its own, and a stop clears the flag of the thread running: a
+    /// thread stopped while it sleeps or mines reads its own flag, so a start
+    /// that comes before it wakes runs a new thread and the stopped one ends,
+    /// not both on.
+    running: Mutex<Arc<AtomicBool>>,
     /// Blocks mined so far, for tests and for the stop message.
     mined: Arc<Mutex<u64>>,
 }
@@ -183,13 +188,16 @@ impl TimedMiner {
             server,
             median,
             pow,
-            running: Arc::new(AtomicBool::new(false)),
+            running: Mutex::new(Arc::new(AtomicBool::new(false))),
             mined: Arc::new(Mutex::new(0)),
         }
     }
 
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .load(Ordering::Acquire)
     }
 
     pub fn median(&self) -> Duration {
@@ -204,15 +212,16 @@ impl TimedMiner {
     /// Start the thread, or do nothing if it is running. The first block
     /// comes after a draw, as in rskj (`start`, line 83), not at once.
     pub fn start(&self) {
-        if self
-            .running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
+        let running = {
+            let mut current = self.running.lock().unwrap_or_else(|e| e.into_inner());
+            if current.load(Ordering::Acquire) {
+                return;
+            }
+            let flag = Arc::new(AtomicBool::new(true));
+            *current = flag.clone();
+            flag
+        };
         let server = self.server.clone();
-        let running = self.running.clone();
         let mined = self.mined.clone();
         let pow = self.pow;
         let mut schedule = TimedSchedule::new(self.median);
@@ -270,7 +279,10 @@ impl TimedMiner {
 
     /// Stop after the block in flight, if any. Idempotent.
     pub fn stop(&self) {
-        self.running.store(false, Ordering::Release);
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .store(false, Ordering::Release);
     }
 }
 

@@ -25,3 +25,16 @@ treat the block as invalid. The audit notes the agreement itself.
 
 Adopting the RSKIP here would mean accepting blocks rskj rejects — the
 accepts-too-much failure mode, and a fork in the chain-selection sense.
+
+---
+
+# misc — RSKIPs the audit skipped (#149)
+
+| RSKIP | verdict |
+|---|---|
+| 0 — RSKIP purpose and guidelines | **no consensus effect**: the process document, not a specification |
+| 59 — child contracts | absent from rustock **and from rskj**, which has no rule for it; matches mainnet |
+
+RSKIP-59 is Accepted in the RSKIPs index, which is where #149's status comes
+from. Its own file says *"Rejected in favor of RSKIP125"*: CREATE2 is what
+was built instead.

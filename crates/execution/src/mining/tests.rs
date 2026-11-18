@@ -8,9 +8,10 @@
 
 use alloy_primitives::{Address, B256, Bytes, U256, address, b256};
 use bitcoin::hashes::Hash as _;
+use num_bigint::BigUint;
 use rustock_core::config::{ActivationHeights, ChainConfig};
 use rustock_core::validation::merged_mining::{compress_coinbase, compute_coinbase_hash};
-use rustock_core::validation::{HeaderValidator, MergedMiningRule};
+use rustock_core::validation::{HeaderValidator, MergedMiningRule, ValidationError};
 use rustock_core::Header;
 use rustock_storage::BlockStore;
 use rustock_trie::{MemoryTrieStore, TrieNode, TrieStore};
@@ -23,7 +24,7 @@ use crate::processor::BlockProcessor;
 // ── fixtures ──────────────────────────────────────────────────────────
 
 /// Activation heights with merged mining live from block 0 and UMM never, so
-/// tests can work at low block numbers. `papyrus200` is raised out of reach
+/// tests can work at low block numbers. RSKIPUMM is left out of reach
 /// deliberately: a separate test covers the `ummRoot` a real chain carries.
 fn test_chain_config() -> Arc<ChainConfig> {
     Arc::new(ChainConfig {
@@ -32,10 +33,10 @@ fn test_chain_config() -> Arc<ChainConfig> {
         duration_limit: 10,
         difficulty_divisor: U256::from(2048),
         min_difficulty: U256::from(1),
+        fallback_mining_difficulty: U256::ZERO,
         max_future_block_time: 0,
         gas_limit_bound_divisor: 1024,
         min_gas_limit: 1,
-        max_gas_limit: 10_000_000,
         // regtest's, as rskj's own partitioner tests use.
         min_sequential_set_gas_limit: 6_800_000,
         activation_heights: ActivationHeights {
@@ -45,10 +46,20 @@ fn test_chain_config() -> Arc<ChainConfig> {
             iris300: 0,
             fingerroot500: 0,
             hop400: 0,
+            reed810: u64::MAX,
             // Active from genesis: this fixture mines blocks back to back,
             // so the ten-minute drop would only add noise.
             rskip97: Some(0),
+            // Neither, as `all_active`, the ladder `fixture_on` runs; the
+            // fixtures that run the sublists take theirs from their ladder
+            // (`with_heights_of`).
             rskip144: None,
+            rskip351: None,
+            // Testnet's floor alone, and this chain is not testnet.
+            rskip290: None,
+            rskip_umm: None,
+            rskip535: None,
+            base_event_recovery_below: None,
         },
         genesis_spec: None,
         skip_pow_validation: false,
@@ -67,8 +78,8 @@ fn header_at(number: u64, parent_hash: B256, state_root: B256) -> Header {
         receipts_root: B256::ZERO,
         logs_bloom: Default::default(),
         extension_data: None,
-        // Small enough that every Bitcoin hash clears the target, so the tests
-        // never have to search for a nonce.
+        // Small: rskj takes a difficulty of 2 or less as 3, a target of
+        // 2^256 / 3, so a nonce search clears it in a few tries.
         difficulty: U256::from(2),
         number,
         gas_limit: U256::from(6_800_000),
@@ -85,6 +96,7 @@ fn header_at(number: u64, parent_hash: B256, state_root: B256) -> Header {
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     }
 }
 
@@ -123,9 +135,9 @@ fn fixture(height: u64) -> MiningFixture {
     fixture_with(height, test_chain_config(), U256::from(2))
 }
 
-fn fixture_with_papyrus_at(papyrus200: u64, height: u64) -> MiningFixture {
+fn fixture_with_umm_at(rskip_umm: u64, height: u64) -> MiningFixture {
     let mut config = (*test_chain_config()).clone();
-    config.activation_heights.papyrus200 = papyrus200;
+    config.activation_heights.rskip_umm = Some(rskip_umm);
     fixture_with(height, Arc::new(config), U256::from(2))
 }
 
@@ -157,10 +169,21 @@ fn fixture_with(
 /// rskj's blocks runs (`--skip-pow-validation`), at a difficulty no nonce
 /// search could meet.
 fn fixture_without_pow(height: u64, flush_every: u64, trie_store: Arc<dyn TrieStore>) -> MiningFixture {
+    fixture_without_pow_gated(height, flush_every, trie_store, None)
+}
+
+/// The same chain, its miner's server wired to the node's sync state as a
+/// node wires it: work is refused while `gate` has a better block to fetch.
+fn fixture_without_pow_gated(
+    height: u64,
+    flush_every: u64,
+    trie_store: Arc<dyn TrieStore>,
+    gate: Option<Arc<dyn SyncGate>>,
+) -> MiningFixture {
     let mut config = (*test_chain_config()).clone();
     config.skip_pow_validation = true;
     config.min_difficulty = U256::from(1u64 << 28);
-    fixture_on(height, Arc::new(config), U256::from(1u64 << 28), trie_store, flush_every)
+    fixture_on_gated(height, Arc::new(config), U256::from(1u64 << 28), trie_store, flush_every, gate)
 }
 
 /// Counts the flushes asked of the trie store it wraps.
@@ -198,8 +221,26 @@ fn fixture_on(
     trie_store: Arc<dyn TrieStore>,
     flush_every: u64,
 ) -> MiningFixture {
+    fixture_on_gated(height, chain_config, parent_difficulty, trie_store, flush_every, None)
+}
+
+fn fixture_on_gated(
+    height: u64,
+    chain_config: Arc<ChainConfig>,
+    parent_difficulty: U256,
+    trie_store: Arc<dyn TrieStore>,
+    flush_every: u64,
+    gate: Option<Arc<dyn SyncGate>>,
+) -> MiningFixture {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    // A store that reads headers under the chain's heights, as a node's does
+    // under the heights it installs at startup.
+    let heights = chain_config.activation_heights.clone();
+    let store = Arc::new(
+        BlockStore::open(dir.path())
+            .unwrap()
+            .with_activations(heights.clone()),
+    );
     let empty_root = TrieNode::empty().compute_hash(trie_store.as_ref());
 
     let mut parent_hash = B256::ZERO;
@@ -207,6 +248,7 @@ fn fixture_on(
     for number in 0..=height {
         let mut header = header_at(number, parent_hash, empty_root);
         header.difficulty = parent_difficulty;
+        header.umm_root = heights.umm_active(number).then(Bytes::new);
         let hash = header.hash();
         store.put_header_with_hash(hash, &header).unwrap();
         store.put_canonical_hash(number, hash).unwrap();
@@ -223,7 +265,12 @@ fn fixture_on(
 
     let hardfork_cfg = RskHardforkConfig::all_active(33);
     let builder = BlockTemplateBuilder::new(
-        Arc::new(BlockProcessor::new(hardfork_cfg.clone(), store.clone())),
+        // With the chain's configuration, as a node wires its miner's
+        // processor: the uncles a template names are held to its rules.
+        Arc::new(
+            BlockProcessor::new(hardfork_cfg.clone(), store.clone())
+                .with_chain_config(chain_config.clone()),
+        ),
         trie_store.clone(),
         chain_config.clone(),
         hardfork_cfg,
@@ -238,12 +285,16 @@ fn fixture_on(
         None,
         flush_every,
     ));
-    let server = Arc::new(MinerServer::new(
+    let mut server = MinerServer::new(
         builder,
         chain,
         Arc::new(NoPendingTransactions),
         chain_config.clone(),
-    ));
+    );
+    if let Some(gate) = gate {
+        server = server.with_sync_gate(gate);
+    }
+    let server = Arc::new(server);
 
     MiningFixture { server, store, trie_store, chain_config, parent, _dir: dir }
 }
@@ -252,9 +303,10 @@ fn fixture_on(
 /// which is to say, actually mined.
 ///
 /// The search is the point: RSK compares the Bitcoin block hash, read
-/// little-endian, against `U256::MAX / difficulty`, so a block built with a
-/// fixed nonce clears the target only by luck. At these difficulties a handful
-/// of nonces suffice, which is what makes the round trip a unit test.
+/// little-endian, against the target rskj derives from the difficulty -- at
+/// best 2^256 / 3 -- so a block built with a fixed nonce clears the target
+/// only by luck. At these difficulties a handful of nonces suffice, which is
+/// what makes the round trip a unit test.
 fn solve(work: &MinerWork) -> bitcoin::Block {
     let coinbase = coinbase::build_coinbase(&work.block_hash_for_merged_mining, 0xDEAD_BEEF);
     for nonce in 0..100_000u32 {
@@ -332,7 +384,11 @@ fn merkle_proofs_fold_back_to_the_root() {
         assert_eq!(proof.len() % 32, 0);
 
         let root = merkle::root_from_proof(&txids[0], &proof);
-        assert_eq!(root, reference_merkle_root(&txids), "{count} transactions");
+        assert_eq!(
+            root,
+            Some(reference_merkle_root(&txids)),
+            "{count} transactions"
+        );
     }
 }
 
@@ -355,7 +411,7 @@ fn reference_merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
 fn a_single_transaction_block_needs_no_proof() {
     let proof = merkle::proof_from_txids(&[[7u8; 32]]).unwrap();
     assert!(proof.is_empty());
-    assert_eq!(merkle::root_from_proof(&[7u8; 32], &proof), [7u8; 32]);
+    assert_eq!(merkle::root_from_proof(&[7u8; 32], &proof), Some([7u8; 32]));
 }
 
 #[test]
@@ -404,7 +460,7 @@ fn fork_detection_data_is_empty_on_a_short_chain() {
     let chain: Vec<Header> = (0..448)
         .map(|i| header_at(448 - i, B256::ZERO, B256::ZERO))
         .collect();
-    assert!(fork_detection::calculate(&chain).is_empty());
+    assert!(fork_detection::calculate(&chain).unwrap().is_empty());
 }
 
 #[test]
@@ -418,10 +474,46 @@ fn fork_detection_data_commits_to_height_and_uncles() {
     }
     chain[32].uncle_count = 99;
 
-    let data = fork_detection::calculate(&chain);
+    let data = fork_detection::calculate(&chain).unwrap();
     assert_eq!(data.len(), fork_detection::FORK_DETECTION_DATA_LENGTH);
     assert_eq!(data[7], 32, "uncles outside the 32-block window must not count");
     assert_eq!(&data[8..12], &5_001u32.to_be_bytes(), "the height being mined");
+}
+
+/// rskj `ForkDataDetectionCalculatorTest.calculateWithDivisibleBy64height`:
+/// mining block 512, a multiple of 64, the first seven bytes are the least
+/// significant byte of the hash of the Bitcoin header of the blocks 63, 127,
+/// 191, 255, 319, 383 and 447 below the best, counting the best as 0; then
+/// the uncle count, none here, and the height. rskj's test names 446 for the
+/// last, where `ForkDetectionDataCalculator.buildCommitToParentsVector` reads
+/// 447 (`bestBlockHeight - cpvStartHeight + i * 64`), and passes because its
+/// chain gives twenty blocks one Bitcoin header: #64 and #65 share theirs.
+/// Here each block has its own, so the block read is the one asserted.
+#[test]
+fn fork_detection_data_commits_to_a_bitcoin_header_every_64_blocks() {
+    let chain: Vec<Header> = (0..fork_detection::REQUIRED_MAINCHAIN_BLOCKS)
+        .map(|i| {
+            let mut header = header_at(511 - i as u64, B256::ZERO, B256::ZERO);
+            // A Bitcoin header of each block's own, told apart by its version.
+            let mut bitcoin_header = [0u8; 80];
+            bitcoin_header[..4].copy_from_slice(&(i as u32).to_le_bytes());
+            header.bitcoin_merged_mining_header = Some(Bytes::copy_from_slice(&bitcoin_header));
+            header
+        })
+        .collect();
+    let least_significant_byte = |i: usize| {
+        let raw = chain[i].bitcoin_merged_mining_header.as_ref().unwrap();
+        let header: bitcoin::block::Header = bitcoin::consensus::deserialize(raw).unwrap();
+        // The hash read as a number is little-endian: its low byte is first.
+        header.block_hash().as_byte_array()[0]
+    };
+
+    let data = fork_detection::calculate(&chain).unwrap();
+    for (k, i) in [63, 127, 191, 255, 319, 383, 447].into_iter().enumerate() {
+        assert_eq!(data[k], least_significant_byte(i), "byte {k}: the block {i} below the best");
+    }
+    assert_eq!(data[7], 0, "no uncles");
+    assert_eq!(&data[8..12], &512u32.to_be_bytes(), "the height being mined");
 }
 
 /// The uncle count is one byte, and a chain busy enough to overflow it must
@@ -436,7 +528,62 @@ fn fork_detection_uncle_count_saturates() {
             h
         })
         .collect();
-    assert_eq!(fork_detection::calculate(&chain)[7], 255);
+    assert_eq!(fork_detection::calculate(&chain).unwrap()[7], 255);
+}
+
+/// The miner sums the uncle counts as the validator does, in rskj's Java
+/// `int`: counts that wrap the sum below zero leave no block to build, as
+/// rskj's `BlockToMineBuilder` throws, and counts that wrap it on past zero
+/// give what it came to, not a saturated 255.
+#[test]
+fn fork_detection_uncle_count_wraps_as_a_java_int() {
+    let chain = |counts: &[u64]| -> Vec<Header> {
+        (0..fork_detection::REQUIRED_MAINCHAIN_BLOCKS)
+            .map(|i| {
+                let mut h = header_at(5_000 - i as u64, B256::ZERO, B256::ZERO);
+                h.uncle_count = counts.get(i).copied().unwrap_or(0);
+                h
+            })
+            .collect()
+    };
+    let max = i32::MAX as u64;
+    assert_eq!(
+        fork_detection::calculate(&chain(&[max, 1])),
+        Err(ValidationError::UncleCountsSumBelowZero { sum: i32::MIN })
+    );
+    // 2 * (2^31 - 1) + 9 = 2^32 + 7.
+    assert_eq!(
+        fork_detection::calculate(&chain(&[max, max, 9])).unwrap()[7],
+        7
+    );
+}
+
+/// And no template either, as rskj's `BlockToMineBuilder` throws before it
+/// executes anything; the same chain without those counts builds.
+#[test]
+fn no_template_on_a_chain_whose_uncle_counts_sum_below_zero() {
+    let fx = fixture(20);
+    let chain = |counts: [u64; 2]| -> Vec<Header> {
+        let mut chain = vec![fx.parent.clone()];
+        chain.extend((1..fork_detection::REQUIRED_MAINCHAIN_BLOCKS).map(|i| {
+            let mut h = header_at(5_000 - i as u64, B256::ZERO, B256::ZERO);
+            h.uncle_count = counts.get(i - 1).copied().unwrap_or(0);
+            h
+        }));
+        chain
+    };
+    let build = |mainchain: &[Header]| {
+        fx.server
+            .builder_for_test()
+            .build(mainchain, Vec::new(), &NoPendingTransactions)
+    };
+    assert!(build(&chain([0, 0])).is_ok());
+    assert!(matches!(
+        build(&chain([i32::MAX as u64, 1])),
+        Err(TemplateError::ForkDetection(
+            ValidationError::UncleCountsSumBelowZero { sum: i32::MIN }
+        ))
+    ));
 }
 
 /// The overlay replaces the last 12 bytes and nothing else: the first 20 are
@@ -556,25 +703,38 @@ fn filling_the_mining_fields_does_not_move_the_merged_mining_hash() {
     assert_eq!(before, header.hash_for_merged_mining());
 }
 
-/// From papyrus200 rskj puts an empty `ummRoot` in every header it builds.
-/// Its presence changes both hashes, so a miner that decided by activation
-/// height differently from its peers produces blocks nobody accepts.
+/// From RSKIPUMM rskj puts an empty `ummRoot` in every header it builds
+/// (`BlockHeaderBuilder`). Its presence changes both hashes, so a miner that
+/// decided by activation height differently from its peers produces blocks
+/// nobody accepts. RSKIPUMM is papyrus200 on mainnet and testnet, and 1 on
+/// rskj's regtest, so papyrus200 alone does not say.
 #[test]
-fn umm_root_appears_once_papyrus_is_active() {
+fn umm_root_appears_once_rskip_umm_is_active() {
     let fx = fixture(20);
     assert!(fx.build().unwrap().block.header.umm_root.is_none());
 
-    let fx = fixture_with_papyrus_at(0, 20);
+    // The template is #21: a height above it is not reached yet.
+    let fx = fixture_with_umm_at(22, 20);
+    assert!(fx.build().unwrap().block.header.umm_root.is_none());
+    let fx = fixture_with_umm_at(21, 20);
     assert_eq!(fx.build().unwrap().block.header.umm_root, Some(Bytes::new()));
+
+    let mut papyrus = (*test_chain_config()).clone();
+    papyrus.activation_heights.papyrus200 = 0;
+    let fx = fixture_with(20, Arc::new(papyrus), U256::from(2));
+    assert!(fx.build().unwrap().block.header.umm_root.is_none());
 }
 
-/// Inheriting the parent's gas limit and minimum gas price is always valid --
-/// both rules are bounds around the parent's value, and the parent's own value
-/// is in range. This is what the builder does when no target is configured.
+/// rskj's miner aims for a gas limit of 6,800,000 unless set, forced: on a
+/// parent already there, as on this chain, a template keeps it; and it keeps
+/// the parent's minimum gas price where its target is too. rskj
+/// `GasLimitCalculatorTest.NextBlockGasLimitRemainsTheSame`, through the
+/// template.
 #[test]
-fn a_template_inherits_gas_limit_and_minimum_gas_price() {
+fn a_template_on_rskjs_defaults_keeps_a_parent_already_there() {
     let fx = fixture(20);
     let header = fx.build().unwrap().block.header;
+    assert_eq!(fx.parent.gas_limit, U256::from(GAS_LIMIT_TARGET));
     assert_eq!(header.gas_limit, fx.parent.gas_limit);
     assert_eq!(header.minimum_gas_price, fx.parent.minimum_gas_price);
 }
@@ -585,6 +745,8 @@ fn a_template_is_never_timestamped_at_or_before_its_parent() {
     // the rule on its own.
     let mut fx = fixture(20);
     fx.parent.timestamp = u64::MAX / 2;
+    // A miner builds on a head its store holds: REMASC reads up from it.
+    fx.store.put_header(&fx.parent).unwrap();
     let header = fx.build_on(&fx.parent).unwrap().block.header;
     assert!(header.timestamp > fx.parent.timestamp);
 }
@@ -849,7 +1011,29 @@ fn is_submission_allowed_when_enabled_and_limit_exceeded_then_should_return_fals
 #[test]
 fn second_build_block_to_mine_turns_notify_flag_off() {
     let fx = fixture(20);
+    // rskj's test fixes its clock. A child is stamped the wall clock or one
+    // second past its parent, whichever is later, so on a parent stamped in
+    // 2100 both builds stamp the same second; on the wall clock, two builds
+    // either side of a second's turn would differ.
+    let mut ahead = header_at(21, fx.parent.hash(), fx.parent.state_root);
+    ahead.timestamp = 4_102_444_800;
+    ahead.umm_root = fx
+        .chain_config
+        .activation_heights
+        .umm_active(21)
+        .then(Bytes::new);
+    let hash = ahead.hash();
+    fx.store.put_header_with_hash(hash, &ahead).unwrap();
+    fx.store.put_canonical_hash(21, hash).unwrap();
+    fx.store.put_total_difficulty(hash, U256::from(22)).unwrap();
+    fx.store.set_head(hash).unwrap();
+    fx.store.set_exec_head(hash, fx.parent.state_root).unwrap();
+
     let work = fx.server.get_work().unwrap();
+    assert_eq!(
+        work.parent_block_hash, hash,
+        "built on the parent stamped in 2100"
+    );
     assert!(work.notify);
     fx.server.build_work().unwrap();
     let again = fx.server.get_work().unwrap();
@@ -891,44 +1075,431 @@ fn rebuilds_on_every_batch_when_there_is_no_candidate_to_compare_against() {
 /// rskj `increaseMgp`: 1000 toward 2000 steps to 1010.
 #[test]
 fn increase_mgp() {
-    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(2000))), U256::from(1010));
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::from(1000u32), U256::from(2000)),
+        BigUint::from(1010u32)
+    );
 }
 
 /// rskj `decreaseMGP`: 1000 toward 900 steps to 990.
 #[test]
 fn decrease_mgp() {
-    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(900))), U256::from(990));
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::from(1000u32), U256::from(900)),
+        BigUint::from(990u32)
+    );
 }
 
 /// rskj `mgpOnRage`: a target inside the 1% band is reached at once.
 #[test]
 fn mgp_on_range() {
-    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(995))), U256::from(995));
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::from(1000u32), U256::from(995)),
+        BigUint::from(995u32)
+    );
 }
 
 /// rskj `previousMgpEqualsTarget`.
 #[test]
 fn previous_mgp_equals_target() {
-    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(1000))), U256::from(1000));
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::from(1000u32), U256::from(1000)),
+        BigUint::from(1000u32)
+    );
 }
 
 /// rskj `previousValueIsZero`: 1% of nothing is one wei.
 #[test]
 fn previous_value_is_zero() {
-    assert_eq!(next_minimum_gas_price(U256::ZERO, Some(U256::from(1000))), U256::from(1));
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::ZERO, U256::from(1000)),
+        BigUint::from(1u32)
+    );
 }
 
 /// rskj `previousValueIsSmallTargetIsZero`: one wei can step down to zero.
 #[test]
 fn previous_value_is_small_target_is_zero() {
-    assert_eq!(next_minimum_gas_price(U256::from(1), Some(U256::ZERO)), U256::ZERO);
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::from(1u32), U256::ZERO),
+        BigUint::ZERO
+    );
 }
 
-/// rskj `cantGetMGPtoBeNegative`: a negative target has no counterpart in
-/// an unsigned type; what is checked is that nothing steps below zero.
+/// rskj `cantGetMGPtoBeNegative`: a target below zero, which a provider's
+/// price can be, reads as zero (`as_coin`), and nothing steps below zero.
 #[test]
 fn cant_get_mgp_to_be_negative() {
-    assert_eq!(next_minimum_gas_price(U256::ZERO, Some(U256::ZERO)), U256::ZERO);
+    use super::min_gas_price::as_coin;
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::ZERO, as_coin(-100)),
+        BigUint::ZERO
+    );
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::from(1000u32), as_coin(-100)),
+        BigUint::from(990u32)
+    );
+}
+
+/// rskj `GasLimitCalculator`, forced: one step towards the target, at most a
+/// 1024th of the parent's gas limit, read whole: past 256 bits, where the
+/// typed field holds `U256::MAX`, the step is as exact.
+#[test]
+fn the_gas_limit_steps_a_1024th_at_any_size() {
+    use super::template::next_gas_limit;
+    let step_by = |gas_limit: &BigUint, target: u64, divisor: u64| {
+        let mut parent = header_at(1, B256::ZERO, B256::ZERO);
+        parent.set_gas_limit(gas_limit);
+        next_gas_limit(&parent, 0, target, true, divisor)
+    };
+    let step = |gas_limit: &BigUint, target: u64| step_by(gas_limit, target, 1024);
+    let start = BigUint::from(1_024_000u32);
+    assert_eq!(step(&start, u64::MAX), BigUint::from(1_025_000u32));
+    assert_eq!(step(&start, 0), BigUint::from(1_023_000u32));
+    assert_eq!(step(&start, 1_024_500), BigUint::from(1_024_500u32));
+    assert_eq!(step(&start, 1_024_000), start);
+    // The chain's own divisor: a 2048th steps half as far.
+    assert_eq!(step_by(&start, u64::MAX, 2048), BigUint::from(1_024_500u32));
+
+    let two = BigUint::from(2u8);
+    let past = two.pow(300);
+    assert_eq!(step(&past, u64::MAX), &past - two.pow(290));
+}
+
+// ── rskj GasLimitCalculatorTest ───────────────────────────────────────
+
+/// The minimum gas limit rskj's test reads, `Constants.regtest()`'s.
+const RSKJ_MIN_GAS_LIMIT: u64 = 3_000_000;
+/// The target it reads, `TestSystemProperties.getTargetGasLimit()`: rskj's
+/// regtest's, from `regtest.conf`.
+const RSKJ_TEST_TARGET: u64 = REGTEST_GAS_LIMIT_TARGET;
+
+/// `GasLimitCalculator.calculateBlockGasLimit(parentGasLimit, parentGasUsed,
+/// minGasLimit, targetGasLimit, forceTarget)`.
+fn calculate_block_gas_limit(
+    parent_gas_limit: u64,
+    parent_gas_used: u64,
+    min_gas_limit: u64,
+    target: u64,
+    force_target: bool,
+) -> u64 {
+    use super::template::next_gas_limit;
+    let mut parent = header_at(1, B256::ZERO, B256::ZERO);
+    parent.set_gas_limit(&BigUint::from(parent_gas_limit));
+    parent.gas_used = parent_gas_used;
+    let next = next_gas_limit(&parent, min_gas_limit, target, force_target, 1024);
+    u64::try_from(next).unwrap()
+}
+
+/// `validByConsensus`, which reads ethereumj's `ParentGasLimitRule(1024)`: a
+/// gas limit within a 1024th of the parent's, either way. The rule a block is
+/// held to, rskj's `BlockParentGasLimitRule`, bounds it below by `parent *
+/// 1023 / 1024`, a gas lower where the 1024th leaves a remainder; whatever
+/// the first takes, the second must take too, and this checks that as well.
+fn valid_by_consensus(new_gas: u64, parent_gas: u64) -> bool {
+    use rustock_core::validation::{BlockParentGasLimitRule, ParentHeaderValidator};
+    let delta = parent_gas / 1024;
+    let within = parent_gas - delta <= new_gas && new_gas <= parent_gas + delta;
+    if within {
+        let mut parent = header_at(1, B256::ZERO, B256::ZERO);
+        parent.set_gas_limit(&BigUint::from(parent_gas));
+        let mut header = header_at(2, parent.hash(), B256::ZERO);
+        header.set_gas_limit(&BigUint::from(new_gas));
+        let rule = BlockParentGasLimitRule {
+            config: test_chain_config(),
+        };
+        assert_eq!(
+            rule.validate_with_parent(&header, &parent),
+            Ok(()),
+            "{new_gas} on {parent_gas}"
+        );
+    }
+    within
+}
+
+/// rskj `NextBlockGasLimitIsDecreasedByAFactor`: not forced, a parent that
+/// used nothing steps down a 1024th.
+#[test]
+fn next_block_gas_limit_is_decreased_by_a_factor() {
+    let parent = RSKJ_MIN_GAS_LIMIT + 21_000;
+    let new = calculate_block_gas_limit(parent, 0, RSKJ_MIN_GAS_LIMIT, RSKJ_TEST_TARGET, false);
+    assert!(new < parent);
+    assert_eq!(new, parent - parent / 1024);
+}
+
+/// rskj `NextBlockGasLimitIsNotDecreasedLowerThanMinGasLimit`.
+#[test]
+fn next_block_gas_limit_is_not_decreased_lower_than_min_gas_limit() {
+    let min = RSKJ_MIN_GAS_LIMIT;
+    assert_eq!(
+        calculate_block_gas_limit(min, 0, min, RSKJ_TEST_TARGET, false),
+        min
+    );
+}
+
+/// rskj `NextBlockGasLimitIsIncreasedBasedOnGasUsed`: 3,500,000 less a
+/// 1024th, plus 3,000,000 times 3/2 over 1024.
+#[test]
+fn next_block_gas_limit_is_increased_based_on_gas_used() {
+    let new = calculate_block_gas_limit(3_500_000, 3_000_000, 0, RSKJ_TEST_TARGET, false);
+    assert_eq!(new, 3_500_977);
+}
+
+/// rskj `NextBlockGasLimitIsIncreasedBasedOnFullGasUsed`.
+#[test]
+fn next_block_gas_limit_is_increased_based_on_full_gas_used() {
+    let new = calculate_block_gas_limit(3_500_000, 3_500_000, 0, RSKJ_TEST_TARGET, false);
+    assert_eq!(new, 3_501_709);
+}
+
+/// rskj `NextBlockGasLimitIsNotIncreasedMoreThanTargetGasLimit`.
+#[test]
+fn next_block_gas_limit_is_not_increased_more_than_target_gas_limit() {
+    let target = RSKJ_TEST_TARGET;
+    assert_eq!(
+        calculate_block_gas_limit(target, target, 0, target, false),
+        target
+    );
+}
+
+/// rskj `NextBlockGasLimitRemainsTheSame`.
+#[test]
+fn next_block_gas_limit_remains_the_same() {
+    let target = RSKJ_TEST_TARGET;
+    let new = calculate_block_gas_limit(target, 0, target, target, true);
+    assert_eq!(new, target);
+    assert!(valid_by_consensus(new, target));
+}
+
+/// rskj `NextBlockGasLimitIsIncreasedByMaximumValue`.
+#[test]
+fn next_block_gas_limit_is_increased_by_maximum_value() {
+    let min = RSKJ_MIN_GAS_LIMIT;
+    let new = calculate_block_gas_limit(min, 0, min, RSKJ_TEST_TARGET, true);
+    let new2 = calculate_block_gas_limit(min, min, min, RSKJ_TEST_TARGET, true);
+    assert_eq!(new, new2);
+    assert_eq!(new, min + min / 1024);
+    assert!(valid_by_consensus(new, min));
+    assert!(valid_by_consensus(new2, min));
+    assert!(!valid_by_consensus(new + 1, min));
+}
+
+/// rskj `NextBlockGasLimitIsIncreasedToTarget`.
+#[test]
+fn next_block_gas_limit_is_increased_to_target() {
+    let min = RSKJ_MIN_GAS_LIMIT;
+    let target = min + 1;
+    let new = calculate_block_gas_limit(min, 0, min, target, true);
+    let new2 = calculate_block_gas_limit(min, min, min, target, true);
+    assert_eq!(new, target);
+    assert_eq!(new, new2);
+    assert!(valid_by_consensus(new, min));
+    assert!(valid_by_consensus(new2, min));
+}
+
+/// rskj `NextBlockGasLimitIsDecreasedToTarget`: a target less than a step
+/// below the parent's gas limit is reached in one block, whatever gas the
+/// parent used.
+#[test]
+fn next_block_gas_limit_is_decreased_to_target() {
+    let min = RSKJ_MIN_GAS_LIMIT;
+    let target = min + 1;
+    let used = target + 1;
+    let new = calculate_block_gas_limit(used, used, min, target, true);
+    let new2 = calculate_block_gas_limit(used, 0, min, target, true);
+    assert_eq!(new, target);
+    assert_eq!(new, new2);
+    assert!(valid_by_consensus(new, used));
+    assert!(valid_by_consensus(new2, used));
+}
+
+/// rskj `NextBlockGasLimitIsDecreasedToMinimum`: a target under the minimum
+/// is the minimum.
+#[test]
+fn next_block_gas_limit_is_decreased_to_minimum() {
+    let min = RSKJ_MIN_GAS_LIMIT;
+    let target = min - 1;
+    let used = min + 1;
+    let new = calculate_block_gas_limit(used, used, min, target, true);
+    let new2 = calculate_block_gas_limit(used, 0, min, target, true);
+    assert_eq!(new, min);
+    assert_eq!(new, new2);
+    assert!(valid_by_consensus(new, used));
+    assert!(valid_by_consensus(new2, used));
+}
+
+/// rskj `NextBlockGasLimitIsDecreasedByMaximumValue`.
+#[test]
+fn next_block_gas_limit_is_decreased_by_maximum_value() {
+    let min = RSKJ_MIN_GAS_LIMIT;
+    let target = RSKJ_TEST_TARGET;
+    let used = target * 2;
+    let new = calculate_block_gas_limit(used, 0, min, target, true);
+    let new2 = calculate_block_gas_limit(used, used, min, target, true);
+    assert_eq!(new, new2);
+    assert_eq!(new, used - used / 1024);
+    assert!(valid_by_consensus(new, used));
+    assert!(valid_by_consensus(new2, used));
+    assert!(!valid_by_consensus(new - 1, used));
+}
+
+/// Not forced, on a parent past 256 bits: the target, a u64, is under any
+/// gas limit there, and rskj keeps the parent's rather than drop more than
+/// a step.
+#[test]
+fn not_forced_a_gas_limit_past_256_bits_is_kept() {
+    use super::template::next_gas_limit;
+    let past = BigUint::from(2u8).pow(300);
+    let mut parent = header_at(1, B256::ZERO, B256::ZERO);
+    parent.set_gas_limit(&past);
+    parent.gas_used = u64::MAX;
+    assert_eq!(next_gas_limit(&parent, 0, u64::MAX, false, 1024), past);
+}
+
+/// rskj `GasLimitCalculator` takes a target under the chain's minimum gas
+/// limit as the minimum: from a parent at 6,800,000 on a chain whose
+/// minimum is 6,799,000, a target of 1 steps down only to 6,799,000, not
+/// the 1024th that would leave a block below the minimum, which the
+/// miner's own block check then refuses.
+#[test]
+fn a_gas_limit_target_under_the_minimum_is_the_minimum() {
+    let mut config = (*test_chain_config()).clone();
+    config.min_gas_limit = 6_799_000;
+    let chain_config = Arc::new(config);
+    let fx = fixture_with(20, chain_config.clone(), U256::from(2));
+    let hardfork_cfg = RskHardforkConfig::all_active(33);
+    let processor = BlockProcessor::new(hardfork_cfg.clone(), fx.store.clone())
+        .with_chain_config(chain_config.clone());
+    let builder = BlockTemplateBuilder::new(
+        Arc::new(processor),
+        fx.trie_store.clone(),
+        chain_config,
+        hardfork_cfg,
+        MiningConfig {
+            gas_limit_target: 1,
+            ..Default::default()
+        },
+    );
+    let parent = std::slice::from_ref(&fx.parent);
+    let template = builder
+        .build(parent, Vec::new(), &NoPendingTransactions)
+        .unwrap();
+    assert_eq!(template.block.header.gas_limit, U256::from(6_799_000));
+}
+
+/// On a parent whose gas limit is past 256 bits, a template steps a 1024th
+/// down from the parent's value towards rskj's target, as rskj's miner
+/// writes it, which the parent rule takes. The `U256::MAX` the typed field
+/// holds is no gas limit the chain allows there.
+#[test]
+fn a_template_on_a_gas_limit_past_256_bits_steps_from_its_value() {
+    use rustock_core::validation::{BlockParentGasLimitRule, ParentHeaderValidator};
+    let mut fx = fixture(20);
+    let two = BigUint::from(2u8);
+    let value = two.pow(300);
+    fx.parent.set_gas_limit(&value);
+    fx.store.put_header(&fx.parent).unwrap();
+    let header = fx.build_on(&fx.parent).unwrap().block.header;
+    assert_eq!(header.gas_limit_value(), &value - two.pow(290));
+    assert_eq!(header.gas_limit, U256::MAX);
+    let rule = BlockParentGasLimitRule {
+        config: fx.chain_config.clone(),
+    };
+    assert_eq!(rule.validate_with_parent(&header, &fx.parent), Ok(()));
+}
+
+/// rskj's `MinimumGasPriceCalculator` steps from the parent's price read
+/// whole: past 256 bits, where the typed field holds `U256::MAX`, by exactly
+/// 1%, down towards any target a U256 can name.
+#[test]
+fn the_minimum_gas_price_steps_one_percent_at_any_size() {
+    let two = BigUint::from(2u8);
+    // 1% of 100 * 2^294 + 12,345 is 2^294 + 123.
+    let parent = two.pow(294) * 100u32 + 12_345u32;
+    let lower = two.pow(294) * 99u32 + 12_222u32;
+    assert_eq!(next_minimum_gas_price(&parent, U256::ZERO), lower);
+    assert_eq!(next_minimum_gas_price(&parent, U256::MAX), lower);
+    // Below 2^256 every target is a U256, so none steps past it.
+    let top = two.pow(256) - 1u8;
+    assert_eq!(next_minimum_gas_price(&(&top - 1u8), U256::MAX), top);
+}
+
+/// The template's filter holds transactions to the minimum, and past 256
+/// bits to `U256::MAX`, which no transaction's price reaches either. revm's
+/// base fee, the minimum cut to 64 bits, would refuse only those priced
+/// under 2^64, and a sender rich enough could pay more.
+#[test]
+fn past_256_bits_the_filter_holds_transactions_to_u256_max() {
+    use super::template::u256_or_max;
+    let two = BigUint::from(2u8);
+    assert_eq!(u256_or_max(&two.pow(300)), U256::MAX);
+    assert_eq!(u256_or_max(&(two.pow(256) - 1u8)), U256::MAX);
+    assert_eq!(
+        u256_or_max(&(two.pow(256) - 2u8)),
+        U256::MAX - U256::from(1)
+    );
+    assert_eq!(u256_or_max(&BigUint::from(1_000u32)), U256::from(1_000));
+}
+
+/// On a parent whose minimum gas price is past 256 bits, a template steps 1%
+/// down from the parent's value, toward rskj's default price of 0, as rskj's
+/// miner writes it, which the parent rule takes.
+#[test]
+fn a_template_on_a_minimum_gas_price_past_256_bits_steps_from_its_value() {
+    use rustock_core::validation::{ParentHeaderValidator, PrevMinGasPriceRule};
+    let mut fx = fixture(20);
+    let value = BigUint::from(2u8).pow(300);
+    fx.parent.set_minimum_gas_price(&value);
+    fx.store.put_header(&fx.parent).unwrap();
+    let header = fx.build_on(&fx.parent).unwrap().block.header;
+    assert_eq!(header.minimum_gas_price_value(), &value - &value / 100u32);
+    assert_eq!(header.minimum_gas_price, U256::MAX);
+    assert_eq!(
+        PrevMinGasPriceRule.validate_with_parent(&header, &fx.parent),
+        Ok(())
+    );
+}
+
+/// rskj's `BlockToMineBuilder` asks its `MinGasPriceProvider` for the
+/// target as it builds: a price of 2,000 on a parent at 1,000 steps to
+/// 1,010, and the default, rskj's `miner.minGasPrice` of 0, to 990.
+#[test]
+fn a_template_steers_its_minimum_gas_price_toward_the_providers() {
+    let mut fx = fixture(20);
+    fx.parent.set_minimum_gas_price(&BigUint::from(1000u32));
+    fx.store.put_header(&fx.parent).unwrap();
+    let built = |min_gas_price: Arc<dyn MinGasPriceProvider>| {
+        let hardfork_cfg = RskHardforkConfig::all_active(33);
+        let processor = BlockProcessor::new(hardfork_cfg.clone(), fx.store.clone())
+            .with_chain_config(fx.chain_config.clone());
+        BlockTemplateBuilder::new(
+            Arc::new(processor),
+            fx.trie_store.clone(),
+            fx.chain_config.clone(),
+            hardfork_cfg,
+            MiningConfig {
+                min_gas_price,
+                ..Default::default()
+            },
+        )
+        .build(
+            std::slice::from_ref(&fx.parent),
+            Vec::new(),
+            &NoPendingTransactions,
+        )
+        .unwrap()
+        .block
+        .header
+        .minimum_gas_price
+    };
+    assert_eq!(
+        built(Arc::new(FixedMinGasPriceProvider::new(2000))),
+        U256::from(1010)
+    );
+    assert_eq!(
+        built(MiningConfig::default().min_gas_price),
+        U256::from(990)
+    );
 }
 
 /// A coinbase tagged with a hash this node never handed out cannot be matched
@@ -1016,6 +1587,33 @@ fn notify_is_reported_once() {
     let fx = fixture(20);
     assert!(fx.server.get_work().unwrap().notify);
     assert!(!fx.server.get_work().unwrap().notify);
+}
+
+/// rskj `MinerServerTest.gasUnitInDollarsIsInitializedOkAtConstructor`, whose
+/// name is not what it asserts: work built on a new parent is a notify
+/// again, though the work before it was read.
+#[test]
+fn work_on_a_new_parent_is_a_notify_again() {
+    let fx = fixture(20);
+    let first = fx.server.get_work().unwrap();
+    assert!(first.notify);
+    assert!(!fx.server.get_work().unwrap().notify);
+    let info = fx
+        .server
+        .submit_bitcoin_block(&bitcoin::consensus::serialize(&solve(&first)))
+        .unwrap();
+    // The submission built the next work, on the block it imported.
+    let next = fx.server.get_work().unwrap();
+    assert_eq!(next.parent_block_hash, info.block_hash);
+    assert!(next.notify, "work on a new parent must be pushed to the miners");
+}
+
+/// rskj `MinerServerTest.workWithNoTransactionsZeroFees`: work on a block with
+/// no transaction but REMASC's pays its miner nothing.
+#[test]
+fn work_with_no_transactions_pays_the_miner_nothing() {
+    let fx = fixture(20);
+    assert_eq!(fx.server.get_work().unwrap().fees_paid_to_miner, U256::ZERO);
 }
 
 /// The three submit methods differ only in how much of the Bitcoin block the
@@ -1126,14 +1724,57 @@ fn a_solution_that_misses_the_target_is_refused() {
     assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
 }
 
+/// rskj `MainNetMinerTest.submitBitcoinBlockInvalidBlockDoesntEliminateCache`:
+/// a solution that misses the target is refused, and the work it answered
+/// stays on offer, so a solution found after it is taken. rskj asserts the
+/// refusal and leaves the rest commented out, its difficulty too high to
+/// solve in a test; this chain's is low enough.
+#[test]
+fn a_refused_solution_leaves_its_work_answerable() {
+    let fx = fixture(20);
+    let work = fx.server.get_work().unwrap();
+    let coinbase = coinbase::build_coinbase(&work.block_hash_for_merged_mining, 0xDEAD_BEEF);
+    let missed = (0..100_000u32)
+        .map(|nonce| coinbase::build_bitcoin_block(coinbase.clone(), nonce))
+        .find(|block| U256::from_le_slice(block.header.block_hash().as_byte_array()) > work.target)
+        .expect("a nonce that misses the target");
+
+    let err = fx
+        .server
+        .submit_bitcoin_block(&bitcoin::consensus::serialize(&missed))
+        .unwrap_err();
+    assert!(matches!(err, SubmitError::SelfCheck(_)), "unexpected error: {err}");
+    assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+
+    let info = fx
+        .server
+        .submit_bitcoin_block(&bitcoin::consensus::serialize(&solve(&work)))
+        .expect("the work is still on offer");
+    assert_eq!(info.block_imported_result, ImportResult::ImportedBest);
+}
+
 /// `mnr_getWork` hands out the target the Bitcoin hash is compared against,
-/// and it has to be the same number the verifier derives from the difficulty.
+/// and it has to be the same number the verifier derives from the difficulty:
+/// the validator's own function, not one the miner keeps beside it.
 #[test]
 fn the_advertised_target_matches_the_difficulty() {
+    use rustock_core::validation::merged_mining::difficulty_to_target as validators;
     let fx = fixture(20);
     let template = fx.build().unwrap();
-    assert_eq!(template.target, U256::MAX / template.block.header.difficulty);
-    assert_eq!(difficulty_to_target(U256::from(1)), U256::MAX);
+    assert_eq!(
+        template.target,
+        validators(template.block.header.difficulty)
+    );
+    // At rskj's corners too: 2^256 over 3 for a difficulty of 2 or less, never
+    // all of 2^256, and a power of two dividing 2^256 exactly.
+    for d in [0u64, 1, 2, 3, 4, 5, 1 << 20] {
+        let d = U256::from(d);
+        assert_eq!(difficulty_to_target(d), validators(d), "difficulty {d}");
+    }
+    assert_eq!(
+        difficulty_to_target(U256::from(1)),
+        U256::MAX / U256::from(3)
+    );
 }
 
 /// A mined block that loses the total-difficulty comparison is still stored --
@@ -1172,6 +1813,105 @@ fn a_losing_block_is_stored_but_not_made_canonical() {
     assert_eq!(fx.store.head().unwrap(), Some(rival_hash), "the head must not move");
 }
 
+/// A block of another miner on the parent a template built on, made the head
+/// and the executed head with `total_difficulty` behind it: the chain moved
+/// on while the work was out.
+fn move_the_chain_on(fx: &MiningFixture, total_difficulty: U256) -> B256 {
+    let rival = header_at(fx.parent.number + 1, fx.parent.hash(), fx.parent.state_root);
+    let rival_hash = rival.hash();
+    fx.store.put_header_with_hash(rival_hash, &rival).unwrap();
+    fx.store
+        .put_canonical_hash(rival.number, rival_hash)
+        .unwrap();
+    fx.store
+        .put_total_difficulty(rival_hash, total_difficulty)
+        .unwrap();
+    fx.store.set_head(rival_hash).unwrap();
+    fx.store
+        .set_exec_head(rival_hash, fx.parent.state_root)
+        .unwrap();
+    rival_hash
+}
+
+/// A solution whose work's parent is no longer the executed head -- the chain
+/// moved on while it was mined -- is connected as rskj connects any block
+/// (`BlockChainImpl.internalTryToConnect`): run against its own parent's
+/// state, kept with its receipts and its total difficulty, and answered
+/// `IMPORTED_NOT_BEST` where the head outweighs it. The head, the canonical
+/// index and the executed head stay where they were. The node refused such a
+/// solution, and the block was lost.
+#[test]
+fn a_solution_on_a_parent_the_chain_left_is_kept_beside_the_chain() {
+    let fx = fixture(20);
+    let work = fx.server.get_work().unwrap();
+    let height = fx.parent.number + 1;
+    let rival_hash = move_the_chain_on(&fx, U256::from(1_000_000));
+
+    let raw = bitcoin::consensus::serialize(&solve(&work));
+    let info = fx
+        .server
+        .submit_bitcoin_block(&raw)
+        .expect("a solution on a parent the chain left is still a block");
+
+    assert_eq!(info.block_imported_result, ImportResult::ImportedNotBest);
+    let mined = fx
+        .store
+        .header(info.block_hash)
+        .unwrap()
+        .expect("the block is kept: it may yet win");
+    assert_eq!(mined.parent_hash, fx.parent.hash());
+    assert_eq!(
+        fx.store.total_difficulty(info.block_hash).unwrap(),
+        Some(U256::from(height) + mined.difficulty),
+        "its total is its parent's and its own"
+    );
+    assert!(
+        fx.server
+            .builder_for_test()
+            .processor()
+            .was_executed_locally(info.block_hash),
+        "it ran against its parent's state, and its receipts are kept by its hash"
+    );
+    assert_eq!(fx.store.head().unwrap(), Some(rival_hash), "the head stays");
+    assert_eq!(fx.store.canonical_hash(height).unwrap(), Some(rival_hash));
+    assert_eq!(
+        fx.store.exec_head().unwrap(),
+        Some((rival_hash, fx.parent.state_root)),
+        "the executed head stays"
+    );
+}
+
+/// The same where the solution outweighs the head: answered `IMPORTED_BEST`,
+/// as rskj answers it, and the switch left to the sync service, which weighs
+/// a block kept beside the chain against the head once it is told of it, and
+/// takes the head by its own way of switching branches.
+#[test]
+fn a_solution_on_a_parent_the_chain_left_that_outweighs_the_head_is_answered_best() {
+    let fx = fixture(20);
+    let work = fx.server.get_work().unwrap();
+    // A rival that adds nothing to its parent's total: the solution's own
+    // difficulty outweighs it.
+    let rival_hash = move_the_chain_on(&fx, U256::from(fx.parent.number + 1));
+
+    let raw = bitcoin::consensus::serialize(&solve(&work));
+    let info = fx
+        .server
+        .submit_bitcoin_block(&raw)
+        .expect("a solution on a parent the chain left is still a block");
+
+    assert_eq!(info.block_imported_result, ImportResult::ImportedBest);
+    assert!(fx.store.header(info.block_hash).unwrap().is_some());
+    assert_eq!(
+        fx.store.head().unwrap(),
+        Some(rival_hash),
+        "the switch is the sync service's"
+    );
+    assert_eq!(
+        fx.store.exec_head().unwrap(),
+        Some((rival_hash, fx.parent.state_root))
+    );
+}
+
 /// The round trip again, but deep enough that REMASC actually pays out.
 ///
 /// Everywhere else these tests mine block #21, and REMASC's
@@ -1206,12 +1946,12 @@ fn a_solution_is_imported_on_a_chain_deep_enough_for_remasc_to_pay() {
 }
 
 /// And the round trip with `ummRoot` present, which is what mainnet actually
-/// carries. Elsewhere these tests keep papyrus200 out of reach so they can
+/// carries. Elsewhere these tests keep RSKIPUMM out of reach so they can
 /// work at low block numbers, which means the field every real header has is
 /// absent from the block they mine.
 #[test]
 fn a_solution_is_imported_with_umm_root_present() {
-    let fx = fixture_with_papyrus_at(0, 20);
+    let fx = fixture_with_umm_at(0, 20);
     let work = fx.server.get_work().unwrap();
 
     let raw = bitcoin::consensus::serialize(&solve(&work));
@@ -1491,10 +2231,20 @@ mod uncle_tests {
 
 mod partitioned_templates {
     use super::*;
-    use crate::mining::template::{PendingTransaction, PendingTransactionSource, is_remasc};
+    use crate::mining::template::{PendingTransaction, PendingTransactionSource};
     use k256::ecdsa::SigningKey;
     use rustock_core::Transaction;
     use sha3::Digest;
+
+    /// A mined block's transactions but the REMASC one that ends it.
+    fn but_remasc(transactions: &[Transaction]) -> &[Transaction] {
+        let (last, rest) = transactions.split_last().expect("a block ends with REMASC");
+        assert!(
+            last.is_remasc(rest.len(), transactions.len()),
+            "a block ends with REMASC"
+        );
+        rest
+    }
 
     /// A pool that hands out exactly what it was given, minus what the
     /// builder told it to evict, and remembers every eviction call.
@@ -1593,14 +2343,15 @@ mod partitioned_templates {
         fixture_with_forks(senders, RskHardforkConfig::all_active_parallel(33))
     }
 
-    /// The same fixture, for the RSKIP-252 tests next door. They need the
-    /// funded senders and the short chain; what they vary is the head's
-    /// minimum gas price, which they rewrite themselves.
+    /// The same fixture, for the tests next door: the funded senders and the
+    /// short chain, its blocks at a `minimum` gas price the miner's own
+    /// matches.
     #[allow(clippy::type_complexity)]
     pub(super) fn fixture_for_cap_test(
         senders: u8,
+        minimum: u64,
     ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
-        fixture_with_forks(senders, RskHardforkConfig::all_active_parallel(33))
+        fixture_with_forks_priced(senders, RskHardforkConfig::all_active_parallel(33), minimum)
     }
 
     #[allow(clippy::type_complexity)]
@@ -1612,13 +2363,47 @@ mod partitioned_templates {
     }
 
     /// `fixture_with_forks` on a chain whose blocks carry `minimum_gas_price`,
-    /// which the template inherits -- the RSKIP252 cap is 100 times it, and
-    /// there is no cap at zero.
+    /// the miner's own `miner.minGasPrice` too, so a template keeps it -- the
+    /// RSKIP252 cap is 100 times it, and there is no cap at zero.
     #[allow(clippy::type_complexity)]
     fn fixture_with_forks_priced(
         senders: u8,
         hardfork_cfg: RskHardforkConfig,
         minimum_gas_price: u64,
+    ) -> (
+        BlockTemplateBuilder,
+        Header,
+        Vec<SigningKey>,
+        Arc<dyn TrieStore>,
+        Arc<BlockStore>,
+    ) {
+        fixture_with_state(senders, hardfork_cfg, minimum_gas_price, |root, _| root)
+    }
+
+    /// The test chain with the header heights `ladder` runs: RSKIP144,
+    /// RSKIP351 and RSKIP535 from the first block that has them, as a node
+    /// moves them with its ladder (`--consensus-rule`). These ladders
+    /// schedule each at 0 or 1, if at all.
+    fn with_heights_of(ladder: &RskHardforkConfig) -> Arc<ChainConfig> {
+        let first = |active: fn(&RskHardforkConfig, u64) -> bool| {
+            (0..=1).find(|&number| active(ladder, number))
+        };
+        let mut config = (*test_chain_config()).clone();
+        let heights = &mut config.activation_heights;
+        heights.rskip144 = first(RskHardforkConfig::has_rskip144);
+        heights.rskip351 = first(RskHardforkConfig::has_rskip351);
+        heights.rskip535 = first(RskHardforkConfig::has_rskip535);
+        Arc::new(config)
+    }
+
+    /// `fixture_with_forks_priced` on a state that `seed` adds to once the
+    /// senders are funded.
+    #[allow(clippy::type_complexity)]
+    fn fixture_with_state(
+        senders: u8,
+        hardfork_cfg: RskHardforkConfig,
+        minimum_gas_price: u64,
+        seed: impl FnOnce(TrieNode, &dyn TrieStore) -> TrieNode,
     ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let store = Arc::new(BlockStore::open(dir.path()).unwrap());
@@ -1635,6 +2420,7 @@ mod partitioned_templates {
             let k = rustock_trie::TrieKeySlice::from_key(&rustock_trie::account_key(&addr));
             root = root.put(&k, &acct.encode(), trie_store.as_ref());
         }
+        let mut root = seed(root, trie_store.as_ref());
         let state_root = root.compute_hash(trie_store.as_ref());
         root.save(trie_store.as_ref(), true);
         // The seeding is the fixture's whole premise; a silent failure here
@@ -1666,10 +2452,13 @@ mod partitioned_templates {
         let builder = BlockTemplateBuilder::new(
             Arc::new(BlockProcessor::new(hardfork_cfg.clone(), store.clone())),
             trie_store.clone(),
-            test_chain_config(),
+            with_heights_of(&hardfork_cfg),
             hardfork_cfg,
             MiningConfig {
                 coinbase_address: address!("00000000000000000000000000000000c0117b45"),
+                min_gas_price: Arc::new(FixedMinGasPriceProvider::new(
+                    i64::try_from(minimum_gas_price).unwrap(),
+                )),
                 ..Default::default()
             },
         );
@@ -1832,6 +2621,193 @@ mod partitioned_templates {
             .expect("the block validates");
     }
 
+    /// rskj's regtest, as a node started from an rskj genesis file runs it,
+    /// runs its blocks as their sublists from block 1: the miner splits
+    /// independent transfers across both parallel sublists, and the
+    /// validator takes the split.
+    #[test]
+    fn rskj_regtest_blocks_run_as_their_sublists() {
+        let ladder = RskHardforkConfig::rskj_regtest();
+        let (builder, parent, keys, trie_store, store) = fixture_with_forks(4, ladder.clone());
+        let pool = Pool(
+            keys.iter()
+                .enumerate()
+                .map(|(i, k)| transfer(k, Address::repeat_byte(0xB0 + i as u8), 0, 33))
+                .collect(),
+        );
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+        let fields = template.block.header.version_fields.as_ref();
+        let edges = fields.and_then(|v| v.edges.as_ref()).map(Vec::len);
+        assert_eq!(edges, Some(2), "both parallel sublists in use");
+
+        let processor = BlockProcessor::new(ladder, store);
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("the validator takes the split");
+    }
+
+    /// rskj `BlockHeaderBuilder`, `ActivationConfig.getHeaderVersion` and
+    /// `BlockExecutor.fill`: the fields a template carries by its height,
+    /// partitioned or not. RSKIP351 makes it version 1 and RSKIP535 version
+    /// 2, whose base event is empty while the Union Bridge holds none; with
+    /// RSKIP144 and RSKIP351 a block that runs as one list has an empty list
+    /// of edges, not none.
+    #[test]
+    fn a_template_carries_the_fields_its_height_brings() {
+        use crate::hardfork::ConsensusRule;
+        use rustock_core::types::header::HeaderVersionFields;
+        let fields = |version, edges: Option<Vec<i16>>, base_event: Option<Bytes>| {
+            Some(HeaderVersionFields {
+                version,
+                edges,
+                base_event,
+            })
+        };
+        let parallel = RskHardforkConfig::all_active_parallel(33);
+        let parallel_without_535 = parallel
+            .clone()
+            .with_consensus_rule(ConsensusRule::Rskip535, None);
+        let only_351 = RskHardforkConfig::all_active(33)
+            .with_consensus_rule(ConsensusRule::Rskip351, Some(0))
+            .with_consensus_rule(ConsensusRule::Rskip535, None);
+        for (ladder, expected) in [
+            (RskHardforkConfig::all_active(33), None),
+            (only_351, fields(1, None, None)),
+            (parallel_without_535, fields(1, Some(vec![]), None)),
+            (parallel, fields(2, Some(vec![]), Some(Bytes::new()))),
+        ] {
+            let (builder, parent, _, trie_store, store) = fixture_with_forks(1, ladder.clone());
+            let template = builder
+                .build(std::slice::from_ref(&parent), Vec::new(), &Pool(Vec::new()))
+                .expect("the template builds");
+            assert_eq!(template.block.header.version_fields, expected, "{ladder:?}");
+
+            let processor = BlockProcessor::new(ladder, store);
+            let parent_state = builder.load_state_root(parent.state_root).unwrap();
+            processor
+                .process_block(&template.block, &parent_state, trie_store)
+                .expect("the block validates");
+        }
+    }
+
+    /// A call from `from` to `to` carrying `input` and no value, signed.
+    fn call(
+        from: &SigningKey,
+        to: Address,
+        nonce: u64,
+        chain_id: u64,
+        input: Vec<u8>,
+    ) -> PendingTransaction {
+        let mut tx = Transaction {
+            nonce,
+            gas_price: U256::from(1),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(to.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign(&mut tx, from, chain_id);
+        let hash = B256::from_slice(&sha3::Keccak256::digest(tx.rlp_for_trie()));
+        PendingTransaction {
+            tx,
+            sender: address_of(from),
+            hash,
+        }
+    }
+
+    /// `setBaseEvent(bytes)`'s call data: the selector, then rskj's
+    /// `BytesType`, an offset, the length and the bytes padded to a word.
+    fn set_base_event(event: &[u8]) -> Vec<u8> {
+        let mut input = sha3::Keccak256::digest(b"setBaseEvent(bytes)")[..4].to_vec();
+        input.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>());
+        input.extend_from_slice(&U256::from(event.len()).to_be_bytes::<32>());
+        input.extend_from_slice(event);
+        input.resize(4 + 64 + event.len().div_ceil(32) * 32, 0);
+        input
+    }
+
+    /// rskj `BlockExecutor.fill`: a version-2 header carries the base event
+    /// the Union Bridge holds once its block has run -- here the one the
+    /// block's own transaction sets, which its parent's state does not hold.
+    #[test]
+    fn a_version_2_template_carries_the_base_event_its_block_sets() {
+        use crate::bridge::union::{union_key, BASE_EVENT_KEY, UNION_CONTRACT_ADDRESS_KEY};
+        use crate::precompiles::BRIDGE_ADDR;
+        use rustock_trie::{
+            account_key, storage_key, storage_prefix_key, AccountState, TrieKeySlice,
+        };
+        let ladder = RskHardforkConfig::all_active_parallel(33);
+        let union_bridge = address_of(&signing_key(1));
+        let (builder, parent, keys, trie_store, store) =
+            fixture_with_state(1, ladder.clone(), 0, |root, trie_store| {
+                // The Bridge, and the cell naming the union bridge contract as
+                // rskj's `serializeRskAddress` writes it: RLP of the twenty
+                // bytes.
+                let at = |key: &[u8]| TrieKeySlice::from_key(key);
+                let account = AccountState::new(U256::ZERO, U256::ZERO).encode();
+                let root = root.put(&at(&account_key(&BRIDGE_ADDR)), &account, trie_store);
+                let root = root.put(&at(&storage_prefix_key(&BRIDGE_ADDR)), &[1], trie_store);
+                let slot = B256::from(union_key(UNION_CONTRACT_ADDRESS_KEY));
+                let named = [&[0x94][..], union_bridge.as_slice()].concat();
+                root.put(&at(&storage_key(&BRIDGE_ADDR, &slot)), &named, trie_store)
+            });
+        let base_event = |state: B256| {
+            let root = builder.load_state_root(state).unwrap();
+            let slot = B256::from(union_key(BASE_EVENT_KEY));
+            root.get(
+                &TrieKeySlice::from_key(&storage_key(&BRIDGE_ADDR, &slot)),
+                trie_store.as_ref(),
+            )
+        };
+        assert_eq!(base_event(parent.state_root), None, "the parent holds none");
+
+        let event = b"a base event".to_vec();
+        let pool = Pool(vec![call(
+            &keys[0],
+            BRIDGE_ADDR,
+            0,
+            33,
+            set_base_event(&event),
+        )]);
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+        assert_eq!(
+            but_remasc(&template.block.transactions).len(),
+            1,
+            "the call is in"
+        );
+        assert_eq!(
+            base_event(template.block.header.state_root),
+            Some(event.clone())
+        );
+        let fields = template
+            .block
+            .header
+            .version_fields
+            .clone()
+            .expect("versioned");
+        assert_eq!(fields.version, 2);
+        assert_eq!(
+            fields.base_event,
+            Some(Bytes::from(event)),
+            "read after the block"
+        );
+
+        let processor = BlockProcessor::new(ladder, store);
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("a block this miner built must be one this node would accept");
+    }
+
     // ── packing by gas used, and the RSKIP252 cap ─────────────────────
 
     /// Ten transfers, each declaring 3 M gas and using 21,000, on a 10 M
@@ -1894,11 +2870,8 @@ mod partitioned_templates {
         let template = builder
             .build(std::slice::from_ref(&parent), Vec::new(), &pool)
             .expect("the template builds");
-        let senders: Vec<Address> = template
-            .block
-            .transactions
+        let senders: Vec<Address> = but_remasc(&template.block.transactions)
             .iter()
-            .filter(|tx| !is_remasc(tx))
             .map(|tx| tx.recover_sender(chain_id).unwrap())
             .collect();
         assert_eq!(senders, vec![address_of(first)], "only the first sender's transfer is in");
@@ -1928,11 +2901,8 @@ mod partitioned_templates {
             .build(std::slice::from_ref(&parent), Vec::new(), &pool)
             .expect("the template builds");
         assert_eq!(template.block.header.minimum_gas_price, U256::from(100));
-        let prices: Vec<U256> = template
-            .block
-            .transactions
+        let prices: Vec<U256> = but_remasc(&template.block.transactions)
             .iter()
-            .filter(|tx| !is_remasc(tx))
             .map(|tx| tx.gas_price)
             .collect();
         assert_eq!(prices, vec![U256::from(10_000)], "at the cap is in, over it is out");
@@ -1945,6 +2915,48 @@ mod partitioned_templates {
         processor
             .process_block(&template.block, &parent_state, trie_store)
             .expect("and executes");
+    }
+
+    /// rskj `BlockToMineBuilder.getTransactions` reads RSKIP252 at the height
+    /// of the block it builds, the parent's plus one: a template for
+    /// fingerroot500's first block leaves a transaction over the cap out, and
+    /// one for the block before it mines it. The ladder ends at fingerroot500,
+    /// every later upgrade left out, and vetiver900's RSKIP536 with it, as
+    /// rskj's schedule would have it.
+    #[test]
+    fn the_miner_caps_prices_from_the_block_rskip252_starts_at() {
+        use crate::hardfork::{ConsensusRule, RskNetworkUpgrade};
+        let ending_at_fingerroot = |height: u64| {
+            RskHardforkConfig::all_active(33)
+                .with_hardfork(RskNetworkUpgrade::Arrowhead631, None)
+                .with_hardfork(RskNetworkUpgrade::Vetiver900, None)
+                .with_consensus_rule(ConsensusRule::Rskip536, None)
+                .with_hardfork(RskNetworkUpgrade::Hop400, Some(0))
+                .with_hardfork(RskNetworkUpgrade::Fingerroot500, Some(height))
+        };
+        // The fixture builds on #20, so every template here is #21.
+        for (fingerroot, mined) in [(21, false), (22, true)] {
+            let ladder = ending_at_fingerroot(fingerroot);
+            assert_eq!(ladder.rskip252_height(), fingerroot);
+            let (builder, parent, keys, _, _) = fixture_with_forks_priced(1, ladder, 100);
+            let pool = Pool(vec![transfer_with(
+                &keys[0],
+                Address::repeat_byte(0xF1),
+                0,
+                33,
+                10_001,
+                21_000,
+            )]);
+            let template = builder
+                .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+                .expect("the template builds");
+            assert_eq!(template.block.header.number, 21);
+            assert_eq!(
+                but_remasc(&template.block.transactions).len(),
+                usize::from(mined),
+                "with fingerroot500 at #{fingerroot}, a price over the cap is mined: {mined}"
+            );
+        }
     }
 
 
@@ -1976,11 +2988,8 @@ mod partitioned_templates {
         let template = builder
             .build(std::slice::from_ref(&parent), Vec::new(), &pool)
             .expect("the template builds although one candidate is invalid");
-        let mined: Vec<Address> = template
-            .block
-            .transactions
+        let mined: Vec<Address> = but_remasc(&template.block.transactions)
             .iter()
-            .filter(|tx| !is_remasc(tx))
             .map(|tx| tx.recover_sender(chain_id).unwrap())
             .collect();
         assert_eq!(mined, vec![good.sender], "the good transfer is in, the refused one is not");
@@ -2052,6 +3061,32 @@ mod partitioned_templates {
         assert_eq!(pool.pending().len(), 1);
     }
 
+    /// Past 256 bits no transaction can pay the minimum, which the filter
+    /// holds them to as `U256::MAX`: the template leaves out even one its
+    /// sender could afford, and the pool is told to drop it, as rskj's
+    /// `isLowGasPriced` has it.
+    #[test]
+    fn past_256_bits_the_minimum_leaves_every_transaction_out() {
+        let (builder, mut parent, keys, _, blocks) =
+            fixture_with_forks(1, RskHardforkConfig::all_active(33));
+        parent.set_minimum_gas_price(&BigUint::from(2u8).pow(300));
+        // A miner builds on a head its store holds: REMASC reads up from it.
+        blocks.put_header(&parent).unwrap();
+        let affordable = transfer_with(
+            &keys[0],
+            Address::repeat_byte(0xE7),
+            0,
+            33,
+            1_000_000_000,
+            21_000,
+        );
+        let pool = Pool(vec![affordable.clone()]);
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("builds");
+        assert_eq!(template.block.transactions.len(), 1, "REMASC alone");
+        assert_eq!(pool.evictions(), vec![vec![affordable.hash]]);
+    }
 }
 
 // ── RSKIP-252: the miner's own price ceiling ──────────────────────────
@@ -2121,27 +3156,14 @@ mod rskip252_cap {
         PendingTransaction { tx, sender, hash }
     }
 
-    /// The partitioning fixture leaves every header at a zero minimum gas
-    /// price, and `TxGasPriceCap` short-circuits on zero -- so a fixture that
-    /// did not set one would pass whatever the miner did. Rewrite the head
-    /// with `minimum`, keeping the store consistent with it.
+    /// The partitioning fixture on a chain at `minimum`, which the miner's own
+    /// price matches. `TxGasPriceCap` short-circuits on a zero minimum, so a
+    /// fixture that left it at zero would pass whatever the miner did.
     fn fixture_with_minimum(
         senders: u8,
         minimum: u64,
     ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
-        let (builder, parent, keys, trie_store, store) =
-            super::partitioned_templates::fixture_for_cap_test(senders);
-        let mut head = parent.clone();
-        head.minimum_gas_price = U256::from(minimum);
-        head.cached_hash = None;
-        head.cached_hash_for_merged_mining = None;
-        let hash = head.hash();
-        store.put_header_with_hash(hash, &head).unwrap();
-        store.put_canonical_hash(head.number, hash).unwrap();
-        store.put_total_difficulty(hash, U256::from(head.number + 1)).unwrap();
-        store.set_head(hash).unwrap();
-        store.set_exec_head(hash, head.state_root).unwrap();
-        (builder, head, keys, trie_store, store)
+        super::partitioned_templates::fixture_for_cap_test(senders, minimum)
     }
 
     #[test]
@@ -2262,10 +3284,35 @@ mod mining_with_uncles {
         orphan
     }
 
+    /// A processor for chain 33 that skips proof of work, as a regtest node
+    /// run with rskj's `miner.server.skipPowValidation` does. Each uncle is
+    /// held to rskj's uncle rules, its own proof of work among them
+    /// (`BlockProcessor::validate_block_rules`), and the uncles offered here
+    /// are copies of a block nobody mined: with the work checked, they would
+    /// be refused before the rules these tests are about were reached.
+    fn processor_without_pow(store: Arc<BlockStore>) -> BlockProcessor {
+        let mut config = rustock_core::config::ChainConfig::regtest();
+        config.skip_pow_validation = true;
+        BlockProcessor::new(RskHardforkConfig::all_active_parallel(33), store)
+            .with_chain_config(Arc::new(config))
+    }
+
+    /// `builder` with [`processor_without_pow`], as a miner on a chain that
+    /// skips proof of work is wired: a builder whose processor checks the
+    /// work leaves those uncles out, as rskj's `BlockToMineBuilder` leaves
+    /// out any the uncle rule refuses.
+    fn builder_without_pow(
+        builder: BlockTemplateBuilder,
+        store: &Arc<BlockStore>,
+    ) -> BlockTemplateBuilder {
+        builder.with_processor_for_test(Arc::new(processor_without_pow(store.clone())))
+    }
+
     #[test]
     fn a_block_sealed_with_an_uncle_is_one_the_importer_accepts() {
         let (builder, parent, _keys, trie_store, store) =
-            super::partitioned_templates::fixture_for_cap_test(1);
+            super::partitioned_templates::fixture_for_cap_test(1, 0);
+        let builder = builder_without_pow(builder, &store);
 
         let orphan = orphan_sibling_of_head(&store, &parent, 0xAA);
         assert_ne!(
@@ -2298,7 +3345,7 @@ mod mining_with_uncles {
         // consensus *body* rules -- including the uncle rule -- live behind
         // `validate_block_rules`, which only the sync path calls. A miner
         // test that runs execution alone never sees them.
-        let processor = BlockProcessor::new(RskHardforkConfig::all_active_parallel(33), store);
+        let processor = processor_without_pow(store);
         processor
             .validate_block(&template.block)
             .expect("a block this miner seals with an uncle must pass the body rules");
@@ -2313,27 +3360,34 @@ mod mining_with_uncles {
     /// The RSKIP-252 lesson is that a validator run over a fixture it has
     /// nothing to say about looks exactly like a validator that approves.
     /// So: hand the miner an uncle that is plainly inadmissible -- the
-    /// canonical parent, which is an ancestor and never an uncle -- and
-    /// require the importer to refuse the result. If this passes, the
-    /// positive test above is evidence of something.
+    /// canonical parent, which is an ancestor and never an uncle. The miner
+    /// builds the block without it, as rskj's `BlockToMineBuilder.createBlock`
+    /// does; and the importer refuses a block that carries it anyway. If
+    /// both hold, the positive test above is evidence of something.
     #[test]
     fn the_importer_rejects_a_block_whose_uncle_is_inadmissible() {
         let (builder, parent, _keys, trie_store, store) =
-            super::partitioned_templates::fixture_for_cap_test(1);
+            super::partitioned_templates::fixture_for_cap_test(1, 0);
+        let builder = builder_without_pow(builder, &store);
 
         // An ancestor, not a sibling. `select_uncles` would never offer it.
         let template = builder
             .build(std::slice::from_ref(&parent), vec![parent.clone()], &NoTransactions)
-            .expect("the miner builds whatever it is handed");
-        assert_eq!(template.block.ommers.len(), 1, "the premise: the block carries it");
+            .expect("the miner builds, without the uncle it was handed");
+        assert!(template.block.ommers.is_empty(), "the miner leaves it out");
 
-        let processor = BlockProcessor::new(RskHardforkConfig::all_active_parallel(33), store);
+        let mut carrying = template.block.clone();
+        carrying.ommers = vec![parent.clone()];
+        carrying.header.uncle_count = 1;
+        carrying.header.ommers_hash = crate::processor::compute_ommers_hash(&carrying.ommers);
+        let processor = processor_without_pow(store);
         let _ = trie_store;
-        let outcome = processor.validate_block(&template.block);
+        let outcome = processor.validate_block(&carrying);
         assert!(
-            outcome.is_err(),
-            "an ancestor offered as an uncle must be refused -- if this is accepted, \
-             the uncle rule is not being applied to mined blocks at all"
+            matches!(outcome, Err(ValidationError::UncleIsAncestor { .. })),
+            "an ancestor offered as an uncle must be refused as one -- if this is \
+             accepted, the uncle rule is not being applied to mined blocks at all: \
+             {outcome:?}"
         );
     }
 
@@ -2343,7 +3397,8 @@ mod mining_with_uncles {
     #[test]
     fn the_header_commits_to_the_uncles_it_carries() {
         let (builder, parent, _keys, _trie_store, store) =
-            super::partitioned_templates::fixture_for_cap_test(1);
+            super::partitioned_templates::fixture_for_cap_test(1, 0);
+        let builder = builder_without_pow(builder, &store);
         let _ = orphan_sibling_of_head(&store, &parent, 0xBB);
         let offered = select_uncles(&store, parent.number + 1, parent.hash());
 
@@ -2450,8 +3505,216 @@ fn by_default_every_mined_block_flushes() {
     }
 }
 
-/// The thread mines on its clock: at a 100 ms median (the floor), a second
-/// of running yields several blocks, and stopping ends it.
+/// rskj's `EthereumImpl.addNewMinedBlock` tells the rest of the node of a
+/// mined block once `blockchain.tryToConnect` has connected it: the hook sees
+/// the block as the head and the executed head, so the sync service it tells
+/// reads the block's state as the node's (#323).
+#[test]
+fn the_commit_hook_runs_once_the_block_is_the_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+    let root = TrieNode::empty().compute_hash(trie_store.as_ref());
+    let parent = header_at(0, B256::ZERO, root);
+    let parent_hash = parent.hash();
+    store.put_header_with_hash(parent_hash, &parent).unwrap();
+    store.put_canonical_hash(0, parent_hash).unwrap();
+    store
+        .put_total_difficulty(parent_hash, U256::from(1))
+        .unwrap();
+    store.set_head(parent_hash).unwrap();
+    store.set_exec_head(parent_hash, root).unwrap();
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook: Arc<dyn Fn(&rustock_core::Block, ImportResult) + Send + Sync> = {
+        let (store, seen) = (store.clone(), seen.clone());
+        Arc::new(move |_block: &rustock_core::Block, result: ImportResult| {
+            let exec_head = store.exec_head().unwrap();
+            let canonical = store.canonical_hash(1).unwrap();
+            seen.lock().unwrap().push((exec_head, canonical, result));
+        })
+    };
+    let chain = StoreChainAccess::new(store.clone(), trie_store, Some(hook));
+    let block = rustock_core::Block {
+        header: header_at(1, parent_hash, root),
+        transactions: Vec::new(),
+        ommers: Vec::new(),
+    };
+    let hash = block.hash();
+
+    let outcome = chain
+        .commit_mined_block(&block, root, &mut crate::breakdown::Laps::new(false))
+        .unwrap();
+
+    assert_eq!(outcome.result, ImportResult::ImportedBest);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(Some((hash, root)), Some(hash), ImportResult::ImportedBest)],
+        "the hook ran once, with the block the executed head and canonical"
+    );
+}
+
+/// rskj connects a mined block as it does a peer's, through
+/// `SelectionRule.shouldWeAddThisBlock`: a mined block that ties the head in
+/// total difficulty, with fees like the head's and the lower hash, takes the
+/// head from the block held first, and one with the higher hash doesn't.
+#[test]
+fn a_mined_block_that_ties_the_head_goes_by_the_selection_rule() {
+    use rustock_core::selection_rule::is_this_block_hash_smaller;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+    let root = TrieNode::empty().compute_hash(trie_store.as_ref());
+    let parent = header_at(0, B256::ZERO, root);
+    let parent_hash = parent.hash();
+    store.put_header_with_hash(parent_hash, &parent).unwrap();
+    store.put_canonical_hash(0, parent_hash).unwrap();
+    store
+        .put_total_difficulty(parent_hash, U256::from(1))
+        .unwrap();
+
+    // Blocks at #1 on that parent, told apart by their extra data. Each has
+    // the total a block mined there gets: the parent's 1 and its own 2.
+    let sibling = |extra: u8| {
+        let mut header = header_at(1, parent_hash, root);
+        header.paid_fees = U256::from(1_000);
+        header.extra_data = Bytes::from(vec![extra]);
+        header
+    };
+    let held_first = sibling(0);
+    let held_first_hash = held_first.hash();
+    store
+        .put_header_with_hash(held_first_hash, &held_first)
+        .unwrap();
+    store.put_canonical_hash(1, held_first_hash).unwrap();
+    store
+        .put_total_difficulty(held_first_hash, U256::from(3))
+        .unwrap();
+    store.set_head(held_first_hash).unwrap();
+    store.set_exec_head(held_first_hash, root).unwrap();
+
+    let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook: Arc<dyn Fn(&rustock_core::Block, ImportResult) + Send + Sync> = {
+        let told = told.clone();
+        Arc::new(move |block: &rustock_core::Block, result: ImportResult| {
+            told.lock().unwrap().push((block.hash(), result));
+        })
+    };
+    let chain = StoreChainAccess::new(store.clone(), trie_store, Some(hook));
+    let mined = |header: Header| rustock_core::Block {
+        header,
+        transactions: Vec::new(),
+        ommers: Vec::new(),
+    };
+    let lower = (1..=u8::MAX)
+        .map(sibling)
+        .find(|header| is_this_block_hash_smaller(&header.hash(), &held_first_hash))
+        .expect("an extra data that hashes below the head");
+    let lower = mined(lower);
+    let outcome = chain
+        .commit_mined_block(&lower, root, &mut crate::breakdown::Laps::new(false))
+        .unwrap();
+    assert_eq!(outcome.result, ImportResult::ImportedBest);
+    assert_eq!(store.head().unwrap(), Some(lower.hash()));
+    assert_eq!(store.canonical_hash(1).unwrap(), Some(lower.hash()));
+
+    let higher = (1..=u8::MAX)
+        .map(sibling)
+        .find(|header| is_this_block_hash_smaller(&lower.hash(), &header.hash()))
+        .expect("an extra data that hashes above the new head");
+    let higher = mined(higher);
+    let outcome = chain
+        .commit_mined_block(&higher, root, &mut crate::breakdown::Laps::new(false))
+        .unwrap();
+    assert_eq!(outcome.result, ImportResult::ImportedNotBest);
+    assert_eq!(store.head().unwrap(), Some(lower.hash()), "the head stays");
+    assert_eq!(store.canonical_hash(1).unwrap(), Some(lower.hash()));
+    assert_eq!(
+        *told.lock().unwrap(),
+        vec![
+            (lower.hash(), ImportResult::ImportedBest),
+            (higher.hash(), ImportResult::ImportedNotBest)
+        ],
+        "the hook is told what each commit made of its block"
+    );
+}
+
+/// A block kept beside the chain leaves the peg decisions it made that the
+/// Bridge logs no event for with `leave_unlogged`, with its hash and height,
+/// before it is stored, so that no path takes it onto the chain without
+/// them. A block that made none leaves nothing, and one already stored is
+/// not left again.
+#[test]
+fn a_block_kept_beside_the_chain_leaves_its_peg_decisions_before_it_is_stored() {
+    use crate::silent::{SilentKind, SilentRecord};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+    let root = TrieNode::empty().compute_hash(trie_store.as_ref());
+    let parent = header_at(0, B256::ZERO, root);
+    let parent_hash = parent.hash();
+    store.put_header_with_hash(parent_hash, &parent).unwrap();
+    store.put_canonical_hash(0, parent_hash).unwrap();
+    store
+        .put_total_difficulty(parent_hash, U256::from(1))
+        .unwrap();
+
+    let left = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let leave: Arc<dyn Fn(B256, u64, Vec<SilentRecord>) + Send + Sync> = {
+        let (store, left) = (store.clone(), left.clone());
+        Arc::new(move |hash: B256, number: u64, records: Vec<SilentRecord>| {
+            let stored = store.has_block(hash).unwrap();
+            left.lock().unwrap().push((hash, number, records, stored));
+        })
+    };
+    let chain = StoreChainAccess::new(store.clone(), trie_store, None).with_leave_unlogged(leave);
+    let block = |extra: u8| {
+        let mut header = header_at(1, parent_hash, root);
+        header.extra_data = Bytes::from(vec![extra]);
+        rustock_core::Block {
+            header,
+            transactions: Vec::new(),
+            ommers: Vec::new(),
+        }
+    };
+    let decision = SilentRecord {
+        kind: SilentKind::BtcTxMarkedProcessed,
+        block: 1,
+        tx_index: 0,
+        fields: Vec::new(),
+    };
+    let laps = || crate::breakdown::Laps::new(false);
+
+    let made = block(1);
+    chain
+        .commit_mined_block_beside(&made, vec![decision.clone()], &mut laps())
+        .unwrap();
+    assert_eq!(
+        *left.lock().unwrap(),
+        vec![(made.hash(), 1, vec![decision.clone()], false)],
+        "left with its hash and height, before it is stored"
+    );
+    assert!(store.has_block(made.hash()).unwrap());
+
+    let none = block(2);
+    chain
+        .commit_mined_block_beside(&none, Vec::new(), &mut laps())
+        .unwrap();
+    let again = chain
+        .commit_mined_block_beside(&made, vec![decision], &mut laps())
+        .unwrap();
+    assert_eq!(again.result, ImportResult::Exist);
+    assert_eq!(
+        left.lock().unwrap().len(),
+        1,
+        "nothing is left for a block that made none, or for one already stored"
+    );
+}
+
+/// The thread mines on its clock: at a 100 ms median (the floor), it yields
+/// several blocks, and stopping ends it.
 #[test]
 fn a_timed_miner_mines_blocks_on_its_own() {
     let fx = fixture_without_pow(20, 10, Arc::new(MemoryTrieStore::new()));
@@ -2460,22 +3723,135 @@ fn a_timed_miner_mines_blocks_on_its_own() {
         std::time::Duration::from_millis(100),
         Pow::Skip,
     );
+    // The thread takes its own handle on the server, the only one taken from
+    // here on: the count is one higher while it runs and falls back when it
+    // ends.
+    let without_thread = Arc::strong_count(&fx.server);
     assert!(!miner.is_running());
     miner.start();
     miner.start(); // idempotent: one thread, not two
     assert!(miner.is_running());
-    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    assert_eq!(
+        Arc::strong_count(&fx.server),
+        without_thread + 1,
+        "one thread, not two"
+    );
+
+    // Waits for the blocks, not a fixed time: a loaded machine builds them
+    // slower than the clock asks for.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while miner.mined() < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {} blocks in 60 s at a 100 ms median",
+            miner.mined()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     miner.stop();
     assert!(!miner.is_running());
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // The thread finishes the block in flight, if any, and ends.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while Arc::strong_count(&fx.server) > without_thread {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "still running 60 s after stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Pairs with the release in the thread's dropping its handle, so all it
+    // did before is seen here.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
 
     let mined = miner.mined();
-    assert!(mined >= 3, "only {mined} blocks in 1.5 s at a 100 ms median");
     let head = fx.store.header(fx.store.head().unwrap().unwrap()).unwrap().unwrap();
-    assert_eq!(head.number, 20 + mined);
-    let after = miner.mined();
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    assert_eq!(miner.mined(), after, "still mining after stop");
+    assert_eq!(head.number, 20 + mined, "the head is the last block it counted");
+}
+
+/// rskj `TimedMinerClientSimpleTest.testMultipleStartStopCycles` and
+/// `TimedMinerClientTest.canStartAndStopMultipleTimes`: the miner starts and
+/// stops again and again. A start right after a stop, while the stopped
+/// thread still sleeps on its draw, runs one thread, not the stopped one
+/// beside the new: each holds a handle on the server, so they are counted.
+#[test]
+fn a_timed_miner_started_again_at_once_runs_one_thread() {
+    use std::time::{Duration, Instant};
+    let fx = fixture_without_pow(20, 10, Arc::new(MemoryTrieStore::new()));
+    let miner = TimedMiner::new(fx.server.clone(), Duration::from_millis(100), Pow::Skip);
+    let without_thread = Arc::strong_count(&fx.server);
+    let threads_settle_at = |threads: usize, when: &str| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Arc::strong_count(&fx.server) != without_thread + threads {
+            assert!(
+                Instant::now() < deadline,
+                "{} threads 60 s {when}, not {threads}",
+                Arc::strong_count(&fx.server) - without_thread
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    for _ in 0..3 {
+        miner.start();
+        miner.stop();
+        assert!(!miner.is_running());
+        miner.start();
+        assert!(miner.is_running());
+        threads_settle_at(1, "after a stop and a start");
+        // Longer than the stopped thread sleeps before it reads its flag.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(Arc::strong_count(&fx.server), without_thread + 1, "the stopped thread ran on");
+        miner.stop();
+        threads_settle_at(0, "after a stop");
+    }
+    // And a start after all that mines.
+    let before = miner.mined();
+    miner.start();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while miner.mined() == before {
+        assert!(Instant::now() < deadline, "no block in 60 s");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    miner.stop();
+    threads_settle_at(0, "after the last stop");
+}
+
+/// rskj `TimedMinerClientMiningTest.handlesMiningErrorsGracefully`: a block
+/// the miner can't build is logged, and the next draw comes as usual. Here
+/// the work is refused because the node has a better block to fetch; once it
+/// has it, the miner mines.
+#[test]
+fn a_timed_miner_rides_out_work_it_cannot_build() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    struct Syncing(AtomicBool);
+    impl SyncGate for Syncing {
+        fn has_better_block_to_sync(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let syncing = Arc::new(Syncing(AtomicBool::new(true)));
+    let gate: Arc<dyn SyncGate> = syncing.clone();
+    let fx = fixture_without_pow_gated(20, 10, Arc::new(MemoryTrieStore::new()), Some(gate));
+    let miner = TimedMiner::new(fx.server.clone(), Duration::from_millis(100), Pow::Skip);
+    let without_thread = Arc::strong_count(&fx.server);
+    miner.start();
+    // Draws come every 100 ms or so, and each fails.
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(miner.is_running(), "a block it couldn't build stopped the miner");
+    assert_eq!(miner.mined(), 0);
+    assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+
+    syncing.0.store(false, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while miner.mined() == 0 {
+        assert!(Instant::now() < deadline, "no block in 60 s once synced");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    miner.stop();
+    while Arc::strong_count(&fx.server) > without_thread {
+        assert!(Instant::now() < deadline, "still running after stop");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// A header whose recomputed hash is not the hash it is stored under: what a
@@ -2620,4 +3996,256 @@ fn cumulative_difficulty_counts_the_uncles() {
     assert_eq!(cumulative_difficulty(&block), U256::from(1_320));
     let alone = rustock_core::Block { header, transactions: Vec::new(), ommers: Vec::new() };
     assert_eq!(cumulative_difficulty(&alone), U256::from(1_000));
+}
+
+// ── the rules a mined block meets ─────────────────────────────────────
+
+mod own_block_rules {
+    use super::*;
+
+    /// A block that lost to the fixture's head, on the head's parent. Mined
+    /// 100 s after that parent, it keeps the parent's difficulty where that
+    /// is the floor, as the difficulty rule wants, and so meets every rule an
+    /// uncle meets but proof of work.
+    fn losing_sibling(fx: &MiningFixture) -> Header {
+        let grandparent = fx.store.header(fx.parent.parent_hash).unwrap().unwrap();
+        let mut sibling = header_at(
+            fx.parent.number,
+            fx.parent.parent_hash,
+            fx.parent.state_root,
+        );
+        sibling.beneficiary = Address::repeat_byte(0xAA);
+        sibling.difficulty = grandparent.difficulty;
+        sibling.timestamp = grandparent.timestamp + 100;
+        fx.store
+            .put_header_with_hash(sibling.hash(), &sibling)
+            .unwrap();
+        sibling
+    }
+
+    fn template_naming(fx: &MiningFixture, uncles: Vec<Header>) -> BlockTemplate {
+        fx.server
+            .builder_for_test()
+            .build(
+                std::slice::from_ref(&fx.parent),
+                uncles,
+                &NoPendingTransactions,
+            )
+            .unwrap()
+    }
+
+    /// rskj `BlockToMineBuilder.createBlock`: a block whose uncles fail the
+    /// uncle rule is built again without them. Where proof of work goes
+    /// unchecked the sibling is an uncle and stays; where it is checked, the
+    /// sibling, never mined, is none, and the block is built without it.
+    #[test]
+    fn a_template_leaves_out_uncles_the_rule_refuses() {
+        let unchecked = fixture_without_pow(20, 1, Arc::new(MemoryTrieStore::new()));
+        let sibling = losing_sibling(&unchecked);
+        let template = template_naming(&unchecked, vec![sibling.clone()]);
+        let named: Vec<B256> = template.block.ommers.iter().map(Header::hash).collect();
+        assert_eq!(named, vec![sibling.hash()]);
+        assert_eq!(template.block.header.uncle_count, 1);
+
+        let checked = fixture(20);
+        let sibling = losing_sibling(&checked);
+        let template = template_naming(&checked, vec![sibling]);
+        assert!(template.block.ommers.is_empty());
+        assert_eq!(template.block.header.uncle_count, 0);
+        assert_eq!(
+            template.block.header.ommers_hash,
+            crate::processor::compute_ommers_hash(&[])
+        );
+    }
+
+    /// rskj connects a mined block through `blockchain.tryToConnect`, which
+    /// holds it to the uncle rule as it holds a peer's block. An uncle the
+    /// block's parent turns out to have named already is used, and a block
+    /// naming it again is refused, not stored and made the best block.
+    #[test]
+    fn a_mined_block_naming_an_uncle_already_used_is_refused() {
+        let fx = fixture_without_pow(20, 1, Arc::new(MemoryTrieStore::new()));
+        let sibling = losing_sibling(&fx);
+        let work = fx.server.build_work().unwrap();
+        // The work names the sibling; now the parent has named it too.
+        fx.store
+            .put_body(fx.parent.hash(), &[], std::slice::from_ref(&sibling))
+            .unwrap();
+
+        let err = dev::submit_unsolved(&fx.server, &work).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                dev::MineError::Submit(SubmitError::SelfCheck(
+                    ValidationError::UncleAlreadyUsed { .. }
+                ))
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+    }
+
+    /// And to the header's rules against its parent, as rskj's
+    /// `BlockValidatorImpl` holds it: here the minimum gas limit, which a
+    /// miner keeping its parent's 6,800,000 falls below on a chain whose
+    /// minimum is 7,000,000. rskj answers the miner OK, with what
+    /// `tryToConnect` made of the block, `INVALID_BLOCK`
+    /// (`MinerServerImpl.processSolution`), and stores nothing; the node's
+    /// own miner reads the rule's error.
+    #[test]
+    fn a_mined_block_below_the_minimum_gas_limit_is_refused() {
+        let mut config = (*test_chain_config()).clone();
+        config.min_gas_limit = 7_000_000;
+        let fx = fixture_with(20, Arc::new(config), U256::from(2));
+        let work = fx.server.get_work().unwrap();
+        let raw = bitcoin::consensus::serialize(&solve(&work));
+
+        let info = fx.server.submit_bitcoin_block(&raw).unwrap();
+        assert_eq!(info.block_imported_result, ImportResult::InvalidBlock);
+        assert_eq!(info.block_imported_result.as_str(), "INVALID_BLOCK");
+        assert_eq!(info.block_included_height, fx.parent.number + 1);
+        assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+
+        let err = fx
+            .server
+            .submit_bitcoin_block_as(&raw, crate::mining::server::Refused::Failed)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SubmitError::SelfCheck(ValidationError::GasLimitBelowMinimum { .. })
+            ),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+    }
+
+    /// What goes wrong in a store, for [`FaultyChain`].
+    #[derive(Clone, Copy)]
+    enum Fault {
+        /// Every read answers; writing a mined block fails.
+        Write,
+        /// The store holds no header for the work's parent.
+        NoParent,
+    }
+
+    /// The node's store, with a `Fault`.
+    struct FaultyChain {
+        inner: StoreChainAccess,
+        fault: Fault,
+    }
+
+    impl ChainAccess for FaultyChain {
+        fn mainchain(&self, limit: usize) -> Result<Vec<Header>, String> {
+            self.inner.mainchain(limit)
+        }
+        fn executed_head(&self) -> Result<Option<B256>, String> {
+            self.inner.executed_head()
+        }
+        fn has_block(&self, hash: B256) -> Result<bool, String> {
+            self.inner.has_block(hash)
+        }
+        fn header(&self, hash: B256) -> Result<Option<Header>, String> {
+            match self.fault {
+                Fault::NoParent => Ok(None),
+                Fault::Write => self.inner.header(hash),
+            }
+        }
+        fn select_uncles(
+            &self,
+            block_number: u64,
+            parent_hash: B256,
+        ) -> Result<Vec<Header>, String> {
+            self.inner.select_uncles(block_number, parent_hash)
+        }
+        fn commit_mined_block(
+            &self,
+            block: &rustock_core::Block,
+            state_root: B256,
+            laps: &mut crate::breakdown::Laps,
+        ) -> Result<CommitOutcome, String> {
+            match self.fault {
+                Fault::Write => Err("the disk is full".into()),
+                Fault::NoParent => self.inner.commit_mined_block(block, state_root, laps),
+            }
+        }
+        fn commit_mined_block_beside(
+            &self,
+            block: &rustock_core::Block,
+            unlogged: Vec<crate::silent::SilentRecord>,
+            laps: &mut crate::breakdown::Laps,
+        ) -> Result<CommitOutcome, String> {
+            match self.fault {
+                Fault::Write => Err("the disk is full".into()),
+                Fault::NoParent => self.inner.commit_mined_block_beside(block, unlogged, laps),
+            }
+        }
+    }
+
+    /// A miner on the fixture's chain whose store has `fault`.
+    fn faulty_miner(fx: &MiningFixture, fault: Fault) -> MinerServer {
+        let hardfork_cfg = RskHardforkConfig::all_active(33);
+        let builder = BlockTemplateBuilder::new(
+            Arc::new(
+                BlockProcessor::new(hardfork_cfg.clone(), fx.store.clone())
+                    .with_chain_config(fx.chain_config.clone()),
+            ),
+            fx.trie_store.clone(),
+            fx.chain_config.clone(),
+            hardfork_cfg,
+            MiningConfig {
+                coinbase_address: address!("00000000000000000000000000000000c0117b45"),
+                ..Default::default()
+            },
+        );
+        let inner = StoreChainAccess::new(fx.store.clone(), fx.trie_store.clone(), None);
+        MinerServer::new(
+            builder,
+            Arc::new(FaultyChain { inner, fault }),
+            Arc::new(NoPendingTransactions),
+            fx.chain_config.clone(),
+        )
+    }
+
+    /// rskj `BlockChainImpl.tryToConnect` answers `INVALID_BLOCK` for
+    /// whatever goes wrong as it connects a block, a store that fails
+    /// included, and the pool is answered OK with it
+    /// (`MinerServerImpl.processSolution`). The node's own miner reads the
+    /// store's error.
+    #[test]
+    fn a_mined_block_the_store_fails_to_take_is_answered_invalid() {
+        let fx = fixture(20);
+        let miner = faulty_miner(&fx, Fault::Write);
+        let work = miner.get_work().unwrap();
+        let raw = bitcoin::consensus::serialize(&solve(&work));
+
+        let info = miner.submit_bitcoin_block(&raw).unwrap();
+        assert_eq!(info.block_imported_result, ImportResult::InvalidBlock);
+        assert_eq!(info.block_included_height, fx.parent.number + 1);
+        assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+
+        let err = miner
+            .submit_bitcoin_block_as(&raw, crate::mining::server::Refused::Failed)
+            .unwrap_err();
+        assert!(
+            matches!(err, SubmitError::Storage(ref e) if e == "the disk is full"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// rskj `BlockChainImpl.internalTryToConnect` answers `NO_PARENT` for a
+    /// block whose parent its store doesn't hold, before any rule, and
+    /// stores nothing.
+    #[test]
+    fn a_mined_block_whose_parent_the_store_lacks_is_answered_no_parent() {
+        let fx = fixture(20);
+        let miner = faulty_miner(&fx, Fault::NoParent);
+        let work = miner.get_work().unwrap();
+        let raw = bitcoin::consensus::serialize(&solve(&work));
+
+        let info = miner.submit_bitcoin_block(&raw).unwrap();
+        assert_eq!(info.block_imported_result, ImportResult::NoParent);
+        assert_eq!(info.block_imported_result.as_str(), "NO_PARENT");
+        assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+    }
 }

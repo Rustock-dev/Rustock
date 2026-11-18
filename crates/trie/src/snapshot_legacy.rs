@@ -475,6 +475,28 @@ pub struct Rebuilt {
     pub long_values: Vec<Vec<u8>>,
     /// The state root the reconstruction produced.
     pub root: B256,
+    /// The size of the whole trie, which the root commits to.
+    pub total: u64,
+    /// The stretch of the traversal the chunk's own nodes fill, from where
+    /// the first begins to where the last ends. `None` when it carried none.
+    ///
+    /// rskj's format states no offsets, but it does not need to: see
+    /// `span_of`. This is what a download advances by, rather than by the
+    /// range it asked for, which an rskj server does not honour.
+    pub span: Option<(u64, u64)>,
+    /// Where the node rskj's walk stopped at sits, from where it begins to
+    /// where it ends. `None` when the walk ran to the trie's end, or the node
+    /// cannot be placed.
+    ///
+    /// rskj keeps a node among a chunk's own only if it ends before the
+    /// window does, and leaves the first one that does not on its stack. It
+    /// sends that node whole all the same, first among the nodes still owed
+    /// their right subtree, and the rebuild has checked it against the root
+    /// with the rest. A node longer than the window -- a contract's code sits
+    /// inside its account's entry, and a value of the Bridge's storage can
+    /// pass 50 KiB -- is never among a chunk's own nodes, wherever it is
+    /// asked for. It only ever arrives this way.
+    pub stopped_at: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -489,6 +511,10 @@ pub enum RebuildError {
     WrongRoot { expected: B256, got: B256 },
     #[error("the chunk is empty")]
     Empty,
+    #[error("node {index} hangs under a parent that has no such child")]
+    Dangling { index: usize },
+    #[error("the chunk's nodes are not one unbroken stretch of the trie")]
+    Unplaced,
 }
 
 /// One node as the blob carries it.
@@ -504,6 +530,16 @@ struct Stub {
     after_path: usize,
     /// The embedded children, already converted to consensus form.
     embedded: Vec<Vec<u8>>,
+    /// Their whole sizes, added up. `children_size` counts them, and in the
+    /// traversal they sit inside this node's own entry.
+    embedded_total: u64,
+    /// Their long values, which rskj's format inlines in the child.
+    ///
+    /// The ones that matter: a contract's code is a long value, and its leaf
+    /// -- a one-byte path, the value's hash and length -- is small enough to
+    /// embed in the account node. Dropped, every contract's code would be a
+    /// hash with nothing behind it.
+    embedded_values: Vec<Vec<u8>>,
     /// The inlined value, if the node carries one.
     value: Vec<u8>,
     has_long_value: bool,
@@ -534,6 +570,12 @@ struct Stub {
 /// would have to collide with the root hash. It is sound, but it establishes
 /// the property at the end rather than by construction -- which is why
 /// rustock asks for its own format when it can.
+///
+/// # Where the chunk sits
+///
+/// Not stated by the chunk, and not needed: the rebuilt tree places its own
+/// nodes, from the sizes it commits to. See `span_of`, which also refuses
+/// a chunk that leaves out a stretch between its first node and its last.
 pub fn rebuild(chunk: &LegacyChunk, expected_root: B256) -> Result<Rebuilt, RebuildError> {
     let mut stubs = assemble(chunk)?;
     if stubs.is_empty() {
@@ -544,6 +586,8 @@ pub fn rebuild(chunk: &LegacyChunk, expected_root: B256) -> Result<Rebuilt, Rebu
 
     // Post-order: a node's message needs its children's hashes.
     let mut hashes: Vec<Option<B256>> = vec![None; stubs.len()];
+    // Each node's own bytes: its message, and the value it keeps outside it.
+    let mut own: Vec<u64> = vec![0; stubs.len()];
     let mut nodes: Vec<(B256, Vec<u8>)> = Vec::with_capacity(stubs.len());
     let mut long_values: Vec<Vec<u8>> = Vec::new();
 
@@ -560,6 +604,17 @@ pub fn rebuild(chunk: &LegacyChunk, expected_root: B256) -> Result<Rebuilt, Rebu
             continue;
         }
 
+        // A child hung where its parent has none never enters the parent's
+        // message, so nothing ties it to the root -- and the root still
+        // matches. Refused, so that every node kept is one the trie holds,
+        // and every node placed sits where the trie has it.
+        let flags = stubs[index].flags;
+        if (left_of[index].is_some() && !separate_left(flags))
+            || (right_of[index].is_some() && !separate_right(flags))
+        {
+            return Err(RebuildError::Dangling { index });
+        }
+
         let left_hash = match left_of[index] {
             Some(child) => hashes[child],
             None => stubs[index].given_left.map(B256::from),
@@ -574,6 +629,13 @@ pub fn rebuild(chunk: &LegacyChunk, expected_root: B256) -> Result<Rebuilt, Rebu
         let hash = keccak256(&message);
         hashes[index] = Some(hash);
 
+        let outside = if stubs[index].has_long_value {
+            stubs[index].value.len() as u64
+        } else {
+            0
+        };
+        own[index] = message.len() as u64 + outside;
+        long_values.append(&mut stubs[index].embedded_values);
         if stubs[index].has_long_value {
             long_values.push(std::mem::take(&mut stubs[index].value));
         }
@@ -584,7 +646,163 @@ pub fn rebuild(chunk: &LegacyChunk, expected_root: B256) -> Result<Rebuilt, Rebu
     if root != expected_root {
         return Err(RebuildError::WrongRoot { expected: expected_root, got: root });
     }
-    Ok(Rebuilt { nodes, long_values, root })
+
+    let total = stubs[root_index]
+        .children_size
+        .checked_add(own[root_index])
+        .ok_or(RebuildError::Malformed)?;
+    // Placed only when there is something to place: the chunk's own nodes, or
+    // the node its walk stopped at.
+    let starts = if chunk.nodes.is_empty() && chunk.post_root.is_empty() {
+        Vec::new()
+    } else {
+        placements(&stubs, &own, &left_of, &right_of, root_index)?
+    };
+    let first = chunk.pre_root.len();
+    let span = match chunk.nodes.len() {
+        0 => None,
+        n => Some(span_of(&stubs, &own, &starts, first, first + n - 1)?),
+    };
+    // rskj hands its stack back top-first, so the node it stopped at leads
+    // the nodes still owed their right subtree.
+    let stopped_at = if chunk.post_root.is_empty() {
+        None
+    } else {
+        let i = first + chunk.nodes.len();
+        match starts[i] {
+            Some(at) => Some((
+                at,
+                at.checked_add(entry(&stubs, &own, i)?)
+                    .ok_or(RebuildError::Unplaced)?,
+            )),
+            None => None,
+        }
+    };
+    Ok(Rebuilt {
+        nodes,
+        long_values,
+        root,
+        total,
+        span,
+        stopped_at,
+    })
+}
+
+/// Whether a node's left child is a node of its own: present, not embedded.
+fn separate_left(flags: u8) -> bool {
+    flags & 0b0000_1000 != 0 && flags & 0b0000_0010 == 0
+}
+
+/// Whether a node's right child is a node of its own: present, not embedded.
+fn separate_right(flags: u8) -> bool {
+    flags & 0b0000_0100 != 0 && flags & 0b0000_0001 == 0
+}
+
+/// Where each node of the rebuilt tree begins in the traversal; `None` for a
+/// node whose two children were both left out, which cannot be placed.
+///
+/// rskj's format carries no offsets, and does not need to. The tree a chunk
+/// rebuilds to is the top of the real trie -- every node it carries, and the
+/// hash of every subtree it leaves out -- and a subtree left out keeps its
+/// size: a parent's `children_size` commits to its two children together, so
+/// beside a carried child the other is the difference. Descending from the
+/// root places every carried node exactly, by the arithmetic of
+/// [`crate::snapshot::seek`]: a node's entry begins after its left branch, and
+/// its right branch after its entry.
+fn placements(
+    stubs: &[Stub],
+    own: &[u64],
+    left_of: &[Option<usize>],
+    right_of: &[Option<usize>],
+    root: usize,
+) -> Result<Vec<Option<u64>>, RebuildError> {
+    let unplaced = || RebuildError::Unplaced;
+    let total = |i: usize| {
+        stubs[i]
+            .children_size
+            .checked_add(own[i])
+            .ok_or_else(unplaced)
+    };
+
+    let mut starts: Vec<Option<u64>> = vec![None; stubs.len()];
+    // Each node, with the offset its subtree begins at.
+    let mut stack = vec![(root, 0u64)];
+    while let Some((i, base)) = stack.pop() {
+        let flags = stubs[i].flags;
+        // The two separate children together.
+        let pair = stubs[i]
+            .children_size
+            .checked_sub(stubs[i].embedded_total)
+            .ok_or_else(unplaced)?;
+        let left = if !separate_left(flags) {
+            0
+        } else if let Some(l) = left_of[i] {
+            total(l)?
+        } else if !separate_right(flags) {
+            pair
+        } else if let Some(r) = right_of[i] {
+            pair.checked_sub(total(r)?).ok_or_else(unplaced)?
+        } else {
+            // Both children left out: where one ends and the other begins is
+            // not known, and nothing below is carried to place.
+            continue;
+        };
+        let at = base.checked_add(left).ok_or_else(unplaced)?;
+        starts[i] = Some(at);
+        if let Some(l) = left_of[i] {
+            stack.push((l, base));
+        }
+        if let Some(r) = right_of[i] {
+            stack.push((
+                r,
+                at.checked_add(entry(stubs, own, i)?).ok_or_else(unplaced)?,
+            ));
+        }
+    }
+    Ok(starts)
+}
+
+/// A node's entry in the traversal: its own bytes, and its embedded children,
+/// which sit inside it.
+fn entry(stubs: &[Stub], own: &[u64], i: usize) -> Result<u64, RebuildError> {
+    own[i]
+        .checked_add(stubs[i].embedded_total)
+        .ok_or(RebuildError::Unplaced)
+}
+
+/// Where a chunk's own nodes sit in the traversal, as [`placements`] has them,
+/// and that nothing between them was left out.
+///
+/// The nodes from `first` to `last` must fill the stretch between them. A
+/// subtree left out in the middle, its hash handed in as the last node's
+/// left, still rebuilds to the right root; without this it is a stretch the
+/// chunk appears to cover and does not carry, a hole a download finds only at
+/// the end.
+///
+/// Returns where the first node's entry begins and the last's ends.
+fn span_of(
+    stubs: &[Stub],
+    own: &[u64],
+    starts: &[Option<u64>],
+    first: usize,
+    last: usize,
+) -> Result<(u64, u64), RebuildError> {
+    let unplaced = || RebuildError::Unplaced;
+    let start = starts[first].ok_or_else(unplaced)?;
+    let end = starts[last]
+        .ok_or_else(unplaced)?
+        .checked_add(entry(stubs, own, last)?)
+        .ok_or_else(unplaced)?;
+    let mut carried = 0u64;
+    for i in first..=last {
+        carried = carried
+            .checked_add(entry(stubs, own, i)?)
+            .ok_or_else(unplaced)?;
+    }
+    if end.checked_sub(start) != Some(carried) {
+        return Err(unplaced());
+    }
+    Ok((start, end))
 }
 
 /// pre-root nodes, the chunk's own, then post-root, with the boundary hashes
@@ -614,6 +832,17 @@ fn assemble(chunk: &LegacyChunk) -> Result<Vec<Stub>, RebuildError> {
 
     for (body, hash) in &chunk.post_root {
         out.push(parse_stub(body, None, *hash, out.len())?);
+    }
+
+    // A chunk that carried none of its own began its walk at the node holding
+    // the offset asked, and stopped there at once: that node leads the ones
+    // still owed their right subtree, and the first node's left hash is its.
+    // Left without it, a node with a separate left child -- a contract's
+    // account over its storage, with its code inside it -- cannot be rebuilt.
+    if chunk.nodes.is_empty() {
+        if let Some(stub) = out.get_mut(first) {
+            stub.given_left = chunk.first_left;
+        }
     }
     Ok(out)
 }
@@ -654,14 +883,33 @@ fn parse_stub(
     // prefix differs between the two encodings and an embedded child that
     // inlines a long value is a different length in each.
     let mut embedded = Vec::new();
+    let mut embedded_total = 0u64;
+    let mut embedded_values = Vec::new();
     for (present, is_embedded) in
         [(left_present, left_embedded), (right_present, right_embedded)]
     {
         if present && is_embedded {
             let len = read_uint24(&mut r).ok_or_else(bad)?;
             let child = r.take(len).ok_or_else(bad)?;
-            let stub = parse_stub(child, None, None, index)?;
-            embedded.push(consensus_message(&stub, None, None).ok_or_else(bad)?);
+            let mut stub = parse_stub(child, None, None, index)?;
+            let message = consensus_message(&stub, None, None).ok_or_else(bad)?;
+            // `total_size` of the child: its message, the value it keeps
+            // outside it, and whatever hangs below it.
+            let outside = if stub.has_long_value {
+                stub.value.len() as u64
+            } else {
+                0
+            };
+            embedded_total = (message.len() as u64)
+                .checked_add(outside)
+                .and_then(|size| size.checked_add(stub.children_size))
+                .and_then(|size| size.checked_add(embedded_total))
+                .ok_or_else(bad)?;
+            embedded.push(message);
+            if stub.has_long_value {
+                embedded_values.push(std::mem::take(&mut stub.value));
+            }
+            embedded_values.append(&mut stub.embedded_values);
         }
     }
 
@@ -682,6 +930,8 @@ fn parse_stub(
         children_size,
         after_path,
         embedded,
+        embedded_total,
+        embedded_values,
         value,
         has_long_value,
     })

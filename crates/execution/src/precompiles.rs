@@ -16,7 +16,7 @@
 /// | 0x01000006     | RSK (genesis)       | Bridge                          |
 /// | 0x01000008     | RSK (genesis)       | REMASC                          |
 /// | 0x01000009+    | RSK (various)       | HDWalletUtils, BlockHeader, etc |
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, B256};
 use revm::context::{Cfg, LocalContextTr};
 use revm::context_interface::{Block as BlockTr, ContextTr, JournalTr};
 use revm::handler::PrecompileProvider;
@@ -31,6 +31,10 @@ use std::sync::Arc;
 
 use crate::bridge::constants::BridgeConstants;
 use crate::hardfork::{RskHardforkConfig, RskNetworkUpgrade};
+use crate::native::block_header::BlockHeader;
+use crate::native::environment::Environment;
+use crate::native::hd_wallet::HdWalletUtils;
+use crate::native::{self, Outcome};
 use crate::remasc::RemascConfig;
 
 // ---------------------------------------------------------------------------
@@ -122,48 +126,223 @@ fn bridge_run(_input: &[u8], gas_limit: u64) -> Result<PrecompileOutput, Precomp
     Ok(PrecompileOutput::new(gas_cost, Vec::new().into()))
 }
 
-/// HDWalletUtils: BIP32/Base58Check/multisig operations (0x01000009).
-///
-/// 4 methods dispatched by 4-byte ABI selector:
-///   - toBase58Check(bytes,int256) → string
-///   - deriveExtendedPublicKey(string,string) → string
-///   - extractPublicKeyFromExtendedPublicKey(string) → bytes
-///   - getMultisigScriptHash(int256,bytes[]) → bytes
-fn hd_wallet_utils_run(input: &[u8], gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
-    if input.len() < 4 {
-        return Err(PrecompileError::other("HDWalletUtils: input too short for selector"));
-    }
-
-    let selector = [input[0], input[1], input[2], input[3]];
-    let data = &input[4..];
-
-    if selector == selector_of("toBase58Check(bytes,int256)") {
-        run_to_base58check(data, gas_limit)
-    } else if selector == selector_of("deriveExtendedPublicKey(string,string)") {
-        run_derive_extended_public_key(data, gas_limit)
-    } else if selector == selector_of("extractPublicKeyFromExtendedPublicKey(string)") {
-        run_extract_pubkey(data, gas_limit)
-    } else if selector == selector_of("getMultisigScriptHash(int256,bytes[])") {
-        run_get_multisig_script_hash(data, gas_limit)
-    } else {
-        Err(PrecompileError::other("HDWalletUtils: unknown method selector"))
-    }
+/// What the precompile set holds for HDWalletUtils, BlockHeader and
+/// Environment, so each address is a precompile from its activation on.
+/// `RskPrecompileProvider` runs these native contracts itself
+/// ([`crate::native`]) and never calls this.
+fn native_contract(_input: &[u8], _gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
+    Err(PrecompileError::Fatal(
+        "a native contract runs through RskPrecompileProvider".into(),
+    ))
 }
 
-/// BlockHeaderContract: exposes block header fields to smart contracts.
-/// Stub — returns empty with base gas cost.
-fn block_header_run(input: &[u8], gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
-    let gas_cost = 4_000u64 + 2 * input.len() as u64;
-    if gas_limit < gas_cost {
+/// ECRecover's address, 0x01.
+const ECRECOVER_ADDR: Address = Address::new(hex_addr("0000000000000000000000000000000000000001"));
+
+/// rskj's ECRecover (`PrecompiledContracts.ECRecover`), which parts from
+/// Ethereum's, the one revm runs, in two places:
+///
+/// - only the last byte of the `v` word counts: `isValid` reads `v[31]`, so
+///   a word whose other bytes aren't zero still recovers a key, where revm
+///   answers nothing;
+/// - a signature whose key is the point at infinity recovers the address
+///   rskj gives that key, the infinity sender, where revm answers nothing.
+///
+/// The rest is as Ethereum's: 3,000 gas, the input's first 128 bytes read,
+/// and nothing for a `v` byte other than 27 or 28, an r or s outside 1 to
+/// below the curve's order, or a key that doesn't recover. An input too
+/// short to hold the hash, `v` and r makes `execute`'s `System.arraycopy`
+/// throw, and it answers nothing for any exception; an s cut short ends in
+/// zeros.
+fn rsk_ecrecover_run(input: &[u8], gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
+    const GAS: u64 = 3_000;
+    if gas_limit < GAS {
         return Err(PrecompileError::OutOfGas);
     }
-    Ok(PrecompileOutput::new(gas_cost, Vec::new().into()))
+    let answer = ecrecover(input).map_or_else(Vec::new, |word| word.to_vec());
+    Ok(PrecompileOutput::new(GAS, answer.into()))
 }
 
-/// Environment: provides call stack depth.
-/// Gas cost: 0.
-fn environment_run(_input: &[u8], _gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
-    Ok(PrecompileOutput::new(0, Vec::new().into()))
+/// The word ECRecover answers, the recovered address at its end, or `None`
+/// for an empty answer. See [`rsk_ecrecover_run`].
+fn ecrecover(input: &[u8]) -> Option<[u8; 32]> {
+    if input.len() < 96 {
+        return None;
+    }
+    let v = input[63];
+    if v != 27 && v != 28 {
+        return None;
+    }
+    let mut hash = [0_u8; 32];
+    hash.copy_from_slice(&input[..32]);
+    let mut signature = [0_u8; 64];
+    signature[..32].copy_from_slice(&input[64..96]);
+    let s = &input[96..input.len().min(128)];
+    signature[32..32 + s.len()].copy_from_slice(s);
+    let address = rustock_core::types::transaction::recover_address(&hash, &signature, v - 27)?;
+    let mut word = [0_u8; 32];
+    word[12..].copy_from_slice(address.as_slice());
+    Some(word)
+}
+
+/// ModExp's address, 0x05.
+const MODEXP_ADDR: Address = Address::new(hex_addr("0000000000000000000000000000000000000005"));
+
+/// rskj's ModExp (`PrecompiledContracts.BigIntegerModexp`): EIP-198's price
+/// and arithmetic, with the lengths read as rskj reads them.
+///
+/// revm's modexp takes a length at its full width. rskj takes it as a Java
+/// int (`DataWord.intValueSafe`), so that 2^31 or more counts as
+/// `Integer.MAX_VALUE`, and answers nothing when an offset passes an int
+/// (`Math.addExact`) or an argument passes what a `BigInteger` holds, 2^31 - 1
+/// bits. The two agree on every call that affords less than about 10^8 gas:
+/// the cheapest call past those limits, an exponent of 2^28 bytes with a
+/// one-byte base and modulus, costs 107,374,182.
+fn rsk_modexp_run(input: &[u8], gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
+    let gas = modexp::gas_for_data(input);
+    if gas > gas_limit {
+        return Err(PrecompileError::OutOfGas);
+    }
+    Ok(PrecompileOutput::new(gas, modexp::execute(input)?.into()))
+}
+
+/// rskj's `BigIntegerModexp`, step by step.
+mod modexp {
+    use revm::precompile::PrecompileError;
+
+    /// Where the base starts, after the three lengths.
+    const ARGS_OFFSET: i32 = 96;
+
+    /// The most bits a `BigInteger` holds.
+    const BIG_INTEGER_BITS: u64 = i32::MAX as u64;
+
+    /// `getGasForData`: EIP-198's price, at most `Long.MAX_VALUE`
+    /// (`GasCost.toGas`).
+    pub(super) fn gas_for_data(data: &[u8]) -> u64 {
+        let [base_len, exp_len, mod_len] = lengths(data);
+        let mult_complexity = mult_complexity(base_len.max(mod_len) as u64);
+        let exp_high_bytes = match ARGS_OFFSET.checked_add(base_len) {
+            Some(offset) => parse_bytes(data, offset, exp_len.min(32)),
+            None => Vec::new(),
+        };
+        let adjusted = adjusted_exponent_length(&exp_high_bytes, exp_len);
+        let gas = u128::from(mult_complexity) * u128::from(adjusted.max(1)) / 20;
+        gas.min(i64::MAX as u128) as u64
+    }
+
+    /// `execute`: the result left-padded to the modulus's length, or nothing
+    /// where an `ArithmeticException` ends it.
+    pub(super) fn execute(data: &[u8]) -> Result<Vec<u8>, PrecompileError> {
+        let [base_len, exp_len, mod_len] = lengths(data);
+        if base_len == 0 && mod_len == 0 {
+            return Ok(Vec::new());
+        }
+        // `Math.addExact` throws past an int.
+        let Some(exp_offset) = ARGS_OFFSET.checked_add(base_len) else {
+            return Ok(Vec::new());
+        };
+        let Some(mod_offset) = exp_offset.checked_add(exp_len) else {
+            return Ok(Vec::new());
+        };
+        let args = [
+            (ARGS_OFFSET, base_len),
+            (exp_offset, exp_len),
+            (mod_offset, mod_len),
+        ];
+        // `new BigInteger(1, bytes)` throws past its bits. rskj reads each
+        // argument whole first; here each is measured before any is read.
+        if args
+            .iter()
+            .any(|&(offset, len)| bit_length(data, offset, len) > BIG_INTEGER_BITS)
+        {
+            return Ok(Vec::new());
+        }
+        let mut answer = vec![0; mod_len as usize];
+        // A modulus of zero answers zeros.
+        if bit_length(data, mod_offset, mod_len) == 0 {
+            return Ok(answer);
+        }
+        let [base, exp, modulus] = args.map(|(offset, len)| parse_bytes(data, offset, len));
+        let result = revm::precompile::crypto().modexp(&base, &exp, &modulus)?;
+        let result = &result[result.iter().take_while(|&&byte| byte == 0).count()..];
+        let Some(start) = answer.len().checked_sub(result.len()) else {
+            return Err(PrecompileError::Fatal(
+                "modexp answered more than its modulus holds".into(),
+            ));
+        };
+        answer[start..].copy_from_slice(result);
+        Ok(answer)
+    }
+
+    /// `parseLen` of the three lengths, each word read as
+    /// `DataWord.intValueSafe` reads it: 2^31 or more is `Integer.MAX_VALUE`.
+    fn lengths(data: &[u8]) -> [i32; 3] {
+        [0, 1, 2].map(|index| {
+            let mut word = [0u8; 32];
+            let bytes = parse_bytes(data, 32 * index, 32);
+            word[..bytes.len()].copy_from_slice(&bytes);
+            let low = i32::from_be_bytes([word[28], word[29], word[30], word[31]]);
+            if word[..28].iter().any(|&byte| byte != 0) || low < 0 {
+                i32::MAX
+            } else {
+                low
+            }
+        })
+    }
+
+    /// `ByteUtil.parseBytes`: `len` bytes of `data` from `offset`, zeros past
+    /// its end, and none at all from past its end or for `len` zero.
+    fn parse_bytes(data: &[u8], offset: i32, len: i32) -> Vec<u8> {
+        let (offset, len) = (offset as usize, len as usize);
+        if offset >= data.len() || len == 0 {
+            return Vec::new();
+        }
+        let mut bytes = vec![0; len];
+        let present = (data.len() - offset).min(len);
+        bytes[..present].copy_from_slice(&data[offset..offset + present]);
+        bytes
+    }
+
+    /// How many bits the number `parse_bytes(data, offset, len)` reads holds,
+    /// found without reading it: its highest byte is one of `data`'s, the rest
+    /// being the zeros it is padded with.
+    fn bit_length(data: &[u8], offset: i32, len: i32) -> u64 {
+        let (offset, len) = (offset as usize, len as usize);
+        let present = data.get(offset..).unwrap_or_default();
+        let present = &present[..present.len().min(len)];
+        match present.iter().position(|&byte| byte != 0) {
+            None => 0,
+            Some(i) => 8 * (len - i) as u64 - u64::from(present[i].leading_zeros()),
+        }
+    }
+
+    /// `getMultComplexity`. `x` is at most 2^31 - 1, so `x * x` fits, as in
+    /// rskj's long arithmetic.
+    fn mult_complexity(x: u64) -> u64 {
+        let x2 = x * x;
+        if x <= 64 {
+            x2
+        } else if x <= 1024 {
+            x2 / 4 + 96 * x - 3072
+        } else {
+            x2 / 16 + 480 * x - 199_680
+        }
+    }
+
+    /// `getAdjustedExponentLength`: the index of the highest bit among the
+    /// exponent's first 32 bytes, and 8 for each byte after them.
+    fn adjusted_exponent_length(exp_high_bytes: &[u8], exp_len: i32) -> u64 {
+        let leading_zeros = match exp_high_bytes.iter().position(|&byte| byte != 0) {
+            None => 8 * exp_high_bytes.len(),
+            Some(i) => 8 * i + exp_high_bytes[i].leading_zeros() as usize,
+        };
+        let highest_bit = (8 * exp_high_bytes.len() - leading_zeros).saturating_sub(1) as u64;
+        if exp_len <= 32 {
+            highest_bit
+        } else {
+            8 * (exp_len as u64 - 32) + highest_bit
+        }
+    }
 }
 
 /// Secp256k1 point addition.
@@ -200,14 +379,15 @@ fn secp256k1_mul_run(input: &[u8], gas_limit: u64) -> Result<PrecompileOutput, P
     Ok(PrecompileOutput::new(gas_cost, encode_secp256k1_point(result).into()))
 }
 
-/// Read a 32-byte big-endian word from `data` at `offset`, zero-padding
-/// if the data is shorter than `offset + 32`.
+/// Read a 32-byte big-endian word from `data` at `offset`. rskj's
+/// `ByteUtil.parseWord` pads a word `data` ends inside with zeros on the
+/// right, and reads one past its end as zero.
 fn parse_word(data: &[u8], offset: usize) -> [u8; 32] {
     let mut word = [0u8; 32];
     if offset < data.len() {
         let end = std::cmp::min(offset + 32, data.len());
         let len = end - offset;
-        word[32 - len..].copy_from_slice(&data[offset..end]);
+        word[..len].copy_from_slice(&data[offset..end]);
     }
     word
 }
@@ -264,504 +444,6 @@ fn encode_secp256k1_point(point: k256::ProjectivePoint) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// BlockHeaderContract helpers
-// ---------------------------------------------------------------------------
-
-/// Compute the 4-byte ABI method selector (keccak256 of the signature).
-fn selector_of(sig: &str) -> [u8; 4] {
-    use sha3::{Digest, Keccak256};
-    let h = Keccak256::digest(sig.as_bytes());
-    [h[0], h[1], h[2], h[3]]
-}
-
-#[derive(Debug)]
-enum DepthError {
-    Overflow,
-    Negative,
-}
-
-/// Parse a 32-byte ABI-encoded int256 into an i16 depth value, matching rskj's
-/// `shortValueExact()` semantics: values outside [-32768, 32767] return Overflow,
-/// negative values return Negative.
-fn parse_int256_as_depth(data: &[u8]) -> Result<i16, DepthError> {
-    let mut word = [0u8; 32];
-    let len = data.len().min(32);
-    word[32 - len..].copy_from_slice(&data[..len]);
-
-    // Check sign: int256 is two's complement, high bit indicates negative.
-    let is_negative = word[0] & 0x80 != 0;
-
-    if is_negative {
-        // Negative: all leading bytes must be 0xFF and the result must fit i16.
-        let all_ff = word[..30].iter().all(|&b| b == 0xFF);
-        if !all_ff {
-            return Err(DepthError::Negative);
-        }
-        let val = i16::from_be_bytes([word[30], word[31]]);
-        if val >= 0 {
-            // e.g. 0xFFFF...FF0001 → the i16 portion is positive, meaning
-            // the int256 value is very large negative; still negative.
-            return Err(DepthError::Negative);
-        }
-        Err(DepthError::Negative)
-    } else {
-        // Positive: all leading bytes must be 0x00 and result must fit i16.
-        let all_zero = word[..30].iter().all(|&b| b == 0);
-        if !all_zero {
-            return Err(DepthError::Overflow);
-        }
-        let val = i16::from_be_bytes([word[30], word[31]]);
-        if val < 0 {
-            // i16 overflowed (e.g. 0x0000...8000 = 32768 doesn't fit signed i16)
-            return Err(DepthError::Overflow);
-        }
-        Ok(val)
-    }
-}
-
-/// ABI-encode raw bytes as a Solidity `bytes` return value, replicating
-/// ethereumj's `SolidityType.BytesType.encode`.
-///
-/// Layout: 32-byte offset (0x20) | 32-byte length | data (right-padded to 32).
-///
-/// ethereumj pads with `((len - 1) / 32 + 1) * 32` — Java's `-1/32 == 0`
-/// makes EMPTY bytes pad to one full zero word (96 bytes total instead of
-/// the canonical 64). The extra returndata word is consensus-visible
-/// (RETURNDATACOPY copy gas): mainnet #1,669,062 calls
-/// getCoinbaseAddress(4000) (≥ MAX_DEPTH → empty result) and rskj's reply
-/// is 96 bytes.
-fn abi_encode_bytes(data: &[u8]) -> Vec<u8> {
-    let padded_len = if data.is_empty() {
-        32
-    } else {
-        data.len().div_ceil(32) * 32
-    };
-    let mut out = vec![0u8; 64 + padded_len];
-    // offset → 0x20
-    out[31] = 0x20;
-    // length
-    let len_be = (data.len() as u64).to_be_bytes();
-    out[56..64].copy_from_slice(&len_be);
-    // data
-    out[64..64 + data.len()].copy_from_slice(data);
-    out
-}
-
-/// Convert a U256 to Java's `BigInteger.toByteArray()` format:
-/// minimal big-endian two's complement with a leading 0x00 when the high bit
-/// of the first data byte is set (to keep the value positive).
-fn u256_to_java_bigint_bytes(val: U256) -> Vec<u8> {
-    if val.is_zero() {
-        return vec![0];
-    }
-    let be = val.to_be_bytes::<32>();
-    let start = be.iter().position(|&b| b != 0).unwrap_or(31);
-    let mut bytes = be[start..].to_vec();
-    if bytes[0] & 0x80 != 0 {
-        bytes.insert(0, 0);
-    }
-    bytes
-}
-
-/// Convert a u64 to Java's `BigInteger.valueOf(n).toByteArray()` format.
-fn u64_to_java_bigint_bytes(val: u64) -> Vec<u8> {
-    u256_to_java_bigint_bytes(U256::from(val))
-}
-
-/// Minimal unsigned big-endian bytes (empty for zero) — the raw form of a
-/// header RLP element. rskj's `GetGasLimit` returns `header.getGasLimit()`
-/// verbatim (the decoded RLP bytes), so unlike the BigInteger-encoded fields
-/// there is no 0x00 sign prefix when the high bit is set.
-fn u256_to_raw_minimal_bytes(val: U256) -> Vec<u8> {
-    let be = val.to_be_bytes::<32>();
-    let start = be.iter().position(|&b| b != 0).unwrap_or(32);
-    be[start..].to_vec()
-}
-
-/// Extract merged mining tags from a block header's bitcoin coinbase tx.
-///
-/// Finds the last occurrence of `RSKBLOCK:` in the coinbase transaction,
-/// skips past the 32-byte block header hash, and returns the remaining bytes.
-fn extract_merged_mining_tags(header: &rustock_core::Header) -> Vec<u8> {
-    let coinbase_tx = match &header.bitcoin_merged_mining_coinbase_transaction {
-        Some(tx) => tx.as_ref(),
-        None => return Vec::new(),
-    };
-
-    // Find the last occurrence of RSK_TAG
-    let tag_pos = coinbase_tx
-        .windows(RSK_TAG.len())
-        .rposition(|w| w == RSK_TAG);
-
-    let tag_pos = match tag_pos {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
-
-    let start = tag_pos + RSK_TAG.len() + RSK_TAG_HASH_SIZE;
-    if start >= coinbase_tx.len() {
-        return Vec::new();
-    }
-    coinbase_tx[start..].to_vec()
-}
-
-// ---------------------------------------------------------------------------
-// HDWalletUtils ABI helpers
-// ---------------------------------------------------------------------------
-
-/// ABI-encode a string return value (identical layout to `abi_encode_bytes`).
-fn abi_encode_string(s: &str) -> Vec<u8> {
-    abi_encode_bytes(s.as_bytes())
-}
-
-/// Read a big-endian uint256 from a 32-byte word, returning its value as usize.
-/// Returns `None` if the value overflows usize.
-fn abi_read_offset(data: &[u8], pos: usize) -> Option<usize> {
-    if pos + 32 > data.len() {
-        return None;
-    }
-    let word = &data[pos..pos + 32];
-    if word[..24].iter().any(|&b| b != 0) {
-        return None; // too large for usize
-    }
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&word[24..32]);
-    Some(u64::from_be_bytes(buf) as usize)
-}
-
-/// ABI-decode a `bytes` parameter. `param_slot` is the 32-byte slot index
-/// (0 for first param, 1 for second, etc.) within `data` (already past the selector).
-fn abi_decode_bytes(data: &[u8], param_slot: usize) -> Option<Vec<u8>> {
-    let offset = abi_read_offset(data, param_slot * 32)?;
-    let length = abi_read_offset(data, offset)?;
-    let start = offset + 32;
-    if start + length > data.len() {
-        return None;
-    }
-    Some(data[start..start + length].to_vec())
-}
-
-/// ABI-decode a `string` parameter.
-fn abi_decode_string(data: &[u8], param_slot: usize) -> Option<String> {
-    let bytes = abi_decode_bytes(data, param_slot)?;
-    String::from_utf8(bytes).ok()
-}
-
-/// ABI-decode a static `int256` parameter as i32. Returns `None` if
-/// the value doesn't fit in i32.
-fn abi_decode_int256_as_i32(data: &[u8], param_slot: usize) -> Option<i32> {
-    let pos = param_slot * 32;
-    if pos + 32 > data.len() {
-        return None;
-    }
-    let word = &data[pos..pos + 32];
-    let is_negative = word[0] & 0x80 != 0;
-    let fill = if is_negative { 0xFF } else { 0x00 };
-    if word[..28].iter().any(|&b| b != fill) {
-        return None;
-    }
-    let val = i32::from_be_bytes([word[28], word[29], word[30], word[31]]);
-    if is_negative && val >= 0 {
-        return None;
-    }
-    if !is_negative && val < 0 {
-        return None;
-    }
-    Some(val)
-}
-
-/// ABI-decode a `bytes[]` parameter.
-fn abi_decode_bytes_array(data: &[u8], param_slot: usize) -> Option<Vec<Vec<u8>>> {
-    let array_offset = abi_read_offset(data, param_slot * 32)?;
-    let count = abi_read_offset(data, array_offset)?;
-    let mut items = Vec::with_capacity(count);
-    for i in 0..count {
-        let elem_rel_offset = abi_read_offset(data, array_offset + 32 + i * 32)?;
-        let elem_abs = array_offset + 32 + elem_rel_offset;
-        let elem_len = abi_read_offset(data, elem_abs)?;
-        let elem_start = elem_abs + 32;
-        if elem_start + elem_len > data.len() {
-            return None;
-        }
-        items.push(data[elem_start..elem_start + elem_len].to_vec());
-    }
-    Some(items)
-}
-
-// ---------------------------------------------------------------------------
-// HDWalletUtils method implementations
-// ---------------------------------------------------------------------------
-
-/// `toBase58Check(bytes hash160, int256 version) → string`
-///
-/// Encodes a 20-byte hash with a version byte into a Base58Check string.
-fn run_to_base58check(data: &[u8], gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
-    const GAS_COST: u64 = 13_000;
-    if gas_limit < GAS_COST {
-        return Err(PrecompileError::OutOfGas);
-    }
-
-    let hash160 = abi_decode_bytes(data, 0)
-        .ok_or_else(|| PrecompileError::other("toBase58Check: cannot decode hash160"))?;
-    if hash160.len() != 20 {
-        return Err(PrecompileError::other("toBase58Check: Invalid hash160"));
-    }
-
-    let version = abi_decode_int256_as_i32(data, 1)
-        .ok_or_else(|| PrecompileError::other("toBase58Check: cannot decode version"))?;
-    if !(0..256).contains(&version) {
-        return Err(PrecompileError::other(
-            "toBase58Check: version must be a numeric value between 0 and 255",
-        ));
-    }
-
-    let mut payload = Vec::with_capacity(21);
-    payload.push(version as u8);
-    payload.extend_from_slice(&hash160);
-
-    let encoded = bitcoin::base58::encode_check(&payload);
-
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_string(&encoded).into()))
-}
-
-/// `deriveExtendedPublicKey(string xpub, string path) → string`
-///
-/// Derives a child extended public key along a BIP32 path.
-fn run_derive_extended_public_key(
-    data: &[u8],
-    gas_limit: u64,
-) -> Result<PrecompileOutput, PrecompileError> {
-    const GAS_COST: u64 = 107_000;
-    if gas_limit < GAS_COST {
-        return Err(PrecompileError::OutOfGas);
-    }
-
-    let xpub_str = abi_decode_string(data, 0)
-        .ok_or_else(|| PrecompileError::other("deriveExtendedPublicKey: cannot decode xpub"))?;
-    let path_str = abi_decode_string(data, 1)
-        .ok_or_else(|| PrecompileError::other("deriveExtendedPublicKey: cannot decode path"))?;
-
-    let xpub = parse_xpub(&xpub_str)?;
-    validate_derivation_path(&path_str)?;
-
-    let child_numbers = parse_derivation_path(&path_str)?;
-
-    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
-    let mut derived = xpub;
-    for child in &child_numbers {
-        derived = derived.ckd_pub(&secp, *child).map_err(|e| {
-            PrecompileError::other(format!("deriveExtendedPublicKey: derivation failed: {e}"))
-        })?;
-    }
-
-    let result_str = derived.to_string();
-
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_string(&result_str).into()))
-}
-
-/// `extractPublicKeyFromExtendedPublicKey(string xpub) → bytes`
-///
-/// Returns the 33-byte compressed public key from an extended public key.
-fn run_extract_pubkey(data: &[u8], gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
-    const GAS_COST: u64 = 11_300;
-    if gas_limit < GAS_COST {
-        return Err(PrecompileError::OutOfGas);
-    }
-
-    let xpub_str = abi_decode_string(data, 0).ok_or_else(|| {
-        PrecompileError::other("extractPublicKeyFromExtendedPublicKey: cannot decode xpub")
-    })?;
-
-    let xpub = parse_xpub(&xpub_str)?;
-    let pubkey_bytes = xpub.public_key.serialize();
-
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_bytes(&pubkey_bytes).into()))
-}
-
-/// `getMultisigScriptHash(int256 minimumSignatures, bytes[] publicKeys) → bytes`
-///
-/// Builds a P2SH multisig redeem script and returns RIPEMD160(SHA256(script)).
-fn run_get_multisig_script_hash(
-    data: &[u8],
-    gas_limit: u64,
-) -> Result<PrecompileOutput, PrecompileError> {
-    use k256::elliptic_curve::sec1::FromEncodedPoint;
-
-    const BASE_COST: u64 = 20_000;
-    const COST_PER_EXTRA_KEY: u64 = 700;
-
-    let min_sigs = abi_decode_int256_as_i32(data, 0)
-        .ok_or_else(|| PrecompileError::other("getMultisigScriptHash: cannot decode minimumSignatures"))?;
-
-    let public_keys = abi_decode_bytes_array(data, 1);
-    let public_keys = match public_keys {
-        Some(keys) => keys,
-        None => {
-            return Err(PrecompileError::other("getMultisigScriptHash: At least 2 public keys are required"));
-        }
-    };
-
-    let gas_cost = if public_keys.len() >= 2 {
-        BASE_COST + (public_keys.len() as u64 - 2) * COST_PER_EXTRA_KEY
-    } else {
-        BASE_COST
-    };
-    if gas_limit < gas_cost {
-        return Err(PrecompileError::OutOfGas);
-    }
-
-    if min_sigs <= 0 {
-        return Err(PrecompileError::other(
-            "getMultisigScriptHash: Minimum required signatures must be present and greater than zero",
-        ));
-    }
-
-    if public_keys.len() < 2 {
-        return Err(PrecompileError::other(
-            "getMultisigScriptHash: At least 2 public keys are required",
-        ));
-    }
-
-    if public_keys.len() < min_sigs as usize {
-        return Err(PrecompileError::other(
-            "getMultisigScriptHash: public keys are less than the minimum required signatures",
-        ));
-    }
-
-    if public_keys.len() > 15 {
-        return Err(PrecompileError::other(
-            "getMultisigScriptHash: public keys are more than the maximum allowed signatures",
-        ));
-    }
-
-    let mut compressed_keys: Vec<[u8; 33]> = Vec::with_capacity(public_keys.len());
-    for key_bytes in &public_keys {
-        if key_bytes.len() != 33 && key_bytes.len() != 65 {
-            return Err(PrecompileError::other(format!(
-                "getMultisigScriptHash: Invalid public key length: {}",
-                key_bytes.len()
-            )));
-        }
-
-        let prefix = key_bytes[0];
-        if prefix != 0x02 && prefix != 0x03 && prefix != 0x04 {
-            return Err(PrecompileError::other("getMultisigScriptHash: Invalid public key format"));
-        }
-
-        let compressed = if key_bytes.len() == 33 {
-            let mut arr = [0u8; 33];
-            arr.copy_from_slice(key_bytes);
-            // Validate the key is on the curve
-            let encoded = k256::EncodedPoint::from_bytes(key_bytes)
-                .map_err(|_| PrecompileError::other("getMultisigScriptHash: Invalid public key format"))?;
-            let pt = k256::AffinePoint::from_encoded_point(&encoded);
-            if pt.is_none().into() {
-                return Err(PrecompileError::other("getMultisigScriptHash: Invalid public key format"));
-            }
-            arr
-        } else {
-            // 65-byte uncompressed: validate and compress
-            let encoded = k256::EncodedPoint::from_bytes(key_bytes)
-                .map_err(|_| PrecompileError::other("getMultisigScriptHash: Invalid public key format"))?;
-            let pt = k256::AffinePoint::from_encoded_point(&encoded);
-            if pt.is_none().into() {
-                return Err(PrecompileError::other("getMultisigScriptHash: Invalid public key format"));
-            }
-            let affine = pt.unwrap();
-            let comp = k256::EncodedPoint::from(affine);
-            let comp_bytes = comp.compress().to_bytes();
-            let mut arr = [0u8; 33];
-            arr.copy_from_slice(&comp_bytes);
-            arr
-        };
-
-        compressed_keys.push(compressed);
-    }
-
-    // Sort keys by compressed bytes (matches bitcoinj's createRedeemScript behavior)
-    compressed_keys.sort();
-
-    // Build multisig redeem script:
-    // OP_m <pubkey1> <pubkey2> ... <pubkeyn> OP_n OP_CHECKMULTISIG
-    let mut script = Vec::new();
-    script.push(0x50 + min_sigs as u8); // OP_m
-    for key in &compressed_keys {
-        script.push(33); // OP_PUSHBYTES_33
-        script.extend_from_slice(key);
-    }
-    script.push(0x50 + compressed_keys.len() as u8); // OP_n
-    script.push(0xAE); // OP_CHECKMULTISIG
-
-    // RIPEMD160(SHA256(script))
-    use sha2::Digest as Sha2Digest;
-    let sha256_hash = sha2::Sha256::digest(&script);
-    let script_hash = ripemd::Ripemd160::digest(sha256_hash);
-
-    Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&script_hash).into()))
-}
-
-/// Parse an xpub/tpub string into a `bitcoin::bip32::Xpub`.
-fn parse_xpub(xpub_str: &str) -> Result<bitcoin::bip32::Xpub, PrecompileError> {
-    if !xpub_str.starts_with("xpub") && !xpub_str.starts_with("tpub") {
-        return Err(PrecompileError::other(format!(
-            "Invalid extended public key '{xpub_str}'"
-        )));
-    }
-
-    xpub_str
-        .parse::<bitcoin::bip32::Xpub>()
-        .map_err(|e| PrecompileError::other(format!("Invalid extended public key '{xpub_str}': {e}")))
-}
-
-/// Validate a BIP32 derivation path string per rskj rules:
-/// - Non-empty, starts and ends with a digit
-/// - No `M` prefix, no hardening `'`, no negative numbers
-/// - Each segment < 2^31, at most 10 segments
-fn validate_derivation_path(path: &str) -> Result<(), PrecompileError> {
-    if path.is_empty() {
-        return Err(PrecompileError::other("Invalid path"));
-    }
-
-    let first_char = path.chars().next().unwrap();
-    let last_char = path.chars().last().unwrap();
-    if !first_char.is_ascii_digit() || !last_char.is_ascii_digit() {
-        return Err(PrecompileError::other("Invalid path"));
-    }
-
-    let chunks: Vec<&str> = path.split('/').collect();
-    if chunks.len() > 10 {
-        return Err(PrecompileError::other("Path should contain 10 levels at most"));
-    }
-
-    for chunk in &chunks {
-        if chunk.contains('\'') || chunk.contains('H') {
-            return Err(PrecompileError::other("Invalid path"));
-        }
-        match chunk.parse::<i64>() {
-            Ok(n) if (0..(1i64 << 31)).contains(&n) => {}
-            _ => return Err(PrecompileError::other("Invalid path")),
-        }
-    }
-
-    Ok(())
-}
-
-/// Parse a validated path string into ChildNumber values.
-fn parse_derivation_path(
-    path: &str,
-) -> Result<Vec<bitcoin::bip32::ChildNumber>, PrecompileError> {
-    path.split('/')
-        .map(|s| {
-            let idx: u32 = s
-                .parse()
-                .map_err(|_| PrecompileError::other("Invalid path"))?;
-            bitcoin::bip32::ChildNumber::from_normal_idx(idx)
-                .map_err(|_| PrecompileError::other("Invalid path"))
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
 // Precompile set builder
 // ---------------------------------------------------------------------------
 
@@ -774,10 +456,21 @@ pub fn rsk_precompiles(hardfork_cfg: &RskHardforkConfig, block_number: u64) -> P
 
     // rskj gates each precompile on its own RSKIP rather than Ethereum spec
     // buckets (PrecompiledContracts.getContractForAddress). From genesis:
-    // 0x01-0x04 (ecrecover, sha256, ripemd160, identity) plus 0x05 modexp
-    // with EIP-198 (Byzantium) pricing.
+    // 0x01-0x04 (ecrecover, sha256, ripemd160, identity) plus 0x05 modexp,
+    // EIP-198's. ECRecover and ModExp are rskj's own, in place of revm's.
     let mut precompiles = Precompiles::new(PrecompileSpecId::HOMESTEAD).clone();
-    precompiles.extend([revm::precompile::modexp::BYZANTIUM]);
+    precompiles.extend([
+        Precompile::new(
+            PrecompileId::custom("rsk-ecrecover"),
+            ECRECOVER_ADDR,
+            rsk_ecrecover_run,
+        ),
+        Precompile::new(
+            PrecompileId::custom("rsk-modexp"),
+            MODEXP_ADDR,
+            rsk_modexp_run,
+        ),
+    ]);
 
     // RSKIP137 (Papyrus200): BN128 add/mul/pairing, priced per EIP-1108
     // (Istanbul: 150 / 6000 / 45000 + 34000 per pair) from activation.
@@ -810,35 +503,29 @@ pub fn rsk_precompiles(hardfork_cfg: &RskHardforkConfig, block_number: u64) -> P
 
     // RSKIP106 (Wasabi100): HDWalletUtils
     if upgrade >= RskNetworkUpgrade::Wasabi100 {
-        precompiles.extend([
-            Precompile::new(
-                PrecompileId::custom("rsk-hdwallet"),
-                HD_WALLET_UTILS_ADDR,
-                hd_wallet_utils_run,
-            ),
-        ]);
+        precompiles.extend([Precompile::new(
+            PrecompileId::custom("rsk-hdwallet"),
+            HD_WALLET_UTILS_ADDR,
+            native_contract,
+        )]);
     }
 
     // RSKIP119 (Wasabi100): BlockHeaderContract
     if upgrade >= RskNetworkUpgrade::Wasabi100 {
-        precompiles.extend([
-            Precompile::new(
-                PrecompileId::custom("rsk-blockheader"),
-                BLOCK_HEADER_ADDR,
-                block_header_run,
-            ),
-        ]);
+        precompiles.extend([Precompile::new(
+            PrecompileId::custom("rsk-blockheader"),
+            BLOCK_HEADER_ADDR,
+            native_contract,
+        )]);
     }
 
     // RSKIP203 (Arrowhead600): Environment
     if upgrade >= RskNetworkUpgrade::Arrowhead600 {
-        precompiles.extend([
-            Precompile::new(
-                PrecompileId::custom("rsk-environment"),
-                ENVIRONMENT_ADDR,
-                environment_run,
-            ),
-        ]);
+        precompiles.extend([Precompile::new(
+            PrecompileId::custom("rsk-environment"),
+            ENVIRONMENT_ADDR,
+            native_contract,
+        )]);
     }
 
     // RSKIP516 (Reed800): Secp256k1 Addition/Multiplication
@@ -874,8 +561,15 @@ pub fn rsk_precompiles(hardfork_cfg: &RskHardforkConfig, block_number: u64) -> P
 /// read by the Bridge precompile inside `run_bridge`.
 #[derive(Debug, Clone, Default)]
 pub struct BridgeTxContext {
-    /// Keccak256 of the RLP-encoded transaction.
+    /// rskj's `rskTx.getHash()`: the Keccak256 of the RLP-encoded
+    /// transaction, and for a contract's call to the Bridge the hash of the
+    /// internal transaction rskj makes of the call, which is the `rskTx` the
+    /// Bridge is then handed (`crate::internal_tx`).
     pub rsk_tx_hash: [u8; 32],
+    /// The hash of the transaction in the block, whoever calls the Bridge:
+    /// rskj's `InternalTransaction.getOriginHash()`, by which the flyover
+    /// method names a refund.
+    pub origin_tx_hash: [u8; 32],
     /// BTC P2PKH destination: RIPEMD160(SHA256(compressed_pubkey)).
     /// Derived from the RSK transaction's secp256k1 signature.
     /// Zero bytes if the pubkey cannot be recovered (system/REMASC transactions).
@@ -898,51 +592,42 @@ pub struct BridgeTxContext {
     pub tx_index: u32,
 }
 
-/// RSKIP197 (iris300): the `requiredGas` (rskj `getGasForData`) charged to a
-/// failing precompile CALL whose error is a *non-OOG* exception. Post-197 such
-/// a call costs exactly this amount (the surplus forwarded gas is refunded and
-/// execution continues with a `0` pushed) — `Program.executePrecompiledAndHandleError`
-/// runs `refundGas(msg.gas - requiredGas)` in its `finally` block.
-///
-/// Two families reach this path. The standard ETH precompiles that revm reports
-/// a non-OOG `Err` for at iris: BN128 add/mul/pairing (0x06–0x08, throw on an
-/// invalid point post-RSKIP197 — `BN128PrecompiledContract.unsafeExecute`) and
-/// BLAKE2F (0x09, throws on a bad final-block byte or bad input length —
-/// `Blake2F.execute`). For BN128 the non-OOG `Err` is only returned after revm's
-/// internal `gas_used <= gas_limit` check, so `requiredGas <= gas_limit` always
-/// holds, matching rskj.
-///
-/// And, from reed800, the RSK secp256k1 precompiles (RSKIP516), which return a
-/// non-OOG `Err` whenever a point is off-curve or a coordinate is >= p. rskj
-/// charges their fixed cost regardless, because `getGasForData` never looks at
-/// the input.
-///
-/// Returns `None` only for addresses that genuinely never reach the non-OOG
-/// error path; `None` becomes 0 gas at the call site, so an omission here is a
-/// silent undercharge rather than a failure.
-fn rskip197_required_gas_on_error(addr: &Address, input: &[u8]) -> Option<u64> {
-    // EIP-1108 / Istanbul pricing, active for BN128 from papyrus200 in rskj
-    // (BN128Addition/Multiplication/Pairing.getGasForData).
-    const BN128_ADD: Address = Address::new(hex_addr("0000000000000000000000000000000000000006"));
-    const BN128_MUL: Address = Address::new(hex_addr("0000000000000000000000000000000000000007"));
-    const BN128_PAIR: Address = Address::new(hex_addr("0000000000000000000000000000000000000008"));
-    const BLAKE2F: Address = Address::new(hex_addr("0000000000000000000000000000000000000009"));
-    const BN128_PAIR_SIZE: usize = 192;
+/// The Ethereum precompiles rskj added after genesis.
+const BN128_ADD_ADDR: Address = Address::new(hex_addr("0000000000000000000000000000000000000006"));
+const BN128_MUL_ADDR: Address = Address::new(hex_addr("0000000000000000000000000000000000000007"));
+const BN128_PAIRING_ADDR: Address =
+    Address::new(hex_addr("0000000000000000000000000000000000000008"));
+const BLAKE2F_ADDR: Address = Address::new(hex_addr("0000000000000000000000000000000000000009"));
 
+/// rskj's `getGasForData` for the precompiles of the set whose `execute` can
+/// throw: what a call costs whether it returns or throws, charged before the
+/// precompile runs.
+///
+/// BN128 add, mul and pairing (0x06 to 0x08) refuse a point off the curve,
+/// and BLAKE2F (0x09) a final-block byte other than 0 or 1, or an input that
+/// is not 213 bytes. From reed800 the secp256k1 contracts (RSKIP516) refuse a
+/// point off the curve or a coordinate of p or more; their gas never depends
+/// on the input.
+///
+/// `None` for the precompiles that never throw. The native contracts work
+/// out their own ([`crate::native`]).
+fn gas_for_data(addr: &Address, input: &[u8]) -> Option<u64> {
+    const BN128_PAIR_SIZE: usize = 192;
     match *addr {
-        BN128_ADD => Some(150),
-        BN128_MUL => Some(6_000),
-        BN128_PAIR => Some(45_000 + 34_000 * (input.len() / BN128_PAIR_SIZE) as u64),
-        // Blake2F.getGasForData: malformed length -> 0 (can't read rounds);
-        // otherwise the big-endian u32 rounds count (rskj F_ROUND == 1).
-        BLAKE2F if input.len() == 213 => Some(u32::from_be_bytes(
-            input[..4].try_into().expect("len checked == 213"),
-        ) as u64),
-        BLAKE2F => Some(0),
-        // RSKIP516 (reed800). rskj's Secp256k1Addition/Multiplication return
-        // their fixed cost from getGasForData REGARDLESS of whether the input
-        // parses, so an off-curve point still costs 150 / 3000. Omitting them
-        // here charged 0, because the caller does `.unwrap_or(0)`.
+        // EIP-1108's prices, which rskj charges from RSKIP137 on.
+        BN128_ADD_ADDR => Some(150),
+        BN128_MUL_ADDR => Some(6_000),
+        BN128_PAIRING_ADDR => Some(
+            ((input.len() / BN128_PAIR_SIZE) as u64)
+                .saturating_mul(34_000)
+                .saturating_add(45_000),
+        ),
+        // `Blake2F.getGasForData`: the big-endian rounds count, F_ROUND being
+        // 1, or 0 when the input is the wrong length to hold one.
+        BLAKE2F_ADDR => Some(match input.split_first_chunk::<4>() {
+            Some((rounds, _)) if input.len() == 213 => u64::from(u32::from_be_bytes(*rounds)),
+            _ => 0,
+        }),
         SECP256K1_ADD_ADDR => Some(150),
         SECP256K1_MUL_ADDR => Some(3_000),
         _ => None,
@@ -959,6 +644,8 @@ pub struct RskPrecompileProvider {
     hardfork_cfg: RskHardforkConfig,
     spec: SpecId,
     block_store: Option<Arc<BlockStore>>,
+    /// The executing block's parent, where BlockHeader starts looking.
+    parent_hash: B256,
     remasc_config: RemascConfig,
     bridge_config: BridgeConstants,
     /// Shared slot for per-transaction context used by Bridge precompile.
@@ -969,13 +656,21 @@ pub struct RskPrecompileProvider {
     /// finalization: no leftover refund, REMASC gets gasLimit * gasPrice.
     /// Cleared by `RskHandler::load_accounts` before each transaction.
     invisible_exception: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set when a precompile that a contract called throws before RSKIP197.
+    /// rskj's `Program.executePrecompiled` has no error handling: the throw
+    /// leaves the VM as a `RuntimeException`, and `VM.steps` fails the
+    /// contract that made the call, spending all its gas. `RskHandler`
+    /// halts that contract as it takes the call's result.
+    aborts_caller: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Precompiles successfully called during the current transaction. rskj
     /// writes the contract storage-prefix marker (`setupContract`) on every
-    /// successful precompile call; the executor drains this after each tx and
-    /// applies the markers to the trie if the tx committed.
+    /// successful precompile call, in the call's own track; the executor
+    /// drains this after each tx and applies the markers to the trie if the
+    /// tx committed. A frame that fails takes its calls back off it
+    /// (`RskHandler`), as rskj rolls that track back with the frame's.
     called_precompiles: std::sync::Arc<std::sync::Mutex<Vec<Address>>>,
-    /// Set when this transaction reaches REMASC or the Bridge. See
-    /// [`RskPrecompileProvider::reached_sequential_only_slot`].
+    /// Whether this transaction reached REMASC or the Bridge. `RskHandler`
+    /// sets it. See [`RskPrecompileProvider::reached_sequential_only_slot`].
     reached_sequential_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -984,7 +679,11 @@ impl std::fmt::Debug for RskPrecompileProvider {
         f.debug_struct("RskPrecompileProvider")
             .field("hardfork_cfg", &self.hardfork_cfg)
             .field("spec", &self.spec)
-            .field("block_store", &self.block_store.as_ref().map(|_| "BlockStore"))
+            .field(
+                "block_store",
+                &self.block_store.as_ref().map(|_| "BlockStore"),
+            )
+            .field("parent_hash", &self.parent_hash)
             .finish()
     }
 }
@@ -1001,6 +700,11 @@ impl RskPrecompileProvider {
         std::sync::Arc::clone(&self.invisible_exception)
     }
 
+    /// Returns the shared caller-abort flag for `RskHandler` (see the field).
+    pub fn aborts_caller_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.aborts_caller)
+    }
+
     /// Returns the shared list of successfully-called precompiles.
     pub fn called_precompiles_slot(&self) -> std::sync::Arc<std::sync::Mutex<Vec<Address>>> {
         std::sync::Arc::clone(&self.called_precompiles)
@@ -1011,12 +715,14 @@ impl RskPrecompileProvider {
     ///
     /// Deliberately **not** the same question as `called_precompiles_slot`,
     /// which records a precompile that returned successfully because that is
-    /// when rskj writes its storage-prefix marker. This one records reaching
-    /// the precompile at all, whatever came of it, because that is what rskj
-    /// records: `Program.callToPrecompiledAddress` adds the address before
-    /// doing anything, and a child frame's set merges into its parent's
-    /// before the parent checks whether the child succeeded. A Bridge call
-    /// that reverts still bars the transaction.
+    /// when rskj writes its storage-prefix marker. This one records the call
+    /// as it starts, whatever came of it, as rskj does
+    /// (`Program.callToPrecompiledAddress` adds the address before it checks
+    /// the depth or the caller's balance), and the run sets it, not the
+    /// precompile, which a call refused before it opens never reaches
+    /// (`RskHandler::with_reached_sequential_only`). A Bridge call that
+    /// reverts still bars the transaction; one made under a constructor of
+    /// a CREATE or CREATE2 doesn't.
     pub fn reached_sequential_only_slot(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         std::sync::Arc::clone(&self.reached_sequential_only)
     }
@@ -1035,10 +741,96 @@ impl RskPrecompileProvider {
         self.hardfork_cfg
             .has_rskip197(context.block().number().to::<u64>())
     }
+
+    /// RSKIP516 (reed800): how much of a contract's input the precompile at
+    /// `addr` takes, its `getMaxInput` (`Program.getInputLength`), or `None`
+    /// for all of it. A transaction's own data reaches a precompile whole
+    /// (`TransactionExecutor.call`), and so does a contract's before reed800
+    /// or to any other precompile. Only BLAKE2F answers differently for it:
+    /// the others never read past their limit, while BLAKE2F refuses an input
+    /// that isn't 213 bytes, at no cost.
+    fn max_input<CTX: crate::RskContextTr>(&self, context: &CTX, addr: &Address) -> Option<usize> {
+        let block = context.block().number().to::<u64>();
+        if context.journal().depth() == 1 || !self.hardfork_cfg.has_rskip516(block) {
+            return None;
+        }
+        match *addr {
+            ECRECOVER_ADDR | BN128_ADD_ADDR | SECP256K1_ADD_ADDR => Some(128),
+            BN128_MUL_ADDR | SECP256K1_MUL_ADDR => Some(96),
+            BLAKE2F_ADDR => Some(213),
+            _ => None,
+        }
+    }
+
+    /// Whether a transaction's own call to `addr` with `input` is one to
+    /// BLAKE2F with no data before RSKIP552 (vetiver900), whose block rskj
+    /// can't process. rskj reads empty data as null (`RLPItem.getRLPData`),
+    /// and BLAKE2F's `getGasForData` reads its length: a NullPointerException,
+    /// which `TransactionExecutor.call` doesn't catch. RSKIP552 prices null
+    /// data at 0 and refuses it as any other wrong length. Every other
+    /// precompile's `getGasForData` takes null, and a contract's call never
+    /// passes null (`Program.callToPrecompiledAddress`).
+    fn blake2f_reads_null(&self, block: u64, addr: &Address, input: &[u8]) -> bool {
+        *addr == BLAKE2F_ADDR && input.is_empty() && !self.hardfork_cfg.has_rskip552(block)
+    }
+
+    /// What the precompile at `addr`, not REMASC nor the Bridge, makes of
+    /// `input`, held to `gas_limit`: a transaction's own call where
+    /// `own_call`, a contract's otherwise.
+    fn outcome<CTX: crate::RskContextTr>(
+        &self,
+        context: &CTX,
+        addr: Address,
+        precompile: &Precompile,
+        input: &[u8],
+        gas_limit: u64,
+        own_call: bool,
+    ) -> Outcome {
+        let block = context.block().number().to::<u64>();
+        if own_call && self.blake2f_reads_null(block, &addr, input) {
+            Outcome::Fatal("BLAKE2F's getGasForData throws on null data".into())
+        } else if NATIVE_CONTRACTS.contains(&addr) {
+            self.run_native(context, addr, input, gas_limit)
+        } else {
+            run_precompile(
+                precompile,
+                &addr,
+                input,
+                gas_limit,
+                self.hardfork_cfg.has_rskip197(block),
+            )
+        }
+    }
+
+    /// A transaction's own call to the precompile at `addr`, as rskj's
+    /// `TransactionExecutor.call` makes it: the transaction's data whole, held
+    /// to `gas_limit`. `None` where `addr` holds no precompile at this block,
+    /// and for REMASC and the Bridge, which the executor runs itself. The
+    /// executor runs such a call this way before RSKIP136, where the price is
+    /// held to the transaction's whole limit; a precompile writes nothing, so
+    /// what it does is known before the transaction is charged.
+    pub(crate) fn run_for_a_transaction<CTX: crate::RskContextTr>(
+        &self,
+        context: &CTX,
+        addr: Address,
+        input: &[u8],
+        gas_limit: u64,
+    ) -> Option<Outcome> {
+        if addr == REMASC_ADDR || addr == BRIDGE_ADDR {
+            return None;
+        }
+        let precompile = self.precompiles.get(&addr)?;
+        Some(self.outcome(context, addr, precompile, input, gas_limit, true))
+    }
 }
 
-/// Addresses handled via the stateful dispatch path (have access to &mut CTX).
-const STATEFUL_PRECOMPILES: [Address; 4] = [ENVIRONMENT_ADDR, BLOCK_HEADER_ADDR, REMASC_ADDR, BRIDGE_ADDR];
+/// REMASC and the Bridge, which run with the whole context: they read and
+/// write the state themselves, the Bridge's storage beside revm's.
+const STATEFUL_PRECOMPILES: [Address; 2] = [REMASC_ADDR, BRIDGE_ADDR];
+
+/// rskj's native contracts (`co.rsk.pcc.NativeContract`), which
+/// [`crate::native`] runs.
+const NATIVE_CONTRACTS: [Address; 3] = [HD_WALLET_UTILS_ADDR, BLOCK_HEADER_ADDR, ENVIRONMENT_ADDR];
 
 /// Precompiles a transaction may not reach from a parallel sublist.
 ///
@@ -1053,20 +845,12 @@ const STATEFUL_PRECOMPILES: [Address; 4] = [ENVIRONMENT_ADDR, BLOCK_HEADER_ADDR,
 /// `run_stateful` and nowhere else.
 pub const SEQUENTIAL_ONLY_PRECOMPILES: [Address; 2] = [REMASC_ADDR, BRIDGE_ADDR];
 
-/// Maximum ancestor depth supported by BlockHeaderContract (REMASC maturity).
-const MAX_BLOCK_DEPTH: i16 = 4000;
-
-/// RSK merged-mining tag in Bitcoin coinbase transactions.
-const RSK_TAG: &[u8] = b"RSKBLOCK:";
-
-/// Size of the block header hash embedded after the RSK tag.
-const RSK_TAG_HASH_SIZE: usize = 32;
-
 impl RskPrecompileProvider {
     pub fn new(
         precompiles: Precompiles,
         hardfork_cfg: &RskHardforkConfig,
         block_store: Option<Arc<BlockStore>>,
+        parent_hash: B256,
         remasc_config: RemascConfig,
     ) -> Self {
         Self {
@@ -1074,10 +858,12 @@ impl RskPrecompileProvider {
             hardfork_cfg: hardfork_cfg.clone(),
             spec: SpecId::default(),
             block_store,
+            parent_hash,
             remasc_config,
             bridge_config: BridgeConstants::mainnet(),
             bridge_tx_context: std::sync::Arc::new(std::sync::Mutex::new(BridgeTxContext::default())),
             invisible_exception: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            aborts_caller: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             called_precompiles: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             reached_sequential_only: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
@@ -1092,7 +878,7 @@ impl RskPrecompileProvider {
     }
 
 
-    /// Dispatch stateful RSK precompiles that need access to the execution context.
+    /// REMASC and the Bridge, which read and write the state themselves.
     ///
     /// Returns `Ok(Some(result))` if the address was handled, `Ok(None)` to
     /// fall through to the generic (pure-function) precompile path.
@@ -1107,14 +893,8 @@ impl RskPrecompileProvider {
             return Ok(None);
         }
 
-        // Before dispatch, so the outcome cannot change the answer: under
-        // RSKIP-144 a transaction that reaches REMASC or the Bridge may only
-        // sit in the sequential sublist, and rskj records the address on the
-        // way in (`Program.callToPrecompiledAddress`).
-        if SEQUENTIAL_ONLY_PRECOMPILES.contains(addr) {
-            self.reached_sequential_only
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        // Whether the transaction reached REMASC or the Bridge is the run's
+        // to record, as each call starts (`RskHandler`'s `note_call`).
 
         // Copy input to owned bytes so we can pass &mut CTX to the handler
         // without conflicting with the SharedBuffer borrow.
@@ -1130,23 +910,55 @@ impl RskPrecompileProvider {
         };
 
         // rskj Program.callToPrecompiledAddress: the zero-value transfer
-        // CREATES the precompile account node on first call (isExist becomes
-        // true, so NEW_ACCT_CALL is charged at most once per address ever).
-        // Touching the loaded account persists it under the pinned
-        // pre-spurious journal semantics.
+        // CREATES the account of the call's context address on first call
+        // (isExist becomes true, so NEW_ACCT_CALL is charged at most once per
+        // address ever). That is the precompile for CALL and STATICCALL, and
+        // the caller itself for CALLCODE and DELEGATECALL
+        // (`msg.getType().isStateless()`), which leave the precompile without
+        // an account. Touching the loaded account persists it under the
+        // pinned pre-spurious journal semantics.
         {
             use revm::context_interface::JournalTr;
-            let _ = context.journal_mut().load_account(*addr);
-            context.journal_mut().touch_account(*addr);
+            let _ = context.journal_mut().load_account(inputs.target_address);
+            context.journal_mut().touch_account(inputs.target_address);
         }
 
-        let exec_result = if *addr == ENVIRONMENT_ADDR {
-            self.run_environment(context, &input_bytes, inputs.gas_limit)
-        } else if *addr == BLOCK_HEADER_ADDR {
-            self.run_block_header(context, &input_bytes, inputs.gas_limit)
-        } else if *addr == BRIDGE_ADDR {
-            self.run_bridge(context, &input_bytes, inputs.gas_limit, inputs.caller, inputs.scheme, inputs.call_value())
+        // What the journal holds of logs before the call, to tell the call's
+        // own apart afterwards.
+        let logs_before = {
+            use revm::context_interface::JournalTr;
+            context.journal().logs().len()
+        };
+
+        let exec_result = if *addr == BRIDGE_ADDR {
+            // rskj gives the Bridge an internal transaction from the program
+            // that made the call (`getOwnerRskAddress`), with the value the
+            // opcode took off the stack. DELEGATECALL takes none, and revm's
+            // caller and value for it are those of the frame that delegates.
+            let (owner, value) = match inputs.scheme {
+                revm::interpreter::CallScheme::DelegateCall => {
+                    (inputs.target_address, revm::primitives::U256::ZERO)
+                }
+                _ => (inputs.caller, inputs.call_value()),
+            };
+            // That internal transaction's hash is what the Bridge names a
+            // refund by. It goes to the call's context address, as the
+            // endowment does.
+            let internal_tx_hash =
+                self.bridge_internal_tx(context, owner, inputs.target_address, value);
+            self.run_bridge(
+                context,
+                &input_bytes,
+                inputs.gas_limit,
+                owner,
+                inputs.scheme,
+                value,
+                internal_tx_hash,
+            )
         } else {
+            // REMASC is handed one too, which counts among those the calling
+            // program has made.
+            context.chain_mut().internal_txs.count();
             self.run_remasc(context, &input_bytes, inputs.gas_limit)
         };
 
@@ -1186,34 +998,47 @@ impl RskPrecompileProvider {
                 assert!(underflow, "gas pre-checked against the cost");
                 return Ok(Some(result));
             }
-            // Internal (depth>1) Bridge method throw: rskj
+            // A call that ends the contract that made it, in every era
+            // (`bridge::CALLER_ABORT_MARKER`): `RskHandler` halts the contract
+            // on the flag, as for a throw before RSKIP197 below.
+            if crate::bridge::ends_its_caller(e) {
+                self.aborts_caller
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let underflow = result.gas.record_cost(inputs.gas_limit);
+                assert!(underflow, "spending exactly the forwarded gas");
+                result.result = InstructionResult::PrecompileError;
+                return Ok(Some(result));
+            }
+            // Internal (depth>1) throw, by a Bridge method or by REMASC: rskj
             // `Program.executePrecompiledAndHandleError` consumes only
             // `requiredGas` and the CALL fails (pushes zero). Record that cost
             // and revert so the caller refunds the forwarded leftover.
             if let Some(spent) = crate::bridge::internal_throw_gas(e) {
                 if !self.rskip197_active(context) {
-                    // Before RSKIP197 (iris300) there is no error handling at
-                    // all. `Program.executePrecompiled` wraps the method's
-                    // `VMException` in a `RuntimeException`, which escapes the
-                    // VM: no `stackPushZero`, no rollback-and-continue. The
-                    // transaction dies and is charged its whole gas limit.
-                    //
-                    // Modelled as a non-revert precompile error, which spends
-                    // the entire forwarded gas. A caller that forwarded
-                    // everything -- what a bare Solidity `.call()` does -- is
-                    // then left with the 63/64 remainder and runs out, so the
-                    // transaction ends where rskj ends it, with the same gas.
-                    // A caller holding back enough to continue would carry on
-                    // here and not there; that case is #295.
-                    //
-                    // Testnet #808,484 is the live instance: a constructor
-                    // calls the Bridge with a selector that is not a Bridge
-                    // method, which post-RSKIP88 throws.
-                    let _ = spent;
+                    // Before RSKIP197 (iris300) `Program.executePrecompiled`
+                    // has no error handling: the throw leaves the VM and fails
+                    // the contract that made the call, with all its gas, which
+                    // `RskHandler` does on the flag. Testnet #808,484 is the
+                    // live instance: a constructor calls the Bridge with a
+                    // selector that is not a Bridge method, which post-RSKIP88
+                    // throws, and the transaction is charged its whole limit.
+                    self.aborts_caller
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     let underflow = result.gas.record_cost(inputs.gas_limit);
                     assert!(underflow, "spending exactly the forwarded gas");
                     result.result = InstructionResult::PrecompileError;
                     return Ok(Some(result));
+                }
+                // The catch rolls back the call's track and nothing else. The
+                // Bridge wrote its logs straight into the calling program's
+                // list (`callToPrecompiledAddress` hands it
+                // `result.getLogInfoList()`), so those stay with the caller;
+                // `RskHandler` writes them again once revm has dropped them
+                // with this call's checkpoint.
+                {
+                    use revm::context_interface::JournalTr;
+                    let kept = context.journal().logs()[logs_before..].to_vec();
+                    context.chain_mut().kept_logs.extend(kept);
                 }
                 let underflow = result.gas.record_cost(spent);
                 assert!(underflow, "gas pre-checked against requiredGas");
@@ -1266,205 +1091,39 @@ impl RskPrecompileProvider {
         Ok(Some(result))
     }
 
-    /// Environment precompile (0x01000011).
-    /// Single method: `getCallStackDepth()` → returns the current call depth.
-    /// Gas: 0.
-    ///
-    /// The depth value matches rskj's `programInvoke.getCallDeep() + 1`:
-    /// in revm, `journal().depth()` already includes the precompile's own
-    /// call frame, so no adjustment is needed.
-    fn run_environment<CTX: crate::RskContextTr>(
+    /// The hash of the internal transaction rskj hands the Bridge when a
+    /// contract calls it as `owner`, for `receiver` and with `value`
+    /// (`crate::internal_tx`). None when the transaction calls the Bridge
+    /// itself.
+    fn bridge_internal_tx<CTX: crate::RskContextTr>(
         &self,
         context: &mut CTX,
-        input: &[u8],
-        _gas_limit: u64,
-    ) -> Result<PrecompileOutput, PrecompileError> {
-        // keccak256("getCallStackDepth()")[0:4]
-        const GET_CALL_STACK_DEPTH: [u8; 4] = [0xe8, 0xce, 0x22, 0x74];
-
-        if input.len() < 4 {
-            return Err(PrecompileError::other(
-                "Environment: input too short for method selector",
-            ));
-        }
-
-        if input[..4] != GET_CALL_STACK_DEPTH {
-            return Err(PrecompileError::other(
-                "Environment: unknown method selector",
-            ));
-        }
-
-        let depth = context.journal().depth() as u32;
-
-        // ABI-encode as uint32 (32-byte left-padded big-endian)
-        let mut output = vec![0u8; 32];
-        output[28..32].copy_from_slice(&depth.to_be_bytes());
-
-        Ok(PrecompileOutput::new(0, output.into()))
-    }
-
-    /// BlockHeaderContract precompile (0x01000010).
-    ///
-    /// Exposes block header fields to smart contracts via ABI method dispatch.
-    /// Gas: 4000 + 2*input.len(). 9 methods, each taking `int256 blockDepth`
-    /// (depth 0 = parent of executing block) and returning ABI-encoded `bytes`.
-    fn run_block_header<CTX: crate::RskContextTr>(
-        &self,
-        context: &mut CTX,
-        input: &[u8],
-        gas_limit: u64,
-    ) -> Result<PrecompileOutput, PrecompileError> {
-        let gas_cost = 4_000u64 + 2 * input.len() as u64;
-        if gas_limit < gas_cost {
-            return Err(PrecompileError::OutOfGas);
-        }
-
-        if input.len() < 4 {
-            return Err(PrecompileError::other(
-                "BlockHeader: input too short for method selector",
-            ));
-        }
-
-        if std::env::var_os("RUSTOCK_TRACE_BH").is_some() {
-            tracing::debug!("BH enter input=0x{}", alloy_primitives::hex::encode(input));
-        }
-        let selector = [input[0], input[1], input[2], input[3]];
-        let empty_result = || PrecompileOutput::new(gas_cost, abi_encode_bytes(&[]).into());
-
-        let is_uncle = selector == selector_of("getUncleCoinbaseAddress(int256,int256)");
-
-        // Parse blockDepth (int256, ABI-encoded starting at input[4])
-        let depth = match parse_int256_as_depth(input.get(4..36).unwrap_or(&[])) {
-            Ok(d) => d,
-            Err(DepthError::Overflow) => return Ok(empty_result()),
-            Err(DepthError::Negative) => {
-                return Err(PrecompileError::other("BlockHeader: negative block depth"))
-            }
-        };
-
-        if depth >= MAX_BLOCK_DEPTH {
-            return Ok(empty_result());
-        }
-
-        let block_store = self.block_store.as_ref().ok_or_else(|| {
-            PrecompileError::other("BlockHeader: no block store configured")
-        })?;
-
-        let current_number = context.block().number().to::<u64>();
-
-        // depth 0 → parent (current_number - 1), depth N → current_number - 1 - N
-        let target_number = current_number
-            .checked_sub(1)
-            .and_then(|n| n.checked_sub(depth as u64));
-
-        let target_number = match target_number {
-            Some(n) => n,
-            None => return Ok(empty_result()),
-        };
-
-        let hash = block_store
-            .canonical_hash(target_number)
-            .map_err(|e| PrecompileError::other(format!("BlockHeader: {e}")))?;
-        let hash = match hash {
-            Some(h) => h,
-            None => return Ok(empty_result()),
-        };
-
-        let header = block_store
-            .header(hash)
-            .map_err(|e| PrecompileError::other(format!("BlockHeader: {e}")))?;
-        let header = match header {
-            Some(h) => h,
-            None => return Ok(empty_result()),
-        };
-
-        let result_bytes: Vec<u8> = if selector == selector_of("getCoinbaseAddress(int256)") {
-            header.beneficiary.as_slice().to_vec()
-        } else if selector == selector_of("getMinGasPrice(int256)") {
-            u256_to_java_bigint_bytes(header.minimum_gas_price)
-        } else if selector == selector_of("getBlockHash(int256)") {
-            hash.as_slice().to_vec()
-        } else if selector == selector_of("getGasLimit(int256)") {
-            u256_to_raw_minimal_bytes(header.gas_limit)
-        } else if selector == selector_of("getGasUsed(int256)") {
-            u64_to_java_bigint_bytes(header.gas_used)
-        } else if selector == selector_of("getDifficulty(int256)") {
-            u256_to_java_bigint_bytes(header.difficulty)
-        } else if selector == selector_of("getBitcoinHeader(int256)") {
-            header
-                .bitcoin_merged_mining_header
-                .as_ref()
-                .map(|b| b.to_vec())
-                .unwrap_or_default()
-        } else if selector == selector_of("getMergedMiningTags(int256)") {
-            extract_merged_mining_tags(&header)
-        } else if selector == selector_of("getDifficultyWithUncles(int256)") {
-            // RSKIP536: block difficulty including uncles
-            // (rskj Block.getCumulativeDifficulty).
-            if !self.hardfork_cfg.has_rskip536(current_number) {
-                return Err(PrecompileError::other("BlockHeader: method not enabled"));
-            }
-            let body = block_store
-                .body(hash)
-                .map_err(|e| PrecompileError::other(format!("BlockHeader: {e}")))?;
-            let (_, ommers) = body.unwrap_or_default();
-            let cumulative = ommers
-                .iter()
-                .fold(header.difficulty, |acc, o| acc.saturating_add(o.difficulty));
-            u256_to_java_bigint_bytes(cumulative)
-        } else if selector == selector_of("getCumulativeWork(int256)") {
-            // RSKIP536: chain work up to the block
-            // (rskj blockStore.getTotalDifficultyForHash).
-            if !self.hardfork_cfg.has_rskip536(current_number) {
-                return Err(PrecompileError::other("BlockHeader: method not enabled"));
-            }
-            match block_store
-                .total_difficulty(hash)
-                .map_err(|e| PrecompileError::other(format!("BlockHeader: {e}")))?
-            {
-                Some(td) => u256_to_java_bigint_bytes(td),
-                None => return Ok(empty_result()),
-            }
-        } else if is_uncle {
-            let uncle_idx = match parse_int256_as_depth(input.get(36..68).unwrap_or(&[])) {
-                Ok(d) => d,
-                Err(DepthError::Overflow) => return Ok(empty_result()),
-                Err(DepthError::Negative) => {
-                    return Err(PrecompileError::other(
-                        "BlockHeader: negative uncle index",
-                    ))
-                }
-            };
-
-            let body = block_store
-                .body(hash)
-                .map_err(|e| PrecompileError::other(format!("BlockHeader: {e}")))?;
-            let (_, ommers) = body.unwrap_or_default();
-
-            if (uncle_idx as usize) >= ommers.len() {
-                return Ok(empty_result());
-            }
-
-            ommers[uncle_idx as usize].beneficiary.as_slice().to_vec()
-        } else {
-            return Err(PrecompileError::other(
-                "BlockHeader: unknown method selector",
-            ));
-        };
-
-        if std::env::var_os("RUSTOCK_TRACE_BH").is_some() {
-            tracing::debug!(
-                "BH input=0x{} target=#{} result=0x{}",
-                alloy_primitives::hex::encode(input),
-                target_number,
-                alloy_primitives::hex::encode(&result_bytes),
-            );
-        }
-        Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&result_bytes).into()))
+        owner: Address,
+        receiver: Address,
+        value: revm::primitives::U256,
+    ) -> Option<[u8; 32]> {
+        use revm::context_interface::JournalTr;
+        let tx_hash = self
+            .bridge_tx_context
+            .lock()
+            .map(|tx| tx.origin_tx_hash)
+            .unwrap_or_default();
+        // The program that calls is running, so its account is loaded.
+        let nonce = context
+            .journal_mut()
+            .load_account(owner)
+            .map(|account| account.info.nonce)
+            .unwrap_or_default();
+        context
+            .chain_mut()
+            .internal_txs
+            .reach_bridge(tx_hash.into(), owner, nonce, receiver, value)
+            .map(|hash| hash.0)
     }
 
     /// Bridge precompile (0x01000006).
     /// BTC–RSK two-way peg with 69 ABI methods.
+    #[allow(clippy::too_many_arguments)]
     fn run_bridge<CTX: crate::RskContextTr>(
         &self,
         context: &mut CTX,
@@ -1473,6 +1132,7 @@ impl RskPrecompileProvider {
         caller: Address,
         scheme: revm::interpreter::CallScheme,
         call_value: revm::primitives::U256,
+        internal_tx_hash: Option<[u8; 32]>,
     ) -> Result<PrecompileOutput, PrecompileError> {
         use revm::context_interface::JournalTr;
         use revm::interpreter::CallScheme;
@@ -1489,9 +1149,14 @@ impl RskPrecompileProvider {
         // reached via a contract CALL (rskj `isContractTx`). revm's depth here
         // already counts the precompile's own frame.
         let call_depth = context.journal().depth();
-        let tx_ctx = self.bridge_tx_context.lock()
+        let mut tx_ctx = self
+            .bridge_tx_context
+            .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
+        if let Some(hash) = internal_tx_hash {
+            tx_ctx.rsk_tx_hash = hash;
+        }
         crate::bridge::execute_bridge(
             context,
             input,
@@ -1514,29 +1179,176 @@ impl RskPrecompileProvider {
     /// which the executor dispatches directly — every invocation arriving
     /// here is a user tx or an internal CALL. rskj (Remasc.processMinersFees)
     /// throws RemascInvalidInvocationException for those, EXCEPT
-    /// getStateForDebugging() which has no caller guard and succeeds
-    /// (no state changes, so only its return data is modelled loosely).
+    /// getStateForDebugging(), which has no caller guard and answers with the
+    /// contract's state, and then saves as every REMASC method that returns
+    /// does (`RemascContract.execute`).
     fn run_remasc<CTX: crate::RskContextTr>(
         &self,
         context: &mut CTX,
         input: &[u8],
         _gas_limit: u64,
     ) -> Result<PrecompileOutput, PrecompileError> {
-        const GET_STATE_FOR_DEBUGGING: [u8; 4] = [0x0d, 0x0c, 0xee, 0x93];
-        if input.len() == 4 && input[..4] == GET_STATE_FOR_DEBUGGING {
-            return Ok(PrecompileOutput::new(0, Bytes::new()));
+        // `RemascContract.getFunction` takes a selector of exactly four bytes.
+        if input == crate::remasc::GET_STATE_FOR_DEBUGGING {
+            let state = crate::remasc::state_for_debugging(context);
+            // `RemascStorageProvider.save`: the method set no balance and no
+            // flag, so the siblings cell is all it writes, as it always does
+            // (`saveSiblings`). It writes through `addStorageBytes`, which
+            // creates REMASC's account where there is none: the one thing
+            // of this a later call can tell, since every block's REMASC
+            // transaction has written the same cell since block 1.
+            {
+                use revm::context_interface::JournalTr;
+                let _ = context.journal_mut().load_account(REMASC_ADDR);
+                context.journal_mut().touch_account(REMASC_ADDR);
+            }
+            context.chain_mut().raw_storage.put(
+                REMASC_ADDR,
+                crate::remasc::remasc_storage_key("siblings"),
+                Some(vec![alloy_rlp::EMPTY_LIST_CODE]),
+            );
+            return Ok(PrecompileOutput::new(0, state.into()));
         }
         // Everything else throws in rskj: invisible for a direct tx
-        // (receipt SUCCESS, intrinsic gas, sender charged the full limit),
-        // a plain CALL failure for internal calls.
+        // (receipt SUCCESS, intrinsic gas, sender charged the full limit).
+        // For a contract's call it is the Bridge's internal throw, costing
+        // REMASC's getGasForData: from RSKIP197 a failed CALL that gives all
+        // the forwarded gas back, and before it the end of the contract that
+        // made the call.
         use revm::context_interface::JournalTr;
         if context.journal().depth() == 1 {
             // REMASC getGasForData is 0; the invisible path forces 0 anyway.
             return Err(crate::bridge::invisible_exception_marker_with_gas(0));
         }
-        Err(PrecompileError::other(
-            "Remasc: invoked outside the block's REMASC system tx",
-        ))
+        Err(crate::bridge::internal_throw_marker_with_gas(0))
+    }
+
+    /// One of rskj's native contracts, on the block executing.
+    fn run_native<CTX: crate::RskContextTr>(
+        &self,
+        context: &CTX,
+        addr: Address,
+        input: &[u8],
+        gas_limit: u64,
+    ) -> Outcome {
+        match addr {
+            HD_WALLET_UTILS_ADDR => native::call(&HdWalletUtils, input, gas_limit),
+            BLOCK_HEADER_ADDR => {
+                let Some(blocks) = self.block_store.as_deref() else {
+                    return Outcome::Fatal(
+                        "BlockHeader reads a block store, and there is none".into(),
+                    );
+                };
+                let number = context.block().number().to::<u64>();
+                let contract = BlockHeader {
+                    blocks,
+                    parent: self.parent_hash,
+                    rskip536: self.hardfork_cfg.has_rskip536(number),
+                };
+                native::call(&contract, input, gas_limit)
+            }
+            ENVIRONMENT_ADDR => {
+                // A precompile's frame is one deeper than its caller's, and the
+                // transaction's own call is at depth 1, so a contract the
+                // transaction calls, rskj's depth 0, calls from depth 2.
+                let caller_depth = context
+                    .journal()
+                    .depth()
+                    .checked_sub(2)
+                    .and_then(|depth| u32::try_from(depth).ok());
+                native::call(&Environment { caller_depth }, input, gas_limit)
+            }
+            _ => Outcome::Fatal(format!("{addr} is not a native contract")),
+        }
+    }
+
+    /// Settles what a precompile did, as rskj's `TransactionExecutor.call`
+    /// does for a transaction's own call and `Program.callToPrecompiledAddress`
+    /// for a contract's.
+    ///
+    /// A precompile that throws in a transaction's own call is rskj's
+    /// invisible exception: the transaction succeeds with no output, having
+    /// used its intrinsic gas and the precompile's, while its sender pays for
+    /// the whole gas limit and keeps the value. The frame reverts here, so
+    /// revm hands the value back and forgets the account's touch, and
+    /// `RskHandler` turns the transaction's result back into a success.
+    ///
+    /// In a contract's call, from RSKIP197 a throw costs what the precompile
+    /// asked for and the call fails. Before it the throw escapes the VM and
+    /// fails the contract that made the call, with all its gas: the call fails
+    /// here, and `RskHandler` halts that contract on the flag set here.
+    ///
+    /// A precompile that returns rskj's `null` gives a transaction's own call
+    /// no output. In a contract's call `Program` reads the output's length as
+    /// it writes the output to memory. From RSKIP197 it does so inside the
+    /// call's own `try` (`executePrecompiledAndHandleError`), and the call
+    /// fails as it does for a throw. Before RSKIP150 `memorySave` does, with
+    /// nothing to catch it, and the contract that made the call fails as it
+    /// did for a throw then. Between the two `saveOutAfterExecution` skips a
+    /// null, and the call succeeds with nothing written.
+    fn finish<CTX: crate::RskContextTr>(
+        &self,
+        context: &CTX,
+        addr: Address,
+        gas_limit: u64,
+        outcome: Outcome,
+    ) -> Result<InterpreterResult, String> {
+        let mut result = InterpreterResult {
+            result: InstructionResult::Return,
+            gas: Gas::new(gas_limit),
+            output: Bytes::new(),
+        };
+        let gas = match &outcome {
+            Outcome::Returned { gas, .. } | Outcome::Null { gas } | Outcome::Threw { gas, .. } => {
+                *gas
+            }
+            Outcome::OutOfGas | Outcome::Fatal(_) => 0,
+        };
+        // Held to the limit before the precompile ran, so this always fits.
+        if !result.gas.record_cost(gas) {
+            result.result = InstructionResult::PrecompileOOG;
+            return Ok(result);
+        }
+        match outcome {
+            Outcome::Returned { output, .. } => {
+                // rskj's setupContract, for a precompile that returns.
+                self.record_called(addr);
+                result.output = output;
+            }
+            Outcome::Null { .. } => {
+                let rskip197 = self.rskip197_active(context);
+                let skipped = !rskip197
+                    && self
+                        .hardfork_cfg
+                        .has_rskip150(context.block().number().to::<u64>());
+                if context.journal().depth() == 1 || skipped {
+                    self.record_called(addr);
+                } else if rskip197 {
+                    result.result = InstructionResult::Revert;
+                } else {
+                    self.aborts_caller
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    result.result = InstructionResult::PrecompileError;
+                }
+            }
+            Outcome::OutOfGas => result.result = InstructionResult::PrecompileOOG,
+            Outcome::Threw { reason, .. } => {
+                tracing::debug!(target: "rustock::precompile", %addr, %reason, "precompile threw");
+                result.result = if context.journal().depth() == 1 {
+                    self.invisible_exception
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    InstructionResult::Revert
+                } else if self.rskip197_active(context) {
+                    InstructionResult::Revert
+                } else {
+                    self.aborts_caller
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    InstructionResult::PrecompileError
+                };
+            }
+            Outcome::Fatal(reason) => return Err(reason),
+        }
+        Ok(result)
     }
 }
 
@@ -1547,10 +1359,12 @@ impl Clone for RskPrecompileProvider {
             hardfork_cfg: self.hardfork_cfg.clone(),
             spec: self.spec,
             block_store: self.block_store.clone(),
+            parent_hash: self.parent_hash,
             remasc_config: self.remasc_config.clone(),
             bridge_config: self.bridge_config.clone(),
             bridge_tx_context: std::sync::Arc::clone(&self.bridge_tx_context),
             invisible_exception: std::sync::Arc::clone(&self.invisible_exception),
+            aborts_caller: std::sync::Arc::clone(&self.aborts_caller),
             called_precompiles: std::sync::Arc::clone(&self.called_precompiles),
             reached_sequential_only: std::sync::Arc::clone(&self.reached_sequential_only),
         }
@@ -1574,96 +1388,55 @@ impl<CTX: crate::RskContextTr> PrecompileProvider<CTX> for RskPrecompileProvider
         context: &mut CTX,
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
-        // Stateful RSK precompiles are intercepted first — they need &mut CTX
-        // for journal depth, block store lookups, or storage access.
+        // REMASC and the Bridge first, for the whole context.
         if let Some(result) = self.run_stateful(context, inputs)? {
             return Ok(Some(result));
         }
 
-        let Some(precompile) = self.precompiles.get(&inputs.bytecode_address) else {
+        // The set holds only what is active at this block; before its
+        // activation a precompile's address is an account like any other.
+        let addr = inputs.bytecode_address;
+        let Some(precompile) = self.precompiles.get(&addr) else {
             return Ok(None);
         };
 
-        // rskj creates the precompile account node on first call (see the
-        // stateful path above).
+        // rskj makes an internal transaction of a contract's call to one of
+        // its native contracts, as of one to the Bridge or to REMASC, and of
+        // a call to no other precompile (`crate::internal_tx`).
+        if NATIVE_CONTRACTS.contains(&addr) {
+            context.chain_mut().internal_txs.count();
+        }
+
+        // rskj creates the account of the call's context address on first
+        // call: the precompile's, or for CALLCODE and DELEGATECALL the
+        // caller's own (see the stateful path above).
         {
             use revm::context_interface::JournalTr;
-            let _ = context.journal_mut().load_account(inputs.bytecode_address);
-            context.journal_mut().touch_account(inputs.bytecode_address);
+            let _ = context.journal_mut().load_account(inputs.target_address);
+            context.journal_mut().touch_account(inputs.target_address);
         }
 
-        let mut result = InterpreterResult {
-            result: InstructionResult::Return,
-            gas: Gas::new(inputs.gas_limit),
-            output: Bytes::new(),
-        };
-
-        // RSKIP197 (iris300): `requiredGas` charged to this call if the
-        // precompile fails with a non-OOG error (computed from the input while
-        // it is still borrowed). Captured here so the error branch below can
-        // refund the surplus forwarded gas, matching rskj's
-        // `executePrecompiledAndHandleError` (gasUsed == getGasForData).
-        let required_gas_on_error;
-        let exec_result = {
-            let r;
-            let input_bytes = match &inputs.input {
+        let max_input = self.max_input(context, &addr);
+        let outcome = {
+            let shared;
+            let input = match &inputs.input {
                 CallInput::SharedBuffer(range) => {
-                    if let Some(slice) = context.local().shared_memory_buffer_slice(range.clone()) {
-                        r = slice;
-                        r.as_ref()
-                    } else {
-                        &[]
+                    match context.local().shared_memory_buffer_slice(range.clone()) {
+                        Some(slice) => {
+                            shared = slice;
+                            shared.as_ref()
+                        }
+                        None => &[],
                     }
                 }
-                CallInput::Bytes(bytes) => bytes.0.iter().as_slice(),
+                CallInput::Bytes(bytes) => bytes.as_ref(),
             };
-            required_gas_on_error =
-                rskip197_required_gas_on_error(&inputs.bytecode_address, input_bytes)
-                    .unwrap_or(0);
-            precompile.execute(input_bytes, inputs.gas_limit)
+            let input = max_input.map_or(input, |max| &input[..input.len().min(max)]);
+            let own_call = context.journal().depth() == 1;
+            self.outcome(context, addr, precompile, input, inputs.gas_limit, own_call)
         };
-
-        match exec_result {
-            Ok(output) => {
-                result.gas.record_refund(output.gas_refunded);
-                let underflow = result.gas.record_cost(output.gas_used);
-                assert!(underflow, "Gas underflow is not possible");
-                result.result = if output.reverted {
-                    InstructionResult::Revert
-                } else {
-                    // rskj setupContract on successful precompile calls.
-                    self.record_called(inputs.bytecode_address);
-                    InstructionResult::Return
-                };
-                result.output = output.bytes;
-            }
-            Err(PrecompileError::Fatal(e)) => return Err(e),
-            Err(e) => {
-                if e.is_oog() {
-                    result.result = InstructionResult::PrecompileOOG;
-                } else if self.rskip197_active(context) {
-                    // RSKIP197 (iris300): a non-OOG precompile failure is
-                    // handled — the call pushes 0 and continues, costing only
-                    // `requiredGas` (the surplus forwarded gas is refunded).
-                    // Modeled as a Revert with empty output: revm refunds the
-                    // surplus (`is_ok_or_revert`) and pushes 0 (`!is_ok`),
-                    // leaving the returnDataBuffer empty — matching rskj's
-                    // `executePrecompiledAndHandleError`
-                    // (returnDataBuffer = null, refundGas(msg.gas - requiredGas)).
-                    let no_underflow = result.gas.record_cost(required_gas_on_error);
-                    debug_assert!(no_underflow, "requiredGas <= gas_limit post-RSKIP197");
-                    result.result = InstructionResult::Revert;
-                } else {
-                    result.result = InstructionResult::PrecompileError;
-                    if context.journal().depth() == 1 {
-                        context
-                            .local_mut()
-                            .set_precompile_error_context(e.to_string());
-                    }
-                }
-            }
-        }
-        Ok(Some(result))
+        self.finish(context, addr, inputs.gas_limit, outcome)
+            .map(Some)
     }
 
     fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
@@ -1672,6 +1445,51 @@ impl<CTX: crate::RskContextTr> PrecompileProvider<CTX> for RskPrecompileProvider
 
     fn contains(&self, address: &Address) -> bool {
         self.precompiles.contains(address)
+    }
+}
+
+/// A precompile of the set that is not one of rskj's native contracts, run as
+/// rskj runs it: what `getGasForData` asks for is held to the gas limit
+/// before it runs, and an input it refuses makes it throw.
+fn run_precompile(
+    precompile: &Precompile,
+    addr: &Address,
+    input: &[u8],
+    gas_limit: u64,
+    rskip197: bool,
+) -> Outcome {
+    let required = gas_for_data(addr, input);
+    if required.is_some_and(|required| required > gas_limit) {
+        return Outcome::OutOfGas;
+    }
+    match precompile.execute(input, gas_limit) {
+        Ok(output) => Outcome::Returned {
+            gas: output.gas_used,
+            output: output.bytes,
+        },
+        Err(PrecompileError::Fatal(reason)) => Outcome::Fatal(reason),
+        Err(error) if error.is_oog() => Outcome::OutOfGas,
+        Err(error) => match required {
+            // `BN128PrecompiledContract.safeExecute`: before RSKIP197 a point
+            // BN128 refuses gets an answer with no bytes.
+            Some(gas)
+                if !rskip197
+                    && [BN128_ADD_ADDR, BN128_MUL_ADDR, BN128_PAIRING_ADDR].contains(addr) =>
+            {
+                Outcome::Returned {
+                    gas,
+                    output: Bytes::new(),
+                }
+            }
+            Some(gas) => Outcome::Threw {
+                gas,
+                reason: error.to_string(),
+            },
+            // Every precompile that can throw has its price in `gas_for_data`.
+            None => Outcome::Fatal(format!(
+                "precompile {addr} threw, and rustock has no price for it: {error}"
+            )),
+        },
     }
 }
 
@@ -1719,35 +1537,22 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
-    // RSKIP197 requiredGas on a non-OOG precompile error
+    // getGasForData, and what a precompile that throws comes to
     // -----------------------------------------------------------------------
 
-    /// Audit FRCR-280. rskj charges a failing precompile CALL exactly
-    /// `getGasForData(input)` post-RSKIP197, and the secp256k1 contracts
-    /// return their flat cost from `getGasForData` without ever looking at the
-    /// input (`Secp256k1Addition.java:27` EC_256_ADDITION_GAS_COST = 150,
-    /// `Secp256k1Multiplication.java:27` = 3000). Before the fix these two
-    /// addresses fell through to `None`, which `.unwrap_or(0)` turned into a
-    /// free failed call — a consensus divergence from reed800 onwards.
+    /// Audit FRCR-280. rskj charges a precompile call `getGasForData(input)`,
+    /// whether it returns or throws, and the secp256k1 contracts return their
+    /// flat cost from `getGasForData` without ever looking at the input
+    /// (`Secp256k1Addition.java:27` EC_256_ADDITION_GAS_COST = 150,
+    /// `Secp256k1Multiplication.java:27` = 3000). Missing from the table, a
+    /// call that throws would be free: a consensus divergence from reed800
+    /// onwards.
     #[test]
-    fn rskip197_required_gas_covers_secp256k1() {
-        assert_eq!(
-            rskip197_required_gas_on_error(&SECP256K1_ADD_ADDR, &[]),
-            Some(150)
-        );
-        assert_eq!(
-            rskip197_required_gas_on_error(&SECP256K1_MUL_ADDR, &[]),
-            Some(3_000)
-        );
-        // Independent of the input, exactly as getGasForData is.
-        assert_eq!(
-            rskip197_required_gas_on_error(&SECP256K1_ADD_ADDR, &[0xff; 128]),
-            Some(150)
-        );
-        assert_eq!(
-            rskip197_required_gas_on_error(&SECP256K1_MUL_ADDR, &[0xff; 96]),
-            Some(3_000)
-        );
+    fn the_secp256k1_contracts_cost_the_same_whatever_their_input() {
+        assert_eq!(gas_for_data(&SECP256K1_ADD_ADDR, &[]), Some(150));
+        assert_eq!(gas_for_data(&SECP256K1_MUL_ADDR, &[]), Some(3_000));
+        assert_eq!(gas_for_data(&SECP256K1_ADD_ADDR, &[0xff; 128]), Some(150));
+        assert_eq!(gas_for_data(&SECP256K1_MUL_ADDR, &[0xff; 96]), Some(3_000));
     }
 
     /// The failure above is only reachable if an off-curve point really does
@@ -1770,35 +1575,270 @@ mod tests {
         assert!(!err.is_oog(), "must not be OOG, got {err:?}");
     }
 
-    /// The other addresses that reach the same path, pinned together so the
-    /// table is read as a whole. rskj: `BN128Addition.getGasForData` = 150,
+    /// The other precompiles that can throw, pinned together so the table is
+    /// read as a whole. rskj: `BN128Addition.getGasForData` = 150,
     /// `BN128Multiplication` = 6000, `BN128Pairing` = 45000 + 34000*pairs,
     /// `Blake2F` = the big-endian rounds word (0 when the length is wrong).
     #[test]
-    fn rskip197_required_gas_bn128_and_blake2f() {
-        let bn128_add = Address::new(hex_addr("0000000000000000000000000000000000000006"));
-        let bn128_mul = Address::new(hex_addr("0000000000000000000000000000000000000007"));
-        let bn128_pair = Address::new(hex_addr("0000000000000000000000000000000000000008"));
-        let blake2f = Address::new(hex_addr("0000000000000000000000000000000000000009"));
-
-        assert_eq!(rskip197_required_gas_on_error(&bn128_add, &[]), Some(150));
-        assert_eq!(rskip197_required_gas_on_error(&bn128_mul, &[]), Some(6_000));
+    fn bn128_and_blake2f_cost_what_rskj_charges() {
+        assert_eq!(gas_for_data(&BN128_ADD_ADDR, &[]), Some(150));
+        assert_eq!(gas_for_data(&BN128_MUL_ADDR, &[]), Some(6_000));
         assert_eq!(
-            rskip197_required_gas_on_error(&bn128_pair, &[0u8; 384]),
+            gas_for_data(&BN128_PAIRING_ADDR, &[0u8; 384]),
             Some(45_000 + 2 * 34_000)
         );
 
         let mut blake_input = [0u8; 213];
         blake_input[..4].copy_from_slice(&12u32.to_be_bytes());
-        assert_eq!(
-            rskip197_required_gas_on_error(&blake2f, &blake_input),
-            Some(12)
-        );
-        assert_eq!(rskip197_required_gas_on_error(&blake2f, &[0u8; 100]), Some(0));
+        assert_eq!(gas_for_data(&BLAKE2F_ADDR, &blake_input), Some(12));
+        assert_eq!(gas_for_data(&BLAKE2F_ADDR, &[0u8; 100]), Some(0));
 
-        // ecrecover never throws a non-OOG error in rskj; it returns empty.
+        // ecrecover never throws in rskj; it returns empty.
         let ecrecover = Address::new(hex_addr("0000000000000000000000000000000000000001"));
-        assert_eq!(rskip197_required_gas_on_error(&ecrecover, &[]), None);
+        assert_eq!(gas_for_data(&ecrecover, &[]), None);
+    }
+
+    /// What `run_precompile` makes of each kind of refusal: rskj's throw, for
+    /// what `getGasForData` asked; for BN128 before RSKIP197, an answer with
+    /// no bytes; and for a modexp length no int holds, running out of gas.
+    #[test]
+    fn a_precompile_that_refuses_its_input_throws_for_its_price() {
+        let set = rsk_precompiles(&RskHardforkConfig::all_active(33), 0);
+        let run = |addr: Address, input: &[u8], gas: u64, rskip197: bool| {
+            run_precompile(set.get(&addr).expect("active"), &addr, input, gas, rskip197)
+        };
+        // (1, 1) is on neither BN128's curve nor secp256k1's.
+        let mut off_curve = [0u8; 128];
+        off_curve[31] = 1;
+        off_curve[63] = 1;
+        assert!(matches!(
+            run(BN128_ADD_ADDR, &off_curve, 1_000, true),
+            Outcome::Threw { gas: 150, .. }
+        ));
+        assert_eq!(
+            run(BN128_ADD_ADDR, &off_curve, 1_000, false),
+            Outcome::Returned {
+                gas: 150,
+                output: Bytes::new()
+            }
+        );
+        assert_eq!(
+            run(BN128_ADD_ADDR, &off_curve, 149, true),
+            Outcome::OutOfGas
+        );
+        assert!(matches!(
+            run(BN128_MUL_ADDR, &off_curve[..96], 6_000, true),
+            Outcome::Threw { gas: 6_000, .. }
+        ));
+        assert_eq!(
+            run(BN128_MUL_ADDR, &off_curve[..96], 5_999, true),
+            Outcome::OutOfGas
+        );
+        // A pairing input that is not whole pairs.
+        assert!(matches!(
+            run(BN128_PAIRING_ADDR, &[0; 100], 1_000_000, true),
+            Outcome::Threw { gas: 45_000, .. }
+        ));
+        // BLAKE2F's input is 213 bytes, or it costs nothing and throws.
+        assert!(matches!(
+            run(BLAKE2F_ADDR, &[0; 100], 1_000, true),
+            Outcome::Threw { gas: 0, .. }
+        ));
+        let mut blake = [0u8; 213];
+        blake[3] = 12;
+        blake[212] = 2;
+        assert!(
+            matches!(
+                run(BLAKE2F_ADDR, &blake, 12, true),
+                Outcome::Threw { gas: 12, .. }
+            ),
+            "a bad final-block flag"
+        );
+        assert_eq!(run(BLAKE2F_ADDR, &blake, 11, true), Outcome::OutOfGas);
+        assert!(matches!(
+            run(SECP256K1_ADD_ADDR, &off_curve, 1_000, true),
+            Outcome::Threw { gas: 150, .. }
+        ));
+        // A base length of 2^248.
+        let mut huge = [0u8; 96];
+        huge[0] = 1;
+        assert_eq!(
+            run(Address::with_last_byte(5), &huge, 1_000_000, true),
+            Outcome::OutOfGas
+        );
+        // What a precompile answers comes through as it is.
+        assert_eq!(
+            run(Address::with_last_byte(4), b"abc", 1_000, true),
+            Outcome::Returned {
+                gas: 18,
+                output: Bytes::from_static(b"abc")
+            }
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ModExp, as rskj's BigIntegerModexp
+    // -----------------------------------------------------------------------
+
+    /// A modexp input: the base, exponent and modulus lengths as words, then
+    /// `rest`.
+    fn modexp_input(lengths: [alloy_primitives::U256; 3], rest: &[u8]) -> Vec<u8> {
+        let mut input: Vec<u8> = lengths
+            .iter()
+            .flat_map(|len| len.to_be_bytes::<32>())
+            .collect();
+        input.extend_from_slice(rest);
+        input
+    }
+
+    fn run_modexp(input: &[u8], gas: u64) -> Result<PrecompileOutput, PrecompileError> {
+        rsk_precompiles(&RskHardforkConfig::mainnet(), 0)
+            .get(&MODEXP_ADDR)
+            .expect("modexp is a genesis precompile")
+            .execute(input, gas)
+    }
+
+    /// EIP-198's examples: 3^(p - 1) mod p is 1 for secp256k1's prime p, and
+    /// 0^(p - 1) mod p is 0, each for 13,056 gas -- a 32-byte modulus,
+    /// squared, times the exponent's top bit, 255, over 20.
+    #[test]
+    fn modexp_answers_eip198s_examples() {
+        use alloy_primitives::{hex, U256};
+        let exponent = hex!("fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2e");
+        let p = hex!("fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f");
+        let (one, thirty_two) = (U256::from(1), U256::from(32));
+
+        let input = modexp_input(
+            [one, thirty_two, thirty_two],
+            &[&[3u8][..], &exponent[..], &p[..]].concat(),
+        );
+        let mut answer = [0u8; 32];
+        answer[31] = 1;
+        let out = run_modexp(&input, 13_056).unwrap();
+        assert_eq!((out.gas_used, out.bytes.as_ref()), (13_056, &answer[..]));
+
+        let input = modexp_input(
+            [U256::ZERO, thirty_two, thirty_two],
+            &[exponent, p].concat(),
+        );
+        let out = run_modexp(&input, 13_056).unwrap();
+        assert_eq!((out.gas_used, out.bytes.as_ref()), (13_056, &[0u8; 32][..]));
+        assert!(matches!(
+            run_modexp(&input, 13_055),
+            Err(PrecompileError::OutOfGas)
+        ));
+    }
+
+    /// Where every length fits an int and every argument a `BigInteger`,
+    /// rskj's ModExp is EIP-198's, revm's: the same price and the same
+    /// answer, for lengths each side of 64 and of 1,024 bytes and inputs cut
+    /// short of what their lengths declare.
+    #[test]
+    fn modexp_is_eip198s_within_rskjs_limits() {
+        use alloy_primitives::U256;
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..300 {
+            let mut len = || {
+                if next() % 20 == 0 {
+                    1_000 + next() % 100
+                } else {
+                    next() % 70
+                }
+            };
+            let lengths = [len(), len(), len()];
+            let declared: u64 = lengths.iter().sum();
+            let rest: Vec<u8> = (0..next() % (declared + 16))
+                .map(|_| next() as u8)
+                .collect();
+            let input = modexp_input(lengths.map(U256::from), &rest);
+
+            let ours = run_modexp(&input, u64::MAX).unwrap();
+            let eip198 = revm::precompile::modexp::byzantium_run(&input, u64::MAX).unwrap();
+            assert_eq!(
+                (ours.gas_used, &ours.bytes),
+                (eip198.gas_used, &eip198.bytes),
+                "case {case}: lengths {lengths:?}"
+            );
+            if ours.gas_used > 0 {
+                let short = run_modexp(&input, ours.gas_used - 1);
+                assert!(
+                    matches!(short, Err(PrecompileError::OutOfGas)),
+                    "case {case}"
+                );
+            }
+        }
+    }
+
+    /// rskj reads a length as a Java int, one of 2^31 or more as
+    /// `Integer.MAX_VALUE`. An exponent 2^32 bytes long is priced as one of
+    /// 2^31 - 1 bytes, and with a one-byte base and modulus the call answers
+    /// nothing, the modulus starting past an int. revm prices the length it
+    /// was given, and runs out of gas.
+    #[test]
+    fn modexp_reads_a_length_as_a_java_int() {
+        use alloy_primitives::U256;
+        let one = U256::from(1);
+        let input = modexp_input([one, one << 32, one], &[2, 1]);
+        // The exponent's top bit among its first 32 bytes is bit 248:
+        // 8 * (2^31 - 1 - 32) + 248 = 17,179,869,168, over 20.
+        let out = run_modexp(&input, 858_993_458).unwrap();
+        assert_eq!((out.gas_used, out.bytes.len()), (858_993_458, 0));
+        assert!(matches!(
+            run_modexp(&input, 858_993_457),
+            Err(PrecompileError::OutOfGas)
+        ));
+        assert!(matches!(
+            revm::precompile::modexp::byzantium_run(&input, 858_993_458),
+            Err(PrecompileError::OutOfGas)
+        ));
+
+        // A base no int holds: (2^31 - 1)^2 / 16 + 480 (2^31 - 1) - 199,680,
+        // over 20. No call with such a base or modulus costs less.
+        let input = modexp_input([one << 255, U256::ZERO, U256::ZERO], &[]);
+        let out = run_modexp(&input, 14_411_570_333_761_358).unwrap();
+        assert_eq!((out.gas_used, out.bytes.len()), (14_411_570_333_761_358, 0));
+        // The price stops at Long.MAX_VALUE.
+        let input = modexp_input([U256::MAX; 3], &[]);
+        assert_eq!(
+            run_modexp(&input, u64::MAX).unwrap().gas_used,
+            i64::MAX as u64
+        );
+    }
+
+    /// rskj's `execute` answers nothing for an `ArithmeticException`: an
+    /// offset past an int (`Math.addExact`), or an argument past what a
+    /// `BigInteger` holds, 2^31 - 1 bits. The cheapest call to reach either
+    /// is an exponent of 2^28 bytes whose top bit is set, 107,374,182 gas;
+    /// with the bit below it the exponent fits, and the zero modulus past the
+    /// input's end answers a zero byte.
+    #[test]
+    fn modexp_answers_nothing_where_rskj_throws() {
+        use alloy_primitives::U256;
+        let one = U256::from(1);
+        let two_28 = one << 28;
+        for (top, answer) in [(0x80, &[][..]), (0x40, &[0][..])] {
+            let input = modexp_input([one, two_28, one], &[2, top]);
+            let out = run_modexp(&input, 107_374_182).unwrap();
+            assert_eq!(
+                (out.gas_used, out.bytes.as_ref()),
+                (107_374_182, answer),
+                "{top:#x}"
+            );
+            // The base, the same way, at whatever price.
+            let input = modexp_input([two_28, one, one], &[top]);
+            let out = run_modexp(&input, u64::MAX).unwrap();
+            assert_eq!(out.bytes.as_ref(), answer, "base {top:#x}");
+        }
+        // The modulus would start at 2^31, past an int. The exponent is all
+        // zeros, which a `BigInteger` holds whatever their number.
+        let input = modexp_input([one, U256::from(i32::MAX as u64 - 96), one], &[2]);
+        assert!(run_modexp(&input, u64::MAX).unwrap().bytes.is_empty());
     }
 
     #[test]
@@ -1828,6 +1868,102 @@ mod tests {
         // Standard Ethereum precompiles should also be present
         let ecrecover = Address::new(hex_addr("0000000000000000000000000000000000000001"));
         assert!(precompiles.contains(&ecrecover));
+    }
+
+    // -----------------------------------------------------------------------
+    // ECRecover, as rskj's
+    // -----------------------------------------------------------------------
+
+    /// The generator's x. Its y is even, so with recovery id 0 the point R
+    /// whose x is r is the generator itself.
+    const GENERATOR_X: [u8; 32] =
+        alloy_primitives::hex!("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+
+    /// ECRecover's input for the hash 1, `v`, r the generator's x and s =
+    /// `s`. The key is r⁻¹(sR − G), where R is G for v 27 and −G for 28.
+    fn ecrecover_input(v: u8, s: u8) -> Vec<u8> {
+        let mut input = vec![0_u8; 128];
+        input[31] = 1;
+        input[63] = v;
+        input[64..96].copy_from_slice(&GENERATOR_X);
+        input[127] = s;
+        input
+    }
+
+    fn rskj_ecrecover(input: &[u8]) -> Bytes {
+        rsk_ecrecover_run(input, 3_000).unwrap().bytes
+    }
+
+    fn ethereum_ecrecover(input: &[u8]) -> Bytes {
+        use revm::precompile::secp256k1::ec_recover_run;
+        ec_recover_run(input, 3_000).unwrap().bytes
+    }
+
+    /// For an ordinary signature rskj's ECRecover recovers what Ethereum's
+    /// does, reading 128 bytes and ending a short s in zeros.
+    #[test]
+    fn ecrecover_recovers_an_ordinary_key_as_ethereums_does() {
+        for v in [27, 28] {
+            let input = ecrecover_input(v, 2);
+            let key = rskj_ecrecover(&input);
+            assert_eq!(key.len(), 32, "v {v} recovers a key");
+            assert_eq!(key, ethereum_ecrecover(&input));
+            let mut longer = input.clone();
+            longer.extend([0xff; 32]);
+            assert_eq!(rskj_ecrecover(&longer), key, "only 128 bytes are read");
+        }
+        // s = 2^249, all in its first byte.
+        let mut short = ecrecover_input(27, 0);
+        short[96] = 2;
+        let whole = rskj_ecrecover(&short);
+        assert_eq!(whole.len(), 32);
+        assert_eq!(rskj_ecrecover(&short[..97]), whole);
+        assert_eq!(ethereum_ecrecover(&short[..97]), whole);
+
+        // Too short to hold r, a v of neither 27 nor 28, or no input: nothing.
+        assert!(rskj_ecrecover(&ecrecover_input(27, 2)[..95]).is_empty());
+        assert!(rskj_ecrecover(&ecrecover_input(29, 2)).is_empty());
+        assert!(rskj_ecrecover(&[]).is_empty());
+        assert!(matches!(
+            rsk_ecrecover_run(&[], 2_999),
+            Err(PrecompileError::OutOfGas)
+        ));
+    }
+
+    /// rskj's `isValid` reads only the last byte of the `v` word, so a word
+    /// with other bytes set still recovers the key. Ethereum's answers nothing.
+    #[test]
+    fn ecrecover_reads_only_the_last_byte_of_v() {
+        let clean = ecrecover_input(27, 2);
+        let mut dirty = clean.clone();
+        dirty[32] = 0x01;
+        dirty[50] = 0xff;
+        assert_eq!(rskj_ecrecover(&dirty), rskj_ecrecover(&clean));
+        assert!(ethereum_ecrecover(&dirty).is_empty());
+    }
+
+    /// With R = G and s = e = 1, sR = eG, and the key is the point at
+    /// infinity: rskj recovers the address it gives that key, from keccak256 of
+    /// nothing, where Ethereum's ECRecover answers nothing. With v 28, R is −G
+    /// and the key an ordinary one. The set from genesis runs rskj's.
+    #[test]
+    fn ecrecover_recovers_the_infinity_sender_as_rskj_does() {
+        let mut infinity = [0_u8; 32];
+        infinity[12..]
+            .copy_from_slice(rustock_core::types::transaction::INFINITY_SENDER.as_slice());
+        let infinity = Bytes::copy_from_slice(&infinity);
+        let input = ecrecover_input(27, 1);
+        assert_eq!(rskj_ecrecover(&input), infinity);
+        assert!(ethereum_ecrecover(&input).is_empty());
+
+        let ordinary = ecrecover_input(28, 1);
+        assert_ne!(rskj_ecrecover(&ordinary), infinity);
+        assert_eq!(rskj_ecrecover(&ordinary), ethereum_ecrecover(&ordinary));
+        assert_eq!(rskj_ecrecover(&ordinary).len(), 32);
+
+        let set = rsk_precompiles(&RskHardforkConfig::mainnet(), 0);
+        let ecrecover = set.get(&ECRECOVER_ADDR).unwrap();
+        assert_eq!(ecrecover.execute(&input, 3_000).unwrap().bytes, infinity);
     }
 
     #[test]
@@ -1918,6 +2054,59 @@ mod tests {
         assert!(!rsk_precompiles(&cfg, 8_804_200).contains(&kzg));
     }
 
+    /// rskj's `getContractForAddress`, upgrade by upgrade, on mainnet and on
+    /// testnet (each network's `hardforkActivationHeights`): the addresses it
+    /// serves on each side of wasabi100, papyrus200, iris300, arrowhead600 and
+    /// reed800, and no other. None of Ethereum's later ones is among them.
+    #[test]
+    fn the_set_is_rskjs_on_each_side_of_each_upgrade() {
+        let low = Address::with_last_byte;
+        let genesis = [
+            low(1),
+            low(2),
+            low(3),
+            low(4),
+            low(5),
+            BRIDGE_ADDR,
+            REMASC_ADDR,
+        ];
+        let added: [&[Address]; 5] = [
+            &[HD_WALLET_UTILS_ADDR, BLOCK_HEADER_ADDR],
+            &[low(6), low(7), low(8)],
+            &[low(9)],
+            &[ENVIRONMENT_ADDR],
+            &[SECP256K1_ADD_ADDR, SECP256K1_MUL_ADDR],
+        ];
+        let networks = [
+            (
+                RskHardforkConfig::mainnet(),
+                [1_591_000, 2_392_700, 3_614_800, 6_223_700, 8_052_200],
+            ),
+            (
+                RskHardforkConfig::testnet(),
+                [0, 863_000, 2_060_500, 4_927_100, 6_835_700],
+            ),
+        ];
+        let served = |cfg: &RskHardforkConfig, number: u64| {
+            let mut set: Vec<Address> = rsk_precompiles(cfg, number).addresses().copied().collect();
+            set.sort();
+            set
+        };
+        for (cfg, heights) in networks {
+            let mut expected = genesis.to_vec();
+            for (height, added) in heights.into_iter().zip(added) {
+                if height > 0 {
+                    expected.sort();
+                    assert_eq!(served(&cfg, height - 1), expected, "#{}", height - 1);
+                }
+                expected.extend_from_slice(added);
+                expected.sort();
+                assert_eq!(served(&cfg, height), expected, "#{height}");
+            }
+            assert_eq!(served(&cfg, 20_000_000), expected);
+        }
+    }
+
     /// Ported from rskj Blake2fNullDataTest (post-RSKIP552 semantics): calling
     /// Blake2F with empty input fails with an input-length error instead of
     /// crashing — revm's blake2 run() returns an error for non-213-byte input,
@@ -1969,12 +2158,6 @@ mod tests {
 
         let oog = bridge_run(&[], 5_000);
         assert!(matches!(oog, Err(PrecompileError::OutOfGas)));
-    }
-
-    #[test]
-    fn test_block_header_gas_scales_with_input() {
-        let result = block_header_run(&[0u8; 100], 100_000).unwrap();
-        assert_eq!(result.gas_used, 4_000 + 200); // 4000 + 2*100
     }
 
     #[test]
@@ -2189,6 +2372,26 @@ mod tests {
         assert_eq!(result.bytes.as_ref(), expected.as_slice());
     }
 
+    /// rskj reads each word with `ByteUtil.parseWord`, which pads a word the
+    /// input ends inside with zeros on the right: the number keeps the bytes
+    /// it has as its high ones. A scalar of the one byte 0x01 multiplies the
+    /// point by 2^248, not by 1.
+    #[test]
+    fn a_word_the_input_ends_inside_is_padded_on_the_right() {
+        let mut input = build_mul_input("1", V1Y, "0");
+        input[64] = 0x01;
+        let by_two_to_the_248 = secp256k1_mul_run(&input, 10_000).unwrap();
+        let cut_after_one_byte = secp256k1_mul_run(&input[..65], 10_000).unwrap();
+        assert_eq!(cut_after_one_byte.bytes, by_two_to_the_248.bytes);
+        assert_ne!(
+            cut_after_one_byte.bytes.as_ref(),
+            build_output("1", V1Y).as_slice()
+        );
+
+        assert_eq!(parse_word(&[0xaa, 0xbb], 0)[..3], [0xaa, 0xbb, 0x00]);
+        assert_eq!(parse_word(&[0xaa; 40], 64), [0; 32]);
+    }
+
     #[test]
     fn test_secp_mul_point_not_on_curve_fails() {
         let bad = decimal_to_32bytes(
@@ -2199,6 +2402,20 @@ mod tests {
         input[32..64].copy_from_slice(&bad);
         input[64..96].copy_from_slice(&bad);
         assert!(secp256k1_mul_run(&input, 10_000).is_err());
+    }
+
+    /// rskj builds each point with BouncyCastle's `validatePoint`, whose field
+    /// element refuses a coordinate of p or more: 1 + p is no point's x though
+    /// it is 1 modulo p, and (1, V1Y) is a point.
+    #[test]
+    fn a_coordinate_of_p_or_more_is_no_point() {
+        let p = alloy_primitives::U256::from_str_radix(SECP256K1_P, 10).unwrap();
+        let one_plus_p = (p + alloy_primitives::U256::from(1)).to_string();
+        assert!(secp256k1_add_run(&build_add_input("1", V1Y, "0", "0"), 1_000).is_ok());
+        assert!(secp256k1_add_run(&build_add_input(&one_plus_p, V1Y, "0", "0"), 1_000).is_err());
+        assert!(secp256k1_add_run(&build_add_input("0", "0", &one_plus_p, V1Y), 1_000).is_err());
+        assert!(secp256k1_mul_run(&build_mul_input("1", V1Y, "1"), 10_000).is_ok());
+        assert!(secp256k1_mul_run(&build_mul_input(&one_plus_p, V1Y, "1"), 10_000).is_err());
     }
 
     #[test]
@@ -2265,11 +2482,11 @@ mod tests {
 
     #[test]
     fn test_stateful_precompiles_list() {
-        assert!(STATEFUL_PRECOMPILES.contains(&ENVIRONMENT_ADDR));
-        assert!(STATEFUL_PRECOMPILES.contains(&BLOCK_HEADER_ADDR));
-        assert!(STATEFUL_PRECOMPILES.contains(&REMASC_ADDR));
-        assert!(STATEFUL_PRECOMPILES.contains(&BRIDGE_ADDR));
-        assert!(!STATEFUL_PRECOMPILES.contains(&SECP256K1_ADD_ADDR));
+        assert_eq!(STATEFUL_PRECOMPILES, [REMASC_ADDR, BRIDGE_ADDR]);
+        assert_eq!(
+            NATIVE_CONTRACTS,
+            [HD_WALLET_UTILS_ADDR, BLOCK_HEADER_ADDR, ENVIRONMENT_ADDR]
+        );
     }
 
     #[test]
@@ -2286,949 +2503,18 @@ mod tests {
     fn test_provider_contains_stateful_addresses() {
         let cfg = RskHardforkConfig::all_active(33);
         let precompiles = rsk_precompiles(&cfg, 0);
-        let provider = RskPrecompileProvider::new(precompiles, &cfg, None, RemascConfig::regtest());
+        let provider = RskPrecompileProvider::new(
+            precompiles,
+            &cfg,
+            None,
+            B256::ZERO,
+            RemascConfig::regtest(),
+        );
 
         assert!(provider.precompiles.contains(&ENVIRONMENT_ADDR));
         assert!(provider.precompiles.contains(&BLOCK_HEADER_ADDR));
         assert!(provider.precompiles.contains(&REMASC_ADDR));
         assert!(provider.precompiles.contains(&BRIDGE_ADDR));
         assert!(provider.precompiles.contains(&SECP256K1_ADD_ADDR));
-    }
-
-    // -----------------------------------------------------------------------
-    // Environment precompile tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_environment_selector_is_keccak256() {
-        use sha3::{Digest, Keccak256};
-        let hash = Keccak256::digest(b"getCallStackDepth()");
-        assert_eq!(
-            &hash[..4],
-            &[0xe8, 0xce, 0x22, 0x74],
-            "selector should be keccak256('getCallStackDepth()')[0:4]"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // BlockHeaderContract helper tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_block_header_selectors_are_consistent() {
-        use sha3::{Digest, Keccak256};
-
-        let sigs = [
-            "getCoinbaseAddress(int256)",
-            "getMinGasPrice(int256)",
-            "getBlockHash(int256)",
-            "getMergedMiningTags(int256)",
-            "getGasLimit(int256)",
-            "getGasUsed(int256)",
-            "getDifficulty(int256)",
-            "getBitcoinHeader(int256)",
-            "getUncleCoinbaseAddress(int256,int256)",
-        ];
-
-        for sig in &sigs {
-            let hash = Keccak256::digest(sig.as_bytes());
-            let expected = [hash[0], hash[1], hash[2], hash[3]];
-            assert_eq!(
-                selector_of(sig), expected,
-                "selector_of({sig}) should match keccak256"
-            );
-        }
-
-        // All selectors must be distinct
-        let sels: Vec<[u8; 4]> = sigs.iter().map(|s| selector_of(s)).collect();
-        for i in 0..sels.len() {
-            for j in (i + 1)..sels.len() {
-                assert_ne!(sels[i], sels[j], "selectors for {} and {} collide", sigs[i], sigs[j]);
-            }
-        }
-    }
-
-    #[test]
-    fn test_abi_encode_bytes_empty() {
-        // ethereumj BytesType.encode pads EMPTY bytes to one full zero word
-        // ((0-1)/32+1 == 1 in Java), so the encoding is 96 bytes, not the
-        // canonical 64 (offset + length + one padding word).
-        let encoded = abi_encode_bytes(&[]);
-        assert_eq!(encoded.len(), 96);
-        // offset = 0x20
-        assert_eq!(encoded[31], 0x20);
-        // length = 0, padding word = 0
-        assert!(encoded[32..96].iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn test_abi_encode_bytes_20_bytes() {
-        let data = [0xAA; 20];
-        let encoded = abi_encode_bytes(&data);
-        // 32 (offset) + 32 (length) + 32 (padded data) = 96
-        assert_eq!(encoded.len(), 96);
-        assert_eq!(encoded[31], 0x20);
-        assert_eq!(encoded[63], 20); // length
-        assert_eq!(&encoded[64..84], &[0xAA; 20]);
-        assert!(encoded[84..96].iter().all(|&b| b == 0)); // padding
-    }
-
-    #[test]
-    fn test_abi_encode_bytes_32_bytes() {
-        let data = [0xBB; 32];
-        let encoded = abi_encode_bytes(&data);
-        assert_eq!(encoded.len(), 96);
-        assert_eq!(encoded[31], 0x20);
-        assert_eq!(encoded[63], 32);
-        assert_eq!(&encoded[64..96], &[0xBB; 32]);
-    }
-
-    #[test]
-    fn test_u256_to_java_bigint_bytes_zero() {
-        assert_eq!(u256_to_java_bigint_bytes(U256::ZERO), vec![0]);
-    }
-
-    #[test]
-    fn test_u256_to_java_bigint_bytes_small() {
-        assert_eq!(u256_to_java_bigint_bytes(U256::from(127u64)), vec![0x7F]);
-    }
-
-    #[test]
-    fn test_u256_to_java_bigint_bytes_needs_sign_byte() {
-        // 128 = 0x80, high bit set → needs leading 0x00
-        assert_eq!(u256_to_java_bigint_bytes(U256::from(128u64)), vec![0x00, 0x80]);
-    }
-
-    #[test]
-    fn test_u256_to_java_bigint_bytes_256() {
-        assert_eq!(u256_to_java_bigint_bytes(U256::from(256u64)), vec![0x01, 0x00]);
-    }
-
-    #[test]
-    fn test_u64_to_java_bigint_bytes_gas_used() {
-        // gas_used = 0 → [0]
-        assert_eq!(u64_to_java_bigint_bytes(0), vec![0]);
-        // gas_used = 21000 = 0x5208
-        assert_eq!(u64_to_java_bigint_bytes(21000), vec![0x52, 0x08]);
-    }
-
-    #[test]
-    fn test_parse_int256_as_depth_zero() {
-        let data = [0u8; 32];
-        assert_eq!(parse_int256_as_depth(&data).unwrap(), 0i16);
-    }
-
-    #[test]
-    fn test_parse_int256_as_depth_positive() {
-        let mut data = [0u8; 32];
-        data[31] = 5;
-        assert_eq!(parse_int256_as_depth(&data).unwrap(), 5i16);
-    }
-
-    #[test]
-    fn test_parse_int256_as_depth_max_valid() {
-        let mut data = [0u8; 32];
-        // 32767 = 0x7FFF
-        data[30] = 0x7F;
-        data[31] = 0xFF;
-        assert_eq!(parse_int256_as_depth(&data).unwrap(), 32767i16);
-    }
-
-    #[test]
-    fn test_parse_int256_as_depth_overflow() {
-        let mut data = [0u8; 32];
-        // 32768 = 0x8000 — doesn't fit in i16
-        data[30] = 0x80;
-        data[31] = 0x00;
-        assert!(matches!(parse_int256_as_depth(&data), Err(DepthError::Overflow)));
-    }
-
-    #[test]
-    fn test_parse_int256_as_depth_large_overflow() {
-        let mut data = [0u8; 32];
-        data[0] = 0x01; // large positive number
-        assert!(matches!(parse_int256_as_depth(&data), Err(DepthError::Overflow)));
-    }
-
-    #[test]
-    fn test_parse_int256_as_depth_negative() {
-        // -1 in int256 = all 0xFF
-        let data = [0xFF; 32];
-        assert!(matches!(parse_int256_as_depth(&data), Err(DepthError::Negative)));
-    }
-
-    #[test]
-    fn test_parse_int256_as_depth_empty_input() {
-        assert_eq!(parse_int256_as_depth(&[]).unwrap(), 0i16);
-    }
-
-    #[test]
-    fn test_extract_merged_mining_tags() {
-        use rustock_core::Header;
-        use alloy_primitives::{B256, Bloom, Bytes as ABytes};
-
-        let mut header = Header {
-            parent_hash: B256::ZERO, ommers_hash: B256::ZERO,
-            beneficiary: Address::ZERO, state_root: B256::ZERO,
-            transactions_root: B256::ZERO, receipts_root: B256::ZERO,
-            logs_bloom: Bloom::ZERO, extension_data: None,
-            difficulty: U256::ZERO, number: 0, gas_limit: U256::ZERO,
-            gas_used: 0, timestamp: 0, extra_data: ABytes::new(),
-            paid_fees: U256::ZERO, minimum_gas_price: U256::ZERO,
-            uncle_count: 0, umm_root: None, version_fields: None,
-            bitcoin_merged_mining_header: None,
-            bitcoin_merged_mining_merkle_proof: None,
-            bitcoin_merged_mining_coinbase_transaction: None,
-            cached_hash: None, cached_hash_for_merged_mining: None,
-        };
-
-        // No coinbase tx → empty
-        assert!(extract_merged_mining_tags(&header).is_empty());
-
-        // Coinbase tx without RSK tag → empty
-        header.bitcoin_merged_mining_coinbase_transaction = Some(ABytes::from(vec![1, 2, 3]));
-        assert!(extract_merged_mining_tags(&header).is_empty());
-
-        // Coinbase tx with RSK tag + 32-byte hash + additional tags
-        let mut coinbase = Vec::new();
-        coinbase.extend_from_slice(b"prefix");
-        coinbase.extend_from_slice(RSK_TAG);
-        coinbase.extend_from_slice(&[0xAA; 32]); // block header hash
-        coinbase.extend_from_slice(b"ALTBLOCK:extra");
-        header.bitcoin_merged_mining_coinbase_transaction = Some(ABytes::from(coinbase));
-
-        let tags = extract_merged_mining_tags(&header);
-        assert_eq!(tags, b"ALTBLOCK:extra");
-    }
-
-    // -----------------------------------------------------------------------
-    // Java BigInteger / ABI compatibility tests using rskj constant values
-    // -----------------------------------------------------------------------
-
-    /// Verify u256_to_java_bigint_bytes matches Java's BigInteger.toByteArray()
-    /// for the exact constants used in rskj BlockHeaderContractTest.
-    #[test]
-    fn test_java_bigint_rskj_min_gas_price() {
-        // rskj: MIN_GAS_PRICE = new BigInteger("500000000000000000")
-        // 500000000000000000 = 0x06F05B59D3B20000
-        // BigInteger.toByteArray() → [0x06, 0xF0, 0x5B, 0x59, 0xD3, 0xB2, 0x00, 0x00]
-        // (0x06 high bit clear → no leading zero needed)
-        let val = U256::from(500_000_000_000_000_000u64);
-        let bytes = u256_to_java_bigint_bytes(val);
-        assert_eq!(
-            bytes,
-            vec![0x06, 0xF0, 0x5B, 0x59, 0xD3, 0xB2, 0x00, 0x00],
-            "must match Java BigInteger.toByteArray() for 500000000000000000"
-        );
-        // Verify round-trip: these bytes interpreted as big-endian unsigned = original
-        let mut padded = [0u8; 32];
-        padded[32 - bytes.len()..].copy_from_slice(&bytes);
-        assert_eq!(U256::from_be_bytes(padded), val);
-    }
-
-    #[test]
-    fn test_gas_limit_raw_bytes_no_sign_prefix() {
-        // rskj GetGasLimit returns the raw header bytes: 10,000,000 =
-        // 0x989680 (high bit of 0x98 set) stays 3 bytes — the signed
-        // BigInteger helper would prepend 0x00.
-        assert_eq!(
-            u256_to_raw_minimal_bytes(U256::from(10_000_000u64)),
-            vec![0x98, 0x96, 0x80]
-        );
-        assert_eq!(
-            u256_to_java_bigint_bytes(U256::from(10_000_000u64)),
-            vec![0x00, 0x98, 0x96, 0x80]
-        );
-        // 6,800,000 = 0x67C280: both forms agree (high bit clear).
-        assert_eq!(
-            u256_to_raw_minimal_bytes(U256::from(6_800_000u64)),
-            vec![0x67, 0xC2, 0x80]
-        );
-        // Zero: raw RLP element is empty (vs BigInteger's [0x00]).
-        assert_eq!(u256_to_raw_minimal_bytes(U256::ZERO), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn test_java_bigint_rskj_gas_limit() {
-        // rskj: GAS_LIMIT = new BigInteger("3000000")
-        // 3000000 = 0x2DC6C0
-        // BigInteger.toByteArray() → [0x2D, 0xC6, 0xC0]
-        let val = U256::from(3_000_000u64);
-        let bytes = u256_to_java_bigint_bytes(val);
-        assert_eq!(
-            bytes,
-            vec![0x2D, 0xC6, 0xC0],
-            "must match Java BigInteger.toByteArray() for 3000000"
-        );
-    }
-
-    #[test]
-    fn test_java_bigint_rskj_difficulty() {
-        // rskj: RSK_DIFFICULTY = new BigInteger("1")
-        // BigInteger.toByteArray() → [0x01]
-        let val = U256::from(1u64);
-        let bytes = u256_to_java_bigint_bytes(val);
-        assert_eq!(bytes, vec![0x01], "must match Java BigInteger.toByteArray() for 1");
-    }
-
-    #[test]
-    fn test_java_bigint_rskj_gas_used_zero() {
-        // rskj: GAS_USED = new BigInteger("0")
-        // BigInteger.toByteArray() → [0x00]
-        let bytes = u64_to_java_bigint_bytes(0);
-        assert_eq!(bytes, vec![0x00], "must match Java BigInteger.toByteArray() for 0");
-    }
-
-    #[test]
-    fn test_java_bigint_high_bit_boundary() {
-        // 0x80 = 128 → BigInteger.toByteArray() → [0x00, 0x80]
-        // (high bit set → leading zero to keep positive)
-        assert_eq!(u256_to_java_bigint_bytes(U256::from(128u64)), vec![0x00, 0x80]);
-        // 0x7F = 127 → [0x7F] (high bit clear → no leading zero)
-        assert_eq!(u256_to_java_bigint_bytes(U256::from(127u64)), vec![0x7F]);
-        // 0xFF = 255 → [0x00, 0xFF]
-        assert_eq!(u256_to_java_bigint_bytes(U256::from(255u64)), vec![0x00, 0xFF]);
-        // 0x100 = 256 → [0x01, 0x00]
-        assert_eq!(u256_to_java_bigint_bytes(U256::from(256u64)), vec![0x01, 0x00]);
-        // 0x7FFF = 32767 → [0x7F, 0xFF]
-        assert_eq!(u256_to_java_bigint_bytes(U256::from(32767u64)), vec![0x7F, 0xFF]);
-        // 0x8000 = 32768 → [0x00, 0x80, 0x00]
-        assert_eq!(u256_to_java_bigint_bytes(U256::from(32768u64)), vec![0x00, 0x80, 0x00]);
-    }
-
-    /// Verify the full ABI-encoded output for getCoinbaseAddress matches
-    /// what Solidity's `abi.encode(bytes(addr))` would produce.
-    ///
-    /// For a 20-byte address 0x3333...33, Solidity abi.encode(bytes) is:
-    ///   offset:  0x0000...0020 (32 bytes)
-    ///   length:  0x0000...0014 (32 bytes, 20 decimal)
-    ///   data:    3333333333333333333333333333333333333333 + 12 zero bytes
-    /// Total: 96 bytes.
-    #[test]
-    fn test_abi_encode_bytes_solidity_compat_address() {
-        let addr = [0x33u8; 20];
-        let encoded = abi_encode_bytes(&addr);
-
-        let mut expected = vec![0u8; 96];
-        // offset = 0x20
-        expected[31] = 0x20;
-        // length = 0x14 (20)
-        expected[63] = 0x14;
-        // data = 20 bytes of 0x33
-        expected[64..84].fill(0x33);
-        // remaining 12 bytes are zero (padding)
-
-        assert_eq!(encoded, expected, "ABI encoding of 20-byte address must match Solidity spec");
-    }
-
-    /// Verify ABI encoding of a 32-byte hash matches Solidity spec.
-    #[test]
-    fn test_abi_encode_bytes_solidity_compat_hash() {
-        let hash = [0xAB; 32];
-        let encoded = abi_encode_bytes(&hash);
-
-        let mut expected = vec![0u8; 96];
-        expected[31] = 0x20;
-        expected[63] = 0x20; // length = 32
-        expected[64..96].fill(0xAB);
-
-        assert_eq!(encoded, expected, "ABI encoding of 32-byte hash must match Solidity spec");
-    }
-
-    /// Verify ABI encoding of empty bytes matches ethereumj (NOT canonical
-    /// Solidity): offset=0x20, length=0, plus one zero padding word.
-    #[test]
-    fn test_abi_encode_bytes_solidity_compat_empty() {
-        let encoded = abi_encode_bytes(&[]);
-
-        let mut expected = vec![0u8; 96];
-        expected[31] = 0x20;
-        // length = 0, padding word = 0 (all zeros)
-
-        assert_eq!(encoded, expected, "empty bytes must encode ethereumj-style to 96 bytes");
-    }
-
-    /// Verify ABI encoding of Java BigInteger bytes for rskj's MIN_GAS_PRICE.
-    /// This tests the full pipeline: value → Java BigInt bytes → ABI encode.
-    #[test]
-    fn test_full_abi_output_rskj_min_gas_price() {
-        let min_gas_price = U256::from(500_000_000_000_000_000u64);
-        let java_bytes = u256_to_java_bigint_bytes(min_gas_price);
-        let abi_output = abi_encode_bytes(&java_bytes);
-
-        // java_bytes = [0x06, 0xF0, 0x5B, 0x59, 0xD3, 0xB2, 0x00, 0x00] (8 bytes)
-        // ABI: offset(32) + length(32) + padded_data(32) = 96 bytes
-        assert_eq!(abi_output.len(), 96);
-
-        // offset
-        assert_eq!(&abi_output[0..32], &{
-            let mut v = [0u8; 32]; v[31] = 0x20; v
-        });
-        // length = 8
-        assert_eq!(&abi_output[32..64], &{
-            let mut v = [0u8; 32]; v[31] = 0x08; v
-        });
-        // data (8 bytes) + 24 zero-padding
-        assert_eq!(&abi_output[64..72], &[0x06, 0xF0, 0x5B, 0x59, 0xD3, 0xB2, 0x00, 0x00]);
-        assert!(abi_output[72..96].iter().all(|&b| b == 0));
-
-        // Verify rskj round-trip: decode back to BigInteger value
-        let decoded_len = u64::from_be_bytes(abi_output[56..64].try_into().unwrap()) as usize;
-        let decoded_bytes = &abi_output[64..64 + decoded_len];
-        let mut padded = [0u8; 32];
-        padded[32 - decoded_bytes.len()..].copy_from_slice(decoded_bytes);
-        let decoded_val = U256::from_be_bytes(padded);
-        assert_eq!(decoded_val, min_gas_price, "round-trip must recover original value");
-    }
-
-    // -----------------------------------------------------------------------
-    // HDWalletUtils tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_hdwallet_selectors_are_distinct() {
-        let sigs = [
-            "toBase58Check(bytes,int256)",
-            "deriveExtendedPublicKey(string,string)",
-            "extractPublicKeyFromExtendedPublicKey(string)",
-            "getMultisigScriptHash(int256,bytes[])",
-        ];
-        let sels: Vec<[u8; 4]> = sigs.iter().map(|s| selector_of(s)).collect();
-        for i in 0..sels.len() {
-            for j in (i + 1)..sels.len() {
-                assert_ne!(sels[i], sels[j], "selectors for {} and {} collide", sigs[i], sigs[j]);
-            }
-        }
-    }
-
-    #[test]
-    fn test_hdwallet_unknown_selector_fails() {
-        let input = [0xFF, 0xFF, 0xFF, 0xFF, 0x00];
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_hdwallet_too_short_input_fails() {
-        assert!(hd_wallet_utils_run(&[0x00, 0x01], 200_000).is_err());
-    }
-
-    // --- ABI decode helpers ---
-
-    #[test]
-    fn test_abi_decode_int256_as_i32() {
-        // Zero
-        let mut data = [0u8; 32];
-        assert_eq!(abi_decode_int256_as_i32(&data, 0), Some(0));
-
-        // Positive: 111
-        data[31] = 111;
-        assert_eq!(abi_decode_int256_as_i32(&data, 0), Some(111));
-
-        // Negative: -1
-        let neg1 = [0xFF; 32];
-        assert_eq!(abi_decode_int256_as_i32(&neg1, 0), Some(-1));
-
-        // Too large for i32 (overflow)
-        let mut big = [0u8; 32];
-        big[0] = 0x01;
-        assert_eq!(abi_decode_int256_as_i32(&big, 0), None);
-    }
-
-    #[test]
-    fn test_abi_decode_bytes_roundtrip() {
-        let original = b"hello world";
-        let encoded = abi_encode_bytes(original);
-        // abi_decode_bytes expects: offset at slot 0 → data starts at offset
-        // Our encoded has offset=0x20, length=11, data at 64..
-        // But abi_decode_bytes reads the offset from slot 0, then follows it
-        let decoded = abi_decode_bytes(&encoded, 0).unwrap();
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn test_abi_decode_string_roundtrip() {
-        let original = "test string";
-        let encoded = abi_encode_string(original);
-        let decoded = abi_decode_string(&encoded, 0).unwrap();
-        assert_eq!(decoded, original);
-    }
-
-    // --- toBase58Check tests ---
-
-    fn build_to_base58check_input(hash160: &[u8], version: i32) -> Vec<u8> {
-        let selector = selector_of("toBase58Check(bytes,int256)");
-
-        // ABI: selector + [offset_hash160(32), version(32), length(32), data(32)]
-        // offset_hash160 = 0x40 (64, pointing past the 2 static param slots)
-        let mut input = Vec::new();
-        input.extend_from_slice(&selector);
-
-        // param 0: offset to bytes data = 0x40 (2 * 32 = 64)
-        let mut offset_word = [0u8; 32];
-        offset_word[31] = 0x40;
-        input.extend_from_slice(&offset_word);
-
-        // param 1: version as int256
-        let mut version_word = [0u8; 32];
-        if version >= 0 {
-            version_word[28..32].copy_from_slice(&version.to_be_bytes());
-        } else {
-            version_word = [0xFF; 32];
-            version_word[28..32].copy_from_slice(&version.to_be_bytes());
-        }
-        input.extend_from_slice(&version_word);
-
-        // bytes data: length + padded data
-        let mut len_word = [0u8; 32];
-        len_word[31] = hash160.len() as u8;
-        input.extend_from_slice(&len_word);
-
-        let padded_len = hash160.len().div_ceil(32) * 32;
-        let mut data_padded = vec![0u8; padded_len];
-        data_padded[..hash160.len()].copy_from_slice(hash160);
-        input.extend_from_slice(&data_padded);
-
-        input
-    }
-
-    #[test]
-    fn test_to_base58check_rskj_vector() {
-        let hash160 = hex::decode("0d3bf5f30dda7584645546079318e97f0e1d044f").unwrap();
-        let input = build_to_base58check_input(&hash160, 111);
-        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
-        assert_eq!(result.gas_used, 13_000);
-
-        let decoded = abi_decode_string(&result.bytes, 0).unwrap();
-        assert_eq!(decoded, "mgivuh9jErcGdRr81cJ3A7YfgbJV7WNyZV");
-    }
-
-    #[test]
-    fn test_to_base58check_invalid_hash_length() {
-        let hash = vec![0xAA; 19]; // wrong length
-        let input = build_to_base58check_input(&hash, 111);
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_to_base58check_version_negative() {
-        let hash = vec![0x00; 20];
-        let input = build_to_base58check_input(&hash, -1);
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_to_base58check_version_too_large() {
-        let hash = vec![0x00; 20];
-        let input = build_to_base58check_input(&hash, 256);
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_to_base58check_oog() {
-        let hash = hex::decode("0d3bf5f30dda7584645546079318e97f0e1d044f").unwrap();
-        let input = build_to_base58check_input(&hash, 111);
-        assert!(matches!(
-            hd_wallet_utils_run(&input, 12_000),
-            Err(PrecompileError::OutOfGas)
-        ));
-    }
-
-    // --- deriveExtendedPublicKey tests ---
-
-    fn build_derive_xpub_input(xpub: &str, path: &str) -> Vec<u8> {
-        let selector = selector_of("deriveExtendedPublicKey(string,string)");
-        let mut input = Vec::new();
-        input.extend_from_slice(&selector);
-
-        // Two dynamic params: offsets then data
-        // param 0 offset: 0x40 (past 2 offset slots)
-        // param 1 offset: computed after param 0 data
-
-        let xpub_bytes = xpub.as_bytes();
-        let path_bytes = path.as_bytes();
-
-        let xpub_padded = xpub_bytes.len().div_ceil(32) * 32;
-        let param0_offset = 64u64; // 2 * 32
-        let param1_offset = param0_offset + 32 + xpub_padded as u64;
-
-        // offset for param 0
-        let mut w = [0u8; 32];
-        w[24..32].copy_from_slice(&param0_offset.to_be_bytes());
-        input.extend_from_slice(&w);
-
-        // offset for param 1
-        let mut w = [0u8; 32];
-        w[24..32].copy_from_slice(&param1_offset.to_be_bytes());
-        input.extend_from_slice(&w);
-
-        // param 0 data: length + padded string
-        let mut w = [0u8; 32];
-        w[24..32].copy_from_slice(&(xpub_bytes.len() as u64).to_be_bytes());
-        input.extend_from_slice(&w);
-        let mut padded = vec![0u8; xpub_padded];
-        padded[..xpub_bytes.len()].copy_from_slice(xpub_bytes);
-        input.extend_from_slice(&padded);
-
-        // param 1 data: length + padded string
-        let path_padded = path_bytes.len().div_ceil(32) * 32;
-        let mut w = [0u8; 32];
-        w[24..32].copy_from_slice(&(path_bytes.len() as u64).to_be_bytes());
-        input.extend_from_slice(&w);
-        let mut padded = vec![0u8; path_padded];
-        padded[..path_bytes.len()].copy_from_slice(path_bytes);
-        input.extend_from_slice(&padded);
-
-        input
-    }
-
-    const TEST_TPUB: &str = "tpubD6NzVbkrYhZ4YHQqwWz3Tm1ESZ9AidobeyLG4mEezB6hN8gFFWrcjczyF77Lw3HEs6Rjd2R11BEJ8Y9ptfxx9DFknkdujp58mFMx9H5dc1r";
-
-    #[test]
-    fn test_derive_xpub_rskj_vector_1() {
-        let input = build_derive_xpub_input(TEST_TPUB, "2/3/4");
-        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
-        assert_eq!(result.gas_used, 107_000);
-        let derived = abi_decode_string(&result.bytes, 0).unwrap();
-        assert_eq!(
-            derived,
-            "tpubDCGMkPKredy7oh6zw8f4ExWFdTgQCrAHToF1ytny3gbVy9GkUNK2Nqh7NbKbh8dkd5VtjUiLJPkbEkeg29NVHwxYwzHJFt9SazGLZrrU4Y4"
-        );
-    }
-
-    #[test]
-    fn test_derive_xpub_rskj_vector_2() {
-        let input = build_derive_xpub_input(TEST_TPUB, "0/0/0/0/0/0");
-        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
-        let derived = abi_decode_string(&result.bytes, 0).unwrap();
-        assert_eq!(
-            derived,
-            "tpubDJ28nwFGUypUD6i8eGCQfMkwNGxzzabA5Mh7AcUdwm6ziFxCSWjy4HyhPXH5uU2ovdMMYLT9W3g3MrGo52TrprMvX8o1dzT2ZGz1pwCPTNv"
-        );
-    }
-
-    #[test]
-    fn test_derive_xpub_rskj_vector_3_max_index() {
-        let input = build_derive_xpub_input(TEST_TPUB, "2147483647");
-        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
-        let derived = abi_decode_string(&result.bytes, 0).unwrap();
-        assert_eq!(
-            derived,
-            "tpubD8fY35uPCY1rUjMUZwhkGUFi33pwkffMEBaCsTSw1he2AbM6DMbPaRR2guvk5qTWDfE9ubFB5pzuUNnMtsqbCeKAAjfepSvEWyetyF9Q4fG"
-        );
-    }
-
-    #[test]
-    fn test_derive_xpub_invalid_key() {
-        let input = build_derive_xpub_input("this-is-not-an-xpub", "0");
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_derive_xpub_path_empty() {
-        let input = build_derive_xpub_input(TEST_TPUB, "");
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_derive_xpub_path_leading_m() {
-        let input = build_derive_xpub_input(TEST_TPUB, "M/0/1/2");
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_derive_xpub_path_leading_slash() {
-        let input = build_derive_xpub_input(TEST_TPUB, "/0");
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_derive_xpub_path_trailing_slash() {
-        let input = build_derive_xpub_input(TEST_TPUB, "0/");
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_derive_xpub_path_hardening() {
-        let input = build_derive_xpub_input(TEST_TPUB, "4'/5");
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_derive_xpub_path_negative() {
-        let input = build_derive_xpub_input(TEST_TPUB, "0/-1");
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_derive_xpub_path_segment_too_large() {
-        let input = build_derive_xpub_input(TEST_TPUB, "0/1/2/2147483648");
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_derive_xpub_path_too_many_segments() {
-        let input = build_derive_xpub_input(TEST_TPUB, "0/1/2/3/4/5/6/7/8/9/10");
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_derive_xpub_oog() {
-        let input = build_derive_xpub_input(TEST_TPUB, "2/3/4");
-        assert!(matches!(
-            hd_wallet_utils_run(&input, 100_000),
-            Err(PrecompileError::OutOfGas)
-        ));
-    }
-
-    // --- extractPublicKeyFromExtendedPublicKey tests ---
-
-    fn build_extract_pubkey_input(xpub: &str) -> Vec<u8> {
-        let selector = selector_of("extractPublicKeyFromExtendedPublicKey(string)");
-        let mut input = Vec::new();
-        input.extend_from_slice(&selector);
-
-        let xpub_bytes = xpub.as_bytes();
-        let xpub_padded = xpub_bytes.len().div_ceil(32) * 32;
-
-        // offset = 0x20 (single dynamic param, offset past 1 slot)
-        let mut w = [0u8; 32];
-        w[31] = 0x20;
-        input.extend_from_slice(&w);
-
-        // length
-        let mut w = [0u8; 32];
-        w[24..32].copy_from_slice(&(xpub_bytes.len() as u64).to_be_bytes());
-        input.extend_from_slice(&w);
-
-        // padded data
-        let mut padded = vec![0u8; xpub_padded];
-        padded[..xpub_bytes.len()].copy_from_slice(xpub_bytes);
-        input.extend_from_slice(&padded);
-
-        input
-    }
-
-    #[test]
-    fn test_extract_pubkey_rskj_vector() {
-        let xpub = "xpub661MyMwAqRbcFMGNG2YcHvj3x63bAZN9U5cKikaiQ4zu2D1cvpnZYyXNR9nH62sGp4RR39Ui7SVQSq1PY4JbPuEuu5prVJJC3d5Pogft712";
-        let input = build_extract_pubkey_input(xpub);
-        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
-        assert_eq!(result.gas_used, 11_300);
-
-        let pubkey = abi_decode_bytes(&result.bytes, 0).unwrap();
-        let expected = hex::decode("02be517550b9e3be7fe42c80932d51e88e698663b4926e598b269d050e87e34d8c").unwrap();
-        assert_eq!(pubkey, expected);
-    }
-
-    #[test]
-    fn test_extract_pubkey_invalid_key() {
-        let input = build_extract_pubkey_input("this-is-not-an-xpub");
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_extract_pubkey_bad_checksum() {
-        // Last char changed: dc1r → dc1s
-        let input = build_extract_pubkey_input(
-            "tpubD6NzVbkrYhZ4YHQqwWz3Tm1ESZ9AidobeyLG4mEezB6hN8gFFWrcjczyF77Lw3HEs6Rjd2R11BEJ8Y9ptfxx9DFknkdujp58mFMx9H5dc1s"
-        );
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_extract_pubkey_oog() {
-        let xpub = "xpub661MyMwAqRbcFMGNG2YcHvj3x63bAZN9U5cKikaiQ4zu2D1cvpnZYyXNR9nH62sGp4RR39Ui7SVQSq1PY4JbPuEuu5prVJJC3d5Pogft712";
-        let input = build_extract_pubkey_input(xpub);
-        assert!(matches!(
-            hd_wallet_utils_run(&input, 10_000),
-            Err(PrecompileError::OutOfGas)
-        ));
-    }
-
-    // --- getMultisigScriptHash tests ---
-
-    fn build_multisig_input(min_sigs: i32, keys: &[Vec<u8>]) -> Vec<u8> {
-        let selector = selector_of("getMultisigScriptHash(int256,bytes[])");
-        let mut input = Vec::new();
-        input.extend_from_slice(&selector);
-
-        // param 0: min_sigs (int256, static)
-        let mut w = [0u8; 32];
-        if min_sigs >= 0 {
-            w[28..32].copy_from_slice(&min_sigs.to_be_bytes());
-        } else {
-            w = [0xFF; 32];
-            w[28..32].copy_from_slice(&min_sigs.to_be_bytes());
-        }
-        input.extend_from_slice(&w);
-
-        // param 1: offset to bytes[] data = 0x40 (past 2 param slots)
-        let mut w = [0u8; 32];
-        w[31] = 0x40;
-        input.extend_from_slice(&w);
-
-        // bytes[] encoding: count, then offsets, then each element
-        // count
-        let mut w = [0u8; 32];
-        w[24..32].copy_from_slice(&(keys.len() as u64).to_be_bytes());
-        input.extend_from_slice(&w);
-
-        // Calculate offsets for each element (relative to start of array content after count)
-        // Each offset points past all offsets + accumulated element data
-        let offsets_size = keys.len() * 32;
-        let mut elem_data = Vec::new();
-        let mut elem_offsets = Vec::new();
-        for key in keys {
-            elem_offsets.push(offsets_size + elem_data.len());
-            // length word
-            let mut lw = [0u8; 32];
-            lw[24..32].copy_from_slice(&(key.len() as u64).to_be_bytes());
-            elem_data.extend_from_slice(&lw);
-            // padded data
-            let padded = key.len().div_ceil(32) * 32;
-            let mut pd = vec![0u8; padded];
-            pd[..key.len()].copy_from_slice(key);
-            elem_data.extend_from_slice(&pd);
-        }
-
-        // Write offsets
-        for off in &elem_offsets {
-            let mut w = [0u8; 32];
-            w[24..32].copy_from_slice(&(*off as u64).to_be_bytes());
-            input.extend_from_slice(&w);
-        }
-
-        // Write element data
-        input.extend_from_slice(&elem_data);
-
-        input
-    }
-
-    fn compressed_test_keys() -> Vec<Vec<u8>> {
-        vec![
-            hex::decode("03b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2").unwrap(),
-            hex::decode("027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344").unwrap(),
-            hex::decode("0355a2e9bf100c00fc0a214afd1bf272647c7824eb9cb055480962f0c382596a70").unwrap(),
-            hex::decode("02566d5ded7c7db1aa7ee4ef6f76989fb42527fcfdcddcd447d6793b7d869e46f7").unwrap(),
-            hex::decode("0294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adc").unwrap(),
-            hex::decode("0372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c6").unwrap(),
-            hex::decode("0340df69f28d69eef60845da7d81ff60a9060d4da35c767f017b0dd4e20448fb44").unwrap(),
-            hex::decode("02ac1901b6fba2c1dbd47d894d2bd76c8ba1d296d65f6ab47f1c6b22afb53e73eb").unwrap(),
-            hex::decode("031aabbeb9b27258f98c2bf21f36677ae7bae09eb2d8c958ef41a20a6e88626d26").unwrap(),
-            hex::decode("0245ef34f5ee218005c9c21227133e8568a4f3f11aeab919c66ff7b816ae1ffeea").unwrap(),
-            hex::decode("02550cc87fa9061162b1dd395a16662529c9d8094c0feca17905a3244713d65fe8").unwrap(),
-            hex::decode("02481f02b7140acbf3fcdd9f72cf9a7d9484d8125e6df7c9451cfa55ba3b077265").unwrap(),
-            hex::decode("03f909ae15558c70cc751aff9b1f495199c325b13a9e5b934fd6299cd30ec50be8").unwrap(),
-            hex::decode("02c6018fcbd3e89f3cf9c7f48b3232ea3638eb8bf217e59ee290f5f0cfb2fb9259").unwrap(),
-            hex::decode("03b65694ccccda83cbb1e56b31308acd08e993114c33f66a456b627c2c1c68bed6").unwrap(),
-        ]
-    }
-
-    #[test]
-    fn test_multisig_rskj_15_compressed_keys() {
-        let keys = compressed_test_keys();
-        let input = build_multisig_input(8, &keys);
-        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
-
-        // Gas: 20000 + (15 - 2) * 700 = 29100
-        assert_eq!(result.gas_used, 29_100);
-
-        let hash = abi_decode_bytes(&result.bytes, 0).unwrap();
-        assert_eq!(
-            hex::encode(&hash),
-            "51f103320b435b5fe417b3f3e0f18972ccc710a0"
-        );
-    }
-
-    #[test]
-    fn test_multisig_mixed_compressed_uncompressed() {
-        let mut keys = compressed_test_keys();
-        // Replace keys 0, 4, 6, 9 with uncompressed versions
-        let uncompressed_replacements = [
-            (0, "04b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2aafaaa2611606699ec4f82777a268b708dab346de4880cd223969f7bbe5422bf"),
-            (4, "0494c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adcb17171aa9ec8d8587098e0771f686ee61ac35279f9e5aadf9b06b738aa6d3720"),
-            (6, "0440df69f28d69eef60845da7d81ff60a9060d4da35c767f017b0dd4e20448fb44e1abebaea4c3c57c6e9e39e205b4df046f7110a8d3477c0d8e26a28be9692c29"),
-            (9, "0445ef34f5ee218005c9c21227133e8568a4f3f11aeab919c66ff7b816ae1ffeeae024d50312de76a7950f8c6268fbf454335cf252f961a67c47e67dc06fa590ba"),
-        ];
-        for (idx, hex_str) in &uncompressed_replacements {
-            keys[*idx] = hex::decode(hex_str).unwrap();
-        }
-
-        let input = build_multisig_input(8, &keys);
-        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
-        let hash = abi_decode_bytes(&result.bytes, 0).unwrap();
-        assert_eq!(
-            hex::encode(&hash),
-            "51f103320b435b5fe417b3f3e0f18972ccc710a0",
-            "mixed keys must produce same hash as all-compressed"
-        );
-    }
-
-    #[test]
-    fn test_multisig_min_sigs_zero() {
-        let keys = compressed_test_keys()[..2].to_vec();
-        let input = build_multisig_input(0, &keys);
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_multisig_less_than_two_keys() {
-        let keys = vec![compressed_test_keys()[0].clone()];
-        let input = build_multisig_input(1, &keys);
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_multisig_keys_less_than_min_sigs() {
-        let keys = compressed_test_keys()[..2].to_vec();
-        let input = build_multisig_input(3, &keys);
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_multisig_too_many_keys() {
-        // 16 keys (max is 15)
-        let mut keys = compressed_test_keys();
-        keys.push(keys[0].clone());
-        let input = build_multisig_input(3, &keys);
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_multisig_invalid_key_length() {
-        let keys = vec![
-            compressed_test_keys()[0].clone(),
-            vec![0xAA, 0xBB, 0xCC], // wrong length
-        ];
-        let input = build_multisig_input(1, &keys);
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_multisig_invalid_key_prefix() {
-        let mut bad_key = compressed_test_keys()[0].clone();
-        bad_key[0] = 0x08; // invalid prefix
-        let keys = vec![compressed_test_keys()[1].clone(), bad_key];
-        let input = build_multisig_input(1, &keys);
-        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
-    }
-
-    #[test]
-    fn test_multisig_gas_base_for_two_keys() {
-        let keys = compressed_test_keys()[..2].to_vec();
-        let input = build_multisig_input(1, &keys);
-        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
-        assert_eq!(result.gas_used, 20_000);
-    }
-
-    #[test]
-    fn test_multisig_oog() {
-        let keys = compressed_test_keys();
-        let input = build_multisig_input(8, &keys);
-        // Need 29100, supply 29000
-        assert!(matches!(
-            hd_wallet_utils_run(&input, 29_000),
-            Err(PrecompileError::OutOfGas)
-        ));
     }
 }

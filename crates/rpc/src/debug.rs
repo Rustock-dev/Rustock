@@ -96,6 +96,8 @@ pub fn debug_trace_transaction(id: Value, params: &Value, state: &RpcState) -> J
     else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid transaction hash");
     };
+    // On the main chain only, as rskj's tracer looks it up
+    // (`receiptStore.getInMainChain`): a block that lost a reorg is no answer.
     let Some((block_hash, index)) =
         crate::helpers::canonical_tx_location(&state.store, tx_hash)
     else {
@@ -201,7 +203,7 @@ fn trace_block_transaction(
         transactions,
         ommers,
     };
-    let processor = rustock_execution::BlockProcessor::new(hardfork_cfg, state.store.clone());
+    let processor = state.block_processor(hardfork_cfg);
 
     match processor.trace_transaction(&block, &root, trie_store, index, MAX_STRUCT_LOGS) {
         Ok(Some(trace)) => Ok(Some(render_trace(&trace))),

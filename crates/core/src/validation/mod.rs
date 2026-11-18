@@ -1,6 +1,7 @@
 use crate::types::header::Header;
 use thiserror::Error;
 use alloy_primitives::{B256, U256};
+use num_bigint::BigUint;
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum ValidationError {
@@ -19,23 +20,19 @@ pub enum ValidationError {
     #[error("Failed to read system time")]
     SystemTimeError,
 
+    /// `limit` is the gas limit's low 64 bits, as `ValidGasUsedRule` reads it.
     #[error("Gas used {used} exceeds gas limit {limit}")]
-    GasUsedExceedsLimit { used: u64, limit: u64 },
+    GasUsedExceedsLimit { used: u64, limit: i64 },
 
-    #[error("Gas limit overflows u64")]
-    GasLimitOverflow,
+    #[error("Gas limit {got} is below the minimum {min}")]
+    GasLimitBelowMinimum { min: u64, got: BigUint },
 
-    #[error("Gas limit {got} out of bounds: [{min}, {max}]")]
-    GasLimitOutOfBounds { min: u64, max: u64, got: u64 },
-
+    /// Both read whole, as rskj's BigIntegers.
     #[error("Gas limit {got} is invalid compared to parent {parent}")]
-    GasLimitInvalid { parent: u64, got: u64 },
+    GasLimitInvalid { parent: BigUint, got: BigUint },
 
     #[error("Difficulty mismatch: expected {expected}, got {got}")]
     DifficultyMismatch { expected: U256, got: U256 },
-
-    #[error("Difficulty is zero")]
-    DifficultyZero,
 
     #[error("Failed to decode Bitcoin block header")]
     BitcoinHeaderDecodeError,
@@ -52,6 +49,9 @@ pub enum ValidationError {
     #[error("Bitcoin Proof of Work invalid: hash {hash} exceeds target {target}")]
     BitcoinPowInvalid { hash: B256, target: U256 },
 
+    #[error("Fallback-mined block #{number} is not signed by its fallback-mining key")]
+    FallbackMiningSignatureInvalid { number: u64 },
+
     #[error("Bitcoin Merkle proof invalid")]
     BitcoinMerkleProofInvalid,
 
@@ -61,8 +61,23 @@ pub enum ValidationError {
     #[error("Merged-mining merkle proof is {got} bytes, over the {max}-byte limit")]
     MerkleProofTooLarge { max: usize, got: usize },
 
+    #[error("Merged-mining coinbase is {length} bytes long, must be over 64")]
+    CoinbaseTooShort { length: i64 },
+
+    #[error("Two nodes of the merged-mining merkle proof parse as a 64-byte Bitcoin transaction")]
+    MerkleNodesFormTransaction,
+
+    #[error("Merged-mining partial merkle tree refused: {0}")]
+    PartialMerkleTreeInvalid(crate::partial_merkle_tree::PmtError),
+
+    #[error("UMM root is {len} bytes, must be empty or 20")]
+    UmmRootInvalid { len: usize },
+
     #[error("Tx gas price {tx_gas_price} is below the block minimum {block_minimum}")]
-    TxGasPriceBelowMinimum { tx_gas_price: U256, block_minimum: U256 },
+    TxGasPriceBelowMinimum {
+        tx_gas_price: U256,
+        block_minimum: BigUint,
+    },
 
     #[error("Tx gas price {tx_gas_price} is above the cap {cap}")]
     TxGasPriceAboveCap { tx_gas_price: U256, cap: U256 },
@@ -73,8 +88,13 @@ pub enum ValidationError {
     #[error("Extra data is {got} bytes, over the {max}-byte maximum")]
     ExtraDataTooLarge { max: usize, got: usize },
 
+    /// Read whole, as rskj's `Coin`s.
     #[error("Minimum gas price {got} outside the allowed range [{lower}, {upper}]")]
-    MinGasPriceOutOfRange { lower: U256, upper: U256, got: U256 },
+    MinGasPriceOutOfRange {
+        lower: BigUint,
+        upper: BigUint,
+        got: BigUint,
+    },
 
     #[error("Uncle list has {got} entries, over the limit of {max}")]
     TooManyUncles { max: usize, got: usize },
@@ -102,6 +122,11 @@ pub enum ValidationError {
 
     #[error("Fork detection data could not be read from the coinbase")]
     ForkDetectionDataUnreadable,
+
+    #[error(
+        "The uncle counts of the 32 blocks below sum to {sum} as a Java int, which rskj refuses"
+    )]
+    UncleCountsSumBelowZero { sum: i32 },
 
     #[error("Invalid transaction execution sublist edges: {reason}")]
     InvalidSublistEdges { reason: String },
@@ -168,6 +193,14 @@ impl BlockVerifier {
 pub struct HeaderVerifier {
     static_rules: Vec<Box<dyn HeaderValidator>>,
     parent_rules: Vec<Box<dyn ParentHeaderValidator>>,
+    /// The rules an uncle passes, which are not a trunk header's: rskj gives
+    /// its uncle rule lists of its own.
+    uncle_rules: Vec<Box<dyn HeaderValidator>>,
+    uncle_parent_rules: Vec<Box<dyn ParentHeaderValidator>>,
+    /// The rules a block a peer sent whole meets against its parent before
+    /// it is taken and relayed, past a trunk header's: see
+    /// [`Self::verify_for_relay`].
+    relay_parent_rules: Vec<Box<dyn ParentHeaderValidator>>,
 }
 
 impl Default for HeaderVerifier {
@@ -181,47 +214,78 @@ impl HeaderVerifier {
         Self {
             static_rules: Vec::new(),
             parent_rules: Vec::new(),
+            uncle_rules: Vec::new(),
+            uncle_parent_rules: Vec::new(),
+            relay_parent_rules: Vec::new(),
         }
     }
 
-    /// Creates a standard RSK verifier with all consensus rules.
+    /// Creates a standard RSK verifier with all consensus rules, and rskj's
+    /// rules for uncles, [`uncles::rsk_header_rules`] and
+    /// [`uncles::rsk_parent_rules`].
     ///
     /// Note: `ParentHashRule` is intentionally **not** included here because
     /// the sync pipeline looks up the parent by `header.parent_hash`, so
-    /// finding it in the store already proves hash consistency.  Including the
-    /// rule would break for the genesis block, whose canonical hash is derived
-    /// from Java's non-canonical RLP encoding (leading zeros in difficulty)
-    /// and cannot be reproduced by our standard `Header::hash()`.
+    /// finding it in the store already proves hash consistency. A store keys
+    /// a header by the hash it came with, and block 0 is the one header that
+    /// ever read back to another: in a store written before it kept its
+    /// difficulty's bytes as the genesis file writes them, which the node
+    /// writes again when it opens one.
     pub fn default_rsk(config: std::sync::Arc<crate::config::ChainConfig>) -> Self {
-        Self::new()
+        let mut verifier = Self::new()
             .with_static_rule(GasUsedRule)
-            .with_static_rule(GasLimitBoundsRule { 
-                min_gas_limit: config.min_gas_limit, 
-                max_gas_limit: config.max_gas_limit 
+            .with_static_rule(GasLimitRule {
+                min_gas_limit: config.min_gas_limit,
             })
             .with_static_rule(MergedMiningRule { config: config.clone() })
             .with_static_rule(BitcoinTimestampRule { config: config.clone() })
+            // rskj `newBlockMaxSecondsInTheFuture`; zero turns the rule off. On
+            // the header alone, as rskj's `BlockValidatorImpl` and its header
+            // sync run it: a block no later than its parent is one rskj imports.
+            .with_static_rule(TimestampRule::new(config.max_future_block_time))
             .with_static_rule(block_rules::ExtraDataRule::default())
             .with_parent_rule(BlockNumberRule)
-            // rskj `newBlockMaxSecondsInTheFuture`; zero turns the rule off.
-            .with_parent_rule(TimestampRule::new(config.max_future_block_time))
             .with_parent_rule(BlockParentGasLimitRule { config: config.clone() })
             .with_parent_rule(block_rules::PrevMinGasPriceRule)
-            .with_parent_rule(DifficultyRule { config })
+            .with_parent_rule(DifficultyRule { config: config.clone() });
+        verifier.uncle_rules = uncles::rsk_header_rules(config.clone());
+        verifier.relay_parent_rules =
+            vec![Box::new(TimestampRule::new(config.max_future_block_time))];
+        verifier.uncle_parent_rules = uncles::rsk_parent_rules(config);
+        verifier
     }
 
-    /// The rules that judge a header on its own, proof of work among them.
-    ///
-    /// Exposed so an uncle can be put through exactly the same rules as a
-    /// trunk header. An uncle that is not checked as hard as a trunk block is
-    /// a way to credit work nobody did.
+    /// The rules that judge a trunk header on its own, proof of work among
+    /// them.
     pub fn static_rules(&self) -> &[Box<dyn HeaderValidator>] {
         &self.static_rules
     }
 
-    /// The rules that judge a header against its parent.
+    /// The rules that judge a trunk header against its parent.
     pub fn parent_rules(&self) -> &[Box<dyn ParentHeaderValidator>] {
         &self.parent_rules
+    }
+
+    /// The rules that judge an uncle on its own: rskj's, which are not a
+    /// trunk header's. An uncle checked less hard than rskj checks it is work
+    /// credited that nobody did; one checked harder is work rskj counts and
+    /// this node does not.
+    pub fn uncle_rules(&self) -> &[Box<dyn HeaderValidator>] {
+        &self.uncle_rules
+    }
+
+    /// The rules that judge an uncle against its own parent.
+    pub fn uncle_parent_rules(&self) -> &[Box<dyn ParentHeaderValidator>] {
+        &self.uncle_parent_rules
+    }
+
+    /// Runs the rules an uncle faces on its own, for a caller that does not
+    /// hold its parent.
+    pub fn verify_uncle(&self, uncle: &Header) -> Result<(), ValidationError> {
+        for rule in &self.uncle_rules {
+            rule.validate(uncle)?;
+        }
+        Ok(())
     }
 
     pub fn with_static_rule(mut self, rule: impl HeaderValidator + 'static) -> Self {
@@ -229,9 +293,42 @@ impl HeaderVerifier {
         self
     }
 
+    pub fn with_uncle_rule(mut self, rule: impl HeaderValidator + 'static) -> Self {
+        self.uncle_rules.push(Box::new(rule));
+        self
+    }
+
+    pub fn with_uncle_parent_rule(mut self, rule: impl ParentHeaderValidator + 'static) -> Self {
+        self.uncle_parent_rules.push(Box::new(rule));
+        self
+    }
+
     pub fn with_parent_rule(mut self, rule: impl ParentHeaderValidator + 'static) -> Self {
         self.parent_rules.push(Box::new(rule));
         self
+    }
+
+    pub fn with_relay_parent_rule(mut self, rule: impl ParentHeaderValidator + 'static) -> Self {
+        self.relay_parent_rules.push(Box::new(rule));
+        self
+    }
+
+    /// What rskj's relay validator holds a block to against its parent, past
+    /// the rules every trunk header meets (`RskContext.getBlockRelayValidator`):
+    /// its time later than its parent's, the parent form of
+    /// `BlockTimeStampValidationRule`.
+    ///
+    /// rskj runs that validator on a block a peer sends whole
+    /// (`AsyncNodeBlockProcessor.processBlock`, its default): one that fails
+    /// is an invalid block to it, neither queued to be connected nor relayed.
+    /// `BlockValidatorImpl` doesn't run it, so the same block is still one
+    /// rskj connects, with a descendant that arrives or through its sync, and
+    /// [`Self::verify`] doesn't run it either.
+    pub fn verify_for_relay(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
+        for rule in &self.relay_parent_rules {
+            rule.validate_with_parent(header, parent)?;
+        }
+        Ok(())
     }
 
     /// Runs only the rules that relate a header to its parent.
@@ -273,7 +370,7 @@ pub mod header_rules;
 pub mod difficulty;
 pub mod merged_mining;
 
-pub use header_rules::{BlockNumberRule, ParentHashRule, TimestampRule, GasUsedRule, GasLimitBoundsRule, BlockParentGasLimitRule};
+pub use header_rules::{BlockNumberRule, ParentHashRule, TimestampRule, GasUsedRule, GasLimitRule, BlockParentGasLimitRule};
 pub use difficulty::DifficultyRule;
 pub use merged_mining::{BitcoinTimestampRule, MergedMiningRule};
 pub use block_rules::{

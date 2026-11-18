@@ -11,15 +11,21 @@
 //! single missing selector shows up as a failed transaction or a doubled gas
 //! bill rather than as anything naming the Bridge.
 //!
+//! RSKIP529 adds six more on the same schedule: a "super event" and a
+//! "base event", each a string of at most 128 bytes that only the union
+//! bridge contract may set or clear and anyone may read.
+//!
 //! Storage keys are `DataWord.fromLongString` -- keccak of the name -- not the
 //! right-aligned ASCII form the older Bridge cells use
 //! (`UnionBridgeStorageIndexKey`).
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, Bytes, U256};
 use revm::precompile::{PrecompileError, PrecompileOutput};
 
 use super::storage::{bridge_load_bytes, bridge_storage_key_long, bridge_store_bytes};
-use crate::hardfork::{RskHardforkConfig, RSK_MAINNET_CHAIN_ID, RSK_TESTNET_CHAIN_ID};
+use crate::hardfork::{
+    RskHardforkConfig, RSK_MAINNET_CHAIN_ID, RSK_REGTEST_CHAIN_ID, RSK_TESTNET_CHAIN_ID,
+};
 
 /// rskj `UnionResponseCode`. Returned as an int256 by every mutating method.
 ///
@@ -49,12 +55,19 @@ pub const UNION_LOCKING_CAP_KEY: &str = "unionBridgeLockingCap";
 pub const WEIS_TRANSFERRED_KEY: &str = "weisTransferredToUnionBridge";
 pub const UNION_REQUEST_ENABLED_KEY: &str = "unionBridgeRequestEnabled";
 pub const UNION_RELEASE_ENABLED_KEY: &str = "unionBridgeReleaseEnabled";
+/// RSKIP529. The event's bytes as they came, with no RLP around them.
+pub const SUPER_EVENT_KEY: &str = "superEvent";
+/// RSKIP529. Read into a mined header's `baseEvent` field under RSKIP535.
+pub const BASE_EVENT_KEY: &str = "baseEvent";
+
+/// rskj `UnionBridgeSupportImpl.MAX_EVENT_DATA_LENGTH`.
+pub const MAX_EVENT_DATA_LENGTH: usize = 128;
 
 /// rskj `UnionBridgeConstants`, per network.
 ///
 /// Mainnet's address and all three authorizers are the zero address: the
-/// union bridge is configured on testnet and not yet on mainnet, so every
-/// authorized method there rejects.
+/// union bridge is configured on testnet and regtest and not yet on mainnet,
+/// so every authorized method there rejects.
 pub struct UnionConstants {
     pub address: Address,
     pub initial_locking_cap: U256,
@@ -78,8 +91,20 @@ pub fn union_constants(hardfork_cfg: &RskHardforkConfig) -> UnionConstants {
             change_locking_cap_authorizer: addr("1a8109af0f019ed3045fbcdf45e5e90d6b6aafaf"),
             change_transfer_permissions_authorizer: addr("8db1f83e8119e4dce5bc708ec2f4390ffd910b19"),
         },
-        // Mainnet and regtest alike: zero address throughout, so nothing is
-        // authorized and the contract address falls back to zero.
+        // rskj `UnionBridgeRegTestConstants`: an account sets the contract's
+        // address, and one contract holds the other two permissions.
+        RSK_REGTEST_CHAIN_ID => UnionConstants {
+            address: Address::ZERO,
+            initial_locking_cap: one_rbtc(),
+            locking_cap_increments_multiplier: 2,
+            change_address_authorizer: addr("6c9dfd950bf748bb26f893f7e5f693c7f60a8f85"),
+            change_locking_cap_authorizer: addr("ff6f4ff09c54561e1476203e56fcfc834911aa64"),
+            change_transfer_permissions_authorizer: addr(
+                "ff6f4ff09c54561e1476203e56fcfc834911aa64",
+            ),
+        },
+        // Mainnet: the zero address throughout, so nothing is authorized and
+        // the contract address is zero.
         _ => UnionConstants {
             address: Address::ZERO,
             initial_locking_cap: one_rbtc(),
@@ -219,7 +244,7 @@ fn int_result(gas: u64, code: i64) -> Result<PrecompileOutput, PrecompileError> 
 /// `setUnionBridgeContractAddressForTestnet(address)` -> int256.
 ///
 /// rskj wraps this in `executeIfTestnetAndAuthorized`, so it is both
-/// network-gated and authorizer-gated.
+/// network-gated and authorizer-gated, and throws at either gate.
 pub fn set_contract_address_for_testnet<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
@@ -228,13 +253,19 @@ pub fn set_contract_address_for_testnet<CTX: crate::RskContextTr>(
     sender: Address,
 ) -> Result<PrecompileOutput, PrecompileError> {
     if hardfork_cfg.chain_id == RSK_MAINNET_CHAIN_ID {
-        return int_result(gas_cost, UnionResponse::GenericError.code());
+        return Err(PrecompileError::other(
+            "The setUnionBridgeContractAddressForTestnet function is disabled in Mainnet.",
+        ));
     }
     let constants = union_constants(hardfork_cfg);
-    if sender != constants.change_address_authorizer {
-        return int_result(gas_cost, UnionResponse::UnauthorizedCaller.code());
-    }
-    let Some(new_address) = abi_address(args, 0) else {
+    require_authorizer(
+        sender,
+        constants.change_address_authorizer,
+        "The sender is not authorized to call setUnionBridgeContractAddressForTestnet",
+    )?;
+    // rskj `new RskAddress((DataWord) args[0])`: the address as its decoder
+    // reads it, an empty argument list being the zero address.
+    let Some(new_address) = crate::abi::Args::new(args).address(0) else {
         return int_result(gas_cost, UnionResponse::GenericError.code());
     };
     store_long(ctx, UNION_CONTRACT_ADDRESS_KEY, &rlp_encode_bytes(new_address.as_slice()));
@@ -275,14 +306,20 @@ pub fn increase_locking_cap<CTX: crate::RskContextTr>(
     sender: Address,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let constants = union_constants(hardfork_cfg);
-    if sender != constants.change_locking_cap_authorizer {
-        return int_result(gas_cost, UnionResponse::UnauthorizedCaller.code());
-    }
-    let Some(new_cap) = abi_uint(args, 0) else {
+    require_authorizer(
+        sender,
+        constants.change_locking_cap_authorizer,
+        "The sender is not authorized to call increaseUnionBridgeLockingCap",
+    )?;
+    let Some(new_cap) = crate::abi::Args::new(args).int(0) else {
         return int_result(gas_cost, UnionResponse::GenericError.code());
     };
     let current = locking_cap(ctx, hardfork_cfg);
     let max_allowed = current * U256::from(constants.locking_cap_increments_multiplier);
+    // A negative cap never increases the current one.
+    let Some(new_cap) = coin(&new_cap) else {
+        return int_result(gas_cost, UnionResponse::InvalidValue.code());
+    };
     if new_cap <= current || new_cap > max_allowed {
         return int_result(gas_cost, UnionResponse::InvalidValue.code());
     }
@@ -310,12 +347,15 @@ pub fn request_rbtc<CTX: crate::RskContextTr>(
     if !request_enabled(ctx) {
         return int_result(gas_cost, UnionResponse::TransferDisabled.code());
     }
-    let Some(amount) = abi_uint(args, 0) else {
+    let Some(amount) = crate::abi::Args::new(args).int(0) else {
         return int_result(gas_cost, UnionResponse::GenericError.code());
     };
-    if amount.is_zero() {
+    // rskj `isAmountRequestedValid` refuses an amount that is not positive,
+    // and the amount is signed: a negative one would otherwise wrap the total
+    // below the cap.
+    let Some(amount) = coin(&amount).filter(|amount| !amount.is_zero()) else {
         return int_result(gas_cost, UnionResponse::InvalidValue.code());
-    }
+    };
     let previous = weis_transferred(ctx);
     let new_total = previous + amount;
     if new_total > locking_cap(ctx, hardfork_cfg) {
@@ -397,10 +437,15 @@ pub fn set_transfer_permissions<CTX: crate::RskContextTr>(
     sender: Address,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let constants = union_constants(hardfork_cfg);
-    if sender != constants.change_transfer_permissions_authorizer {
-        return int_result(gas_cost, UnionResponse::UnauthorizedCaller.code());
-    }
-    let (Some(request), Some(release)) = (abi_bool(args, 0), abi_bool(args, 1)) else {
+    require_authorizer(
+        sender,
+        constants.change_transfer_permissions_authorizer,
+        "The sender is not authorized to call setUnionBridgeTransferPermissions",
+    )?;
+    // rskj's `BoolType` looks at its word's low 32 bits only, and an empty
+    // argument list reads as two falses.
+    let args = crate::abi::Args::new(args);
+    let (Some(request), Some(release)) = (args.bool(0), args.bool(1)) else {
         return int_result(gas_cost, UnionResponse::GenericError.code());
     };
 
@@ -415,36 +460,120 @@ pub fn set_transfer_permissions<CTX: crate::RskContextTr>(
     int_result(gas_cost, UnionResponse::Success.code())
 }
 
+/// `getSuperEvent()` / `getBaseEvent()` -> bytes: the event `key` holds,
+/// empty when there is none.
+///
+/// rskj `UnionBridgeStorageProviderImpl.getSuperEvent` takes the cell's bytes
+/// as they are (`data -> data`), with no RLP to strip, and an absent cell
+/// reads as the empty array.
+pub fn get_event<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    key: &str,
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let event = load_long(ctx, key);
+    let encoded = super::getters::abi_encode_bytes(&event);
+    Ok(PrecompileOutput::new(gas_cost, encoded.into()))
+}
+
+/// `setSuperEvent(bytes)` / `setBaseEvent(bytes)`, void.
+///
+/// rskj `UnionBridgeSupportImpl.setSuperEvent`: the caller must be the union
+/// bridge contract and the event at most 128 bytes. Unlike the RSKIP502
+/// methods, which answer a refusal with a response code, both checks throw
+/// `IllegalArgumentException`, so the call fails as any Bridge method that
+/// throws: its cost is spent and nothing is written.
+pub fn set_event<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    key: &str,
+    args: &[u8],
+    gas_cost: u64,
+    hardfork_cfg: &RskHardforkConfig,
+    sender: Address,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let event = crate::abi::Args::new(args)
+        .bytes(0)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| {
+            PrecompileError::other("union bridge event: the bytes argument does not decode")
+        })?;
+    require_union_bridge_caller(ctx, hardfork_cfg, sender)?;
+    if event.len() > MAX_EVENT_DATA_LENGTH {
+        return Err(PrecompileError::other(format!(
+            "union bridge event: {} bytes is above the maximum of {MAX_EVENT_DATA_LENGTH}",
+            event.len()
+        )));
+    }
+    // An empty event deletes the cell, as rskj's addStorageBytes does.
+    store_long(ctx, key, &event);
+    Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// `clearSuperEvent()` / `clearBaseEvent()`, void: the union bridge contract
+/// sets the event to the empty array, which deletes the cell.
+pub fn clear_event<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    key: &str,
+    gas_cost: u64,
+    hardfork_cfg: &RskHardforkConfig,
+    sender: Address,
+) -> Result<PrecompileOutput, PrecompileError> {
+    require_union_bridge_caller(ctx, hardfork_cfg, sender)?;
+    store_long(ctx, key, &[]);
+    Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// rskj `Bridge.executeIfAuthorized`: the executor of a method that only its
+/// authorizer may call throws a `VMException` for anyone else, before the
+/// method runs. `UNAUTHORIZED_CALLER` is not its answer but that of the two
+/// methods that check for the union bridge contract themselves.
+fn require_authorizer(
+    sender: Address,
+    authorizer: Address,
+    refusal: &'static str,
+) -> Result<(), PrecompileError> {
+    if sender != authorizer {
+        return Err(PrecompileError::other(refusal));
+    }
+    Ok(())
+}
+
+/// rskj `UnionBridgeSupportImpl.validateCallerIsUnionBridge`, which throws.
+fn require_union_bridge_caller<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    hardfork_cfg: &RskHardforkConfig,
+    sender: Address,
+) -> Result<(), PrecompileError> {
+    if sender != contract_address(ctx, hardfork_cfg) {
+        return Err(PrecompileError::other(
+            "union bridge event: the caller is not the union bridge contract",
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn abi_word(args: &[u8], index: usize) -> Option<&[u8]> {
-    args.get(index * 32..index * 32 + 32)
+/// rskj `new co.rsk.core.Coin((BigInteger) arg)`: the word as a signed
+/// number, `None` where it is negative.
+fn coin(value: &crate::abi::Int) -> Option<U256> {
+    let value = value.signed();
+    (!value.is_negative()).then(|| value.into_raw())
 }
 
-fn abi_address(args: &[u8], index: usize) -> Option<Address> {
-    abi_word(args, index).map(|w| Address::from_slice(&w[12..]))
-}
-
-fn abi_uint(args: &[u8], index: usize) -> Option<U256> {
-    abi_word(args, index).map(U256::from_be_slice)
-}
-
-fn abi_bool(args: &[u8], index: usize) -> Option<bool> {
-    abi_word(args, index).map(|w| w.iter().any(|b| *b != 0))
-}
-
-/// Moves RBTC out of the Bridge's own balance.
+/// Moves RBTC out of the Bridge's own balance, whatever it holds
+/// (`bridge_transfer`).
 fn transfer_from_bridge<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     to: Address,
     amount: U256,
 ) -> Result<(), PrecompileError> {
-    use revm::context_interface::JournalTr;
-    ctx.journal_mut()
-        .transfer(crate::precompiles::BRIDGE_ADDR, to, amount)
+    super::storage::bridge_transfer(ctx, to, amount)
         .map_err(|e| PrecompileError::other(format!("union bridge transfer: {e:?}")))?;
+    // rskj `BridgeSupport.transferTo` reports it as a CALL subtrace.
+    crate::tracer::record_precompile_transfer(ctx, crate::precompiles::BRIDGE_ADDR, to, amount);
     Ok(())
 }
 
@@ -553,15 +682,315 @@ mod tests {
         assert_eq!(cap, current * U256::from(2u64));
     }
 
-    /// Only the configured authorizer may move the cap.
+    /// rskj gives three methods an executor that throws for anyone but the
+    /// method's authorizer (`Bridge.executeIfAuthorized`), before the method
+    /// runs. None of them answers `UNAUTHORIZED_CALLER`: that is the answer of
+    /// the two methods that check for the union bridge contract themselves.
     #[test]
-    fn an_unauthorized_caller_cannot_move_the_locking_cap() {
+    fn the_authorizers_methods_throw_for_anyone_else() {
         let cfg = RskHardforkConfig::testnet();
+        let stranger = Address::repeat_byte(0xAA);
+        let constants = union_constants(&cfg);
+
         let mut c = ctx();
-        let args = (one_rbtc() * U256::from(2u64)).to_be_bytes::<32>();
-        let out = increase_locking_cap(&mut c, &args, 0, &cfg, Address::repeat_byte(0xAA)).unwrap();
-        let code = i64::from_be_bytes(out.bytes[24..32].try_into().unwrap());
-        assert_eq!(code, UnionResponse::UnauthorizedCaller.code());
+        let cap = (one_rbtc() * U256::from(2u64)).to_be_bytes::<32>();
+        assert!(increase_locking_cap(&mut c, &cap, 0, &cfg, stranger).is_err());
         assert_eq!(locking_cap(&mut c, &cfg), one_rbtc(), "unchanged");
+        // Each authorizer is its own method's alone.
+        let another = constants.change_transfer_permissions_authorizer;
+        assert!(increase_locking_cap(&mut c, &cap, 0, &cfg, another).is_err());
+
+        let both_off = [0u8; 64];
+        assert!(set_transfer_permissions(&mut c, &both_off, 0, &cfg, stranger).is_err());
+        assert!(
+            request_enabled(&mut c) && release_enabled(&mut c),
+            "unchanged"
+        );
+        let authorizer = constants.change_transfer_permissions_authorizer;
+        let out = set_transfer_permissions(&mut c, &both_off, 0, &cfg, authorizer).unwrap();
+        assert_eq!(code(out), UnionResponse::Success.code());
+
+        let mut address = [0u8; 32];
+        address[12..].copy_from_slice(union_bridge().as_slice());
+        assert!(set_contract_address_for_testnet(&mut c, &address, 0, &cfg, stranger).is_err());
+        assert_eq!(
+            contract_address(&mut c, &cfg),
+            constants.address,
+            "unchanged"
+        );
+        let authorizer = constants.change_address_authorizer;
+        let out = set_contract_address_for_testnet(&mut c, &address, 0, &cfg, authorizer).unwrap();
+        assert_eq!(code(out), UnionResponse::Success.code());
+        assert_eq!(contract_address(&mut c, &cfg), union_bridge());
+    }
+
+    /// `executeIfTestnetAndAuthorized` throws on mainnet before it asks who is
+    /// calling.
+    #[test]
+    fn the_contract_address_is_never_set_on_mainnet() {
+        let cfg = RskHardforkConfig::mainnet();
+        let mut c = ctx();
+        for caller in [
+            Address::repeat_byte(0xAA),
+            union_constants(&cfg).change_address_authorizer,
+        ] {
+            assert!(set_contract_address_for_testnet(&mut c, &[0u8; 32], 0, &cfg, caller).is_err());
+        }
+    }
+
+    /// rskj's regtest names its own authorizers (`UnionBridgeRegTestConstants`):
+    /// an account for the contract's address, and one contract for both the
+    /// locking cap and the transfer permissions.
+    #[test]
+    fn regtest_has_the_authorizers_rskj_gives_it() {
+        let cfg = RskHardforkConfig::rskj_regtest();
+        let for_the_address = addr("6c9dfd950bf748bb26f893f7e5f693c7f60a8f85");
+        let for_the_rest = addr("ff6f4ff09c54561e1476203e56fcfc834911aa64");
+
+        let mut c = ctx();
+        let doubled = one_rbtc() * U256::from(2u64);
+        let cap = doubled.to_be_bytes::<32>();
+        assert!(increase_locking_cap(&mut c, &cap, 0, &cfg, for_the_address).is_err());
+        let out = increase_locking_cap(&mut c, &cap, 0, &cfg, for_the_rest).unwrap();
+        assert_eq!(code(out), UnionResponse::Success.code());
+        assert_eq!(locking_cap(&mut c, &cfg), doubled);
+
+        let both_off = [0u8; 64];
+        assert!(set_transfer_permissions(&mut c, &both_off, 0, &cfg, for_the_address).is_err());
+        let out = set_transfer_permissions(&mut c, &both_off, 0, &cfg, for_the_rest).unwrap();
+        assert_eq!(code(out), UnionResponse::Success.code());
+        assert!(!request_enabled(&mut c) && !release_enabled(&mut c));
+
+        let mut address = [0u8; 32];
+        address[12..].copy_from_slice(union_bridge().as_slice());
+        assert!(set_contract_address_for_testnet(&mut c, &address, 0, &cfg, for_the_rest).is_err());
+        let out =
+            set_contract_address_for_testnet(&mut c, &address, 0, &cfg, for_the_address).unwrap();
+        assert_eq!(code(out), UnionResponse::Success.code());
+        assert_eq!(contract_address(&mut c, &cfg), union_bridge());
+    }
+
+    // -- RSKIP529: the super and base events ------------------------------
+
+    /// The union bridge contract testnet's tests call from.
+    fn union_bridge() -> Address {
+        addr("2c1d1ba63ca24d08a92b309db6729332c4f76834")
+    }
+
+    /// A testnet context whose union bridge contract is `union_bridge()`.
+    fn testnet_ctx() -> impl crate::RskContextTr {
+        let mut c = ctx();
+        let address = rlp_encode_bytes(union_bridge().as_slice());
+        store_long(&mut c, UNION_CONTRACT_ADDRESS_KEY, &address);
+        c
+    }
+
+    /// `bytes` as a lone ABI argument: offset, length, data padded to a word.
+    fn bytes_arg(data: &[u8]) -> Vec<u8> {
+        let mut a = U256::from(32u64).to_be_bytes::<32>().to_vec();
+        a.extend_from_slice(&U256::from(data.len()).to_be_bytes::<32>());
+        a.extend_from_slice(data);
+        a.resize(64 + data.len().div_ceil(32) * 32, 0);
+        a
+    }
+
+    /// `setSuperEvent` / `setBaseEvent` on testnet, called by `from`.
+    fn set_as(
+        c: &mut impl crate::RskContextTr,
+        key: &str,
+        event: &[u8],
+        from: Address,
+    ) -> Result<PrecompileOutput, PrecompileError> {
+        let cfg = RskHardforkConfig::testnet();
+        set_event(c, key, &bytes_arg(event), 8_000, &cfg, from)
+    }
+
+    /// `clearSuperEvent` / `clearBaseEvent` on testnet, called by `from`.
+    fn clear_as(
+        c: &mut impl crate::RskContextTr,
+        key: &str,
+        from: Address,
+    ) -> Result<PrecompileOutput, PrecompileError> {
+        clear_event(c, key, 8_000, &RskHardforkConfig::testnet(), from)
+    }
+
+    /// rskj stores the event as it came, with no RLP around it, and answers
+    /// it ABI-encoded as `bytes`.
+    #[test]
+    fn an_event_is_stored_as_it_came_and_read_back_as_bytes() {
+        let mut c = testnet_ctx();
+        let event = b"a super event".to_vec();
+        set_as(&mut c, SUPER_EVENT_KEY, &event, union_bridge()).unwrap();
+        assert_eq!(load_long(&mut c, SUPER_EVENT_KEY), event, "no RLP");
+
+        let out = get_event(&mut c, SUPER_EVENT_KEY, 3_000).unwrap();
+        assert_eq!(out.bytes.as_ref(), bytes_arg(&event).as_slice());
+        assert_eq!(out.gas_used, 3_000);
+    }
+
+    /// An absent event reads as the empty array, which rskj's `BytesType`
+    /// encodes as 96 bytes: offset 32, length 0, and one zero word of data.
+    #[test]
+    fn an_absent_event_reads_as_empty_bytes() {
+        let mut c = testnet_ctx();
+        let out = get_event(&mut c, BASE_EVENT_KEY, 3_000).unwrap();
+        let mut empty = U256::from(32u64).to_be_bytes::<32>().to_vec();
+        empty.resize(96, 0);
+        assert_eq!(out.bytes.as_ref(), empty.as_slice());
+    }
+
+    /// rskj `setSuperEvent_afterChangingUnionBridgeAddress_newAddressShouldSet_
+    /// oldAddressShouldNot` and its `clear` twin: only the contract the Bridge
+    /// currently names may write, and a refusal is a throw, not a code.
+    #[test]
+    fn only_the_union_bridge_contract_may_set_or_clear_an_event() {
+        let mut c = testnet_ctx();
+        let first = b"first".to_vec();
+        set_as(&mut c, BASE_EVENT_KEY, &first, union_bridge()).unwrap();
+
+        let stranger = Address::repeat_byte(0xAA);
+        assert!(set_as(&mut c, BASE_EVENT_KEY, b"x", stranger).is_err());
+        assert!(clear_as(&mut c, BASE_EVENT_KEY, stranger).is_err());
+        assert_eq!(load_long(&mut c, BASE_EVENT_KEY), first, "untouched");
+
+        // The address moves: the old contract is refused, the new one is not.
+        let moved = Address::repeat_byte(0x11);
+        let address = rlp_encode_bytes(moved.as_slice());
+        store_long(&mut c, UNION_CONTRACT_ADDRESS_KEY, &address);
+        assert!(clear_as(&mut c, BASE_EVENT_KEY, union_bridge()).is_err());
+        clear_as(&mut c, BASE_EVENT_KEY, moved).unwrap();
+        assert_eq!(load_long(&mut c, BASE_EVENT_KEY), Vec::<u8>::new());
+    }
+
+    /// `MAX_EVENT_DATA_LENGTH`: 128 bytes is an event, 129 is a throw.
+    #[test]
+    fn an_event_may_be_128_bytes_and_no_more() {
+        let mut c = testnet_ctx();
+        let longest = vec![0x5A; MAX_EVENT_DATA_LENGTH];
+        set_as(&mut c, SUPER_EVENT_KEY, &longest, union_bridge()).unwrap();
+        assert_eq!(load_long(&mut c, SUPER_EVENT_KEY), longest);
+
+        let too_long = vec![0x5A; MAX_EVENT_DATA_LENGTH + 1];
+        let refused = set_as(&mut c, SUPER_EVENT_KEY, &too_long, union_bridge());
+        assert!(refused.is_err());
+        assert_eq!(load_long(&mut c, SUPER_EVENT_KEY), longest, "unchanged");
+    }
+
+    /// Clearing, or setting the empty array, deletes the cell (rskj's
+    /// `addStorageBytes` stores an empty value as no value), and the two
+    /// events are separate cells.
+    #[test]
+    fn clearing_an_event_deletes_only_its_own_cell() {
+        let mut c = testnet_ctx();
+        let base = b"base".to_vec();
+        set_as(&mut c, SUPER_EVENT_KEY, b"super", union_bridge()).unwrap();
+        set_as(&mut c, BASE_EVENT_KEY, &base, union_bridge()).unwrap();
+
+        clear_as(&mut c, SUPER_EVENT_KEY, union_bridge()).unwrap();
+        let cell = super::super::storage::bridge_load_raw(&mut c, union_key(SUPER_EVENT_KEY));
+        assert_eq!(cell, None, "no value at all, not an empty one");
+        assert_eq!(load_long(&mut c, BASE_EVENT_KEY), base, "its own cell");
+
+        set_as(&mut c, BASE_EVENT_KEY, &[], union_bridge()).unwrap();
+        assert_eq!(load_long(&mut c, BASE_EVENT_KEY), Vec::<u8>::new());
+    }
+
+    /// rskj reads the offset and length words as Java ints, so a word whose
+    /// high bytes are set still says 32. Converting the whole word to a
+    /// `usize` panics on it instead.
+    #[test]
+    fn the_bytes_argument_is_read_as_rskj_reads_it() {
+        let event = b"event".to_vec();
+        let mut args = bytes_arg(&event);
+        args[..28].fill(0xFF);
+        args[32..60].fill(0x01);
+        let cfg = RskHardforkConfig::testnet();
+        let mut c = testnet_ctx();
+        set_event(&mut c, SUPER_EVENT_KEY, &args, 8_000, &cfg, union_bridge()).unwrap();
+        assert_eq!(load_long(&mut c, SUPER_EVENT_KEY), event);
+        assert!(set_event(&mut c, SUPER_EVENT_KEY, &[], 8_000, &cfg, union_bridge()).is_err());
+        assert!(
+            set_event(
+                &mut c,
+                SUPER_EVENT_KEY,
+                &args[..40],
+                8_000,
+                &cfg,
+                union_bridge()
+            )
+            .is_err(),
+            "the length word is cut short"
+        );
+    }
+
+    fn code(out: PrecompileOutput) -> i64 {
+        i64::from_be_bytes(out.bytes[24..32].try_into().unwrap())
+    }
+
+    /// rskj's amounts are signed: a word with its top bit set is a negative
+    /// cap or request, refused as INVALID_VALUE, where read unsigned it was a
+    /// huge one that wrapped the running total back under the cap.
+    #[test]
+    fn a_negative_cap_or_amount_is_an_invalid_value() {
+        let cfg = RskHardforkConfig::testnet();
+        let minus_one = [0xFF; 32];
+        let authorizer = union_constants(&cfg).change_locking_cap_authorizer;
+        let mut c = ctx();
+        let out = increase_locking_cap(&mut c, &minus_one, 0, &cfg, authorizer).unwrap();
+        assert_eq!(code(out), UnionResponse::InvalidValue.code());
+
+        let mut c = testnet_ctx();
+        store_coin(&mut c, WEIS_TRANSFERRED_KEY, U256::from(5u64));
+        let out = request_rbtc(&mut c, &minus_one, 0, &cfg, union_bridge()).unwrap();
+        assert_eq!(code(out), UnionResponse::InvalidValue.code());
+        assert_eq!(
+            weis_transferred(&mut c),
+            U256::from(5u64),
+            "the total is untouched"
+        );
+    }
+
+    /// An empty argument list reads as zeros: two falses for the permissions,
+    /// and a zero cap, which is no increase.
+    #[test]
+    fn an_empty_argument_list_reads_as_zeros() {
+        let cfg = RskHardforkConfig::testnet();
+        let constants = union_constants(&cfg);
+        let mut c = ctx();
+        let out = set_transfer_permissions(
+            &mut c,
+            &[],
+            0,
+            &cfg,
+            constants.change_transfer_permissions_authorizer,
+        )
+        .unwrap();
+        assert_eq!(code(out), UnionResponse::Success.code());
+        assert!(!request_enabled(&mut c) && !release_enabled(&mut c));
+
+        let out = increase_locking_cap(
+            &mut c,
+            &[],
+            0,
+            &cfg,
+            constants.change_locking_cap_authorizer,
+        )
+        .unwrap();
+        assert_eq!(code(out), UnionResponse::InvalidValue.code());
+    }
+
+    /// rskj's `BoolType` is `intValue() != 0`: a word whose only set bits are
+    /// above its low 32 is false.
+    #[test]
+    fn a_flag_looks_only_at_its_low_32_bits() {
+        let cfg = RskHardforkConfig::testnet();
+        let authorizer = union_constants(&cfg).change_transfer_permissions_authorizer;
+        let mut args = [0u8; 64];
+        args[0] = 1;
+        args[63] = 1;
+        let mut c = ctx();
+        set_transfer_permissions(&mut c, &args, 0, &cfg, authorizer).unwrap();
+        assert!(!request_enabled(&mut c), "only a high bit set");
+        assert!(release_enabled(&mut c));
     }
 }

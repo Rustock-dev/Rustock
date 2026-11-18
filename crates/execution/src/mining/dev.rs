@@ -28,15 +28,21 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 /// Seconds added to wall clock when stamping a mined block.
 ///
-/// Signed, because rskj's `increaseTime` takes a value that can in principle
-/// be negative, and an offset that silently clamped would make a test that
-/// went backwards pass for the wrong reason.
+/// A Java `long` in rskj (`MinerClock.timeAdjustment`), signed here too. It
+/// only grows: rskj's `increaseTime` takes a value that can be negative, and
+/// ignores it.
 static TIME_OFFSET: AtomicI64 = AtomicI64::new(0);
 
 /// Move the clock forward by `seconds` and return the new total offset, which
-/// is what `evm_increaseTime` answers with.
+/// is what `evm_increaseTime` answers with. As rskj's `MinerClock.increaseTime`,
+/// a move of no seconds or fewer changes nothing and answers the offset as it
+/// stands; a clock moved back could stamp a block before one already mined.
 pub fn increase_time(seconds: i64) -> i64 {
-    TIME_OFFSET.fetch_add(seconds, Ordering::SeqCst) + seconds
+    if seconds <= 0 {
+        return time_offset();
+    }
+    // Java's `long` addition wraps, as `fetch_add` does.
+    TIME_OFFSET.fetch_add(seconds, Ordering::SeqCst).wrapping_add(seconds)
 }
 
 /// The current offset, in seconds.
@@ -131,7 +137,11 @@ fn submit(
     let mut raw = Vec::new();
     bitcoin::consensus::Encodable::consensus_encode(block, &mut raw)
         .map_err(|e| MineError::Encode(e.to_string()))?;
-    server.submit_bitcoin_block(&raw).map_err(MineError::Submit)
+    // The node's own miner reads a refused block as the rule's error, not
+    // as the `INVALID_BLOCK` answer a miner submitting over RPC gets.
+    server
+        .submit_bitcoin_block_as(&raw, crate::mining::server::Refused::Failed)
+        .map_err(MineError::Submit)
 }
 
 #[derive(Debug)]
