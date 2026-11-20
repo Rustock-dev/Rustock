@@ -350,6 +350,259 @@ depend on. Capping `max_open_files` fixes the memory and costs 4.6x in file
 churn. A bounded block cache holding index and filter blocks does both, and is
 what `open_read_only` now configures.
 
+### 6.9a Bloom filters: tried, measured, does not work
+
+`lsm_stats` reports `# entries for filter=0` on every segbuild segment: they
+were written with no filter policy at all. The tool's own header says what that
+costs -- "a store written without a filter policy makes every point lookup pay
+an index probe and a data-block read per candidate file, for every reader,
+forever" -- and a reader cannot add a filter block afterwards, only the writer
+can.
+
+That reads like an obvious win, and the arithmetic looked persuasive: 100 blocks
+cost 17,015 block-cache misses and 2,954 MB of actual device reads, about 178 KB
+of disk per trie node fetched, against 17 candidate files. 17 x ~10 KB is
+roughly 178 KB, so "every lookup touches every file" fit the number exactly.
+
+**It was wrong.** Segment `012-3283389-3314242` was copied twice to the same
+device, one copy rewritten by a full forced compaction with a 10-bit/key full
+bloom filter (`refilter_segment`), and the two replayed interleaved over the
+same 100 blocks:
+
+| | median rate | device reads |
+|---|---|---|
+| original, no filter | **4.26 blocks/s** | ~130 MB |
+| rewritten, filters on all 6,296,521 entries | **4.17 blocks/s** | ~157 MB |
+
+The filtered copy was marginally *slower* and read *more*. Filters cost
+essentially nothing in space (684 MB -> 682 MB), and bought nothing in time.
+
+**Why, and this is the part worth keeping.** A filter tells you which file
+*not* to open. It does nothing about the number of *serialized round trips*,
+and that is what binds: a trie walk is a chain of dependent reads, each level's
+key coming from the previous level's value, so none of them can be issued in
+parallel. At the 0.78 ms random-read latency measured in 6.8, the 268
+block-cache misses per block seen here come to ~209 ms of pure waiting, which
+is ~4.8 blocks/s -- the rate actually observed, from first principles.
+
+Two further observations confirm it is latency and not volume:
+
+- the same workload reads ~130 MB on `sdb` and ~4,100 MB on `sdc` and runs at
+  the same 4.2--4.5 blocks/s. A 31x difference in bytes moved changes nothing.
+- the process sits at 57--68% CPU with 10--11% iowait: neither saturated. It is
+  stalled on round trips, not short of cycles or bandwidth.
+
+**Do not add a filter policy to `build_segments`.** The segment writer is not
+the problem, and rewriting all 97 segments would have cost hours for a
+regression. What does help is overlapping the stalls -- more workers (6.7) --
+or removing the round trips altogether (6.9b).
+
+### 6.9b Loading a segment into RAM instead of paging it in
+
+If the binding constraint is per-read latency rather than bytes, the fix is to
+stop doing random reads during replay: read the segment once, sequentially,
+into an in-memory map, then serve every lookup from RAM.
+
+This is attractive on the numbers. A segment is 684 MB--2.2 GB against the 131
+GB whole store, so unlike the store it *can* be made resident; a sequential
+read at the 211 MB/s measured in 6.8 loads one in ~3--10 s, and the load is
+parallelisable by splitting the key space across threads, which a dependent
+trie walk is not. 6.6 already measures the ceiling from the other direction:
+with the working set resident and **zero** device reads, the same replay ran at
+**26.75 blocks/s against 4.5 cold**, 10.6x.
+
+**Measured, and it works: 7.7x.** Segment `012-3283389-3314242` (684 MB) was
+copied onto `tmpfs` and replayed interleaved against the identical copy on
+`sdb`, same 100 blocks, same `--cache 500000`, three repetitions each:
+
+| | rep 1 | rep 2 | rep 3 | median |
+|---|---|---|---|---|
+| disk (`sdb`) | 4.56 | 4.58 | 4.53 | **4.56 blocks/s** |
+| RAM (`tmpfs`) | 35.00 | 35.14 | 35.45 | **35.14 blocks/s** |
+
+Every root matched on both sides. Note how tight the RAM figures are: the
+variance on disk is the device, not the workload.
+
+**This settles the 6.6 / 6.7 disagreement in favour of 6.6.** The zero-I/O rate
+is tens of blocks per second, not 4.57, and 35 blocks/s is precisely the figure
+6.9 reports for a well-configured handle -- a number that turns out to be
+unreachable from this device at all, and routine from RAM.
+
+`tmpfs` is a *lower bound* on an in-memory map, because it still pays RocksDB's
+per-`get` cost: index probe, block decode, syscall. A hashtable keyed by node
+hash skips all three. So 7.7x is the floor of what this design buys, not the
+ceiling.
+
+**What binds next is no longer the trie.** At 33 blocks/s from RAM the process
+uses ~0.6 of one core with three cores idle, and iowait is still 9--12%. That
+residual is the *block store*: replay reads a header and a body per block from
+`/var/lib/rustock`, which 6.7 already flagged at ~560 IOPS for 280 blocks/s. So
+once the trie is resident the block store becomes the next thing worth
+attacking, and single-worker CPU is nowhere near the limit -- which is what
+makes the worker scaling in 6.7 worth having on top.
+
+Two constraints to carry into any design:
+
+- **Representation, not just residency.** 6.3 M entries as
+  `HashMap<Vec<u8>, Vec<u8>>` costs two `Vec` headers and two allocations each,
+  and would land near 2--3x the on-disk size. Keys here are content hashes, so
+  a `HashMap<[u8; 32], (u32, u32)>` over one values arena is ~56 bytes of index
+  per entry plus the values back-to-back: roughly 950 MB for a 684 MB segment,
+  which fits where the naive form does not.
+- **RAM scales with workers.** 6.7 already notes that each worker needs its own
+  segment resident, and that "8 x 512 MB plus the OS does not fit in 7.7 GB".
+  At ~950 MB per segment this box supports about three workers, which is also
+  where core scaling flattens.
+
+### 6.9c The staged-segment rate across eras, measured
+
+6.9b measured one segment. Running scoped re-execution over fourteen ranges of
+2,001 blocks each, every segment staged into `tmpfs` first, gives the rate
+across the whole Unitrie era:
+
+| range | segment | blocks/s |
+|---|---|---|
+| twoToThree | 002 | 60.35 |
+| papyrus200 / UMM | 004 | 54.94 |
+| iris300 | 020 | 44.32 |
+| hop400 / RSKIP294 | 044 | 46.65 |
+| hop401 / RSKIP353+357 | 048 | 49.92 |
+| fingerroot500 / RSKIP374+385 | 052 | 52.81 |
+| arrowhead600 / RSKIP376+400 | 060 | 41.61 |
+| arrowhead631 | 065 | 46.45 |
+| lovell700 / RSKIP419+438 | 076 | 46.16 |
+| reed800 / RSKIP305 | 084 | 51.71 |
+| vetiver900 | 091 | 47.15 |
+| rskip351 | 093 | 42.53 |
+| dense era #8.5M | 088 | 44.75 |
+| dense era #9.15M | 095 | 52.60 |
+
+**41--60 blocks/s, against 4.5 from the device.** So the 7.7x of 6.9b was
+conservative; across eras the staged rate is **9--13x**, and it does not decay
+with chain height the way the on-device rate does (6.4: 10.53 at #2.5M falling
+to 4.52 at #9.15M). That decay was the device, not the work.
+
+28,014 blocks were re-executed this way with every state root matching, in
+1,246 s wall including staging and open costs.
+
+At this rate a full pass over the Unitrie era is ~2 days on one worker, which
+is the first point at which exhaustive re-execution is worth planning rather
+than dismissing.
+
+**Three ranges could not run at all**, and the reason is worth recording
+because it looks like a failure and is not: `bahamas` (#3,397), `orchid`
+(#729,000) and `wasabi100` (#1,591,000) sit at or below the first block whose
+header carries a Unitrie root. `replay_bench` seeds from `from - 1`, and no
+Unitrie pre-state exists there, so it refuses to start -- distinctly from a
+root mismatch. Blocks 1--1,590,999, 17% of the chain, stay unverifiable by
+re-execution until the recorded-roots baseline of 8 is built.
+
+### 6.9d A segment cannot validate a read the builder never made
+
+This cost most of a night, so it is worth stating plainly: **a segbuild segment
+holds the trie nodes its build touched, not the whole state at its heights.**
+A segment is therefore sound for replaying the code that built it, and unsound
+for validating code that reads state that code never read.
+
+How it surfaced. Re-executing #374 against segment `093-8920462-9017691`
+diverged at mainnet #8,922,011: gas and fees identical, but `tx[3]` emitted 3
+logs where the header implies 0, and a peg-in was refunded that mainnet never
+refunded. `replay_bench` reproduced it from a different seed, pre-374 matched
+the header, and `git bisect` named `a1cdd41` ("registerBtcTransaction
+classifies by rskj's pegout index"). All of which pointed at a consensus bug
+in #374.
+
+It is not that, or at least not shown to be. `a1cdd41` makes
+`registerBtcTransaction` read the RSKIP379 pegout index, which earlier code
+wrote and never read. Instrumenting the classification:
+
+```
+DIAG  rsk=#8922011 btc_height=952667 pegout_index=true rskip379=true start=841909
+DIAG2 sig_hash=cbf77977... in_index=false live_outputs=1 n_inputs=3 witness_inputs=3
+DIAG3 fixture_6241417 in_index=false
+DIAG3 fixture_6245419 in_index=false
+```
+
+The gate is right (952,667 is past 841,909). But the last two lines are the
+answer: those are sighashes **rskj's own mainnet node holds**, taken from the
+fixture `a1cdd41` itself added, written by pre-374 code at RSK #6,241,417 and
+#6,245,419 under a key derivation identical in both versions
+(`compound_key(PEGOUT_TX_SIG_HASH_KEY, "-", to_hex(sig_hash))`,
+`save_pegout_tx_sig_hash`). They read as absent too. The index is not
+mis-keyed; it is **not in the segment at all**.
+
+Which follows from how segments are built. Pre-374 wrote index entries when it
+created each pegout, in whichever segment covered that height, and never read
+them again. Segment 093's build never read the entries written at #6.2M, so
+those leaves were never captured into it. Post-374 reads them, finds nothing,
+and classifies an indexed pegout as a peg-in -- then refunds it, which writes
+state and emits events. Pre-374 is immune by construction: it never looks.
+
+**The asymmetry is the trap.** This failure mode can only ever appear in the
+newer code, which makes it look exactly like a regression the newer code
+introduced. A passing pre-374 run is not a control here.
+
+Consequences worth carrying:
+
+- Segment replay validates **execution arithmetic** well -- gas, fees, state
+  roots for ordinary transactions -- and cannot validate **new state reads**.
+  The 28,014 blocks of 6.9c are sound; they simply contained no such read.
+- Before blaming a divergence on code, check whether the state it reads is in
+  the segment. A clean `None` from a trie lookup is not evidence of absence
+  from the chain, only from the store.
+- To settle such a case the block has to run against a **complete** state. That
+  is currently awkward: `inspect_block` takes a single RocksDB trie, while the
+  production store is an epoch-structured backend it cannot open. Closing that
+  gap is the prerequisite for using replay as consensus evidence at all.
+
+### 6.9e Why the re-executor uses a fixed worker count
+
+Sergio asked whether `reexec_all` should spawn workers dynamically -- filling
+memory with whatever segments fit rather than running a fixed two -- and noted
+that this becomes a subset-packing / multi-knapsack problem, worth solving only
+if the segments differ greatly in size.
+
+They do not. Measured over the 96 segments the tool actually processes:
+
+| | |
+|---|---|
+| min / median / mean / max | 2 / 1,297 / 1,321 / 2,182 MB |
+| std dev | 370 MB |
+| **coefficient of variation** | **0.28** |
+
+Apart from one 2 MB oddity (`096`, 64 blocks) everything sits between 684 and
+2,182 MB. Optimal packing of near-identical items is just "as many as fit",
+which is what the scheduler already does: `Sched::take` picks the first segment
+fitting the remaining budget and a worker with nothing that fits waits on a
+condvar. Concurrency is therefore **already memory-limited rather than
+thread-limited**; `--threads` only caps the handful of occasions when three or
+four of the smallest would fit.
+
+**What actually binds is the fixed per-worker cost.** With
+`need = size + 1100` against a 4,889 MB budget:
+
+| segment | need | max concurrent |
+|---|---|---|
+| smallest | 1,102 MB | 4 |
+| median | 2,397 MB | **2** |
+| largest | 3,282 MB | 1 |
+
+The 1,100 MB fixed term is 33--62% of each worker's footprint, and it is what
+holds the median at two.
+
+**So the return is in shrinking that term, not in packing better.** Each worker
+opens its own handle to the 131 GB fallback trie, which costs a separate 64 MB
+block cache plus pinned index and filter blocks -- and `run_segment` opens it
+**per segment**, at ~35 s each. Over 95 segments that is ~55 minutes of pure
+open time, about 8% of an 11-hour run. Opening it once and sharing the `Arc`
+recovers both the memory and the time, and may free enough to allow a third
+worker.
+
+Two ceilings to keep in view: 6.7 measures worker scaling flattening at ~3.2x
+on these four cores, so a fourth worker buys little regardless; and dynamic
+thread count only becomes interesting *after* the fixed cost is reduced, because
+that is when the size variance starts to matter relatively more.
+
 ### 6.10 Sliding-window miss rate
 
 The build design Sergio proposed keeps the last few block-ranges' nodes in RAM
@@ -401,6 +654,39 @@ sealed dense tables over the archive as the miss path, and it is the difference
 between a 14% tax and losing about 40% of throughput.
 
 Keep the archive reachable as a correctness net that should never fire.
+
+### 6.9f Extending the set past where the archive stops
+
+The archive at `/mnt/import/rustock-trie` holds the state root of #9,238,111
+and not of #9,238,112, measured by bisection (`archive_bound`, which probes
+each height's state root for presence). The segments end at #9,230,008, so the
+archive outruns them by 8,103 blocks and falls about 190,000 short of the
+chain head.
+
+That sounds like it bounds the backfill, and it does not. An archive is
+cumulative: its upper bound says which *state roots* it can seed from, not
+which nodes it holds. A node still live at #9,300,000 that was last written at
+#5,000,000 is in the archive, because the archive recorded it when it was
+written. Replaying forward from a seed needs exactly two things -- a complete
+seed state, and every node written before the archive's cap -- and both hold
+well past the cap. Measured: a build seeded at #9,230,008 ran to #9,420,000 --
+181,889 blocks beyond the cap -- verifying all 189,992 state roots, at 68.4
+blocks/s, with the fallback rate *falling* from 1.9% to under 0.3% as the
+window warmed.
+
+What the cap does bound is **parallelism**. Each chunk seeds from the parent
+state root of its own first block, and `run_chunk` takes one fallback store.
+Below the cap that root is in the archive, so the original 97 segments could be
+built in any order -- which is how they were built. Above it, the only copy of
+that root is in the previous chunk's sealed output, which the next chunk cannot
+reach. So the backfill past #9,238,111 is inherently **sequential, one worker**,
+and the natural shape is a single long chunk resuming from its own checkpoint
+rather than a queue of independent ones. One large segment is in keeping:
+`000-1-1591000` is 9.6 GB across 1,591,000 blocks, against a 1.35 GB median.
+
+Chaining fallbacks -- a chunk reading from the archive *and* its predecessor's
+sealed store -- would restore parallelism here, and is the same capability
+needed to extend the set from the node's own store later. It is not implemented.
 
 ## 7. Answers
 
@@ -489,11 +775,17 @@ permanent and every later run agrees with it. That is regression detection, not
 correctness -- worth having, but only trustworthy if something independent
 validates it.
 
-One independent check exists and is a single comparison. **#1,591,000 is the
-first block whose header carries a Unitrie root.** Replaying 0 -> #1,591,000
-from genesis and matching that header validates the entire cumulative pre-Unitrie
-state -- every balance, nonce, code blob and storage cell that survived to that
-point. Trust the baseline only if that anchor holds.
+One check comes from our own data and is a single comparison. **#1,591,000 is
+the first block whose header carries a Unitrie root.** Replaying 0 ->
+#1,591,000 from genesis and matching that header validates the entire
+cumulative pre-Unitrie state -- every balance, nonce, code blob and storage
+cell that survived to that point. Trust the baseline only if that anchor holds.
+
+**It is not the only independent check, and the claim that it was cost an
+afternoon.** This section said so until 2026-11-20, and §8.3 records what it
+missed: rskj's migration left a table mapping every pre-fork Orchid state root
+to the Unitrie root holding the same state, and that table is a per-block
+oracle for the whole era, obtained by lookup rather than replay.
 
 The finer-grained check would be the Orchid conversion, per block or at
 intervals, which is what rskj 1.x did while building its Unitrie from genesis.
@@ -512,8 +804,9 @@ reads as 1,591,000 failures instead of one "baseline is stale".
 ### 8.1 Cost
 
 `cargo run --release -p rustock-cli --example pre_unitrie_roots -- <block-dir>
-<trie-dir> <count> [orchid-interval] [csv]` replays from genesis, recording the
-computed root per block and optionally running the Orchid check.
+<trie-dir> <roots-db> <count> [orchid-interval]` replays from genesis, recording
+the computed root per block into `<roots-db>` and optionally running the Orchid
+check.
 
 | | |
 |---|---|
@@ -524,6 +817,163 @@ computed root per block and optionally running the Orchid check.
 Early blocks run 20x faster than Unitrie-era ones (4--5 blocks/s): they are
 nearly empty and the whole trie stays resident, which is the same locality
 effect §6.5 measures from the other side.
+
+### 8.2 Making the era run like every other segment
+
+The baseline of §8 exists and is anchored. `pre-roots.csv` holds a computed
+Unitrie root for each of blocks 1..1,591,000, and its last row equals the
+header state root of #1,591,000 -- the first header to carry a Unitrie root --
+so the cumulative pre-Unitrie state is validated end-to-end, which is the only
+independent check the era admits. Segment `000-1-1591000` already holds the
+nodes: five recorded roots spanning #1 to #1,591,000 all probe PRESENT in its
+sealed store.
+
+So nothing is missing. What is missing is that none of it is automatic:
+`reexec_all` refuses the segment outright, and the baseline is a 135 MB CSV on a
+scratch volume that no tool reads and that would not travel with the database if
+it were handed to anyone.
+
+**Two things stop `run_segment` from replaying the era**, both from headers
+below #1,591,000 declaring Orchid roots:
+
+1. *Seeding.* It seeds from `header(start-1).state_root`. For this segment that
+   is an Orchid hash, which is not a key in a Unitrie store, so the lookup
+   misses and the run aborts with "no pre-state". Block 1's true seed is the
+   genesis state built from `ChainConfig::mainnet()`, not anything stored.
+2. *The expected root.* It compares each computed root against
+   `header.state_root`. Below the fork that is an Orchid root, so every block
+   mismatches by construction.
+
+**The baseline becomes part of the segment.** A separate CSV defeats the point:
+the goal is that the era verifies like any other range, and a segment that needs
+an external file to be checked is not self-contained. It is written to
+`000-1-1591000/baseline`, so shipping the segment ships its own proof
+obligation.
+
+Format is a fixed 32-byte stride, block *N* at offset `(N-1)*32`, behind a short
+header carrying a magic, a **schema version**, the block range, and the anchor
+root. Fixed-width means a worker seeks to any block in O(1) with no index, which
+is what makes the era range-parallelisable at all. The schema version is §8's
+instruction taken literally: a deliberate change to trie encoding or key mapping
+legitimately changes every recorded root, and without a tag that reads as
+1,591,000 failures rather than one "baseline is stale". A flat file rather than
+RocksDB because fixed-width records with a computable offset need no LSM, no
+column family and no block cache; it is ~50.9 MB and one file to checksum.
+
+**The verification rule** for a segment below the fork:
+
+- seed from the genesis state when the range starts at block 1, otherwise from
+  `baseline[start-1]`;
+- the expected root for block *N* is `baseline[N]`, not the header;
+- at #1,591,000 assert `baseline[N] == header.state_root` as well.
+
+That last line is not a formality and must never become optional. Checking
+rustock against roots rustock recorded is regression detection, not
+correctness: a wrong root at #400,000 becomes permanent and every later run
+agrees with it. The anchor is the single point where the era is measured against
+the chain instead of against itself, so a run that skips it has verified nothing
+about correctness, however green it looks.
+
+**Splitting the era beats making the tool cope with its size.** The segment is
+9,797 MB against a 7,746 MB box, so residency is not merely over budget but
+impossible with the node stopped. The obvious repair is to teach the replayer to
+work straight off RocksDB, and that was the first plan here. Sergio's is better:
+rebuild the era as nine ~1 GB segments instead. Each then loads resident and
+runs through the existing per-segment scheduler, and the two mechanisms the
+first plan needed -- a non-resident replay path and a sub-range scheduler --
+are not needed at all. Fewer moving parts for the same result.
+
+The split has to be a **rebuild**, not a partition of what exists.
+`segments.csv` shows the era was sealed in 110 block-delimited flushes, so the
+boundaries were known at build time, but all of them were flushed into one
+RocksDB and compaction has since reorganised them into 167 SSTs ordered by node
+hash. Trie nodes are content-addressed and carry no block number, so nothing
+survives to cut along. Re-running the builder over nine sub-ranges, each seeded
+from `baseline[start-1]`, is the only way -- and the baseline is the enabler
+either way, so this costs no groundwork beyond it.
+
+The nine will not sum to 9,797 MB. Copy-on-read means each captures the live
+state its own range touches, so early-era nodes are re-captured in several
+chunks; expect 12--15 GB total. Against 173 GB free that is noise, and it buys
+permanent residency and parallelism for the era.
+
+Numbering uses **900--908**, a distinct pre-fork group. `000`--`008` would
+collide with the existing post-fork `001`--`096`, and a duplicate index is the
+overlapping-range hazard of §11 reintroduced deliberately. 900--908 parse under
+the same `NNN-start-end` convention and need no renames anywhere.
+
+When the nine verify, the monolithic `000-1-1591000` is **retired by rename**.
+Leaving it in place would give segbuild two overlapping covers of blocks
+1--1,591,000, which is the same trap; the manifest must describe one set.
+
+Parallelism then comes from the baseline rather than from residency, which is
+§8's "record the root keyed so that a worker starting at block N can look up its
+parent's" and the reason that section said the era is serial only once. The
+original recording run logged `elapsed_s` 13,972 at #1,591,000 -- 3.9 hours
+serial -- so three workers rebuild the era in about an hour and a half.
+
+### 8.3 rskj's migration table is a per-block oracle for the era
+
+The baseline is ours, so agreeing with it proves determinism and not
+correctness. §8 concluded from that the era has one independent check, the
+anchor at #1,591,000. That was wrong, and the omission is worth recording
+because it turned a 37,840-block question into a four-hour replay when a
+lookup would have answered it.
+
+When rskj migrated to the Unitrie at RSKIP126 it kept a mapping from each
+pre-migration **Orchid** state root to the Unitrie root holding the same
+state, in a `stateRoots` database. Every block below the fork declares an
+Orchid root in its header, so for any such block:
+
+```
+header(N).stateRoot  ->  rskj's stateRoots  ->  the Unitrie root rskj migrated
+```
+
+compared against `baseline[N]`. Nothing in that chain is derived from anything
+rustock computed, which is exactly what the baseline cannot provide about
+itself. `baseline_audit` is the tool; the table lives at
+`/mnt/import/paseo/rskj-stateRoots` and is **not regenerable on this machine**
+(see the notice beside it).
+
+What §8 did consider and correctly rejected is the *Orchid conversion* --
+computing an Orchid root from a Unitrie and comparing it to the header -- which
+remains unavailable for the REMASC `siblings` reason below. The table is the
+other direction, a stored mapping rather than a computation, and it never
+stopped working.
+
+**Measured 2026-11-20.** Auditing the baseline recorded on 2026-11-09 against
+the table reported 37,840 differing blocks in exactly one contiguous run,
+#729,030..#766,869, and named rskj's root for each. An independent
+genesis-relative replay of the same range produced the identical count and the
+identical rejoin point, #766,870. The two methods agree to the block, and the
+lookup takes minutes against the replay's 1.47 hours.
+
+It also settled which build was right, which the anchor alone could not have
+done quickly: at #729,030 the table gives the root the *current* build
+computes, not the one the old baseline recorded. Orchid activates at #729,000
+and RSKIP87 with it, so from that height a whitelist getter writes the
+`unlimitedLockWhitelist` cell back as rskj's `save()` does. The first affected
+block in 1.59M is thirty blocks after the fork that enables the write, the
+difference is overwritten 37,840 blocks later, and the anchor matches either
+way -- which is why the anchor could not localise it and the table could.
+
+**The whole era, audited.** Against the corrected baseline the table reports
+1,590,999 checked, 1,590,999 agreed, 0 differing, and exactly one block with no
+entry: **#1,591,000**. That is the right answer rather than a gap. Orchid roots
+exist only *below* the fork, and #1,591,000 is the first block whose header
+carries a Unitrie root -- so it has nothing to translate, and it is precisely
+the block the anchor checks. The table covers #1..#1,590,999, the anchor covers
+#1,591,000, and between them every root in the era is verified against
+something rustock did not produce.
+
+So the era is better off than §8 claimed, and in a way that changes how a
+baseline should be made. Since `table[header(N).stateRoot]` *is* `baseline[N]`
+for every block below the fork, a baseline can be generated by lookup in
+minutes instead of derived from a replay in hours -- and it would then be
+independent of rustock by construction rather than audited against something
+independent afterwards. The replay route remains useful as a cross-check, and
+the two agreeing to the block is what established that today, but it should not
+be the primary route.
 
 ## 9. What this does not answer
 
@@ -655,24 +1105,67 @@ roots suggests a specific condition rather than a broken method.
 - **The run survived an OOM kill** (a `cargo` link step on the same box took the
   memory) and several restarts, because chunks are claimed and checkpointed.
   A killed worker re-takes its own chunk and resumes.
+- **`reexec_all` reported `ALL SEGMENTS VERIFIED` after executing 0 blocks.**
+  Found while verifying the backfilled segment 097. When the smallest pending
+  segment does not fit `--budget-mb` the scheduler clears its queue and drains,
+  which is correct -- a run that cannot proceed should not hang. But the final
+  verdict tested only whether a divergence had been recorded, so a run that did
+  no work at all took the same exit path as a run that verified everything, and
+  exited 0. The tool whose entire purpose is to certify a database before it is
+  handed to another developer could therefore certify one it had never read.
+  Fixed by comparing `blocks_done` against the planned `total_blocks` and
+  exiting 2 with `INCOMPLETE` unless they match; the pass line now names the
+  count it verified. The general shape is worth remembering: a green light
+  conditioned on the absence of failures, rather than on the presence of
+  completed work, passes vacuously.
 
 ## 11. Where the segment databases live
 
-**Current layout, since 2026-09-20.** All 97 chunks live in one directory:
+**Current layout, since 2026-11-20.** All 98 segments live in one directory,
+owned by `paseo` rather than root so the set can be managed without privilege:
 
 ```
-/var/lib/rustock/segbuild/          139 GB, 97 chunks
-/mnt/import/replay/chunks/          97 completion markers, <idx>-<start>-<end>.done
+/var/lib/rustock/segbuild/          151 GB, 98 segments, #1..#9,420,000
+/var/lib/rustock/segbuild/MANIFEST  the authoritative segment list
+/mnt/import/replay/chunks/          97 build-time markers (historical, see below)
 ```
 
-Plus `095-9133348-9229943.truncated-superseded-20260917`, the retained first
-attempt at chunk 095 (§11.4), which is not one of the 97.
+**Selection goes through `MANIFEST`, not through a directory listing.** Three
+retired directories sit alongside the live ones, and some of their ranges
+overlap real segments:
 
-The chunks were consolidated from two volumes onto one, verified by a full
-checksum comparison reporting zero differences, then confirmed as 97 chunks
-matching 97 markers and tiling `#1..#9,230,008` with no gaps. Sections 11.1 and
-11.2 below describe the **build-time** layout and are kept because they explain
-why the build ran the way it did, not where anything is now.
+| | |
+|---|---|
+| `095-...truncated-superseded-20260917` | first attempt at 095, kept deliberately (§11.4) |
+| `012-2938787-3081559.abandoned-empty-superseded-20261120` | 1 MB abandoned output directory |
+| `044-4794523-4932211.abandoned-empty-superseded-20261120` | 1 MB abandoned output directory |
+
+The latter two were found on 2026-11-20 while backfilling. Each was 1 MB, held a
+`sealed` directory with no real contents, had no `.done` marker, and carried the
+build's own timestamp of 2026-09-20 14:20:55 -- ranges that were claimed, had
+an output directory created, and were abandoned when the chunking was revised.
+Because `012-2938787-3081559` straddles the 007/008 boundary and
+`044-4794523-4932211` straddles 046/047, the numbers 012 and 044 each appeared
+twice and a listing showed 100 entries for a set of 97.
+
+The hazard was not untidiness. A reader selecting by range could have opened one
+of them for a block the real segments cover, missed every node, and -- under the
+abort-on-missing-node rule (#398) -- reported a consensus divergence with no
+consensus problem behind it. Both have been retired by rename; nothing was
+deleted. A live segment is now exactly a directory named `NNN-start-end`, and
+anything with a suffix is not one.
+
+`MANIFEST` records index, start, end, bytes and sealed-store presence per
+segment, plus the retired names, and is regenerated rather than maintained:
+
+```
+/home/paseo/ops/segbuild-manifest.sh            # regenerate
+/home/paseo/ops/segbuild-manifest.sh --check    # exit 1 if it drifts from disk
+```
+
+It replaces the `.done` markers as the authority. The markers remain useful
+history but cannot be the authority any longer: they live on another volume
+under root, so segment 097 has none and never will.
 
 ### 11.1 Why the build used two volumes (historical)
 
@@ -854,3 +1347,62 @@ The truncated copy is retained deliberately rather than deleted: it is the
 artifact that the two Bridge consensus bugs produced, and it costs 1.4 GB. It is
 excluded from the verification commands in §11.3 by its suffix. Delete it only
 deliberately.
+
+### 11.5 Segment 097: the backfill to #9,420,000
+
+`097-9230009-9420000` extends the contiguous range from #9,230,008 to
+#9,420,000. Built 2026-11-20 by a single sequential chunk (§6.9f): 189,992
+blocks at 68.4 blocks/s, 2.7 GB over 5 seals, every state root verified during
+construction. It carries the same `sealed/`, `checkpoint` and `segments.csv` as
+the others.
+
+**Self-contained for re-execution, after one repair.** Replaying all 189,991
+blocks from the segment alone -- the archive attached only to record reads the
+segment could not serve -- took *zero* fallback reads and found zero absent
+nodes, at 141.9 blocks/s RAM-resident. No bridge-node holes, unlike the older
+segments (§11.3b): those came from the builder running pre-#374 code while the
+re-executor read the peg-out index, and 097 was built with the post-#374 binary.
+
+That distinction is the point, not pedantry. Roots verified *during
+construction* is a weaker claim than roots verified *from the segment alone*,
+because the archive is reachable as a fallback throughout a build -- which is
+exactly how the older segments came to hold holes while reporting a clean build
+(§6.9d).
+
+**But a clean replay was not sufficient either, and nearly passed as if it
+were.** `reexec_all` reports its range for this segment as `#9230010..#9420000`:
+it seeds from the state root of the segment's *first* block and replays from the
+second, so it never reads the parent root of #9,230,008. That node is the one
+read in the whole build that escapes capture -- `build_segments` takes it
+straight from the fallback (§11.3a, first row) -- and it was **absent**,
+confirmed by probing the sealed store for it directly. A consumer replaying the
+segment from its own first block, which is the normal thing to do, would have
+failed at step one, while the verifier reported zero gaps.
+
+Repaired with `repair_chunk --limit 1`, which adds the root and the enumerated
+key set's descent through it: 1,003 nodes, purely additive. `probe_seed` now
+reports the seed present for every segment in the set, 097 included.
+
+The general lesson is the same shape as the vacuous green light in §10.5: the
+verifier's range and the segment's range differed by one block, and the
+difference was exactly the node that no other read covers. A verification whose
+bounds are derived from the artifact it is verifying can agree with itself while
+both are wrong.
+
+**A limit worth knowing before relying on 097.** The §11.3b repair -- the
+enumerated precompile and Bridge key set walked at sampled roots -- cannot be
+run across most of this segment. It sources missing nodes from the archive, and
+the archive stops at #9,238,111 (§6.9f), while 097 runs to #9,420,000. So
+roots above #9,238,111 can be repaired only from some other complete source;
+the node's own store is garbage-collected and holds only what is live now. For
+re-execution of its own range this does not matter, which is what the clean
+replay above establishes. For a consumer issuing reads rustock does not make,
+097 is repairable only over its first 8,103 blocks.
+
+Copied onto `sdc` cross-device and verified by a full checksum comparison of all
+58 files with zero differences, then renamed into place.
+
+The range stops at a fixed #9,420,000 rather than at the head because a chunk
+needs a terminating bound. The residual gap to the head -- a few thousand blocks
+and growing -- is what the live capture closes, and it is the reason the capture
+exists rather than a second backfill.

@@ -34,6 +34,8 @@ tmp/
 # root-owned file under /etc, referenced from the config as ${NAME} — never
 # committed. These patterns stop a stray copy in the working tree.
 *.env
+.env.*
+!.env.example
 pegout-alerts.toml
 !pegout-alerts.example.toml
 
@@ -48,3 +50,8 @@ pegout-alerts.toml
 /wallet/
 /client/
 /server/
+
+# Agent-local settings. settings.local.json records tool permissions for this
+# checkout and is per-machine, not per-project; it is also exactly the kind of
+# file that should never reach a commit.
+/.claude/

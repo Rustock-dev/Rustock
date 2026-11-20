@@ -1,6 +1,6 @@
 # The `examples/` tools
 
-Sixty small programs under [`crates/cli/examples/`](../crates/cli/examples/),
+Eighty-five small programs under [`crates/cli/examples/`](../crates/cli/examples/),
 each answering one question about a running or stopped node. They are
 `cargo` examples rather than subcommands so they stay out of the node binary
 and out of its argument surface: a diagnostic that only three people will
@@ -87,6 +87,29 @@ usage.
 | [`probe_seed`](../crates/cli/examples/probe_seed.rs) | Is each segment chunk missing the parent state root of its own first block? |
 | [`snap_serve_check`](../crates/cli/examples/snap_serve_check.rs) | Does snapshot sync work on the real trie? |
 | [`pin_cost`](../crates/cli/examples/pin_cost.rs) | What does pinning the snapshot checkpoint cost the collector? |
+| [`reexec_all`](../crates/cli/examples/reexec_all.rs) | Re-execute an era against the segment set on N threads, verifying every state root. The tool that certifies the set. |
+| [`repair_segments`](../crates/cli/examples/repair_segments.rs) **(writes)** | Fill a segment's holes by re-executing the blocks that exposed them, in dependency order. |
+| [`replay_ram`](../crates/cli/examples/replay_ram.rs) | Replay a block range with the whole segment held in a plain in-memory map. |
+| [`archive_bound`](../crates/cli/examples/archive_bound.rs) | How high does an archive trie actually reach? |
+| [`refilter_segment`](../crates/cli/examples/refilter_segment.rs) **(writes)** | Rewrite a segment's SSTs with a bloom policy. The measurement behind §6.9a's negative result. |
+| [`key_shape`](../crates/cli/examples/key_shape.rs) | Key and value shape of a trie store: fixed-length keys, and how large do values get? |
+
+## The pre-RSKIP126 root baseline
+
+Headers below #1,591,000 declare Orchid-format state roots, which are not
+Unitrie roots: they cannot be compared against a computed root, nor seeded
+from. These tools supply what the headers cannot. See
+[`trie-segments-design.md`](trie-segments-design.md) §8.
+
+| tool | what it answers |
+|---|---|
+| [`baseline_build`](../crates/cli/examples/baseline_build.rs) **(writes)** | Pack recorded roots into the versioned baseline, refusing one whose anchor does not match the chain. |
+| [`baseline_from_rskj`](../crates/cli/examples/baseline_from_rskj.rs) **(writes)** | Build the baseline from rskj's migration table by lookup — independent of anything rustock computed. |
+| [`baseline_info`](../crates/cli/examples/baseline_info.rs) | Validate a baseline and report its range and anchor. |
+| [`baseline_audit`](../crates/cli/examples/baseline_audit.rs) | Audit a baseline against rskj's Orchid-to-Unitrie table, block by block. |
+| [`baseline_probe`](../crates/cli/examples/baseline_probe.rs) | Check individual pre-fork blocks independently — no replay chain needed. |
+| [`baseline_rebuild`](../crates/cli/examples/baseline_rebuild.rs) **(writes)** | Recompute a stale baseline tail, refusing to write unless it reaches the anchor. |
+| [`baseline_seed_repair`](../crates/cli/examples/baseline_seed_repair.rs) **(writes)** | Give a pre-fork segment the one node it needs to replay its own first block. |
 
 ## Recovery and surgery
 
@@ -100,6 +123,11 @@ usage.
 | [`verify_range`](../crates/cli/examples/verify_range.rs) | Verify a range of blocks against rskj's own state, reporting every divergence rather than stopping at the first. |
 
 ## rskj interoperability
+
+| tool | what it answers |
+|---|---|
+| [`make_empty_rocksdb`](../crates/cli/examples/make_empty_rocksdb.rs) **(writes)** | Create an empty valid RocksDB, for a consumer that must open a store it never reads. |
+
 
 | tool | what it answers |
 |---|---|

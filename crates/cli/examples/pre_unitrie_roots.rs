@@ -65,7 +65,9 @@ fn open_roots_db(path: &str) -> anyhow::Result<DB> {
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let block_dir = args.next().expect("usage: pre_unitrie_roots <block-dir> <trie-dir> <count> [orchid-interval] [csv]");
+    let block_dir = args.next().expect(
+        "usage: pre_unitrie_roots <block-dir> <trie-dir> <roots-db> <count> [orchid-interval]",
+    );
     let trie_dir = args.next().expect("trie-dir");
     let roots_db = args.next().expect("roots-db");
     let count: u64 = args.next().expect("count").parse()?;

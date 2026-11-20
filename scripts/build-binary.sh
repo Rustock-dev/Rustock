@@ -45,6 +45,12 @@ cd "$repo"
 
 crate_version="$(awk -F'"' '/^version *=/ {print $2; exit}' crates/cli/Cargo.toml)"
 [ -n "$crate_version" ] || fail "cannot read the version from crates/cli/Cargo.toml"
+# One source of truth for the compiler: rust-toolchain.toml is what a local
+# `cargo build` obeys, so the container is told to use the same one rather than
+# relying on the Dockerfile's ARG default staying in step by hand.
+rust_version="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)"
+[ -n "$rust_version" ] || fail "cannot read the [toolchain] channel from rust-toolchain.toml"
+
 commit="$(git rev-parse --short HEAD)"
 version="${crate_version}-${commit}"
 if [ -n "$(git status --porcelain)" ]; then
@@ -62,6 +68,7 @@ docker buildx build \
     --platform "linux/${arch}" \
     --file docker/build.Dockerfile \
     --target binary \
+    --build-arg "RUST_VERSION=${rust_version}" \
     --build-arg "FEATURES=${FEATURES:-}" \
     ${TOOLS:+--build-arg "TOOLS=${TOOLS}"} \
     --output "type=local,dest=${staging}" \
@@ -74,6 +81,7 @@ docker buildx build \
     --platform "linux/${arch}" \
     --file docker/build.Dockerfile \
     --target tools \
+    --build-arg "RUST_VERSION=${rust_version}" \
     --build-arg "FEATURES=${FEATURES:-}" \
     ${TOOLS:+--build-arg "TOOLS=${TOOLS}"} \
     --output "type=local,dest=${staging}/tools" \
