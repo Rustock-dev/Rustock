@@ -9,3 +9,6 @@ docs
 tools
 *.md
 !README.md
+.env
+.env.*
+!.env.example

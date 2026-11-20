@@ -34,6 +34,8 @@ tmp/
 # root-owned file under /etc, referenced from the config as ${NAME} — never
 # committed. These patterns stop a stray copy in the working tree.
 *.env
+.env.*
+!.env.example
 pegout-alerts.toml
 !pegout-alerts.example.toml
 
