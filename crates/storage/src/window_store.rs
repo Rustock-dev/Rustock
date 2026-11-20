@@ -3,8 +3,18 @@
 //! A build worker replaying a block range keeps the nodes it has recently
 //! touched in memory, and seals them to disk in block-ranged segments as it
 //! moves on. Every node **read or written** goes into the newest in-memory
-//! table, which is what makes a sealed segment self-contained for its range:
-//! replaying those blocks later reads only what that segment holds.
+//! table.
+//!
+//! **This does not make a sealed segment self-contained for its range**, which
+//! this comment claimed for months and which cost a night of work to disprove.
+//! A segment holds what the range *touched*, not the state it can *reach*: a
+//! node written long before and still live, which nothing in this range
+//! re-reads, is never captured. Replaying those blocks later with code that
+//! *does* read it gets `None` from `TrieStore::get` and cannot tell that from
+//! a genuine absence -- which made #374 look like it broke mainnet consensus
+//! at #8,922,011. See `docs/trie-segments-design.md` §6.9d, #397 and #398.
+//!
+//! What a segment is sound for is **the code that sealed it**.
 //!
 //! Lookup order is newest-first -- in-memory tables, then sealed segments
 //! newest-first, then a fallback store (the archival trie). Measured on

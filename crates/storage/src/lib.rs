@@ -13,6 +13,7 @@ pub mod trie_tool;
 pub mod trie_snapshot;
 pub mod trie_inspect;
 pub mod epoch_store;
+pub mod segbuild_tee;
 pub mod window_store;
 pub mod position;
 pub mod pruner;
