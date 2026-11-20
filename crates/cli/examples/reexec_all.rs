@@ -94,9 +94,6 @@ impl Shard {
         }
         None
     }
-    fn bytes(&self) -> usize {
-        self.keys.capacity() + self.vals.capacity() + self.offs.capacity() * 4
-    }
 }
 
 struct RamTrie {
@@ -108,14 +105,6 @@ struct RamTrie {
     span: usize,
 }
 
-impl RamTrie {
-    fn nodes(&self) -> usize {
-        self.shards.iter().map(|s| s.len()).sum()
-    }
-    fn bytes(&self) -> usize {
-        self.shards.iter().map(|s| s.bytes()).sum()
-    }
-}
 
 impl RamTrie {
     fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -414,7 +403,7 @@ fn main() -> anyhow::Result<()> {
     let shards: usize = flag("--shards").and_then(|s| s.parse().ok()).unwrap_or(4);
     anyhow::ensure!(shards.is_power_of_two() && shards <= 256, "--shards must be a power of two");
     let fallback_dir: Option<String> =
-        flag("--fallback").map(|d| { unsafe { FIXED_NOW = FIXED_OVERHEAD_FALLBACK_MB }; d });
+        flag("--fallback").inspect(|_| unsafe { FIXED_NOW = FIXED_OVERHEAD_FALLBACK_MB });
     // Relative by default: an absolute path from the machine this was written on
     // is a poor default anywhere else, and the gap list is written beside it.
     let state_path =

@@ -95,12 +95,6 @@ impl RamTrie {
     fn shard_of(&self, key: &[u8]) -> usize {
         (*key.first().unwrap_or(&0) as usize) / self.span
     }
-    fn nodes(&self) -> usize {
-        self.shards.iter().map(|s| s.len()).sum()
-    }
-    fn bytes(&self) -> usize {
-        self.shards.iter().map(|s| s.bytes()).sum()
-    }
 }
 
 impl RamTrie {
@@ -280,7 +274,6 @@ fn main() -> anyhow::Result<()> {
         }
         Ok(out)
     })?;
-    let per_shard: Vec<usize> = built.iter().map(|s| s.len()).collect();
     let per_shard: Vec<usize> = built.iter().map(|s| s.len()).collect();
     let nodes: usize = per_shard.iter().sum();
     let vbytes: usize = built.iter().map(|s| s.bytes()).sum();

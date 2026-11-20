@@ -67,7 +67,7 @@ fn main() -> Result<()> {
 
     let base = baseline::Baseline::open(Path::new(&base_path))?;
     anyhow::ensure!(
-        from >= base.first() + 1 && to <= base.last(),
+        from > base.first() && to <= base.last(),
         "range #{from}..#{to} needs seeds and roots inside the baseline's #{}..#{}; \
          block #{} has no recorded parent",
         base.first(),
