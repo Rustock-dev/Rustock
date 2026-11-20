@@ -32,7 +32,11 @@ use rocksdb::{Direction, IteratorMode, Options, DB};
 use rustock_core::Block;
 use rustock_execution::{BlockProcessor, RskHardforkConfig};
 use rustock_storage::BlockStore;
-use rustock_trie::{TrieNode, TrieStore};
+use rustock_core::config::ChainConfig;
+use rustock_trie::{account_key, AccountState, TrieKeySlice, TrieNode, TrieStore};
+
+#[path = "support/baseline.rs"]
+mod baseline;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -43,9 +47,10 @@ use std::time::Instant;
 const CF_TRIE: &str = "trie_nodes";
 const KEY_LEN: usize = 32;
 /// First block whose header carries a Unitrie root. Below it the headers are
-/// Orchid-format, so no pre-state exists to seed a worker mid-chain and
-/// re-execution cannot verify the range at all
-/// (docs/trie-segments-design.md 8).
+/// Orchid-format, so neither a seed nor an expected root can come from them --
+/// both come from `--baseline` instead, and without one a segment ending at or
+/// below this height cannot be checked and is skipped
+/// (docs/trie-segments-design.md 8, 8.2).
 const UNITRIE_FROM: u64 = 1_591_000;
 /// Replay's own heap on top of the resident segment: the materialized TrieNode
 /// tree and friends, measured at ~630 MB against a 639 MB map (6.5a).
@@ -250,8 +255,21 @@ impl Segment {
     fn need_mb(&self) -> u64 {
         self.disk_mb + unsafe { FIXED_NOW }
     }
+    /// Blocks this segment will actually replay.
+    ///
+    /// Normally the first block of the range only supplies the seed state and
+    /// is not itself re-executed, so the count is `end - start`. A range
+    /// starting at block 1 is the exception: there is no parent block to seed
+    /// from, the seed is the genesis allocation, and block 1 is replayed like
+    /// any other -- so it is one more. Getting this wrong makes the planned
+    /// total disagree with the executed total, which the completeness check at
+    /// the end of a run reports as INCOMPLETE.
     fn blocks(&self) -> u64 {
-        self.end.saturating_sub(self.start)
+        if self.start <= 1 {
+            self.end.saturating_sub(self.start) + 1
+        } else {
+            self.end.saturating_sub(self.start)
+        }
     }
 }
 
@@ -272,7 +290,7 @@ fn dir_mb(p: &Path) -> u64 {
     walk(p) / 1_048_576
 }
 
-fn discover(segroot: &Path) -> anyhow::Result<Vec<Segment>> {
+fn discover(segroot: &Path, have_baseline: bool) -> anyhow::Result<Vec<Segment>> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(segroot)?.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
@@ -296,8 +314,11 @@ fn discover(segroot: &Path) -> anyhow::Result<Vec<Segment>> {
         if disk_mb <= 1 {
             continue;
         }
-        if end <= UNITRIE_FROM {
-            println!("skip {name}: entirely below #{UNITRIE_FROM}, no Unitrie pre-state to seed");
+        if end <= UNITRIE_FROM && !have_baseline {
+            println!(
+                "skip {name}: ends at or below #{UNITRIE_FROM}, where headers carry Orchid \
+                 roots -- pass --baseline to check it"
+            );
             continue;
         }
         out.push(Segment { name, dir, start, end, disk_mb });
@@ -398,6 +419,50 @@ fn main() -> anyhow::Result<()> {
         flag("--state").unwrap_or_else(|| "/home/paseo/reexec/state/done.txt".to_string());
     let dry = a.iter().any(|x| x == "--dry");
 
+    // The pre-fork era's expected roots and seeds. Loaded once and shared: it
+    // is ~49 MB and every worker reads it.
+    let base: Option<Arc<baseline::Baseline>> = match flag("--baseline") {
+        Some(f) => {
+            let b = baseline::Baseline::open(Path::new(&f))?;
+            println!(
+                "baseline {f}: #{}..#{} ({} roots), anchor 0x{}",
+                b.first(),
+                b.last(),
+                b.len(),
+                b.anchor().iter().map(|x| format!("{x:02x}")).collect::<String>()
+            );
+            Some(Arc::new(b))
+        }
+        None => None,
+    };
+
+    // Check the anchor against the chain once, now, rather than discovering a
+    // stale baseline partway through a multi-hour run. This is the era's only
+    // comparison against something rustock did not produce: #1,591,000 is the
+    // first header to carry a Unitrie root, so matching it validates the whole
+    // cumulative pre-fork state. Matching the baseline elsewhere only shows
+    // rustock still agrees with itself.
+    if let Some(b) = &base {
+        let probe = BlockStore::open_read_only(&block_dir)
+            .with_context(|| format!("opening block store {block_dir} to check the anchor"))?;
+        let hash = probe
+            .canonical_hash(b.last())?
+            .with_context(|| format!("no canonical hash for anchor block #{}", b.last()))?;
+        let hdr = probe
+            .header(hash)?
+            .with_context(|| format!("no header for anchor block #{}", b.last()))?;
+        anyhow::ensure!(
+            hdr.state_root.as_slice() == b.anchor(),
+            "BASELINE ANCHOR MISMATCH at #{}: baseline says 0x{} and the chain says {}. \
+             Every pre-fork root in this baseline describes a state the chain does not have, \
+             so verifying against it would prove nothing. Regenerate it.",
+            b.last(),
+            b.anchor().iter().map(|x| format!("{x:02x}")).collect::<String>(),
+            hdr.state_root
+        );
+        println!("baseline anchor matches the chain at #{}", b.last());
+    }
+
     let budget_mb: u64 = flag("--budget-mb").and_then(|s| s.parse().ok()).unwrap_or_else(|| {
         // MemAvailable less a reserve for the OS and anything else on the box.
         let avail = std::fs::read_to_string("/proc/meminfo")
@@ -419,7 +484,7 @@ fn main() -> anyhow::Result<()> {
         .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
         .unwrap_or_default();
 
-    let all = discover(&segroot)?;
+    let all = discover(&segroot, base.is_some())?;
     let pending: Vec<Segment> = all.iter().filter(|s| !done.contains(&s.name)).cloned().collect();
     let total_blocks: u64 = pending.iter().map(|s| s.blocks()).sum();
     println!(
@@ -431,7 +496,10 @@ fn main() -> anyhow::Result<()> {
         budget_mb
     );
     for s in pending.iter().take(5) {
-        println!("  {:<30} #{}..#{}  {} MB  needs {} MB", s.name, s.start + 1, s.end, s.disk_mb, s.need_mb());
+        // A range starting at block 1 replays block 1 too, having no parent to
+        // seed from; every other range's first block is only the seed.
+        let first_replayed = if s.start <= 1 { s.start } else { s.start + 1 };
+        println!("  {:<30} #{}..#{}  {} MB  needs {} MB", s.name, first_replayed, s.end, s.disk_mb, s.need_mb());
     }
     if pending.len() > 5 {
         println!("  ... {} more", pending.len() - 5);
@@ -521,6 +589,7 @@ fn main() -> anyhow::Result<()> {
                 (sched.clone(), store.clone(), state.clone(), stop.clone(), blocks_done.clone());
             let (fb, from_full, absent, gaps) =
                 (fallback_dir.clone(), from_full.clone(), absent.clone(), gaps.clone());
+            let bl = base.clone();
             scope.spawn(move || {
                 loop {
                     if stop.load(Ordering::Relaxed) {
@@ -548,7 +617,7 @@ fn main() -> anyhow::Result<()> {
                         return;
                     };
 
-                    let r = run_segment(&seg, &store, shards, &blocks_done, fb.as_deref(), &from_full, &absent, &gaps);
+                    let r = run_segment(&seg, &store, shards, &blocks_done, fb.as_deref(), &from_full, &absent, &gaps, bl.as_ref());
 
                     {
                         let (m, cv) = &*sched;
@@ -629,12 +698,24 @@ fn main() -> anyhow::Result<()> {
     // nothing reaches this line looking exactly like a run that executed
     // everything -- and this tool's whole purpose is to certify a database
     // before it is handed to someone else. Compare against the plan.
-    if bd != total_blocks {
+    if bd < total_blocks {
         println!(
             "INCOMPLETE: {bd} of {total_blocks} planned blocks re-executed ({} not run). \
              No divergence was found, but this is not a pass -- see the errors above \
              (a segment over the memory budget is the usual cause).",
             total_blocks - bd
+        );
+        std::process::exit(2);
+    }
+    if bd > total_blocks {
+        // Not a verification failure: every block that ran, matched. But the
+        // plan and the work disagree, so the plan is wrong, and a plan that
+        // cannot be trusted cannot certify anything either.
+        println!(
+            "INCONSISTENT: {bd} blocks re-executed against a plan of {total_blocks} ({} more \
+             than planned). Every block that ran verified, but Segment::blocks() disagrees \
+             with what run_segment replays, so this run's accounting is unreliable.",
+            bd - total_blocks
         );
         std::process::exit(2);
     }
@@ -652,6 +733,7 @@ fn run_segment(
     from_full: &Arc<AtomicU64>,
     absent: &Arc<AtomicU64>,
     gaps: &Arc<Mutex<Vec<(u64, String, Vec<u8>)>>>,
+    base: Option<&Arc<baseline::Baseline>>,
 ) -> anyhow::Result<(u64, f64)> {
     let loaded = load_segment(&seg.dir, shards)?;
     let mut with_fb: Option<Arc<RamWithFallback>> = None;
@@ -672,14 +754,54 @@ fn run_segment(
         None => Arc::new(loaded),
     };
 
-    let from = seg.start + 1;
+    // Where to start, and what state to start from. Three cases, and only the
+    // last is the ordinary one.
+    //
+    // A range beginning at block 1 has no parent block at all, so its seed is
+    // the genesis allocation, built here rather than read. It is also the only
+    // case that replays block 1 itself; seeding from `baseline[1]` instead
+    // would take that block's root on trust and never check it.
+    //
+    // A range beginning inside the pre-fork era seeds from the baseline,
+    // because the parent header's state root is an Orchid hash and is not a
+    // key in a Unitrie store. This is what lets the era be cut into segments
+    // at all.
+    let mut from = seg.start + 1;
     let to = seg.end;
-    let seed_hash = store.canonical_hash(from - 1)?.context("no canonical hash for seed")?;
-    let seed = store.header(seed_hash)?.context("no seed header")?;
-    let root_data = trie
-        .get(seed.state_root.as_slice())
-        .with_context(|| format!("no pre-state: seed root for #{} absent from {}", from - 1, seg.name))?;
-    let mut root = TrieNode::from_message(&root_data, trie.as_ref());
+    let mut root = if seg.start <= 1 {
+        from = 1;
+        let config = ChainConfig::mainnet();
+        let mut r = TrieNode::empty();
+        for e in &config.genesis_alloc() {
+            let k = account_key(&e.address);
+            r = r.put(
+                &TrieKeySlice::from_key(&k),
+                &AccountState::new(e.nonce, e.balance).encode(),
+                trie.as_ref(),
+            );
+        }
+        // Deliberately not saved: this is a verification run against a
+        // read-only segment, and the tree is small and fully materialized, so
+        // nothing needs to resolve it through the store.
+        r
+    } else if let Some(seed_root) = base.as_ref().and_then(|b| {
+        if seg.start < UNITRIE_FROM { b.root(seg.start) } else { None }
+    }) {
+        let data = trie.get(&seed_root).with_context(|| {
+            format!(
+                "no pre-state: baseline seed root for #{} absent from {}",
+                seg.start, seg.name
+            )
+        })?;
+        TrieNode::from_message(&data, trie.as_ref())
+    } else {
+        let seed_hash = store.canonical_hash(from - 1)?.context("no canonical hash for seed")?;
+        let seed = store.header(seed_hash)?.context("no seed header")?;
+        let root_data = trie.get(seed.state_root.as_slice()).with_context(|| {
+            format!("no pre-state: seed root for #{} absent from {}", from - 1, seg.name)
+        })?;
+        TrieNode::from_message(&root_data, trie.as_ref())
+    };
 
     let processor = BlockProcessor::new(RskHardforkConfig::mainnet(), store.clone());
     let t = Instant::now();
@@ -691,13 +813,39 @@ fn run_segment(
         let hash = store.canonical_hash(num)?.context("no canonical hash")?;
         let header = store.header(hash)?.context("no header")?;
         let (transactions, ommers) = store.body(hash)?.context("no body")?;
-        let expected = header.state_root;
+
+        // Below the fork the header's root is Orchid-format and can never
+        // equal a computed Unitrie root, so the baseline supplies the expected
+        // value. At and above #1,591,000 the header is authoritative again --
+        // which means the first block of the fork is checked against the chain
+        // rather than against the baseline, and that comparison is the anchor
+        // that makes the whole era's recorded roots worth anything (8).
+        let (expected, from_baseline) = if num < UNITRIE_FROM {
+            let b = base.as_ref().context(
+                "below the fork with no baseline: the header root is Orchid-format and \
+                 cannot be compared against a computed Unitrie root",
+            )?;
+            let r = b.root(num).with_context(|| {
+                format!(
+                    "baseline covers #{}..#{} and so has no root for #{num}; it cannot check \
+                     this segment",
+                    b.first(),
+                    b.last()
+                )
+            })?;
+            (r.to_vec(), true)
+        } else {
+            (header.state_root.as_slice().to_vec(), false)
+        };
+
         let block = Block { header, transactions, ommers };
         let p = processor.execute_block(&block, &root, trie.clone())?;
         anyhow::ensure!(
             p.state_root_hash.as_slice() == expected.as_slice(),
-            "#{num}: STATE ROOT MISMATCH computed {} header {expected}",
-            p.state_root_hash
+            "#{num}: STATE ROOT MISMATCH computed {} {} 0x{}",
+            p.state_root_hash,
+            if from_baseline { "baseline" } else { "header" },
+            expected.iter().map(|x| format!("{x:02x}")).collect::<String>()
         );
         root = p.new_state_root;
         n += 1;

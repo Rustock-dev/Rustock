@@ -32,6 +32,9 @@ use rustock_core::Block;
 use rustock_execution::{BlockProcessor, RskHardforkConfig};
 use rustock_storage::window_store::{WindowConfig, WindowStore};
 use rustock_storage::{BlockStore, RocksDbTrieStore};
+#[path = "support/baseline.rs"]
+mod baseline;
+
 use rustock_trie::{account_key, AccountState, TrieKeySlice, TrieNode, TrieStore};
 use std::io::Write;
 use std::sync::atomic::Ordering;
@@ -142,6 +145,21 @@ fn main() -> anyhow::Result<()> {
     let chunks = std::path::PathBuf::from(chunks_dir);
     reclaim_own(&chunks, id);
 
+    // Pre-fork expected roots and seeds. Without it a range below #1,591,000
+    // is replayed but not checked, which is how a segment gets built out of
+    // state nobody ever verified (docs/trie-segments-design.md 8.2).
+    let base: Option<std::sync::Arc<baseline::Baseline>> = match a.iter()
+        .position(|x| x == "--baseline")
+        .and_then(|i| a.get(i + 1))
+    {
+        Some(f) => {
+            let b = baseline::Baseline::open(std::path::Path::new(f))?;
+            eprintln!("[w{id}] baseline #{}..#{}", b.first(), b.last());
+            Some(std::sync::Arc::new(b))
+        }
+        None => None,
+    };
+
     let t_all = Instant::now();
     let mut total_done: u64 = 0;
     let mut prefer: Option<u64> = None;
@@ -153,7 +171,7 @@ fn main() -> anyhow::Result<()> {
         let out_dir = format!("{out_root}/{stem}");
         eprintln!("[w{id}] claimed {stem} (#{start}..#{end})");
         match run_chunk(id, block_dir, archive, &out_dir, start, end, seal_mb, tables,
-                        &progress, &t_all, &mut total_done) {
+                        &progress, &t_all, &mut total_done, base.as_ref()) {
             Ok(n) => {
                 let _ = std::fs::rename(chunks.join(format!("{stem}.run-{id}")),
                                         chunks.join(format!("{stem}.done")));
@@ -176,6 +194,7 @@ fn run_chunk(
     id: &str, block_dir: &str, archive: &str, out_dir: &str,
     start: u64, end: u64, seal_mb: u64, tables: usize,
     progress: &str, t_all: &Instant, total_done: &mut u64,
+    base: Option<&std::sync::Arc<baseline::Baseline>>,
 ) -> anyhow::Result<u64> {
 
     let store = Arc::new(BlockStore::open_read_only(block_dir)?);
@@ -220,6 +239,21 @@ fn run_chunk(
         r.save(win.as_ref(), true);
         eprintln!("[w{id}] genesis root {:?}", r.compute_hash(win.as_ref()));
         r
+    } else if let Some(seed) = base.and_then(|b| {
+        if start - 1 < UNITRIE_FROM { b.root(start - 1) } else { None }
+    }) {
+        // The parent header below the fork declares an Orchid root, which is
+        // not a key in a Unitrie store, so the baseline is the only way to
+        // start a range mid-era -- and the reason the era can be split at all.
+        let data = fallback.get(&seed).ok_or_else(|| {
+            anyhow::anyhow!(
+                "[w{id}] baseline seed root for #{} is not in the fallback store",
+                start - 1
+            )
+        })?;
+        eprintln!("[w{id}] seeded from baseline #{} root 0x{}", start - 1,
+                  seed.iter().map(|x| format!("{x:02x}")).collect::<String>());
+        TrieNode::from_message(&data, fallback.as_ref())
     } else {
         let h = store.header(store.canonical_hash(start)?.expect("hash"))?.expect("header");
         let p = store.header(h.parent_hash)?.expect("parent");
@@ -235,6 +269,15 @@ fn run_chunk(
     let t0 = Instant::now();
     let total = end - start + 1;
     let mut verified = 0u64;
+    if start < UNITRIE_FROM && base.is_none() {
+        eprintln!(
+            "[w{id}] WARNING: #{start}..#{} lies below #{UNITRIE_FROM}, where headers carry \
+             Orchid roots. Without --baseline these blocks are replayed but NOT verified, so \
+             this segment will be built out of state nothing has checked.",
+            end.min(UNITRIE_FROM - 1)
+        );
+    }
+
     let mut done = 0u64;
     let chunk_base = *total_done;
 
@@ -243,13 +286,24 @@ fn run_chunk(
         let hash = match store.canonical_hash(n)? { Some(h) => h, None => { eprintln!("[w{id}] no canonical hash at #{n}"); break } };
         let header = match store.header(hash)? { Some(h) => h, None => break };
         let (txs, oms) = match store.body(hash)? { Some(b) => b, None => { eprintln!("[w{id}] no body at #{n}"); break } };
-        let expected = header.state_root;
+        let header_root = header.state_root;
         let p = processor.execute_block(&Block { header, transactions: txs, ommers: oms }, &root, win.clone())?;
 
-        if n >= UNITRIE_FROM {
-            if p.state_root_hash != expected {
-                eprintln!("[w{id}] STATE ROOT MISMATCH at #{n}: computed {:?} header {:?}",
-                          p.state_root_hash, expected);
+        // At and above #1,591,000 the header is authoritative. Below it the
+        // header is Orchid-format, so the baseline is the only thing that can
+        // check the block -- and with no baseline the range is replayed
+        // unchecked, which the warning above the loop calls out.
+        let expected: Option<Vec<u8>> = if n >= UNITRIE_FROM {
+            Some(header_root.as_slice().to_vec())
+        } else {
+            base.and_then(|b| b.root(n)).map(|r| r.to_vec())
+        };
+
+        if let Some(expected) = expected {
+            if p.state_root_hash.as_slice() != expected.as_slice() {
+                eprintln!("[w{id}] STATE ROOT MISMATCH at #{n}: computed {:?} expected 0x{}",
+                          p.state_root_hash,
+                          expected.iter().map(|x| format!("{x:02x}")).collect::<String>());
                 write_progress(progress, &[
                     ("id", id.to_string()), ("state", "FAILED".into()),
                     ("block", n.to_string()), ("start", start.to_string()), ("end", end.to_string()),
