@@ -421,3 +421,30 @@ contain.
   nothing about sync throughput.
 - **Whether 1.62x holds elsewhere in the chain.** One range, 5,000 blocks, in
   the most recent segment.
+
+---
+
+## 10. Reproducing this
+
+The code is self-contained; the measurements are not, and cannot be. Every tool
+here reads data that does not belong in a repository. What you need:
+
+| | size | where it comes from |
+|---|---|---|
+| a block store | — | a synced rustock node's data directory. Needed by every tool |
+| the segment set | 161 GB | built by `build_segments`, or copied |
+| an archive trie | 131 GB | only to *build* or repair segments, not to read them |
+| the root baseline | 51 MB | `baseline_build` from recorded roots, or `baseline_from_rskj` from the table below |
+| rskj's `stateRoots` | 119 MB | **not regenerable** without a mainnet snapshot from a node that *executed* blocks #1..#1,591,000 — a full sync from genesis, not a snap sync |
+| an rskj database | 30 GB | `blocks/` and `stateRoots/` from a snapshot; `unitrie/` is what segments replace |
+
+So a reviewer can read and compile all of this, and cannot re-run §7 without
+roughly 300 GB and a snapshot download. The ratios are the transferable claim;
+the absolute rates are specific to one 4-core, 7.7 GB box.
+
+The one genuinely scarce input is rskj's `stateRoots` table. Orchid roots exist
+only below #1,591,000, so no node will ever produce another entry, and a
+snap-synced node never builds the table at all. Without it the pre-fork era has
+only the single end-of-era anchor described in `docs/trie-segments-design.md`
+§8, not the per-block oracle of §8.3.
+
