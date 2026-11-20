@@ -251,6 +251,13 @@ fn run_chunk(
                 start - 1
             )
         })?;
+        // Put the seed node into the window as well as reading it. This read
+        // is the one in the whole build that bypasses copy-on-read, which is
+        // why 96 of the original 97 chunks could not seed themselves (11.3a)
+        // and why segment 097 needed repairing after the fact. Without this a
+        // chunk cannot replay its own first block: that needs the state at
+        // start-1, and the only node naming it would be missing.
+        win.put(&seed, &data);
         eprintln!("[w{id}] seeded from baseline #{} root 0x{}", start - 1,
                   seed.iter().map(|x| format!("{x:02x}")).collect::<String>());
         TrieNode::from_message(&data, fallback.as_ref())

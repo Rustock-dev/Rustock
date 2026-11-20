@@ -775,11 +775,17 @@ permanent and every later run agrees with it. That is regression detection, not
 correctness -- worth having, but only trustworthy if something independent
 validates it.
 
-One independent check exists and is a single comparison. **#1,591,000 is the
-first block whose header carries a Unitrie root.** Replaying 0 -> #1,591,000
-from genesis and matching that header validates the entire cumulative pre-Unitrie
-state -- every balance, nonce, code blob and storage cell that survived to that
-point. Trust the baseline only if that anchor holds.
+One check comes from our own data and is a single comparison. **#1,591,000 is
+the first block whose header carries a Unitrie root.** Replaying 0 ->
+#1,591,000 from genesis and matching that header validates the entire
+cumulative pre-Unitrie state -- every balance, nonce, code blob and storage
+cell that survived to that point. Trust the baseline only if that anchor holds.
+
+**It is not the only independent check, and the claim that it was cost an
+afternoon.** This section said so until 2026-11-20, and §8.3 records what it
+missed: rskj's migration left a table mapping every pre-fork Orchid state root
+to the Unitrie root holding the same state, and that table is a per-block
+oracle for the whole era, obtained by lookup rather than replay.
 
 The finer-grained check would be the Orchid conversion, per block or at
 intervals, which is what rskj 1.x did while building its Unitrie from genesis.
@@ -810,6 +816,163 @@ computed root per block and optionally running the Orchid check.
 Early blocks run 20x faster than Unitrie-era ones (4--5 blocks/s): they are
 nearly empty and the whole trie stays resident, which is the same locality
 effect §6.5 measures from the other side.
+
+### 8.2 Making the era run like every other segment
+
+The baseline of §8 exists and is anchored. `pre-roots.csv` holds a computed
+Unitrie root for each of blocks 1..1,591,000, and its last row equals the
+header state root of #1,591,000 -- the first header to carry a Unitrie root --
+so the cumulative pre-Unitrie state is validated end-to-end, which is the only
+independent check the era admits. Segment `000-1-1591000` already holds the
+nodes: five recorded roots spanning #1 to #1,591,000 all probe PRESENT in its
+sealed store.
+
+So nothing is missing. What is missing is that none of it is automatic:
+`reexec_all` refuses the segment outright, and the baseline is a 135 MB CSV on a
+scratch volume that no tool reads and that would not travel with the database if
+it were handed to anyone.
+
+**Two things stop `run_segment` from replaying the era**, both from headers
+below #1,591,000 declaring Orchid roots:
+
+1. *Seeding.* It seeds from `header(start-1).state_root`. For this segment that
+   is an Orchid hash, which is not a key in a Unitrie store, so the lookup
+   misses and the run aborts with "no pre-state". Block 1's true seed is the
+   genesis state built from `ChainConfig::mainnet()`, not anything stored.
+2. *The expected root.* It compares each computed root against
+   `header.state_root`. Below the fork that is an Orchid root, so every block
+   mismatches by construction.
+
+**The baseline becomes part of the segment.** A separate CSV defeats the point:
+the goal is that the era verifies like any other range, and a segment that needs
+an external file to be checked is not self-contained. It is written to
+`000-1-1591000/baseline`, so shipping the segment ships its own proof
+obligation.
+
+Format is a fixed 32-byte stride, block *N* at offset `(N-1)*32`, behind a short
+header carrying a magic, a **schema version**, the block range, and the anchor
+root. Fixed-width means a worker seeks to any block in O(1) with no index, which
+is what makes the era range-parallelisable at all. The schema version is §8's
+instruction taken literally: a deliberate change to trie encoding or key mapping
+legitimately changes every recorded root, and without a tag that reads as
+1,591,000 failures rather than one "baseline is stale". A flat file rather than
+RocksDB because fixed-width records with a computable offset need no LSM, no
+column family and no block cache; it is ~50.9 MB and one file to checksum.
+
+**The verification rule** for a segment below the fork:
+
+- seed from the genesis state when the range starts at block 1, otherwise from
+  `baseline[start-1]`;
+- the expected root for block *N* is `baseline[N]`, not the header;
+- at #1,591,000 assert `baseline[N] == header.state_root` as well.
+
+That last line is not a formality and must never become optional. Checking
+rustock against roots rustock recorded is regression detection, not
+correctness: a wrong root at #400,000 becomes permanent and every later run
+agrees with it. The anchor is the single point where the era is measured against
+the chain instead of against itself, so a run that skips it has verified nothing
+about correctness, however green it looks.
+
+**Splitting the era beats making the tool cope with its size.** The segment is
+9,797 MB against a 7,746 MB box, so residency is not merely over budget but
+impossible with the node stopped. The obvious repair is to teach the replayer to
+work straight off RocksDB, and that was the first plan here. Sergio's is better:
+rebuild the era as nine ~1 GB segments instead. Each then loads resident and
+runs through the existing per-segment scheduler, and the two mechanisms the
+first plan needed -- a non-resident replay path and a sub-range scheduler --
+are not needed at all. Fewer moving parts for the same result.
+
+The split has to be a **rebuild**, not a partition of what exists.
+`segments.csv` shows the era was sealed in 110 block-delimited flushes, so the
+boundaries were known at build time, but all of them were flushed into one
+RocksDB and compaction has since reorganised them into 167 SSTs ordered by node
+hash. Trie nodes are content-addressed and carry no block number, so nothing
+survives to cut along. Re-running the builder over nine sub-ranges, each seeded
+from `baseline[start-1]`, is the only way -- and the baseline is the enabler
+either way, so this costs no groundwork beyond it.
+
+The nine will not sum to 9,797 MB. Copy-on-read means each captures the live
+state its own range touches, so early-era nodes are re-captured in several
+chunks; expect 12--15 GB total. Against 173 GB free that is noise, and it buys
+permanent residency and parallelism for the era.
+
+Numbering uses **900--908**, a distinct pre-fork group. `000`--`008` would
+collide with the existing post-fork `001`--`096`, and a duplicate index is the
+overlapping-range hazard of §11 reintroduced deliberately. 900--908 parse under
+the same `NNN-start-end` convention and need no renames anywhere.
+
+When the nine verify, the monolithic `000-1-1591000` is **retired by rename**.
+Leaving it in place would give segbuild two overlapping covers of blocks
+1--1,591,000, which is the same trap; the manifest must describe one set.
+
+Parallelism then comes from the baseline rather than from residency, which is
+§8's "record the root keyed so that a worker starting at block N can look up its
+parent's" and the reason that section said the era is serial only once. The
+original recording run logged `elapsed_s` 13,972 at #1,591,000 -- 3.9 hours
+serial -- so three workers rebuild the era in about an hour and a half.
+
+### 8.3 rskj's migration table is a per-block oracle for the era
+
+The baseline is ours, so agreeing with it proves determinism and not
+correctness. §8 concluded from that the era has one independent check, the
+anchor at #1,591,000. That was wrong, and the omission is worth recording
+because it turned a 37,840-block question into a four-hour replay when a
+lookup would have answered it.
+
+When rskj migrated to the Unitrie at RSKIP126 it kept a mapping from each
+pre-migration **Orchid** state root to the Unitrie root holding the same
+state, in a `stateRoots` database. Every block below the fork declares an
+Orchid root in its header, so for any such block:
+
+```
+header(N).stateRoot  ->  rskj's stateRoots  ->  the Unitrie root rskj migrated
+```
+
+compared against `baseline[N]`. Nothing in that chain is derived from anything
+rustock computed, which is exactly what the baseline cannot provide about
+itself. `baseline_audit` is the tool; the table lives at
+`/mnt/import/paseo/rskj-stateRoots` and is **not regenerable on this machine**
+(see the notice beside it).
+
+What §8 did consider and correctly rejected is the *Orchid conversion* --
+computing an Orchid root from a Unitrie and comparing it to the header -- which
+remains unavailable for the REMASC `siblings` reason below. The table is the
+other direction, a stored mapping rather than a computation, and it never
+stopped working.
+
+**Measured 2026-11-20.** Auditing the baseline recorded on 2026-11-09 against
+the table reported 37,840 differing blocks in exactly one contiguous run,
+#729,030..#766,869, and named rskj's root for each. An independent
+genesis-relative replay of the same range produced the identical count and the
+identical rejoin point, #766,870. The two methods agree to the block, and the
+lookup takes minutes against the replay's 1.47 hours.
+
+It also settled which build was right, which the anchor alone could not have
+done quickly: at #729,030 the table gives the root the *current* build
+computes, not the one the old baseline recorded. Orchid activates at #729,000
+and RSKIP87 with it, so from that height a whitelist getter writes the
+`unlimitedLockWhitelist` cell back as rskj's `save()` does. The first affected
+block in 1.59M is thirty blocks after the fork that enables the write, the
+difference is overwritten 37,840 blocks later, and the anchor matches either
+way -- which is why the anchor could not localise it and the table could.
+
+**The whole era, audited.** Against the corrected baseline the table reports
+1,590,999 checked, 1,590,999 agreed, 0 differing, and exactly one block with no
+entry: **#1,591,000**. That is the right answer rather than a gap. Orchid roots
+exist only *below* the fork, and #1,591,000 is the first block whose header
+carries a Unitrie root -- so it has nothing to translate, and it is precisely
+the block the anchor checks. The table covers #1..#1,590,999, the anchor covers
+#1,591,000, and between them every root in the era is verified against
+something rustock did not produce.
+
+So the era is better off than §8 claimed, and in a way that changes how a
+baseline should be made. Since `table[header(N).stateRoot]` *is* `baseline[N]`
+for every block below the fork, a baseline can be generated by lookup in
+minutes instead of derived from a replay in hours -- and it would then be
+independent of rustock by construction rather than audited against something
+independent afterwards. The replay route remains useful as a cross-check, and
+the two agreeing to the block is what established that today, but it should not
+be the primary route.
 
 ## 9. What this does not answer
 
