@@ -252,7 +252,8 @@ databases usable by a second implementation.
 
 ### 6.1 One correction to that patch
 
-The document's §4.1 had `get()` answer from the cache. That is wrong, and
+`rskj-patch-demand-cache.md` §4.1 (that document's own numbering, not this
+report's) had `get()` answer from the cache. That is wrong, and
 rskj's own `RepositoryBtcBlockStoreWithCacheTest.cacheLivesAcrossInstances`
 fails on it: one `Factory` owns one cache and hands it to every store it makes,
 while each store holds its own `Repository` track, so answering from the cache
@@ -262,7 +263,7 @@ not have.
 
 `get()` therefore populates but does not answer. Nothing is lost, because
 `getStoredBlockAtMainChainDepth` already consults `getFromCache` before falling
-back. §4.1, §4.6 and §5.1 of that document are corrected and dated.
+back. Sections 4.1, 4.6 and 5.1 of the patch document are corrected and dated.
 
 ---
 
