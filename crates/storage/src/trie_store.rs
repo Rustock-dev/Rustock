@@ -111,6 +111,29 @@ impl RocksDbTrieStore {
         Ok(Self { db: Arc::new(db), write_failed: Arc::new(Default::default()) })
     }
 
+    /// Write many nodes in one atomic batch.
+    ///
+    /// Per-node `put` costs ~3.1 us here (memtable plus WAL), which at the
+    /// 1,235--5,700 node accesses per block of
+    /// `docs/trie-segments-design.md` 6.9b is 6--18 ms a block -- enough to
+    /// halve a node's sync rate. A caller that only needs durability at a
+    /// block boundary should accumulate and call this once instead.
+    pub fn put_many(&self, items: &[(Vec<u8>, Vec<u8>)]) {
+        let Some(cf) = self.db.cf_handle(CF_TRIE) else {
+            warn!(target: "rustock::trie_store", "trie_nodes CF not found");
+            self.write_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        };
+        let mut batch = rocksdb::WriteBatch::default();
+        for (k, v) in items {
+            batch.put_cf(cf, k, v);
+        }
+        if let Err(e) = self.db.write(batch) {
+            warn!(target: "rustock::trie_store", "RocksDB batch write failed: {e}");
+            self.write_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Whether any write to this store has failed. A replay that returns
     /// `true` here has been reading back nodes it believes it wrote, and
     /// nothing it computed afterwards can be trusted.

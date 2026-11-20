@@ -83,6 +83,15 @@ pub struct SegbuildCapture {
     captured: AtomicU64,
     /// Serialises sealing against block-boundary bookkeeping.
     seal_lock: Mutex<()>,
+    /// This block's captured nodes, written as one batch at `end_block`.
+    ///
+    /// Writing each node as it is touched cost 3.1 us -- measured at 7.6x the
+    /// bare store, which is 6--18 ms a block and would have halved the node's
+    /// sync rate. The high-water mark only needs durability at a block
+    /// boundary, so one batch per block gives the same guarantee: a crash
+    /// loses the block in flight either way, and the mark stays conservative
+    /// because it is written in the same batch as the nodes it covers.
+    pending: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
 }
 
 impl SegbuildCapture {
@@ -115,6 +124,7 @@ impl SegbuildCapture {
                 sealed: AtomicU64::new(0),
                 captured: AtomicU64::new(0),
                 seal_lock: Mutex::new(()),
+                pending: Mutex::new(Vec::new()),
             },
             hwm,
         ))
@@ -162,7 +172,11 @@ impl SegbuildCapture {
         let (size, should_seal) = {
             let mut guard = self.open.write().unwrap();
             let Some(open) = guard.as_mut() else { return Ok(()) };
-            open.store.put(HWM_KEY, &block.to_be_bytes());
+            // The mark rides in the same batch as the nodes it covers, so the
+            // two can never disagree after a crash.
+            let mut items = std::mem::take(&mut *self.pending.lock().unwrap());
+            items.push((HWM_KEY.to_vec(), block.to_be_bytes().to_vec()));
+            open.store.put_many(&items);
             open.store.flush();
             open.hwm = block;
             let size = dir_size(&open.path);
@@ -232,8 +246,8 @@ fn dir_size(p: &Path) -> u64 {
 impl TrieStore for SegbuildCapture {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let v = self.primary.get(key)?;
-        if let Some(open) = self.open.read().unwrap().as_ref() {
-            open.store.put(key, &v);
+        if self.open.read().unwrap().is_some() {
+            self.pending.lock().unwrap().push((key.to_vec(), v.clone()));
             self.captured.fetch_add(1, Ordering::Relaxed);
         }
         Some(v)
@@ -243,8 +257,8 @@ impl TrieStore for SegbuildCapture {
         // Primary first: the capture must never be ahead of what the node
         // actually persisted.
         self.primary.put(key, value);
-        if let Some(open) = self.open.read().unwrap().as_ref() {
-            open.store.put(key, value);
+        if self.open.read().unwrap().is_some() {
+            self.pending.lock().unwrap().push((key.to_vec(), value.to_vec()));
             self.captured.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -391,5 +405,67 @@ mod tests {
         // A new block opens a fresh segment rather than reopening the sealed one.
         cap.begin_block(43).unwrap();
         assert!(dir.path().join("open-43").exists());
+    }
+}
+
+/// What capture costs, measured rather than assumed -- step 2 of enabling this
+/// on a live node. Run with:
+///   cargo test -p rustock-storage --release capture_overhead -- --ignored --nocapture
+#[cfg(test)]
+mod overhead {
+    use super::*;
+    use rustock_trie::MemoryTrieStore;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "timing; run explicitly"]
+    fn capture_overhead() {
+        const N: usize = 200_000;
+        let keys: Vec<[u8; 32]> = (0..N)
+            .map(|i| {
+                let mut k = [0u8; 32];
+                k[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                k
+            })
+            .collect();
+        let val = vec![0u8; 70]; // mean trie node, per 6.9b
+
+        // Baseline: the node's store alone.
+        let plain = Arc::new(MemoryTrieStore::new());
+        let t = Instant::now();
+        for k in &keys {
+            plain.put(k, &val);
+        }
+        for k in &keys {
+            let _ = plain.get(k);
+        }
+        let base = t.elapsed().as_secs_f64();
+
+        // With capture.
+        let dir = tempfile::tempdir().unwrap();
+        let primary = Arc::new(MemoryTrieStore::new());
+        let (cap, _) = SegbuildCapture::open(
+            primary,
+            CaptureConfig { dir: dir.path().to_path_buf(), seal_bytes: 1 << 40 },
+        )
+        .unwrap();
+        cap.begin_block(1).unwrap();
+        let t = Instant::now();
+        for k in &keys {
+            cap.put(k, &val);
+        }
+        for k in &keys {
+            let _ = cap.get(k);
+        }
+        let with = t.elapsed().as_secs_f64();
+        cap.end_block(1).unwrap();
+
+        let (captured, _, hwm) = cap.stats();
+        eprintln!("  {N} puts + {N} gets");
+        eprintln!("  primary only : {base:.3}s");
+        eprintln!("  with capture : {with:.3}s  ({:.2}x)", with / base);
+        eprintln!("  captured {captured} nodes, hwm {hwm}, segment {} MB",
+            dir_size(&dir.path().join("open-1")) / 1_048_576);
+        eprintln!("  per-node capture cost: {:.1} us", (with - base) / (2.0 * N as f64) * 1e6);
     }
 }
