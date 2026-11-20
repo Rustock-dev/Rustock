@@ -7,10 +7,14 @@
 //! rewritten. A full compaction with the policy set does exactly that, since
 //! compaction output uses the table options in force at the time.
 //!
-//! Usage: refilter_segment <dir> [bits-per-key]
+//! Usage: refilter_segment <dir> [bits-per-key] [--protect <dir>]...
 //!
-//! REFUSES to run against the live store or the sealed originals. Point it at
-//! a copy.
+//! This opens the store read-write and rewrites every SST, so it must never be
+//! pointed at a live store or at sealed originals. Pass `--protect <dir>` for
+//! each directory it must refuse to touch, or set `REFILTER_PROTECT` to a
+//! colon-separated list. With neither it warns that nothing is protected and
+//! proceeds, because the paths worth protecting are a property of the machine
+//! and not of this program.
 use rocksdb::{
     BlockBasedOptions, BottommostLevelCompaction, Cache, ColumnFamilyDescriptor, CompactOptions,
     Options, DB,
@@ -20,19 +24,46 @@ use std::time::Instant;
 const CF_TRIE: &str = "trie_nodes";
 
 fn main() -> anyhow::Result<()> {
-    let path = std::env::args().nth(1).ok_or_else(|| {
-        anyhow::anyhow!("usage: refilter_segment <dir> [bits-per-key]")
-    })?;
-    let bits: f64 = std::env::args().nth(2).unwrap_or_else(|| "10".into()).parse()?;
+    let args: Vec<String> = std::env::args().collect();
+    let positional: Vec<&String> = args[1..].iter().filter(|a| !a.starts_with("--")).collect();
+    let path = positional
+        .first()
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!("usage: refilter_segment <dir> [bits-per-key] [--protect <dir>]...")
+        })?
+        .clone();
+    let bits: f64 = positional.get(1).map_or(Ok(10.0), |s| s.parse())?;
 
-    // This opens read-write and rewrites every SST. Never let it near the
-    // originals or the node's own store.
+    // Directories this must refuse to rewrite. Taken from the caller, because
+    // which paths hold a live store or the sealed originals is a fact about the
+    // machine; hardcoding one machine's layout protects nobody else and leaks
+    // that layout into a shared repository.
+    let mut protect: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--protect")
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect();
+    if let Ok(env) = std::env::var("REFILTER_PROTECT") {
+        protect.extend(env.split(':').filter(|p| !p.is_empty()).map(str::to_string));
+    }
+
+    // This opens read-write and rewrites every SST.
     let real = std::fs::canonicalize(&path)?;
     let s = real.to_string_lossy();
-    for forbidden in ["/srv/segbuild-ro", "/var/lib/rustock", "/srv/rustock"] {
+    if protect.is_empty() {
+        eprintln!(
+            "WARNING: no --protect directories given and REFILTER_PROTECT is unset, so nothing \
+             is guarded. {s} will be rewritten in place."
+        );
+    }
+    for forbidden in &protect {
+        let root = std::fs::canonicalize(forbidden).unwrap_or_else(|_| forbidden.into());
         anyhow::ensure!(
-            !s.starts_with(forbidden),
-            "refusing to rewrite {s}: it is under {forbidden}. Copy it first."
+            !real.starts_with(&root),
+            "refusing to rewrite {s}: it is under {}. Copy it first.",
+            root.display()
         );
     }
 
