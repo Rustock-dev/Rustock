@@ -957,36 +957,51 @@ roots suggests a specific condition rather than a broken method.
 
 ## 11. Where the segment databases live
 
-**Current layout, since 2026-09-20.** All 97 chunks live in one directory:
+**Current layout, since 2026-11-20.** All 98 segments live in one directory,
+owned by `paseo` rather than root so the set can be managed without privilege:
 
 ```
-/var/lib/rustock/segbuild/          139 GB, 97 chunks
-/mnt/import/replay/chunks/          97 completion markers, <idx>-<start>-<end>.done
+/var/lib/rustock/segbuild/          151 GB, 98 segments, #1..#9,420,000
+/var/lib/rustock/segbuild/MANIFEST  the authoritative segment list
+/mnt/import/replay/chunks/          97 build-time markers (historical, see below)
 ```
 
-Plus `095-9133348-9229943.truncated-superseded-20260917`, the retained first
-attempt at chunk 095 (§11.4), which is not one of the 97.
+**Selection goes through `MANIFEST`, not through a directory listing.** Three
+retired directories sit alongside the live ones, and some of their ranges
+overlap real segments:
 
-**Two further directories are not segments and must not be read as ones.**
-`012-2938787-3081559` and `044-4794523-4932211` are 1 MB each, carry a `sealed`
-directory with no real contents, have no `.done` marker in
-`/mnt/import/replay/chunks/`, and both date from 2026-09-20 14:20:55 -- the
-build's own timestamps show them as ranges that were claimed, had their output
-directory created, and were then abandoned when the chunking was revised. Their
-ranges overlap real segments (`012-2938787-3081559` straddles the boundary
-between 007 and 008; `044-4794523-4932211` straddles 046 and 047), so the two
-numbers 012 and 044 each appear twice in a plain listing. A listing therefore
-shows 100 entries where the set is 97.
+| | |
+|---|---|
+| `095-...truncated-superseded-20260917` | first attempt at 095, kept deliberately (§11.4) |
+| `012-2938787-3081559.abandoned-empty-superseded-20261120` | 1 MB abandoned output directory |
+| `044-4794523-4932211.abandoned-empty-superseded-20261120` | 1 MB abandoned output directory |
 
-This matters beyond tidiness. A reader that picks a segment by range could
-select one of these for a block the real segments cover, open a near-empty
-store, and miss every node in it. Under the abort-on-missing-node rule (#398)
-that surfaces as a consensus alarm with no consensus problem behind it. Select
-segments against the `.done` markers, or against a manifest, rather than against
-whatever matches `[0-9][0-9][0-9]-*`.
+The latter two were found on 2026-11-20 while backfilling. Each was 1 MB, held a
+`sealed` directory with no real contents, had no `.done` marker, and carried the
+build's own timestamp of 2026-09-20 14:20:55 -- ranges that were claimed, had
+an output directory created, and were abandoned when the chunking was revised.
+Because `012-2938787-3081559` straddles the 007/008 boundary and
+`044-4794523-4932211` straddles 046/047, the numbers 012 and 044 each appeared
+twice and a listing showed 100 entries for a set of 97.
 
-Retiring them by rename -- the `.truncated-superseded-` convention already used
-for 095 -- would remove the ambiguity without destroying anything.
+The hazard was not untidiness. A reader selecting by range could have opened one
+of them for a block the real segments cover, missed every node, and -- under the
+abort-on-missing-node rule (#398) -- reported a consensus divergence with no
+consensus problem behind it. Both have been retired by rename; nothing was
+deleted. A live segment is now exactly a directory named `NNN-start-end`, and
+anything with a suffix is not one.
+
+`MANIFEST` records index, start, end, bytes and sealed-store presence per
+segment, plus the retired names, and is regenerated rather than maintained:
+
+```
+/home/paseo/ops/segbuild-manifest.sh            # regenerate
+/home/paseo/ops/segbuild-manifest.sh --check    # exit 1 if it drifts from disk
+```
+
+It replaces the `.done` markers as the authority. The markers remain useful
+history but cannot be the authority any longer: they live on another volume
+under root, so segment 097 has none and never will.
 
 ### 11.1 Why the build used two volumes (historical)
 
@@ -1169,31 +1184,61 @@ artifact that the two Bridge consensus bugs produced, and it costs 1.4 GB. It is
 excluded from the verification commands in §11.3 by its suffix. Delete it only
 deliberately.
 
-### 11.5 Segment 097, and what it is still waiting on
+### 11.5 Segment 097: the backfill to #9,420,000
 
-`097-9230009-9420000` extends the contiguous range to #9,420,000. It was built
-on 2026-11-20 by a single sequential chunk (§6.9f), 189,992 blocks at 68.4
-blocks/s, 2.7 GB over 5 seals, every state root verified during construction.
-It carries the same `sealed/`, `checkpoint` and `segments.csv` as the others.
+`097-9230009-9420000` extends the contiguous range from #9,230,008 to
+#9,420,000. Built 2026-11-20 by a single sequential chunk (§6.9f): 189,992
+blocks at 68.4 blocks/s, 2.7 GB over 5 seals, every state root verified during
+construction. It carries the same `sealed/`, `checkpoint` and `segments.csv` as
+the others.
 
-It is **not yet in `/var/lib/rustock/segbuild`**; it sits on the other volume
-awaiting a copy, which is a cross-device one, not a rename. Two caveats belong
-with it:
+**Self-contained for re-execution, after one repair.** Replaying all 189,991
+blocks from the segment alone -- the archive attached only to record reads the
+segment could not serve -- took *zero* fallback reads and found zero absent
+nodes, at 141.9 blocks/s RAM-resident. No bridge-node holes, unlike the older
+segments (§11.3b): those came from the builder running pre-#374 code while the
+re-executor read the peg-out index, and 097 was built with the post-#374 binary.
 
-- Roots verified *during construction* is a weaker statement than roots
-  verified *from the segment alone*, because the archive was reachable as a
-  fallback throughout the build. Self-containment is a separate run (§6.9d is
-  the reason that distinction is not pedantry). The expectation is that it is
-  clean, since the holes repaired in the older segments came from the builder
-  running pre-#374 code while the re-executor read the peg-out index, and this
-  segment was built with the post-#374 binary -- but expectation is not
-  measurement.
-- The range stops at a fixed #9,420,000 rather than at the head, because a
-  chunk needs a terminating bound. The residual gap to the head is what the
-  live capture closes.
+That distinction is the point, not pedantry. Roots verified *during
+construction* is a weaker claim than roots verified *from the segment alone*,
+because the archive is reachable as a fallback throughout a build -- which is
+exactly how the older segments came to hold holes while reporting a clean build
+(§6.9d).
 
-The chunks were consolidated from two volumes onto one, verified by a full
-checksum comparison reporting zero differences, then confirmed as 97 chunks
-matching 97 markers and tiling `#1..#9,230,008` with no gaps. Sections 11.1 and
-11.2 below describe the **build-time** layout and are kept because they explain
-why the build ran the way it did, not where anything is now.
+**But a clean replay was not sufficient either, and nearly passed as if it
+were.** `reexec_all` reports its range for this segment as `#9230010..#9420000`:
+it seeds from the state root of the segment's *first* block and replays from the
+second, so it never reads the parent root of #9,230,008. That node is the one
+read in the whole build that escapes capture -- `build_segments` takes it
+straight from the fallback (§11.3a, first row) -- and it was **absent**,
+confirmed by probing the sealed store for it directly. A consumer replaying the
+segment from its own first block, which is the normal thing to do, would have
+failed at step one, while the verifier reported zero gaps.
+
+Repaired with `repair_chunk --limit 1`, which adds the root and the enumerated
+key set's descent through it: 1,003 nodes, purely additive. `probe_seed` now
+reports the seed present for every segment in the set, 097 included.
+
+The general lesson is the same shape as the vacuous green light in §10.5: the
+verifier's range and the segment's range differed by one block, and the
+difference was exactly the node that no other read covers. A verification whose
+bounds are derived from the artifact it is verifying can agree with itself while
+both are wrong.
+
+**A limit worth knowing before relying on 097.** The §11.3b repair -- the
+enumerated precompile and Bridge key set walked at sampled roots -- cannot be
+run across most of this segment. It sources missing nodes from the archive, and
+the archive stops at #9,238,111 (§6.9f), while 097 runs to #9,420,000. So
+roots above #9,238,111 can be repaired only from some other complete source;
+the node's own store is garbage-collected and holds only what is live now. For
+re-execution of its own range this does not matter, which is what the clean
+replay above establishes. For a consumer issuing reads rustock does not make,
+097 is repairable only over its first 8,103 blocks.
+
+Copied onto `sdc` cross-device and verified by a full checksum comparison of all
+58 files with zero differences, then renamed into place.
+
+The range stops at a fixed #9,420,000 rather than at the head because a chunk
+needs a terminating bound. The residual gap to the head -- a few thousand blocks
+and growing -- is what the live capture closes, and it is the reason the capture
+exists rather than a second backfill.
