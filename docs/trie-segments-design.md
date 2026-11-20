@@ -655,6 +655,39 @@ between a 14% tax and losing about 40% of throughput.
 
 Keep the archive reachable as a correctness net that should never fire.
 
+### 6.9f Extending the set past where the archive stops
+
+The archive at `/mnt/import/rustock-trie` holds the state root of #9,238,111
+and not of #9,238,112, measured by bisection (`archive_bound`, which probes
+each height's state root for presence). The segments end at #9,230,008, so the
+archive outruns them by 8,103 blocks and falls about 190,000 short of the
+chain head.
+
+That sounds like it bounds the backfill, and it does not. An archive is
+cumulative: its upper bound says which *state roots* it can seed from, not
+which nodes it holds. A node still live at #9,300,000 that was last written at
+#5,000,000 is in the archive, because the archive recorded it when it was
+written. Replaying forward from a seed needs exactly two things -- a complete
+seed state, and every node written before the archive's cap -- and both hold
+well past the cap. Measured: a build seeded at #9,230,008 ran to #9,420,000 --
+181,889 blocks beyond the cap -- verifying all 189,992 state roots, at 68.4
+blocks/s, with the fallback rate *falling* from 1.9% to under 0.3% as the
+window warmed.
+
+What the cap does bound is **parallelism**. Each chunk seeds from the parent
+state root of its own first block, and `run_chunk` takes one fallback store.
+Below the cap that root is in the archive, so the original 97 segments could be
+built in any order -- which is how they were built. Above it, the only copy of
+that root is in the previous chunk's sealed output, which the next chunk cannot
+reach. So the backfill past #9,238,111 is inherently **sequential, one worker**,
+and the natural shape is a single long chunk resuming from its own checkpoint
+rather than a queue of independent ones. One large segment is in keeping:
+`000-1-1591000` is 9.6 GB across 1,591,000 blocks, against a 1.35 GB median.
+
+Chaining fallbacks -- a chunk reading from the archive *and* its predecessor's
+sealed store -- would restore parallelism here, and is the same capability
+needed to extend the set from the node's own store later. It is not implemented.
+
 ## 7. Answers
 
 ### 7.1 Segment size `S`
@@ -908,6 +941,19 @@ roots suggests a specific condition rather than a broken method.
 - **The run survived an OOM kill** (a `cargo` link step on the same box took the
   memory) and several restarts, because chunks are claimed and checkpointed.
   A killed worker re-takes its own chunk and resumes.
+- **`reexec_all` reported `ALL SEGMENTS VERIFIED` after executing 0 blocks.**
+  Found while verifying the backfilled segment 097. When the smallest pending
+  segment does not fit `--budget-mb` the scheduler clears its queue and drains,
+  which is correct -- a run that cannot proceed should not hang. But the final
+  verdict tested only whether a divergence had been recorded, so a run that did
+  no work at all took the same exit path as a run that verified everything, and
+  exited 0. The tool whose entire purpose is to certify a database before it is
+  handed to another developer could therefore certify one it had never read.
+  Fixed by comparing `blocks_done` against the planned `total_blocks` and
+  exiting 2 with `INCOMPLETE` unless they match; the pass line now names the
+  count it verified. The general shape is worth remembering: a green light
+  conditioned on the absence of failures, rather than on the presence of
+  completed work, passes vacuously.
 
 ## 11. Where the segment databases live
 
@@ -921,11 +967,26 @@ roots suggests a specific condition rather than a broken method.
 Plus `095-9133348-9229943.truncated-superseded-20260917`, the retained first
 attempt at chunk 095 (§11.4), which is not one of the 97.
 
-The chunks were consolidated from two volumes onto one, verified by a full
-checksum comparison reporting zero differences, then confirmed as 97 chunks
-matching 97 markers and tiling `#1..#9,230,008` with no gaps. Sections 11.1 and
-11.2 below describe the **build-time** layout and are kept because they explain
-why the build ran the way it did, not where anything is now.
+**Two further directories are not segments and must not be read as ones.**
+`012-2938787-3081559` and `044-4794523-4932211` are 1 MB each, carry a `sealed`
+directory with no real contents, have no `.done` marker in
+`/mnt/import/replay/chunks/`, and both date from 2026-09-20 14:20:55 -- the
+build's own timestamps show them as ranges that were claimed, had their output
+directory created, and were then abandoned when the chunking was revised. Their
+ranges overlap real segments (`012-2938787-3081559` straddles the boundary
+between 007 and 008; `044-4794523-4932211` straddles 046 and 047), so the two
+numbers 012 and 044 each appear twice in a plain listing. A listing therefore
+shows 100 entries where the set is 97.
+
+This matters beyond tidiness. A reader that picks a segment by range could
+select one of these for a block the real segments cover, open a near-empty
+store, and miss every node in it. Under the abort-on-missing-node rule (#398)
+that surfaces as a consensus alarm with no consensus problem behind it. Select
+segments against the `.done` markers, or against a manifest, rather than against
+whatever matches `[0-9][0-9][0-9]-*`.
+
+Retiring them by rename -- the `.truncated-superseded-` convention already used
+for 095 -- would remove the ambiguity without destroying anything.
 
 ### 11.1 Why the build used two volumes (historical)
 
@@ -1107,3 +1168,32 @@ The truncated copy is retained deliberately rather than deleted: it is the
 artifact that the two Bridge consensus bugs produced, and it costs 1.4 GB. It is
 excluded from the verification commands in §11.3 by its suffix. Delete it only
 deliberately.
+
+### 11.5 Segment 097, and what it is still waiting on
+
+`097-9230009-9420000` extends the contiguous range to #9,420,000. It was built
+on 2026-11-20 by a single sequential chunk (§6.9f), 189,992 blocks at 68.4
+blocks/s, 2.7 GB over 5 seals, every state root verified during construction.
+It carries the same `sealed/`, `checkpoint` and `segments.csv` as the others.
+
+It is **not yet in `/var/lib/rustock/segbuild`**; it sits on the other volume
+awaiting a copy, which is a cross-device one, not a rename. Two caveats belong
+with it:
+
+- Roots verified *during construction* is a weaker statement than roots
+  verified *from the segment alone*, because the archive was reachable as a
+  fallback throughout the build. Self-containment is a separate run (§6.9d is
+  the reason that distinction is not pedantry). The expectation is that it is
+  clean, since the holes repaired in the older segments came from the builder
+  running pre-#374 code while the re-executor read the peg-out index, and this
+  segment was built with the post-#374 binary -- but expectation is not
+  measurement.
+- The range stops at a fixed #9,420,000 rather than at the head, because a
+  chunk needs a terminating bound. The residual gap to the head is what the
+  live capture closes.
+
+The chunks were consolidated from two volumes onto one, verified by a full
+checksum comparison reporting zero differences, then confirmed as 97 chunks
+matching 97 markers and tiling `#1..#9,230,008` with no gaps. Sections 11.1 and
+11.2 below describe the **build-time** layout and are kept because they explain
+why the build ran the way it did, not where anything is now.
