@@ -68,8 +68,10 @@ fn main() -> Result<()> {
     let (block_dir, trie_dir, old_path) = (pos[0].clone(), pos[1].clone(), pos[2].clone());
     let from: u64 = pos[3].parse().context("bad <from>")?;
     let out_path = pos[4].clone();
+    // Relative by default; an absolute path from one machine is no use on
+    // another. This wants a volume with room for the replay's new nodes.
     let scratch = flag("--scratch")
-        .unwrap_or_else(|| "/mnt/import/paseo/baseline-rebuild-scratch".to_string());
+        .unwrap_or_else(|| "baseline-rebuild-scratch".to_string());
     let progress = flag("--progress");
 
     let old = baseline::Baseline::open(Path::new(&old_path))?;

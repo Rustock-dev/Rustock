@@ -415,8 +415,10 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(shards.is_power_of_two() && shards <= 256, "--shards must be a power of two");
     let fallback_dir: Option<String> =
         flag("--fallback").map(|d| { unsafe { FIXED_NOW = FIXED_OVERHEAD_FALLBACK_MB }; d });
+    // Relative by default: an absolute path from the machine this was written on
+    // is a poor default anywhere else, and the gap list is written beside it.
     let state_path =
-        flag("--state").unwrap_or_else(|| "/home/paseo/reexec/state/done.txt".to_string());
+        flag("--state").unwrap_or_else(|| "reexec-done.txt".to_string());
     let dry = a.iter().any(|x| x == "--dry");
 
     // The pre-fork era's expected roots and seeds. Loaded once and shared: it
@@ -681,12 +683,30 @@ fn main() -> anyhow::Result<()> {
             absent.load(Ordering::Relaxed),
             g.len()
         );
-        if let Ok(mut f) = std::fs::File::create("/home/paseo/reexec/segment-gaps.txt") {
-            let _ = writeln!(f, "# block\tsegment\tnode-key -- reads a segment could not serve");
-            for (b, seg, k) in g.iter() {
-                let _ = writeln!(f, "{b}\t{seg}\t{}", alloy_primitives::hex::encode(k));
+        // Beside the state file, not at a path baked in from the machine this
+        // was written on. It used to be the latter, inside an `if let Ok`, so
+        // anywhere else it produced no repair list and said nothing -- the
+        // failure mode this tool exists to complain about.
+        let gaps_path = std::path::Path::new(&state_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("segment-gaps.txt");
+        match std::fs::File::create(&gaps_path) {
+            Ok(mut f) => {
+                let _ = writeln!(f, "# block\tsegment\tnode-key -- reads a segment could not serve");
+                for (b, seg, k) in g.iter() {
+                    let _ = writeln!(f, "{b}\t{seg}\t{}", alloy_primitives::hex::encode(k));
+                }
+                println!("gap keys written to {} (the repair list)", gaps_path.display());
             }
-            println!("gap keys written to /home/paseo/reexec/segment-gaps.txt (the repair list)");
+            Err(e) => {
+                println!(
+                    "WARNING: could not write the repair list to {}: {e}. The {} gap(s) above \
+                     are the only record.",
+                    gaps_path.display(),
+                    g.len()
+                );
+            }
         }
     }
     if stop.load(Ordering::Relaxed) {
