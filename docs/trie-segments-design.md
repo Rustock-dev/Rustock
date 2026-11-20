@@ -804,8 +804,9 @@ reads as 1,591,000 failures instead of one "baseline is stale".
 ### 8.1 Cost
 
 `cargo run --release -p rustock-cli --example pre_unitrie_roots -- <block-dir>
-<trie-dir> <count> [orchid-interval] [csv]` replays from genesis, recording the
-computed root per block and optionally running the Orchid check.
+<trie-dir> <roots-db> <count> [orchid-interval]` replays from genesis, recording
+the computed root per block into `<roots-db>` and optionally running the Orchid
+check.
 
 | | |
 |---|---|
