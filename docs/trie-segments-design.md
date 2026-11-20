@@ -350,6 +350,259 @@ depend on. Capping `max_open_files` fixes the memory and costs 4.6x in file
 churn. A bounded block cache holding index and filter blocks does both, and is
 what `open_read_only` now configures.
 
+### 6.9a Bloom filters: tried, measured, does not work
+
+`lsm_stats` reports `# entries for filter=0` on every segbuild segment: they
+were written with no filter policy at all. The tool's own header says what that
+costs -- "a store written without a filter policy makes every point lookup pay
+an index probe and a data-block read per candidate file, for every reader,
+forever" -- and a reader cannot add a filter block afterwards, only the writer
+can.
+
+That reads like an obvious win, and the arithmetic looked persuasive: 100 blocks
+cost 17,015 block-cache misses and 2,954 MB of actual device reads, about 178 KB
+of disk per trie node fetched, against 17 candidate files. 17 x ~10 KB is
+roughly 178 KB, so "every lookup touches every file" fit the number exactly.
+
+**It was wrong.** Segment `012-3283389-3314242` was copied twice to the same
+device, one copy rewritten by a full forced compaction with a 10-bit/key full
+bloom filter (`refilter_segment`), and the two replayed interleaved over the
+same 100 blocks:
+
+| | median rate | device reads |
+|---|---|---|
+| original, no filter | **4.26 blocks/s** | ~130 MB |
+| rewritten, filters on all 6,296,521 entries | **4.17 blocks/s** | ~157 MB |
+
+The filtered copy was marginally *slower* and read *more*. Filters cost
+essentially nothing in space (684 MB -> 682 MB), and bought nothing in time.
+
+**Why, and this is the part worth keeping.** A filter tells you which file
+*not* to open. It does nothing about the number of *serialized round trips*,
+and that is what binds: a trie walk is a chain of dependent reads, each level's
+key coming from the previous level's value, so none of them can be issued in
+parallel. At the 0.78 ms random-read latency measured in 6.8, the 268
+block-cache misses per block seen here come to ~209 ms of pure waiting, which
+is ~4.8 blocks/s -- the rate actually observed, from first principles.
+
+Two further observations confirm it is latency and not volume:
+
+- the same workload reads ~130 MB on `sdb` and ~4,100 MB on `sdc` and runs at
+  the same 4.2--4.5 blocks/s. A 31x difference in bytes moved changes nothing.
+- the process sits at 57--68% CPU with 10--11% iowait: neither saturated. It is
+  stalled on round trips, not short of cycles or bandwidth.
+
+**Do not add a filter policy to `build_segments`.** The segment writer is not
+the problem, and rewriting all 97 segments would have cost hours for a
+regression. What does help is overlapping the stalls -- more workers (6.7) --
+or removing the round trips altogether (6.9b).
+
+### 6.9b Loading a segment into RAM instead of paging it in
+
+If the binding constraint is per-read latency rather than bytes, the fix is to
+stop doing random reads during replay: read the segment once, sequentially,
+into an in-memory map, then serve every lookup from RAM.
+
+This is attractive on the numbers. A segment is 684 MB--2.2 GB against the 131
+GB whole store, so unlike the store it *can* be made resident; a sequential
+read at the 211 MB/s measured in 6.8 loads one in ~3--10 s, and the load is
+parallelisable by splitting the key space across threads, which a dependent
+trie walk is not. 6.6 already measures the ceiling from the other direction:
+with the working set resident and **zero** device reads, the same replay ran at
+**26.75 blocks/s against 4.5 cold**, 10.6x.
+
+**Measured, and it works: 7.7x.** Segment `012-3283389-3314242` (684 MB) was
+copied onto `tmpfs` and replayed interleaved against the identical copy on
+`sdb`, same 100 blocks, same `--cache 500000`, three repetitions each:
+
+| | rep 1 | rep 2 | rep 3 | median |
+|---|---|---|---|---|
+| disk (`sdb`) | 4.56 | 4.58 | 4.53 | **4.56 blocks/s** |
+| RAM (`tmpfs`) | 35.00 | 35.14 | 35.45 | **35.14 blocks/s** |
+
+Every root matched on both sides. Note how tight the RAM figures are: the
+variance on disk is the device, not the workload.
+
+**This settles the 6.6 / 6.7 disagreement in favour of 6.6.** The zero-I/O rate
+is tens of blocks per second, not 4.57, and 35 blocks/s is precisely the figure
+6.9 reports for a well-configured handle -- a number that turns out to be
+unreachable from this device at all, and routine from RAM.
+
+`tmpfs` is a *lower bound* on an in-memory map, because it still pays RocksDB's
+per-`get` cost: index probe, block decode, syscall. A hashtable keyed by node
+hash skips all three. So 7.7x is the floor of what this design buys, not the
+ceiling.
+
+**What binds next is no longer the trie.** At 33 blocks/s from RAM the process
+uses ~0.6 of one core with three cores idle, and iowait is still 9--12%. That
+residual is the *block store*: replay reads a header and a body per block from
+`/var/lib/rustock`, which 6.7 already flagged at ~560 IOPS for 280 blocks/s. So
+once the trie is resident the block store becomes the next thing worth
+attacking, and single-worker CPU is nowhere near the limit -- which is what
+makes the worker scaling in 6.7 worth having on top.
+
+Two constraints to carry into any design:
+
+- **Representation, not just residency.** 6.3 M entries as
+  `HashMap<Vec<u8>, Vec<u8>>` costs two `Vec` headers and two allocations each,
+  and would land near 2--3x the on-disk size. Keys here are content hashes, so
+  a `HashMap<[u8; 32], (u32, u32)>` over one values arena is ~56 bytes of index
+  per entry plus the values back-to-back: roughly 950 MB for a 684 MB segment,
+  which fits where the naive form does not.
+- **RAM scales with workers.** 6.7 already notes that each worker needs its own
+  segment resident, and that "8 x 512 MB plus the OS does not fit in 7.7 GB".
+  At ~950 MB per segment this box supports about three workers, which is also
+  where core scaling flattens.
+
+### 6.9c The staged-segment rate across eras, measured
+
+6.9b measured one segment. Running scoped re-execution over fourteen ranges of
+2,001 blocks each, every segment staged into `tmpfs` first, gives the rate
+across the whole Unitrie era:
+
+| range | segment | blocks/s |
+|---|---|---|
+| twoToThree | 002 | 60.35 |
+| papyrus200 / UMM | 004 | 54.94 |
+| iris300 | 020 | 44.32 |
+| hop400 / RSKIP294 | 044 | 46.65 |
+| hop401 / RSKIP353+357 | 048 | 49.92 |
+| fingerroot500 / RSKIP374+385 | 052 | 52.81 |
+| arrowhead600 / RSKIP376+400 | 060 | 41.61 |
+| arrowhead631 | 065 | 46.45 |
+| lovell700 / RSKIP419+438 | 076 | 46.16 |
+| reed800 / RSKIP305 | 084 | 51.71 |
+| vetiver900 | 091 | 47.15 |
+| rskip351 | 093 | 42.53 |
+| dense era #8.5M | 088 | 44.75 |
+| dense era #9.15M | 095 | 52.60 |
+
+**41--60 blocks/s, against 4.5 from the device.** So the 7.7x of 6.9b was
+conservative; across eras the staged rate is **9--13x**, and it does not decay
+with chain height the way the on-device rate does (6.4: 10.53 at #2.5M falling
+to 4.52 at #9.15M). That decay was the device, not the work.
+
+28,014 blocks were re-executed this way with every state root matching, in
+1,246 s wall including staging and open costs.
+
+At this rate a full pass over the Unitrie era is ~2 days on one worker, which
+is the first point at which exhaustive re-execution is worth planning rather
+than dismissing.
+
+**Three ranges could not run at all**, and the reason is worth recording
+because it looks like a failure and is not: `bahamas` (#3,397), `orchid`
+(#729,000) and `wasabi100` (#1,591,000) sit at or below the first block whose
+header carries a Unitrie root. `replay_bench` seeds from `from - 1`, and no
+Unitrie pre-state exists there, so it refuses to start -- distinctly from a
+root mismatch. Blocks 1--1,590,999, 17% of the chain, stay unverifiable by
+re-execution until the recorded-roots baseline of 8 is built.
+
+### 6.9d A segment cannot validate a read the builder never made
+
+This cost most of a night, so it is worth stating plainly: **a segbuild segment
+holds the trie nodes its build touched, not the whole state at its heights.**
+A segment is therefore sound for replaying the code that built it, and unsound
+for validating code that reads state that code never read.
+
+How it surfaced. Re-executing #374 against segment `093-8920462-9017691`
+diverged at mainnet #8,922,011: gas and fees identical, but `tx[3]` emitted 3
+logs where the header implies 0, and a peg-in was refunded that mainnet never
+refunded. `replay_bench` reproduced it from a different seed, pre-374 matched
+the header, and `git bisect` named `a1cdd41` ("registerBtcTransaction
+classifies by rskj's pegout index"). All of which pointed at a consensus bug
+in #374.
+
+It is not that, or at least not shown to be. `a1cdd41` makes
+`registerBtcTransaction` read the RSKIP379 pegout index, which earlier code
+wrote and never read. Instrumenting the classification:
+
+```
+DIAG  rsk=#8922011 btc_height=952667 pegout_index=true rskip379=true start=841909
+DIAG2 sig_hash=cbf77977... in_index=false live_outputs=1 n_inputs=3 witness_inputs=3
+DIAG3 fixture_6241417 in_index=false
+DIAG3 fixture_6245419 in_index=false
+```
+
+The gate is right (952,667 is past 841,909). But the last two lines are the
+answer: those are sighashes **rskj's own mainnet node holds**, taken from the
+fixture `a1cdd41` itself added, written by pre-374 code at RSK #6,241,417 and
+#6,245,419 under a key derivation identical in both versions
+(`compound_key(PEGOUT_TX_SIG_HASH_KEY, "-", to_hex(sig_hash))`,
+`save_pegout_tx_sig_hash`). They read as absent too. The index is not
+mis-keyed; it is **not in the segment at all**.
+
+Which follows from how segments are built. Pre-374 wrote index entries when it
+created each pegout, in whichever segment covered that height, and never read
+them again. Segment 093's build never read the entries written at #6.2M, so
+those leaves were never captured into it. Post-374 reads them, finds nothing,
+and classifies an indexed pegout as a peg-in -- then refunds it, which writes
+state and emits events. Pre-374 is immune by construction: it never looks.
+
+**The asymmetry is the trap.** This failure mode can only ever appear in the
+newer code, which makes it look exactly like a regression the newer code
+introduced. A passing pre-374 run is not a control here.
+
+Consequences worth carrying:
+
+- Segment replay validates **execution arithmetic** well -- gas, fees, state
+  roots for ordinary transactions -- and cannot validate **new state reads**.
+  The 28,014 blocks of 6.9c are sound; they simply contained no such read.
+- Before blaming a divergence on code, check whether the state it reads is in
+  the segment. A clean `None` from a trie lookup is not evidence of absence
+  from the chain, only from the store.
+- To settle such a case the block has to run against a **complete** state. That
+  is currently awkward: `inspect_block` takes a single RocksDB trie, while the
+  production store is an epoch-structured backend it cannot open. Closing that
+  gap is the prerequisite for using replay as consensus evidence at all.
+
+### 6.9e Why the re-executor uses a fixed worker count
+
+Sergio asked whether `reexec_all` should spawn workers dynamically -- filling
+memory with whatever segments fit rather than running a fixed two -- and noted
+that this becomes a subset-packing / multi-knapsack problem, worth solving only
+if the segments differ greatly in size.
+
+They do not. Measured over the 96 segments the tool actually processes:
+
+| | |
+|---|---|
+| min / median / mean / max | 2 / 1,297 / 1,321 / 2,182 MB |
+| std dev | 370 MB |
+| **coefficient of variation** | **0.28** |
+
+Apart from one 2 MB oddity (`096`, 64 blocks) everything sits between 684 and
+2,182 MB. Optimal packing of near-identical items is just "as many as fit",
+which is what the scheduler already does: `Sched::take` picks the first segment
+fitting the remaining budget and a worker with nothing that fits waits on a
+condvar. Concurrency is therefore **already memory-limited rather than
+thread-limited**; `--threads` only caps the handful of occasions when three or
+four of the smallest would fit.
+
+**What actually binds is the fixed per-worker cost.** With
+`need = size + 1100` against a 4,889 MB budget:
+
+| segment | need | max concurrent |
+|---|---|---|
+| smallest | 1,102 MB | 4 |
+| median | 2,397 MB | **2** |
+| largest | 3,282 MB | 1 |
+
+The 1,100 MB fixed term is 33--62% of each worker's footprint, and it is what
+holds the median at two.
+
+**So the return is in shrinking that term, not in packing better.** Each worker
+opens its own handle to the 131 GB fallback trie, which costs a separate 64 MB
+block cache plus pinned index and filter blocks -- and `run_segment` opens it
+**per segment**, at ~35 s each. Over 95 segments that is ~55 minutes of pure
+open time, about 8% of an 11-hour run. Opening it once and sharing the `Arc`
+recovers both the memory and the time, and may free enough to allow a third
+worker.
+
+Two ceilings to keep in view: 6.7 measures worker scaling flattening at ~3.2x
+on these four cores, so a fourth worker buys little regardless; and dynamic
+thread count only becomes interesting *after* the fixed cost is reduced, because
+that is when the size variance starts to matter relatively more.
+
 ### 6.10 Sliding-window miss rate
 
 The build design Sergio proposed keeps the last few block-ranges' nodes in RAM
