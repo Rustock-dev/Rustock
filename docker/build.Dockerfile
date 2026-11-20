@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
 
-# Keep in step with rust-toolchain.toml.
+# Must match the channel in rust-toolchain.toml. This default is a fallback for
+# a hand-run `docker build`; scripts/build-binary.sh reads the real value out of
+# rust-toolchain.toml and passes it. Either way the build checks it below.
 ARG RUST_VERSION=1.93.1
 
 # The binary links this image's glibc and libstdc++; docker/runtime.Dockerfile
@@ -18,6 +20,28 @@ ENV RUSTUP_TOOLCHAIN=${RUST_VERSION}
 
 WORKDIR /src
 COPY . .
+
+# The compiler is pinned in two places: RUST_VERSION above, which picks the base
+# image and (via RUSTUP_TOOLCHAIN) the toolchain used here, and
+# rust-toolchain.toml, which is what a developer's local `cargo build` obeys. A
+# comment cannot hold an invariant across two files -- so check it here, the
+# first point where both are present. Drift becomes a failed build instead of
+# shipped binaries built by a compiler nobody is running locally.
+RUN set -eu; \
+    pinned="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)"; \
+    [ -n "$pinned" ] || { echo "error: no [toolchain] channel found in rust-toolchain.toml" >&2; exit 1; }; \
+    if [ "$pinned" != "${RUST_VERSION}" ]; then \
+        echo "error: RUST_VERSION is ${RUST_VERSION} but rust-toolchain.toml pins ${pinned}" >&2; \
+        echo "       fix: update the ARG default in docker/build.Dockerfile, or build with" >&2; \
+        echo "            --build-arg RUST_VERSION=${pinned}" >&2; \
+        exit 1; \
+    fi; \
+    actual="$(rustc --version | cut -d' ' -f2)"; \
+    if [ "$actual" != "${pinned}" ]; then \
+        echo "error: rust-toolchain.toml pins ${pinned} but this image's rustc is ${actual}" >&2; \
+        exit 1; \
+    fi; \
+    echo "toolchain ${pinned} agrees across rust-toolchain.toml, RUST_VERSION and rustc"
 
 # Comma-separated cargo features for rustock-cli, e.g. "smtp".
 ARG FEATURES=""
