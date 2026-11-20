@@ -105,7 +105,27 @@ go stale and needs no invalidation.
 
 ## 4. The patch
 
-### 4.1 `RepositoryBtcBlockStoreWithCache.get` — consult and populate
+### 4.1 `RepositoryBtcBlockStoreWithCache.get` — populate, but do not answer
+
+> **Corrected 2026-11-20.** This section originally had `get` consult the cache
+> before reading the repository. That is wrong, and rskj's own
+> `RepositoryBtcBlockStoreWithCacheTest.cacheLivesAcrossInstances` fails on it.
+> One `Factory` owns one cache and hands it to every store it makes, while each
+> store holds its own `Repository` track — so answering from the cache lets a
+> store report a block present that only another track wrote. The test uses
+> `get` as the repository-truth probe and `getFromCache` as the cache probe,
+> and asserts the two differ; that distinction is load-bearing, not incidental.
+>
+> It is also the mirror of R2. R2 forbids caching an absence because a missing
+> node and a genuine absence are the same `null`. Answering reads from a
+> cross-track cache commits the opposite error: reporting a presence the
+> caller's own state does not have. Both turn incomplete state into a confident
+> wrong answer.
+>
+> Nothing is lost by the narrower change. `getStoredBlockAtMainChainDepth`
+> already calls `getFromCache` before falling back to `get` (§4.6), so the
+> consensus path keeps every cache hit it had.
+
 
 Currently (l.124–133):
 
@@ -127,16 +147,14 @@ Replace with:
 ```java
     @Override
     public synchronized StoredBlock get(Sha256Hash hash) {
-        // The cache is keyed by the block's own header hash, and a StoredBlock's
-        // height and chain work are fixed by its ancestry, so an entry can never
-        // go stale and needs no invalidation.
-        if (cacheBlocks != null) {
-            StoredBlock cached = cacheBlocks.get(hash);
-            if (cached != null) {
-                return cached;
-            }
-        }
-
+        // Deliberately does NOT answer from the cache. get() reports what this
+        // instance's repository holds, and callers rely on that: the cache is
+        // shared by every store a Factory makes, while each store has its own
+        // repository track, so serving from it here would let one track report a
+        // block that only exists in another -- a presence leak across forks.
+        // getFromCache() is the cache accessor, and
+        // getStoredBlockAtMainChainDepth already consults it before falling
+        // back here, so the consensus path loses no hits.
         logger.trace("[get] Looking in storage for block with hash {}", hash);
         byte[] ba = repository.getStorageBytes(contractAddress, DataWord.valueFromHex(hash.toString()));
         if (ba == null) {
@@ -237,9 +255,13 @@ gets "optimised" away by someone who does not know why it is there:
 ### 4.6 `BtcBlockStoreWithCache.getFromCache` — unchanged, now redundant
 
 `getStoredBlockAtMainChainDepth` (l.271) calls `getFromCache` then falls back to
-`get`. With §4.1 applied, `get` already consults the cache, so the explicit
-check is redundant — but harmless, and removing it changes the interface.
-**Leave it.** A follow-up may simplify it; this patch should not.
+`get`. With §4.1 as corrected, that explicit check is **not** redundant — it is
+the only place a read is served from the cache, because `get` populates without
+answering. **Leave it**, and note that removing it would quietly turn every
+main-chain-depth lookup back into a repository read.
+
+(The original text here called this check redundant, which was true only of the
+uncorrected §4.1.)
 
 ### 4.7 Configuration
 
@@ -271,6 +293,25 @@ Genesis reaches the cache through `checkIfInitialized()` (l.345), which calls
 `put(storedGenesis)` — and `populateCache` returns immediately when the head
 *is* genesis (l.248), so it never contributed. Verify by running the suite
 before and after.
+
+> **Corrected 2026-11-20.** The reading above stops at that test's first three
+> assertions and is right about them. It misses the rest of the test, which is
+> what actually matters:
+>
+> ```java
+>     assertNull(btcBlockStore.get(secondBlockHash));   // l.163
+>     assertNull(btcBlockStore2.get(firstBlockHash));   // l.166
+> ```
+>
+> Two stores, one shared cache, **separate repository tracks**. Those lines use
+> `get` to assert the tracks are isolated. Under the uncorrected §4.1 — `get`
+> answering from the shared cache — l.163 fails with
+> `expected: <null> but was: <Block ... at height 2>`, measured.
+>
+> With §4.1 as corrected the claim in this section's title holds: 16 of 16 in
+> this class and 56 of 56 in `…ChainWorkTest` pass unmodified. The advice to
+> "verify by running the suite before and after" was the right advice; the
+> analysis above simply did not go far enough down the test it was analysing.
 
 `put_oldBlockShouldNotGoToCache` still passes: it tests the `put` gate (§4.4),
 which is unchanged.
