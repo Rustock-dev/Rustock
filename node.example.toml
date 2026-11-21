@@ -182,6 +182,36 @@
 # rotate_mb = 1024                  # default
 # burial = 4000                     # default
 # check_secs = 60                   # default
+# A bound is a consumer saying "do not discard what blocks after this wrote" --
+# a segment build that has not run yet. It blocks collection while it is held,
+# so a consumer that is stuck or far behind would hold the floor down until the
+# disk filled. Past this distance from the head the bound is ignored, loudly:
+# an incomplete segment set is a thing to repair later, a node out of disk is
+# not.
+# max_bound_lag = 12000             # default
+
+# Extending the segbuild segment set while syncing. The node counts the bytes
+# each block writes, records where segments should end, and re-executes each
+# range once it is `lag` blocks settled -- so blocks are executed twice, which
+# at the tip is about ten seconds of work per eight hours of chain. See
+# docs/segbuild-continuous-design.md.
+#
+# `out` must already hold a `NNN-start-end` segment and be current with this
+# node's executed head, or the node refuses to start: the blocks in a gap
+# cannot be rebuilt from a garbage-collected store, so recording them would
+# only record ranges that must fail. Unset leaves the feature off.
+#
+# `target_mb` is the segment size, in written state rather than blocks: cost
+# per block varies tenfold across eras, so equal block counts give segments
+# from 0.2 GB to over 2 GB while equal bytes give ones a consumer can hold in
+# memory. `seal_mb` is something else -- the builder's own memory budget, two
+# tables of it, flushed into the segment as they fill.
+[segbuild]
+# out = "/var/lib/rustock/segbuild"  # default: unset
+# target_mb = 1024                  # default
+# lag = 1000                        # default
+# seal_mb = 256                     # default
+
 # ---------------------------------------------------------------------------
 # Peg events the Bridge does not emit
 # ---------------------------------------------------------------------------

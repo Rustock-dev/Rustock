@@ -1749,6 +1749,12 @@ fn apply_file_config(
     apply(matches, "gc_rotate_mb", f.gc.rotate_mb.as_ref(), &mut a.gc_rotate_mb);
     apply(matches, "gc_burial", f.gc.burial.as_ref(), &mut a.gc_burial);
     apply(matches, "gc_check_secs", f.gc.check_secs.as_ref(), &mut a.gc_check_secs);
+    apply(matches, "gc_max_bound_lag", f.gc.max_bound_lag.as_ref(), &mut a.gc_max_bound_lag);
+
+    apply_opt(matches, "segbuild_out", f.segbuild.out.as_ref(), &mut a.segbuild_out);
+    apply(matches, "segbuild_target_mb", f.segbuild.target_mb.as_ref(), &mut a.segbuild_target_mb);
+    apply(matches, "segbuild_lag", f.segbuild.lag.as_ref(), &mut a.segbuild_lag);
+    apply(matches, "segbuild_seal_mb", f.segbuild.seal_mb.as_ref(), &mut a.segbuild_seal_mb);
 
     apply(matches, "read_threads", f.trie.read_threads.as_ref(), &mut a.read_threads);
 

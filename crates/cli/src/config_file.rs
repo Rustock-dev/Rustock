@@ -45,6 +45,8 @@ pub struct FileConfig {
     #[serde(default)]
     pub gc: GcSection,
     #[serde(default)]
+    pub segbuild: SegbuildSection,
+    #[serde(default)]
     pub prune: PruneSection,
     #[serde(default)]
     pub mining: MiningSection,
@@ -248,6 +250,36 @@ pub struct GcSection {
     pub rotate_mb: Option<u64>,
     pub burial: Option<u64>,
     pub check_secs: Option<u64>,
+    /// Ignore a collection bound that has fallen this far behind the head.
+    ///
+    /// A bound is a consumer saying "do not discard what blocks after this
+    /// wrote" -- currently a segment build that has not run yet. It blocks
+    /// collection while held, so a consumer that is stuck would otherwise hold
+    /// the floor down until the disk filled.
+    pub max_bound_lag: Option<u64>,
+}
+
+/// Extending the segbuild segment set while syncing.
+///
+/// The node counts the bytes each block writes, records where segments should
+/// end, and re-executes each range once it has settled. See
+/// `docs/segbuild-continuous-design.md`.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SegbuildSection {
+    /// The segment set to extend. Unset means the feature is off.
+    ///
+    /// Must already hold a `NNN-start-end` segment and be current with this
+    /// node's executed head, or the node refuses to start: a gap cannot be
+    /// built from a garbage-collected store.
+    pub out: Option<std::path::PathBuf>,
+    /// Written state a segment accumulates before it is cut.
+    pub target_mb: Option<u64>,
+    /// Blocks to wait after a boundary before building its range.
+    pub lag: Option<u64>,
+    /// Memory one of the builder's two in-memory tables may hold. The
+    /// builder's budget, not the segment size.
+    pub seal_mb: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -592,6 +624,11 @@ pub const CONFIGURABLE: &[&str] = &[
     "gc_rotate_mb",
     "gc_burial",
     "gc_check_secs",
+    "gc_max_bound_lag",
+    "segbuild_out",
+    "segbuild_target_mb",
+    "segbuild_lag",
+    "segbuild_seal_mb",
     "prune_keep_depth",
     "prune_max_batch",
     "prune_blocks",
