@@ -76,13 +76,34 @@ fn main() -> Result<()> {
     let engine_parsed = rustock_storage::TrieEngine::parse(&engine)?;
     let config = EpochConfig::default();
     let expected = rustock_storage::epoch_backend::keys_for_rotation(config.rotate_bytes);
-    let watermark = match EpochTrieStore::open_read_only_with(
+    let opened = EpochTrieStore::open_read_only_with(
         std::path::Path::new(&trie_dir),
         config,
         engine_parsed.factory(expected),
-    ) {
+    );
+    let watermark = match &opened {
         Ok(es) => Ok(es.collected_below()),
-        Err(e) => Err(e),
+        Err(e) => Err(anyhow::anyhow!("{e:#}")),
+    };
+
+    // The seed a gap's build would start from: the state root the set's last
+    // block declares. One lookup, and it is the only part of a gap that the
+    // watermark cannot settle -- those nodes were written below it, so whether
+    // they survived depends on whether they were still live when the sweep
+    // drained. Checking it costs a single read and replaces the one unknown in
+    // deciding whether to build a gap.
+    //
+    // A present root proves the top node is there, not the whole trie beneath
+    // it, so this is a necessary condition and not a sufficient one.
+    let seed = match (&opened, set_end) {
+        (Ok(es), Some(end)) => {
+            let root = store
+                .canonical_hash(end)?
+                .and_then(|h| store.header(h).ok().flatten())
+                .map(|h| h.state_root);
+            root.map(|r| (end, r, rustock_trie::TrieStore::get(es, r.as_slice()).is_some()))
+        }
+        _ => None,
     };
 
     println!("block store   {data_dir}");
@@ -104,6 +125,12 @@ fn main() -> Result<()> {
         Ok(Some(n)) => println!("  collected below     #{n}"),
         Ok(None) => println!("  collected below     (no sweep has completed)"),
         Err(e) => println!("  collected below     unreadable: {e:#}"),
+    }
+    if let Some((end, root, present)) = &seed {
+        println!(
+            "  seed root at #{end}   {} ({root:?})",
+            if *present { "PRESENT" } else { "ABSENT" }
+        );
     }
 
     // What is pending, if the logs exist yet.
@@ -162,6 +189,18 @@ fn main() -> Result<()> {
             "Buildability unknown: the watermark could not be read (see above). Check \
              --trie-dir and --engine against what the node runs."
         ),
+    }
+    match seed {
+        Some((end, _, true)) => println!(
+            "The seed state root at #{end} is present, so a build has somewhere to \
+             start. That is the top node, not proof of the whole trie beneath it."
+        ),
+        Some((end, _, false)) => println!(
+            "The seed state root at #{end} is ABSENT. A build would fail on its first \
+             read. Seed it from that segment's own sealed store instead -- it holds \
+             the verified state at its end block."
+        ),
+        None => {}
     }
     Ok(())
 }
