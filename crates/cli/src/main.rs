@@ -3153,15 +3153,17 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                 warn!(
                     "segbuild: the set ends at #{set_end} and this node has executed to \
                      #{exec_head}, a gap of {gap} blocks. The collector has not been \
-                     beneath it ({}), so it is still buildable, and it will be cut as a \
-                     range of its own at startup. Its seed state at #{set_end} is the one \
+                     beneath it ({}), so it is still buildable, and all but the last {} \
+                     blocks of it are cut as a range of their own now. Its seed state at \
+                     #{set_end} is the one \
                      part nothing can promise -- it was written below the watermark and \
                      was not pinned while the node ran -- so the build may fail on a \
                      missing node, loudly, leaving no segment.",
                     match watermark {
                         Some(w) => format!("watermark #{w}"),
                         None => "no sweep has completed".into(),
-                    }
+                    },
+                    args.segbuild_lag
                 );
             }
             if exec_head < set_end {
@@ -3182,21 +3184,33 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             // it would wait a gigabyte of writes -- about a month of chain --
             // before anything tried to build it, and its collection bound would
             // go stale long before that.
-            if gap > 0 {
-                match boundaries.cut_at(exec_head) {
+            //
+            // Cut `lag` blocks *below* the executed head, not at it. A boundary
+            // at the head is zero blocks settled, so `ready` would hold the
+            // range for another `lag` blocks -- eight hours at mainnet's block
+            // time -- before building state the node already has. One block
+            // lower than that and it is ready on the first tick. The `lag`
+            // blocks left over stay in the open range and are absorbed by the
+            // next size-driven cut, which is what would have happened to all of
+            // them anyway.
+            let catch_up_end = exec_head.saturating_sub(args.segbuild_lag);
+            if gap > 0 && catch_up_end > set_end {
+                match boundaries.cut_at(catch_up_end) {
                     Ok(Some(b)) => info!(
                         "segbuild: recorded a boundary at #{} so #{}..#{} is built as a \
-                         range of its own",
+                         range of its own, starting on the next tick -- it is already \
+                         {} blocks settled",
                         b.block,
                         set_end + 1,
-                        b.block
+                        b.block,
+                        args.segbuild_lag
                     ),
                     Ok(None) => debug!(
-                        "segbuild: a boundary at or above #{exec_head} is already recorded"
+                        "segbuild: a boundary at or above #{catch_up_end} is already recorded"
                     ),
                     Err(e) => warn!(
                         "segbuild: could not record the catch-up boundary at \
-                         #{exec_head}: {e:#}"
+                         #{catch_up_end}: {e:#}"
                     ),
                 }
             }
