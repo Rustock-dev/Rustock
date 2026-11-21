@@ -211,6 +211,20 @@ fast.
 The counter is approximate by design. It drives *where to cut*, and a cut in
 roughly the right place is all that is needed.
 
+**It is persisted, and the first draft of this document was wrong to say it need
+not be.** The argument was that a reset costs one late cut, and sizes are
+advisory. That holds for one late cut and breaks at the real time scale: on the
+mainnet node a gigabyte of written state is 25,000-50,000 blocks, nine to
+eighteen days, so a node restarted weekly would return to zero every time and
+never cut a boundary at all. The feature would look healthy and extend nothing.
+
+The asymmetry with the boundary log is deliberate. `COUNTER` is rewritten in
+place and not fsynced; `BOUNDARIES` is appended and fsynced. Losing the last few
+megabytes of accounting to a power cut delays a cut, which is what "advisory"
+genuinely covers. Losing a boundary merges two segments. The write is done by
+the poll that cuts, not by the block being executed, so the hot path is still
+one relaxed atomic add.
+
 ### 4.2 The boundary log
 
 Append-only, one line per boundary, fsynced:
@@ -298,7 +312,7 @@ numbering.
 
 | event | what happens |
 |---|---|
-| node restarts | counter resets, so one segment is cut late. Harmless: sizes are advisory |
+| node restarts | the counter resumes from `COUNTER`, so at most the last poll's bytes are lost. Before it was persisted this reset to zero, which at nine to eighteen days per segment meant a frequently restarted node never cut at all |
 | crash mid-build | `.building-A-B` stays behind, which no reader parses as a segment; the build resumes from its last checkpoint |
 | reorg below a boundary | the boundary is above `head - lag` and so not yet built; re-record it |
 | reorg below an already-built segment | only possible for a reorg deeper than the lag. A `HALTED` file is written and building stops until a human clears it (§7) |

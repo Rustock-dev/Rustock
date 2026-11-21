@@ -3661,6 +3661,20 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                 };
 
                 if head >= first_block {
+                    // Persist the byte counter on the same poll that cuts.
+                    // Without this the counter restarts at zero on every
+                    // restart, and since a gigabyte of written state is nine
+                    // to eighteen days of mainnet, a node restarted weekly
+                    // would never reach the target and never cut a boundary --
+                    // extending nothing, while logging nothing wrong.
+                    if let Err(e) = boundaries.persist() {
+                        warn!(
+                            target: "rustock::segbuild",
+                            "Could not persist the segbuild byte counter: {e:#}. The count \
+                             will restart from its last saved value after a restart, which \
+                             delays a cut rather than losing a segment."
+                        );
+                    }
                     match boundaries.end_block(head) {
                         Ok(Some(b)) => info!(
                             target: "rustock::segbuild",
