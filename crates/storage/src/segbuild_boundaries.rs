@@ -172,10 +172,26 @@ impl SegmentBoundaries {
     /// Only ever cuts at a block boundary, because a segment that ended
     /// mid-block would cover part of a block's writes and claim the block.
     pub fn end_block(&self, block: u64) -> Result<Option<Boundary>> {
-        let acc = self.counter.load(Ordering::Relaxed);
-        if acc < self.target_bytes {
+        if self.counter.load(Ordering::Relaxed) < self.target_bytes {
             return Ok(None);
         }
+        self.cut_at(block)
+    }
+
+    /// Record a boundary at `block` whatever the counter says.
+    ///
+    /// For a cut that is not about size: a node starting with the set behind
+    /// its executed head closes that catch-up as a range of its own, rather
+    /// than leaving it to be merged into the next size-driven segment. Merging
+    /// it would mean the gap waited a gigabyte of writes -- about a month of
+    /// chain -- before anything tried to build it, by which time its
+    /// collection bound would have gone stale and the state would be gone.
+    ///
+    /// Still refuses a boundary at or below the last one, for the same reason
+    /// `end_block` does: ranges are derived by walking boundaries in order, so
+    /// one that goes backwards produces a range with `start > end`.
+    pub fn cut_at(&self, block: u64) -> Result<Option<Boundary>> {
+        let acc = self.counter.load(Ordering::Relaxed);
         // Reset first: if appending fails, the next block tries again rather
         // than this one cutting repeatedly.
         self.counter.store(0, Ordering::Relaxed);
