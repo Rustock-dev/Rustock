@@ -66,11 +66,21 @@ pub struct EpochConfig {
     /// Rotate once the newest epoch reaches this many bytes. Size-based rather
     /// than time- or block-based, because it is the size that has to be bounded.
     pub rotate_bytes: u64,
+    /// How far below the head a collection bound may hold the floor before it
+    /// is overridden.
+    ///
+    /// A bound blocks collection, so a consumer that stops advancing one --
+    /// stuck, crashed, or far behind -- would otherwise grow the store without
+    /// limit. Past this distance the bound is ignored and the override logged
+    /// at warning level. The trade is deliberate and matches an unservable
+    /// pin: whatever the bound was protecting becomes a gap to repair, which
+    /// is a better outcome than a node out of disk.
+    pub max_bound_lag: u64,
 }
 
 impl Default for EpochConfig {
     fn default() -> Self {
-        Self { epochs: 4, burial_depth: 4_000, rotate_bytes: 1 << 30 }
+        Self { epochs: 4, burial_depth: 4_000, rotate_bytes: 1 << 30, max_bound_lag: 12_000 }
     }
 }
 
@@ -211,6 +221,11 @@ pub struct CollectStats {
     /// Pinned roots that could not be marked in full, so whatever they
     /// describe is already incomplete and cannot be served.
     pub unservable: Vec<B256>,
+    /// Set when a registered bound held the floor below the oldest epoch's
+    /// writes, so the cycle did nothing. Not a failure: a consumer is still
+    /// reading history the collector wanted to reclaim, and it will be
+    /// reclaimed once that consumer moves on. The value is the floor.
+    pub held_by_bound: Option<u64>,
 }
 
 /// A trie store split into epochs, with wholesale reclamation of the oldest.
@@ -537,6 +552,65 @@ impl EpochTrieStore {
         self.collect_pinned(root_hash, &[], root_block, current_block)
     }
 
+    /// As [`Self::collect_pinned`], but also refuses to sweep any epoch holding
+    /// writes above the lowest of `bounds`.
+    ///
+    /// A **bound** is a block number a consumer needs kept: "do not discard
+    /// what blocks after this wrote." It is the right shape for protecting a
+    /// *range* of blocks, which a pin cannot do -- a pin keeps what is
+    /// reachable from one state, and a node created and destroyed inside a
+    /// range is reachable from neither end of it. Epochs are already tagged
+    /// with the highest block they received, so a bound composes with the
+    /// collector's own floor by taking the minimum.
+    ///
+    /// A bound further than [`EpochConfig::max_bound_lag`] below
+    /// `current_block` is ignored and the override logged: a bound that stops
+    /// advancing would otherwise block collection for ever.
+    pub fn collect_bounded(
+        &self,
+        root_hash: B256,
+        pins: &[B256],
+        bounds: &[u64],
+        root_block: u64,
+        current_block: u64,
+    ) -> Result<CollectStats> {
+        let floor = self.effective_floor(bounds, root_block, current_block);
+        self.collect_at_floor(root_hash, pins, root_block, current_block, floor)
+    }
+
+    /// The block above which no epoch may be swept.
+    ///
+    /// `root_block` is the collector's own bound; a registered bound simply
+    /// joins it, and the minimum wins.
+    fn effective_floor(&self, bounds: &[u64], root_block: u64, current_block: u64) -> u64 {
+        let mut floor = root_block;
+        for &b in bounds {
+            if current_block.saturating_sub(b) > self.config.max_bound_lag {
+                warn!(
+                    target: "rustock::gc",
+                    "Ignoring collection bound at block {b}: it is {} blocks below the head \
+                     at {current_block}, past the {} limit. Whatever it protects may be \
+                     collected and will have to be rebuilt.",
+                    current_block.saturating_sub(b),
+                    self.config.max_bound_lag
+                );
+                continue;
+            }
+            if b < floor {
+                floor = b;
+            }
+        }
+        if floor < root_block {
+            info!(
+                target: "rustock::gc",
+                "Collection floor held at block {floor} by a registered bound, {} blocks \
+                 below the collection root at {root_block}",
+                root_block.saturating_sub(floor)
+            );
+        }
+        floor
+    }
+
     /// As [`Self::collect`], but also keeps everything reachable from `pins`.
     ///
     /// A pin is a state the node must keep for a reason the chain does not
@@ -547,12 +621,29 @@ impl EpochTrieStore {
     /// [`CollectStats::unservable`] and does not stop the cycle: its state was
     /// already incomplete, and refusing to reclaim would only turn one broken
     /// thing into two.
+    ///
+    /// A pin protects a *state*; it cannot protect a *range* of blocks. For
+    /// that, see [`Self::collect_bounded`].
     pub fn collect_pinned(
         &self,
         root_hash: B256,
         pins: &[B256],
         root_block: u64,
         current_block: u64,
+    ) -> Result<CollectStats> {
+        self.collect_at_floor(root_hash, pins, root_block, current_block, root_block)
+    }
+
+    /// The shared body. `floor` is the block above which no epoch may be
+    /// swept; without registered bounds it is `root_block`, which is what
+    /// every existing caller gets.
+    fn collect_at_floor(
+        &self,
+        root_hash: B256,
+        pins: &[B256],
+        root_block: u64,
+        current_block: u64,
+        floor: u64,
     ) -> Result<CollectStats> {
         // One cycle at a time. Two concurrent cycles would each drain and sweep
         // the oldest epoch, and the second would delete an epoch the first had
@@ -564,7 +655,7 @@ impl EpochTrieStore {
         {
             bail!("a collection cycle is already running");
         }
-        let result = self.collect_inner(root_hash, pins, root_block, current_block);
+        let result = self.collect_inner(root_hash, pins, root_block, current_block, floor);
         self.collecting.store(false, Ordering::SeqCst);
         if let Ok(stats) = &result {
             *self.last_collect.write().unwrap() = Some(stats.clone());
@@ -578,7 +669,9 @@ impl EpochTrieStore {
         pins: &[B256],
         root_block: u64,
         current_block: u64,
+        floor: u64,
     ) -> Result<CollectStats> {
+        debug_assert!(floor <= root_block, "the floor is a minimum, so it never exceeds the root");
         let mut stats = CollectStats::default();
 
         // Refuse to collect against a root the store cannot resolve.
@@ -615,7 +708,8 @@ impl EpochTrieStore {
         }
 
         // The epoch about to be swept must not hold writes for any block above
-        // the collection root.
+        // the collection floor -- the collection root, or lower if a consumer
+        // registered a bound (see `collect_bounded`).
         //
         // Invariant I4 keeps later state alive by writing it unconditionally to
         // the *newest* epoch -- which only helps if the epoch being swept is a
@@ -636,7 +730,25 @@ impl EpochTrieStore {
             let epochs = self.epochs.read().unwrap();
             let oldest = epochs.first().context("no epochs")?;
             match oldest.last_block {
-                Some(b) if b <= root_block => {}
+                Some(b) if b <= floor => {}
+                // A bound holds the floor. This is not a failure and must not
+                // be reported as one: a consumer is reading history the
+                // collector wanted to reclaim, the disk will be reclaimed when
+                // it moves on, and a cycle that errored once a minute would
+                // bury the failures that do matter. §7.1's "report it" is this
+                // log, and its safeguard is `max_bound_lag`.
+                Some(b) if floor < root_block => {
+                    info!(
+                        target: "rustock::gc",
+                        "Not collecting: the oldest epoch holds writes up to block {b}, above \
+                         the floor at block {floor} that a registered bound is holding ({} \
+                         blocks below the collection root at {root_block}). The store will \
+                         grow until that consumer catches up.",
+                        root_block.saturating_sub(floor)
+                    );
+                    stats.held_by_bound = Some(floor);
+                    return Ok(stats);
+                }
                 Some(b) => bail!(
                     "refusing to sweep: the oldest epoch received writes up to block {b}, \
                      above the collection root at block {root_block}. Sweeping it would \
@@ -1333,7 +1445,7 @@ mod tests {
     use rustock_trie::TrieKeySlice;
 
     fn cfg(epochs: usize) -> EpochConfig {
-        EpochConfig { epochs, burial_depth: 0, rotate_bytes: 1 }
+        EpochConfig { epochs, burial_depth: 0, rotate_bytes: 1, ..Default::default() }
     }
 
     fn key(n: u64) -> Vec<u8> {
@@ -1346,7 +1458,7 @@ mod tests {
     fn flat_store(dir: &std::path::Path, epochs: usize) -> EpochTrieStore {
         EpochTrieStore::open_with(
             dir,
-            EpochConfig { epochs, burial_depth: 0, rotate_bytes: 1 << 30 },
+            EpochConfig { epochs, burial_depth: 0, rotate_bytes: 1 << 30, ..Default::default() },
             None,
             Arc::new(crate::epoch_backend::FlatFactory {
                 expected_keys: 4096,
@@ -1829,6 +1941,132 @@ mod tests {
         // Both states are intact: nothing was swept.
         walk(&s, new_root).expect("current state survives a refused collection");
         walk(&s, old_root).expect("earlier state survives too");
+    }
+
+    /// A bound is what protects a *pending segment* -- a range of blocks the
+    /// deferred segbuild builder has not re-executed yet. It is not a pin: the
+    /// builder needs every node the range read, including nodes created and
+    /// destroyed inside it, which no end state reaches.
+    #[test]
+    fn a_bound_below_the_collection_root_refuses_the_sweep() {
+        let d = tempfile::tempdir().unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(4), None).unwrap();
+
+        let root = build(&s, 120, 0);
+        // Grow to full width, closing each epoch at block 5,000.
+        for _ in 0..3 {
+            s.collect(root, 5_000, 5_000).unwrap();
+        }
+        assert_eq!(s.epoch_count(), 4, "grown, nothing swept yet");
+
+        // Unbounded, the next cycle sweeps: the oldest epoch's writes are at
+        // or below the collection root.
+        //
+        // Bounded at block 1,000 -- a segment whose range the builder has not
+        // reached -- it must not, because the oldest epoch holds writes up to
+        // 5,000 and those are what the builder will read.
+        let stats = s
+            .collect_bounded(root, &[], &[1_000], 5_000, 5_000)
+            .expect("a held floor is not a failure: the node must not see an error here");
+        assert_eq!(
+            stats.held_by_bound,
+            Some(1_000),
+            "the cycle must say which floor held it"
+        );
+        assert_eq!(stats.reclaimed_bytes, 0, "and must have reclaimed nothing");
+        assert!(s.sweep_log().is_empty(), "nothing was swept");
+
+        // Nothing was swept, so the cycle is repeatable once the bound moves.
+        walk(&s, root).expect("state survives a held collection");
+        s.collect_bounded(root, &[], &[5_000], 5_000, 5_000)
+            .expect("the same cycle proceeds once the bound has caught up");
+    }
+
+    #[test]
+    fn a_bound_at_or_above_the_root_changes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let bounded = tempfile::tempdir().unwrap();
+
+        // Two identical stores driven through identical cycles, one with the
+        // bound held above the collection root throughout.
+        let plain = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
+        let with_bound = EpochTrieStore::open(bounded.path(), cfg(3), None).unwrap();
+        for i in 0..5u64 {
+            let r1 = build(&plain, 64, i * 10_000);
+            let r2 = build(&with_bound, 64, i * 10_000);
+            assert_eq!(r1, r2, "the two stores hold the same state");
+            let at = (i + 1) * 1_000;
+            plain.collect(r1, at, at).unwrap();
+            // The bound sits above the root, so the minimum is still the root.
+            with_bound.collect_bounded(r2, &[], &[at + 500], at, at).unwrap();
+        }
+
+        assert_eq!(
+            plain.sweep_log().len(),
+            with_bound.sweep_log().len(),
+            "a bound above the collection root must not change what is swept"
+        );
+        assert_eq!(plain.collected_below(), with_bound.collected_below());
+    }
+
+    /// §7.1: a builder that dies with a bound registered must not be able to
+    /// stop collection for ever. The store overrides a bound that has stopped
+    /// advancing rather than filling the disk.
+    #[test]
+    fn a_stale_bound_is_overridden() {
+        let d = tempfile::tempdir().unwrap();
+        let s = EpochTrieStore::open(
+            d.path(),
+            EpochConfig {
+                epochs: 4,
+                burial_depth: 0,
+                rotate_bytes: 1,
+                max_bound_lag: 2_000,
+            },
+            None,
+        )
+        .unwrap();
+
+        let root = build(&s, 120, 0);
+        for _ in 0..3 {
+            s.collect(root, 5_000, 5_000).unwrap();
+        }
+
+        // 1,000 is 4,000 blocks below the head, past the 2,000 limit, so it is
+        // ignored and the floor falls back to the collection root.
+        s.collect_bounded(root, &[], &[1_000], 5_000, 5_000)
+            .expect("a bound lagging past max_bound_lag must not block collection");
+
+        // The same bound within the limit still holds.
+        let root = build(&s, 120, 1);
+        let stats = s.collect_bounded(root, &[], &[4_000], 5_000, 5_000).unwrap();
+        assert_eq!(
+            stats.held_by_bound,
+            Some(4_000),
+            "a bound inside the lag limit is honoured"
+        );
+    }
+
+    #[test]
+    fn the_floor_is_the_minimum_of_every_bound() {
+        let d = tempfile::tempdir().unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(4), None).unwrap();
+        // Several consumers, several bounds: the lowest decides, so one slow
+        // consumer protects what a fast one has already finished with.
+        assert_eq!(s.effective_floor(&[9_000, 3_000, 7_000], 10_000, 10_000), 3_000);
+        assert_eq!(s.effective_floor(&[], 10_000, 10_000), 10_000);
+        assert_eq!(
+            s.effective_floor(&[20_000], 10_000, 10_000),
+            10_000,
+            "a bound above the root cannot raise the floor"
+        );
+        // 1,000 is 99,000 blocks below the head, past the default 12,000
+        // limit, so it is dropped and the next-lowest bound decides.
+        assert_eq!(
+            s.effective_floor(&[1_000, 95_000], 100_000, 100_000),
+            95_000,
+            "the stale bound at 1,000 is ignored, so 95,000 decides"
+        );
     }
 
     #[test]

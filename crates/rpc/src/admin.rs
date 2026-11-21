@@ -35,6 +35,7 @@ pub fn rsk_collect_trie(
     epoch_store: &Option<Arc<EpochTrieStore>>,
     burial: u64,
     pins: Vec<B256>,
+    bounds: Vec<u64>,
 ) -> JsonRpcResponse {
     let Some(es) = epoch_store.clone() else {
         return JsonRpcResponse::error(
@@ -89,9 +90,13 @@ pub fn rsk_collect_trie(
         .unwrap_or(at);
     let store_for_task = es.clone();
     let pin_count = pins.len();
+    // A forced collection honours the same bounds as a background cycle. An
+    // operator asking for a cycle is asking to reclaim what is reclaimable,
+    // not to overrule a consumer that is still reading history.
+    let bound_count = bounds.len();
     tokio::spawn(async move {
         match tokio::task::spawn_blocking(move || {
-            store_for_task.collect_pinned(root, &pins, at, head_now)
+            store_for_task.collect_bounded(root, &pins, &bounds, at, head_now)
         })
         .await
         {
@@ -106,9 +111,9 @@ pub fn rsk_collect_trie(
                 tracing::info!(
                     target: "rustock::gc",
                     "Forced collection complete: marked {} ({} held by {} pin(s)), drained {}, \
-                     reclaimed {} MB",
+                     reclaimed {} MB, {} bound(s) honoured",
                     s.marked, s.pinned, pin_count, s.drained,
-                    s.reclaimed_bytes / (1 << 20)
+                    s.reclaimed_bytes / (1 << 20), bound_count
                 )
             }
             Ok(Err(e)) => tracing::error!(target: "rustock::gc", "Forced collection failed: {e:?}"),
@@ -148,6 +153,10 @@ pub fn rsk_collect_trie_status(
             "markSeconds": s.mark_secs,
             "drainSeconds": s.drain_secs,
             "sweepSeconds": s.sweep_secs,
+            // Set when a registered bound held the floor, so the cycle did
+            // nothing on purpose. Without it a held cycle is indistinguishable
+            // from one that found nothing to reclaim.
+            "heldByBound": s.held_by_bound,
         })
     });
     JsonRpcResponse::success(
@@ -277,6 +286,7 @@ pub fn rsk_storage_status(
                     "reclaimedBytes": s.reclaimed_bytes,
                     "markSeconds": s.mark_secs,
                     "sweepSeconds": s.sweep_secs,
+                    "heldByBound": s.held_by_bound,
                 })
             });
             json!({

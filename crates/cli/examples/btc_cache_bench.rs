@@ -70,7 +70,7 @@ fn main() -> Result<()> {
 
     // The epoch config only affects rotation and sweeping, neither of which a
     // read-only store performs; the values just have to pass validation.
-    let cfg = EpochConfig { epochs: 4, burial_depth: 4_000, rotate_bytes: 1 << 30 };
+    let cfg = EpochConfig { epochs: 4, burial_depth: 4_000, rotate_bytes: 1 << 30, ..Default::default() };
     let epochs = EpochTrieStore::open_read_only(&trie_dir, cfg)
         .with_context(|| format!("opening {trie_dir} read-only"))?;
     let raw: Arc<dyn TrieStore> = Arc::new(epochs);

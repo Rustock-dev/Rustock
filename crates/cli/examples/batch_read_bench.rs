@@ -103,6 +103,7 @@ fn main() -> Result<()> {
             epochs: 4,
             burial_depth: 4000,
             rotate_bytes: 1 << 30,
+            ..Default::default()
         };
         if flatdb {
             Arc::new(rustock_storage::epoch_store::EpochTrieStore::open_read_only_with(

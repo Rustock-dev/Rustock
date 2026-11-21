@@ -161,6 +161,16 @@ pub struct RpcState {
     /// the answer has to be the one true at the moment of the cycle. Absent,
     /// or empty, means nothing to pin.
     pub gc_pins: Option<Arc<dyn Fn() -> Vec<alloy_primitives::B256> + Send + Sync>>,
+    /// Block numbers a collection must not discard state above -- the start of
+    /// each range the segment builder has not re-executed yet, minus one.
+    ///
+    /// A **bound** protects a *range of blocks*, which a pin cannot: a node
+    /// created and destroyed inside the range is reachable from no state. It
+    /// travels with a pin on the state root at the same block, which covers
+    /// the other half (the seed trie the build starts from). A closure for the
+    /// same reason `gc_pins` is one: a range stops holding the floor the moment
+    /// it is built.
+    pub gc_bounds: Option<Arc<dyn Fn() -> Vec<u64> + Send + Sync>>,
     /// Blocks kept below the head when a prune request names no block.
     pub prune_keep_depth: u64,
     /// Most blocks one prune sweep may remove.
@@ -545,6 +555,7 @@ async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
             &state.epoch_store,
             state.gc_burial,
             state.gc_pins.as_ref().map(|f| f()).unwrap_or_default(),
+            state.gc_bounds.as_ref().map(|f| f()).unwrap_or_default(),
         ),
         "rsk_collectTrieStatus" => admin::rsk_collect_trie_status(id, &state.epoch_store),
         "rsk_flush" => admin::rsk_flush(id, state),

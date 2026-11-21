@@ -78,9 +78,16 @@ usage.
 
 ## Snapshot sync and segments
 
+Building the initial set is
+[`generating-segbuild.md`](generating-segbuild.md); a running node extends it
+itself, which is
+[`segbuild-continuous-design.md`](segbuild-continuous-design.md). The tools
+below are for building a set from an archive, and for asking what a segment
+does and does not hold.
+
 | tool | what it answers |
 |---|---|
-| [`build_segments`](../crates/cli/examples/build_segments.rs) **(writes)** | Replay a block range, verifying every state root, and build the range's trie segments as a by-product. |
+| [`build_segments`](../crates/cli/examples/build_segments.rs) **(writes)** | Replay a block range, verifying every state root, and build the range's trie segments as a by-product. The library form a node uses is `rustock_execution::segment_build`. |
 | [`audit_chunk`](../crates/cli/examples/audit_chunk.rs) | What does a segment chunk NOT contain that a consumer needs? |
 | [`patch_size`](../crates/cli/examples/patch_size.rs) | How many nodes would it take to make a chunk answer the lookups it cannot? |
 | [`repair_chunk`](../crates/cli/examples/repair_chunk.rs) **(writes)** | Make a segment chunk answer the lookups a foreign client issues. |

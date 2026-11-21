@@ -122,6 +122,7 @@ fn main() -> Result<()> {
                 epochs: args.epochs,
                 burial_depth: args.burial,
                 rotate_bytes: args.rotate_mb * (1 << 20),
+                ..Default::default()
             },
             // The benchmark drives block heights itself from an empty store.
             None,
