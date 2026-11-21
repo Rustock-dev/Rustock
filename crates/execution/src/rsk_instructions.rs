@@ -1043,6 +1043,54 @@ fn record_rsk_opcode(op: u8) {
     }
 }
 
+/// Contracts whose creation kept code, and how many of those carried RSK's
+/// code header.
+///
+/// `[created, headered]`. The header -- a 0xfc first byte, four bytes plus
+/// `code[3]` more, intended for selecting a VM version -- is skipped by every
+/// program rskj builds, under no activation rule. Whether any contract was
+/// ever deployed with one is a separate question from whether one was ever
+/// *executed*: a headered contract that nobody called would leave no trace in
+/// an execution counter.
+///
+/// A census of the state at #3,614,799 found none among the 9,130 contracts
+/// alive then, which leaves the ones created and destroyed before it. This
+/// counts creations as they happen, so a replay answers that for whatever
+/// range it covers.
+pub static CONTRACTS_CREATED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Count a creation that kept its code, and say so if it carries a header.
+///
+/// Called where the deposit has been paid and the code committed, so a
+/// creation that ran out of gas or exceeded the size limit -- which rskj
+/// deploys as empty -- is not counted as a contract.
+pub fn record_contract_created(code: &[u8]) {
+    CONTRACTS_CREATED[0].fetch_add(1, Ordering::Relaxed);
+    if code.first() == Some(&0xfc) {
+        let n = CONTRACTS_CREATED[1].fetch_add(1, Ordering::Relaxed) + 1;
+        // Every one of these, not a capped few: the expectation is zero, so
+        // each is worth a line, and if the expectation is wrong the count is
+        // small enough that it stays readable.
+        tracing::warn!(
+            target: "rustock::rsk_opcodes",
+            "a contract was deployed carrying the RSK code header: {} bytes, \
+             exeVersion {:?}, scriptVersion {:?}, extra header length {:?}, occurrence {n}",
+            code.len(),
+            code.get(1),
+            code.get(2),
+            code.get(3),
+        );
+    }
+}
+
+/// `[contracts created, of those carrying the code header]`.
+pub fn contracts_created() -> [u64; 2] {
+    [
+        CONTRACTS_CREATED[0].load(Ordering::Relaxed),
+        CONTRACTS_CREATED[1].load(Ordering::Relaxed),
+    ]
+}
+
 /// Every count so far: DUPN, SWAPN, TXINDEX.
 pub fn rsk_opcode_hits() -> [u64; 3] {
     [

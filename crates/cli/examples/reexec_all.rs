@@ -750,11 +750,23 @@ fn main() -> anyhow::Result<()> {
 /// actually covered the era, which is why the block counts are printed with it.
 fn report_rsk_opcodes(done: u64, planned: u64) {
     let [dupn, swapn, txindex] = rustock_execution::rsk_instructions::rsk_opcode_hits();
+    let [created, headered] = rustock_execution::rsk_instructions::contracts_created();
     println!();
     println!(
         "RSK opcodes executed in this run ({done} of {planned} planned blocks): \
          DUPN {dupn}, SWAPN {swapn}, TXINDEX {txindex}"
     );
+    println!(
+        "contracts deployed in this run: {created}, of which {headered} carried the RSK \
+         code header"
+    );
+    if created > 0 && headered == 0 {
+        println!(
+            "  no contract in this range was ever deployed with a header. A census of the \
+             state at #3,614,799 found none alive there either, so for this range the \
+             header is unused by deployment as well as by execution."
+        );
+    }
     if dupn == 0 && swapn == 0 && txindex == 0 {
         println!(
             "  none reached. For a range covering #1..#3,614,799 that is the answer to \
