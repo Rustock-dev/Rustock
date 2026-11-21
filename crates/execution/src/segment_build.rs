@@ -72,6 +72,14 @@ const REROOT_EVERY: u64 = 500;
 /// costs minutes rather than hours.
 const CHECKPOINT_EVERY: u64 = 20_000;
 
+/// Blocks between progress lines.
+///
+/// A segment is ~90,000 blocks and runs at order 100 blk/s, so without this a
+/// build is a quarter of an hour of silence between "Building" and "Built" --
+/// and an operator cannot tell a slow build from a stuck one. Nine lines per
+/// segment is enough to see the rate and cheap enough to ignore.
+const PROGRESS_EVERY: u64 = 10_000;
+
 #[derive(Clone, Debug)]
 pub struct BuildConfig {
     /// Directory holding the segment set. The segment is created inside it.
@@ -292,7 +300,7 @@ pub fn build_range(
             // replay their own first block (§11.3a) and why segment 097 needed
             // repairing after the fact.
             win.put(seed.as_slice(), &data);
-            debug!(
+            info!(
                 target: "rustock::segbuild",
                 "Seeded #{start}..#{end} from #{} root {seed:?}", parent.number
             );
@@ -356,6 +364,16 @@ pub fn build_range(
         }
         if done.is_multiple_of(CHECKPOINT_EVERY) {
             window.checkpoint(n, root_hash.as_slice())?;
+        }
+        if done.is_multiple_of(PROGRESS_EVERY) {
+            let secs = t0.elapsed().as_secs_f64();
+            info!(
+                target: "rustock::segbuild",
+                "Building #{start}..#{end}: at #{n}, {done} of {} blocks, {:.0} blk/s,                  {} MB sealed",
+                end - first + 1,
+                done as f64 / secs.max(0.001),
+                window.sealed_bytes.load(std::sync::atomic::Ordering::Relaxed) / (1 << 20)
+            );
         }
     }
 
@@ -487,6 +505,11 @@ impl SegmentBuilder {
     /// following the chain.
     pub fn tick(&self, head: u64, cancel: &(dyn Fn() -> bool + Sync)) -> Tick {
         if let Some(reason) = self.boundaries.halted() {
+            // Already halted. Said at `debug` because the caller is expected to
+            // report the state at its own rate -- every 30 seconds for as long
+            // as a human takes to respond would be thousands of identical
+            // lines.
+            debug!(target: "rustock::segbuild", "Still halted, building nothing: {reason}");
             return Tick::Halted(reason);
         }
 
@@ -498,7 +521,18 @@ impl SegmentBuilder {
         match self.boundaries.verify_built_still_canonical(|h| {
             blocks.canonical_hash(h).ok().flatten().map(|hash| hash.into())
         }) {
-            Ok(Some(reason)) => return Tick::Halted(reason),
+            Ok(Some(reason)) => {
+                // The moment it happens, and the loudest line this module has.
+                // A reorg deeper than the lag means settled history was
+                // rewritten; the builder stops and stays stopped, and an
+                // operator who never sees this has no way to know why the set
+                // stopped growing.
+                error!(
+                    target: "rustock::segbuild",
+                    "HALTING segment building: {reason} Nothing will be built until a human                      investigates and removes the HALTED file. The node is unaffected and                      keeps following the chain."
+                );
+                return Tick::Halted(reason);
+            }
             Ok(None) => {}
             Err(e) => {
                 warn!(

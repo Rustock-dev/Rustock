@@ -3121,19 +3121,47 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                     rustock_execution::segment_build::UNITRIE_FROM
                 )
             })?;
-            // A gap between the set and the node is unbuildable from here: the
-            // node's store is garbage-collected, so the state those ranges read
-            // is gone. Saying so now beats recording ranges that must fail.
-            if exec_head > set_end + args.segbuild_lag {
-                anyhow::bail!(
-                    "--segbuild-out {} ends at #{set_end}, but this node has executed to \
-                     #{exec_head}. The {} blocks in between cannot be built from a \
-                     garbage-collected store. Fill #{}..#{exec_head} with the offline tool \
-                     against an archive trie first, or point --segbuild-out at a set that \
-                     is current.",
-                    dir.display(),
-                    exec_head - set_end,
-                    set_end + 1
+            // A gap between where the set ends and where the node has executed
+            // is a gap in *coverage*. Whether it can still be built is a
+            // different question, and the store answers it: the collection
+            // watermark is the height beneath which a missing node was taken by
+            // the collector and is not recoverable here.
+            //
+            // Distance from the head does not answer it, and an earlier version
+            // of this check used distance -- the same mistake §7.3 corrects
+            // inside the builder. A node stopped for a week has a gap of
+            // thousands of blocks whose nodes are all still present, because
+            // nothing swept while it was down.
+            let watermark = epoch_store.as_ref().and_then(|es| es.collected_below());
+            let gap = exec_head.saturating_sub(set_end);
+            if gap > 0 {
+                // The gap's blocks wrote at or after set_end + 1. Those writes
+                // are intact unless the collector has been at or above there.
+                if watermark.is_some_and(|w| w > set_end + 1) {
+                    anyhow::bail!(
+                        "--segbuild-out {} ends at #{set_end}, this node has executed to \
+                         #{exec_head}, and the collector has already swept beneath \
+                         #{}. The {gap} blocks in between wrote nodes this store can no \
+                         longer return, so they cannot be rebuilt from here. Fill \
+                         #{}..#{exec_head} with the offline tool against an archive trie \
+                         first, or point --segbuild-out at a set that is current.",
+                        dir.display(),
+                        watermark.unwrap_or(0),
+                        set_end + 1
+                    );
+                }
+                warn!(
+                    "segbuild: the set ends at #{set_end} and this node has executed to \
+                     #{exec_head}, a gap of {gap} blocks. The collector has not been \
+                     beneath it ({}), so it is still buildable, and it will be cut as a \
+                     range of its own at startup. Its seed state at #{set_end} is the one \
+                     part nothing can promise -- it was written below the watermark and \
+                     was not pinned while the node ran -- so the build may fail on a \
+                     missing node, loudly, leaving no segment.",
+                    match watermark {
+                        Some(w) => format!("watermark #{w}"),
+                        None => "no sweep has completed".into(),
+                    }
                 );
             }
             if exec_head < set_end {
@@ -3149,6 +3177,28 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                 )?);
             if let Some(reason) = boundaries.halted() {
                 warn!("segbuild is halted and will build nothing: {reason}");
+            }
+            // Close the catch-up as its own range. Left to the size-driven cut
+            // it would wait a gigabyte of writes -- about a month of chain --
+            // before anything tried to build it, and its collection bound would
+            // go stale long before that.
+            if gap > 0 {
+                match boundaries.cut_at(exec_head) {
+                    Ok(Some(b)) => info!(
+                        "segbuild: recorded a boundary at #{} so #{}..#{} is built as a \
+                         range of its own",
+                        b.block,
+                        set_end + 1,
+                        b.block
+                    ),
+                    Ok(None) => debug!(
+                        "segbuild: a boundary at or above #{exec_head} is already recorded"
+                    ),
+                    Err(e) => warn!(
+                        "segbuild: could not record the catch-up boundary at \
+                         #{exec_head}: {e:#}"
+                    ),
+                }
             }
             info!(
                 "segbuild: extending {} from #{}, cutting every ~{} MB, building {} blocks \
@@ -3530,10 +3580,14 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             first_block,
         ));
         let store_for_segbuild = store.clone();
+        let segbuild_dir_for_log = args.segbuild_out.clone().expect("checked above");
         tokio::spawn(async move {
             // Deliberately slow. A boundary is one decision per gigabyte of
             // written state, and a build is minutes of work; polling faster
             // would only read `exec_head` more often.
+            // One reminder an hour while halted, at a 30-second tick.
+            const HALT_REMINDER_TICKS: u64 = 120;
+            let mut halted_ticks: u64 = 0;
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
             // A build runs for minutes, so ticks are missed while it does.
             // Delay rather than burst through the backlog afterwards: the
@@ -3584,7 +3638,24 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                 // which is the whole point of keeping this out of the node's
                 // path.
                 match tokio::task::spawn_blocking(move || b.tick(head, &|| false)).await {
-                    Ok(_) => {}
+                    // Each outcome has already said what it did, at the level
+                    // it deserved, except being halted: that persists, so it is
+                    // the one state worth repeating. A node halted for a week
+                    // should say so in a log an operator reads today, without
+                    // writing the same line every 30 seconds.
+                    Ok(rustock_execution::segment_build::Tick::Halted(reason)) => {
+                        if halted_ticks.is_multiple_of(HALT_REMINDER_TICKS) {
+                            warn!(
+                                target: "rustock::segbuild",
+                                "Segment building is halted and is extending nothing: \
+                                 {reason} Remove the HALTED file under {} once the set has \
+                                 been checked.",
+                                segbuild_dir_for_log.display()
+                            );
+                        }
+                        halted_ticks += 1;
+                    }
+                    Ok(_) => halted_ticks = 0,
                     Err(e) => warn!(
                         target: "rustock::segbuild",
                         "The segment builder stopped with {e}; it will be tried again"
