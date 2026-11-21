@@ -111,6 +111,60 @@ pub struct BuildOutcome {
     pub end_hash: [u8; 32],
 }
 
+/// Make a finished segment readable by whatever will consume it.
+///
+/// The node runs with `UMask=0077` -- sensible hardening for a node -- so
+/// everything it creates is owner-only. A segment nothing but the node can open
+/// defeats the entire purpose of the set, and the failure is silent: the build
+/// verifies, the log says so, and a consumer gets a permission error that looks
+/// nothing like "this segment is fine, you just cannot read it".
+///
+/// So the mode is set explicitly rather than inherited. Offline builds produce
+/// `drwxr-xr-x`/`-rw-r--r--` because the tool runs under a normal umask, and
+/// this makes the node's output match, so a consumer cannot tell which built
+/// which.
+///
+/// Best-effort: a segment that is correct but awkwardly permissioned is still
+/// a correct segment, so a failure here is logged and not fatal.
+#[cfg(unix)]
+fn relax_permissions(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn walk(path: &Path, depth: u32) -> std::io::Result<()> {
+        // Segment stores are two levels deep (`<segment>/sealed/*.sst`); the
+        // bound is only here so a symlink loop cannot spin.
+        if depth > 8 {
+            return Ok(());
+        }
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
+            return Ok(());
+        }
+        let mode = if meta.is_dir() { 0o755 } else { 0o644 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                walk(&entry?.path(), depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    if let Err(e) = walk(dir, 0) {
+        warn!(
+            target: "rustock::segbuild",
+            "Built {} but could not make it readable ({e}); a consumer running as another \
+             user will get a permission error rather than data. Fix with \
+             `chmod -R a+rX {}`.",
+            dir.display(),
+            dir.display()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn relax_permissions(_dir: &Path) {}
+
 /// The directory a build in progress uses. Deliberately not parseable as
 /// `NNN-start-end`, so no reader can mistake it for a segment.
 pub fn pending_dir(out_root: &Path, start: u64, end: u64) -> PathBuf {
@@ -395,6 +449,9 @@ pub fn build_range(
     std::fs::rename(&pending, &final_dir).with_context(|| {
         format!("renaming {} to {}", pending.display(), final_dir.display())
     })?;
+    // After the rename, so a half-built directory is never briefly readable as
+    // a segment, and before the log line, so "Built" means "built and usable".
+    relax_permissions(&final_dir);
 
     let secs = t0.elapsed().as_secs_f64();
     info!(
@@ -667,6 +724,37 @@ mod tests {
         std::fs::create_dir(d.path().join("999-7-8.abandoned")).unwrap();
         std::fs::create_dir(d.path().join(".building-9-10")).unwrap();
         assert_eq!(next_index(d.path()).unwrap(), 909);
+    }
+
+    /// A segment nothing but the node can open is useless, and the failure is
+    /// silent: the build verifies, the log says so, and a consumer gets a
+    /// permission error that looks nothing like "this segment is fine".
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_segment_is_readable_by_a_consumer() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let seg = d.path().join("909-1-2");
+        std::fs::create_dir_all(seg.join("sealed")).unwrap();
+        std::fs::write(seg.join("sealed").join("000001.sst"), b"nodes").unwrap();
+
+        // What `UMask=0077` leaves behind, which is what the mainnet node runs.
+        for p in [seg.join("sealed").join("000001.sst"), seg.join("sealed"), seg.clone()] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        relax_permissions(&seg);
+
+        let mode = |p: &std::path::Path| {
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode(&seg), 0o755, "the segment directory must be enterable");
+        assert_eq!(mode(&seg.join("sealed")), 0o755, "and so must its store");
+        assert_eq!(
+            mode(&seg.join("sealed").join("000001.sst")),
+            0o644,
+            "and its files readable"
+        );
     }
 
     #[test]

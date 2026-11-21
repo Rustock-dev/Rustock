@@ -145,6 +145,7 @@ impl SegmentBoundaries {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating {}", dir.display()))?;
+        set_mode(&dir, 0o755);
         let boundaries = read_boundaries(&dir.join(BOUNDARIES))?;
         let built = read_built(&dir.join(BUILT))?;
         let uncovered = read_uncovered(&dir.join(UNCOVERED))?;
@@ -395,6 +396,7 @@ impl SegmentBoundaries {
             ),
         )
         .with_context(|| format!("writing {}", path.display()))?;
+        set_mode(&path, 0o644);
         Ok(())
     }
 
@@ -470,6 +472,21 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Give a path a mode, ignoring failure.
+///
+/// These logs are operational state that a human and the offline tools read,
+/// and the node creates them under `UMask=0077`, which would leave them
+/// owner-only. Set the mode rather than inherit it. Not fatal: a log that is
+/// written but awkwardly permissioned has still recorded the fact.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) {}
+
 /// Append one line and fsync it.
 ///
 /// `sync_all` rather than a buffered write: a boundary that is in the page
@@ -484,6 +501,7 @@ fn append_line(path: &Path, line: &str) -> Result<()> {
         .with_context(|| format!("opening {}", path.display()))?;
     writeln!(f, "{line}").with_context(|| format!("writing {}", path.display()))?;
     f.sync_all().with_context(|| format!("syncing {}", path.display()))?;
+    set_mode(path, 0o644);
     Ok(())
 }
 

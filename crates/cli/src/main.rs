@@ -3177,6 +3177,35 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                     dir,
                     args.segbuild_target_mb * (1 << 20),
                 )?);
+            // Probe the directory rather than trust it. The node runs with
+            // `UMask=0077` and the set may be owned by whoever built it
+            // offline, so "the set is current" is not the same as "this node
+            // can extend it". §7.2's rule applies: a config error that makes
+            // the feature impossible is loud at startup, before anything is
+            // serving.
+            //
+            // Not hypothetical. On 2026-11-21 this node started with the set
+            // owned by another user, could not append `BOUNDARIES`, said so
+            // once, and then had nothing further to say -- the next attempt
+            // would have been a gigabyte of writes later, about a month. The
+            // feature was inert and the log looked fine.
+            let probe = dir.join(".writable-probe");
+            std::fs::write(&probe, b"")
+                .and_then(|()| std::fs::remove_file(&probe))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "--segbuild-out {} is not writable by this node ({e}). The segment \
+                         set is often owned by whoever built it offline, while the node \
+                         runs as its own user. Give the node ownership, or group write with \
+                         setgid so both keep access:\n  chown -R {}:<group> {}\n  chmod -R \
+                         g+w {}\n  find {} -type d -exec chmod g+s {{}} +",
+                        dir.display(),
+                        std::env::var("USER").unwrap_or_else(|_| "<node-user>".into()),
+                        dir.display(),
+                        dir.display(),
+                        dir.display()
+                    )
+                })?;
             if let Some(reason) = boundaries.halted() {
                 warn!("segbuild is halted and will build nothing: {reason}");
             }
