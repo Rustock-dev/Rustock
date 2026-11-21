@@ -100,6 +100,7 @@ does and does not hold.
 | [`archive_bound`](../crates/cli/examples/archive_bound.rs) | How high does an archive trie actually reach? |
 | [`refilter_segment`](../crates/cli/examples/refilter_segment.rs) **(writes)** | Rewrite a segment's SSTs with a bloom policy. The measurement behind §6.9a's negative result. |
 | [`key_shape`](../crates/cli/examples/key_shape.rs) | Key and value shape of a trie store: fixed-length keys, and how large do values get? |
+| [`opcode_census`](../crates/cli/examples/opcode_census.rs) | Can any contract alive at a block reach a given opcode? Decodes every contract's code, so a byte inside a `PUSH` immediate, the metadata trailer or a dead region does not count. The cheap half of "is this rule change dead code?" |
 
 ## The pre-RSKIP126 root baseline
 

@@ -29,6 +29,7 @@ use revm::interpreter::{
 };
 use revm::context_interface::host::LoadError;
 use revm::primitives::{Address, B256, U256};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// rskj `GasCost.CALL`: static cost of every CALL-family opcode.
 const CALL_STATIC_GAS: u64 = 700;
@@ -991,7 +992,68 @@ fn rsk_gaslimit<WIRE: InterpreterTypes, H: Host + ?Sized>(
 /// over the next byte. A depth the stack doesn't reach throws
 /// (`Program.verifyStackSize`, or `DataWord.intValueCheck` from 2^31), which
 /// spends all of the frame's gas.
+/// How many times each of RSK's own opcodes has executed in this process.
+///
+/// Indexed by [`RSK_DUPN`], [`RSK_SWAPN`], [`RSK_TXINDEX`] in that order, via
+/// [`rsk_opcode_index`]. Exists to answer a question the code cannot: these
+/// three were live from genesis until RSKIP191 removed them at iris300, and
+/// nothing says whether any transaction ever reached one.
+///
+/// A static scan of the state at #3,614,799 says no contract alive then could
+/// (`opcode_census`), which rules it out for surviving code but not for
+/// contracts created and destroyed before the fork. Re-executing the era with
+/// these counters is what settles it.
+///
+/// The cost is one relaxed atomic add per execution of one of these three
+/// opcodes, and nothing at all for any other opcode -- so this is cheap enough
+/// to leave in rather than gate behind a build flag that would then need
+/// remembering.
+pub static RSK_OPCODE_HITS: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Index into [`RSK_OPCODE_HITS`] for one of the three opcodes.
+fn rsk_opcode_index(op: u8) -> usize {
+    match op {
+        RSK_DUPN => 0,
+        RSK_SWAPN => 1,
+        _ => 2,
+    }
+}
+
+/// Counts an execution, and says so the first few times.
+///
+/// Logged as well as counted because a count is only read by whoever thought
+/// to look: the first occurrence of an opcode that may never have run on this
+/// chain belongs in the journal. Capped, because a contract in a loop would
+/// otherwise fill the log with the same discovery.
+fn record_rsk_opcode(op: u8) {
+    let n = RSK_OPCODE_HITS[rsk_opcode_index(op)].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 {
+        let name = match op {
+            RSK_DUPN => "DUPN",
+            RSK_SWAPN => "SWAPN",
+            _ => "TXINDEX",
+        };
+        tracing::warn!(
+            target: "rustock::rsk_opcodes",
+            "{name} (0x{op:02x}) executed, occurrence {n} in this process, transaction \
+             index {} of its block. These opcodes were removed by RSKIP191 at iris300.",
+            TX_INDEX.with(|i| i.get())
+        );
+    }
+}
+
+/// Every count so far: DUPN, SWAPN, TXINDEX.
+pub fn rsk_opcode_hits() -> [u64; 3] {
+    [
+        RSK_OPCODE_HITS[0].load(Ordering::Relaxed),
+        RSK_OPCODE_HITS[1].load(Ordering::Relaxed),
+        RSK_OPCODE_HITS[2].load(Ordering::Relaxed),
+    ]
+}
+
 fn rsk_dupn<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    record_rsk_opcode(RSK_DUPN);
     let Some([depth]) = context.interpreter.stack.popn::<1>() else {
         context.interpreter.halt_underflow();
         return;
@@ -1009,6 +1071,7 @@ fn rsk_dupn<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContex
 /// top with the item `d + 2` from the top, so SWAPN of 0 is SWAP1. It fails
 /// as DUPN does, and steps over the next byte in the same way.
 fn rsk_swapn<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    record_rsk_opcode(RSK_SWAPN);
     let Some([depth]) = context.interpreter.stack.popn::<1>() else {
         context.interpreter.halt_underflow();
         return;
@@ -1045,6 +1108,7 @@ fn step_over_next_byte<WIRE: InterpreterTypes>(
 /// TXINDEX (before RSKIP191), rskj `VM.doTXINDEX`: pushes the index in its
 /// block of the transaction being executed. See `TX_INDEX`.
 fn rsk_txindex<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    record_rsk_opcode(RSK_TXINDEX);
     assert_configured("TX_INDEX");
     let index = TX_INDEX.with(|i| i.get());
     if !context.interpreter.stack.push(U256::from(index)) {

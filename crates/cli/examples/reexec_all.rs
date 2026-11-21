@@ -707,6 +707,9 @@ fn main() -> anyhow::Result<()> {
     // nothing reaches this line looking exactly like a run that executed
     // everything -- and this tool's whole purpose is to certify a database
     // before it is handed to someone else. Compare against the plan.
+    // Reported before the verdict as well, because a run that stops early still
+    // observed whatever it executed, and that observation is worth keeping.
+    report_rsk_opcodes(bd, total_blocks);
     if bd < total_blocks {
         println!(
             "INCOMPLETE: {bd} of {total_blocks} planned blocks re-executed ({} not run). \
@@ -729,7 +732,41 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(2);
     }
     println!("ALL {total_blocks} BLOCKS RE-EXECUTED, ALL SEGMENTS VERIFIED");
+    report_rsk_opcodes(bd, total_blocks);
     Ok(())
+}
+
+/// What RSK's own opcodes did during the replay.
+///
+/// `DUPN` (0xa8), `SWAPN` (0xa9) and `TXINDEX` (0xaa) were live from genesis
+/// until RSKIP191 removed them at iris300 (#3,614,800). Whether any
+/// transaction ever reached one is not answerable from the code, and a replay
+/// is the only thing that answers it exactly: a static scan of the state at
+/// the fork rules it out for contracts alive then (`opcode_census` reports
+/// none reachable), but not for contracts created and destroyed before it, nor
+/// for code a contract computed at runtime.
+///
+/// Zero is therefore a result and not an absence -- provided the range replayed
+/// actually covered the era, which is why the block counts are printed with it.
+fn report_rsk_opcodes(done: u64, planned: u64) {
+    let [dupn, swapn, txindex] = rustock_execution::rsk_instructions::rsk_opcode_hits();
+    println!();
+    println!(
+        "RSK opcodes executed in this run ({done} of {planned} planned blocks): \
+         DUPN {dupn}, SWAPN {swapn}, TXINDEX {txindex}"
+    );
+    if dupn == 0 && swapn == 0 && txindex == 0 {
+        println!(
+            "  none reached. For a range covering #1..#3,614,799 that is the answer to \
+             whether RSKIP191 removed anything live."
+        );
+    } else {
+        println!(
+            "  at least one was reached: RSKIP191 removed something this chain had used. \
+             The first eight occurrences are logged at WARN under \
+             target=rustock::rsk_opcodes."
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
