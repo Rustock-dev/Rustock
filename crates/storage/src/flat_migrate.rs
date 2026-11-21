@@ -295,7 +295,7 @@ mod tests {
     }
 
     fn config() -> EpochConfig {
-        EpochConfig { epochs: 3, burial_depth: 10, rotate_bytes: 32 * 1024 }
+        EpochConfig { epochs: 3, burial_depth: 10, rotate_bytes: 32 * 1024, ..Default::default() }
     }
 
     fn trie_key(i: u16) -> Vec<u8> {

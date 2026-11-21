@@ -819,7 +819,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = EpochTrieStore::open_with(
             dir.path(),
-            EpochConfig { epochs: 3, burial_depth: 10, rotate_bytes: 64 * 1024 },
+            EpochConfig { epochs: 3, burial_depth: 10, rotate_bytes: 64 * 1024, ..Default::default() },
             None,
             // Small segments: they are reserved whole, so a production
             // 512 MiB one does not belong in a temporary directory.
@@ -897,7 +897,7 @@ mod tests {
             dir.path(),
             // Tiny, so writing forces rotations and the entries spread
             // over several epochs.
-            EpochConfig { epochs: 4, burial_depth: 5, rotate_bytes: 8 * 1024 },
+            EpochConfig { epochs: 4, burial_depth: 5, rotate_bytes: 8 * 1024, ..Default::default() },
             None,
             Arc::new(FlatFactory::new(4096).with_segment_size(1 << 20)),
         )

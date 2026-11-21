@@ -103,7 +103,7 @@ fn main() -> Result<()> {
     let store: Box<dyn TrieStore> = if backend == "epoch" {
         Box::new(EpochTrieStore::open(
             &dir,
-            EpochConfig { epochs: 4, burial_depth: 0, rotate_bytes: u64::MAX },
+            EpochConfig { epochs: 4, burial_depth: 0, rotate_bytes: u64::MAX, ..Default::default() },
             // A read benchmark never collects, so there is nothing to close.
             None,
         )?)
@@ -124,7 +124,7 @@ fn main() -> Result<()> {
     let store: Box<dyn TrieStore> = if backend == "epoch" {
         Box::new(EpochTrieStore::open(
             &dir,
-            EpochConfig { epochs: 4, burial_depth: 0, rotate_bytes: u64::MAX },
+            EpochConfig { epochs: 4, burial_depth: 0, rotate_bytes: u64::MAX, ..Default::default() },
             // A read benchmark never collects, so there is nothing to close.
             None,
         )?)

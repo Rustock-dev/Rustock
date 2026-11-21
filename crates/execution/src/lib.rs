@@ -14,6 +14,7 @@ pub mod precompiles;
 pub mod processor;
 pub mod raw_storage;
 pub mod remasc;
+pub mod segment_build;
 pub mod sender_cache;
 pub mod rsk_handler;
 pub mod rsk_instructions;

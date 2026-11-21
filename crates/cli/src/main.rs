@@ -1029,6 +1029,19 @@ struct Args {
     #[arg(long, default_value_t = 4_000)]
     gc_burial: u64,
 
+    /// Ignore a collection bound that has fallen this many blocks behind the
+    /// head (default 12,000).
+    ///
+    /// A bound is a consumer saying "do not discard what blocks after this
+    /// wrote" -- currently a segment build that has not run yet. It blocks
+    /// collection while it is held, so a consumer that is stuck, crashed or
+    /// simply far behind would otherwise hold the floor down until the disk
+    /// filled. Past this distance the bound is ignored and the override
+    /// logged: an incomplete segment set is a thing to repair later, a node
+    /// out of disk is not.
+    #[arg(long, default_value_t = 12_000)]
+    gc_max_bound_lag: u64,
+
     /// Entries in the BTC stored-block cache, or 0 to disable it.
     ///
     /// Answering "which BTC block is at height H?" costs one trie read per
@@ -1487,6 +1500,58 @@ struct Args {
     /// a genesis file would make this another chain.
     #[arg(long, default_value_t = false)]
     allow_chain_overrides: bool,
+
+    /// Extend the segbuild segment set into this directory while syncing.
+    ///
+    /// The node syncs normally into its own store. Each executed block adds the
+    /// bytes it wrote to a counter, and when enough has accumulated the block
+    /// number is recorded as a segment boundary. Once the head is
+    /// --segbuild-lag blocks past a boundary, a background task builds that
+    /// range by re-executing it from the node's own store.
+    ///
+    /// Blocks are therefore executed twice. At the tip that is close to free --
+    /// a 1,000-block range is about ten seconds of work per eight hours of
+    /// chain -- and it buys a segment that is exactly its range's read set,
+    /// with no state from blocks executed beside the chain that never became
+    /// canonical. See docs/segbuild-continuous-design.md.
+    #[arg(long, value_name = "DIR")]
+    segbuild_out: Option<std::path::PathBuf>,
+
+    /// Written state a segment should accumulate before being cut (default
+    /// 1024 MB).
+    ///
+    /// Bytes rather than a block count: cost per block varies tenfold across
+    /// eras, so equal block counts give segments from 0.2 GB to over 2 GB,
+    /// while equal bytes give segments a consumer can hold in memory -- which
+    /// is what makes replaying one fast. Advisory: a cut lands on the block
+    /// that crosses the target.
+    #[arg(long, value_name = "MB", default_value_t = 1024)]
+    segbuild_target_mb: u64,
+
+    /// Blocks to wait after a boundary before building its range (default
+    /// 1000).
+    ///
+    /// Also how far behind the tip the node may be and still extend the set.
+    /// A pending range is protected from the collector while it waits -- by a
+    /// bound, which keeps what its blocks wrote, and a pin on the state it
+    /// seeds from -- so the wait itself is safe for as long as the builder
+    /// keeps up. A builder that falls more than `--gc-max-bound-lag` behind
+    /// has its protection released, and its ranges then fail on missing nodes:
+    /// loudly, leaving no segment rather than an incomplete one.
+    #[arg(long, value_name = "BLOCKS", default_value_t = 1000)]
+    segbuild_lag: u64,
+
+    /// Memory one of the builder's two in-memory tables may hold before it is
+    /// written out (default 256 MB, so ~512 MB resident).
+    ///
+    /// This is the builder's memory budget, not the segment size: a segment is
+    /// the whole range, and sealing a table merely flushes it into the
+    /// segment's store. Sizing it like the segment target would mean ~2 GB
+    /// resident on a box that also has to run the node -- three builders at
+    /// 700 MB x 2 tables was the measured ceiling on a 7.7 GB machine, and a
+    /// fourth was slower than three.
+    #[arg(long, value_name = "MB", default_value_t = 256)]
+    segbuild_seal_mb: u64,
 
     /// Import the blocks of an rskj `ExportBlocks` file (`number,hash,td,rlp`
     /// per line, plain or .gz) on top of this node's best block, through the
@@ -3023,6 +3088,85 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         ..rustock_sync::SnapConfig::default()
     };
 
+    // Extending the segbuild segment set while syncing.
+    //
+    // Two halves, neither of them in the execution path: a counter that wraps
+    // the store execution writes through, and a background task that cuts
+    // boundaries and re-executes settled ranges
+    // (docs/segbuild-continuous-design.md).
+    //
+    // Only the handle given to the block processor is wrapped. The readers'
+    // handle is not: an `eth_call` writes speculative state through the same
+    // store, and counting it would cut segments early for no reason.
+    let segbuild = match &args.segbuild_out {
+        Some(dir) => {
+            let exec_head = match store.exec_head()? {
+                Some((hash, _)) => store.header(hash)?.map(|h| h.number).unwrap_or(0),
+                None => 0,
+            };
+            let set_end = rustock_execution::segment_build::set_end(dir)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--segbuild-out {} holds no NNN-start-end segment. A continuous builder \
+                     extends an existing set; it cannot bootstrap one, because the ranges \
+                     below #{} cannot be verified against their headers and the ones above \
+                     it are no longer in this node's store. Build the initial set with the \
+                     offline tool (docs/generating-segbuild.md).",
+                    dir.display(),
+                    rustock_execution::segment_build::UNITRIE_FROM
+                )
+            })?;
+            // A gap between the set and the node is unbuildable from here: the
+            // node's store is garbage-collected, so the state those ranges read
+            // is gone. Saying so now beats recording ranges that must fail.
+            if exec_head > set_end + args.segbuild_lag {
+                anyhow::bail!(
+                    "--segbuild-out {} ends at #{set_end}, but this node has executed to \
+                     #{exec_head}. The {} blocks in between cannot be built from a \
+                     garbage-collected store. Fill #{}..#{exec_head} with the offline tool \
+                     against an archive trie first, or point --segbuild-out at a set that \
+                     is current.",
+                    dir.display(),
+                    exec_head - set_end,
+                    set_end + 1
+                );
+            }
+            if exec_head < set_end {
+                info!(
+                    "segbuild: the set already covers #{set_end}, past this node's executed \
+                     head #{exec_head}. Nothing will be cut until the node passes it."
+                );
+            }
+            let boundaries =
+                Arc::new(rustock_storage::segbuild_boundaries::SegmentBoundaries::open(
+                    dir,
+                    args.segbuild_target_mb * (1 << 20),
+                )?);
+            if let Some(reason) = boundaries.halted() {
+                warn!("segbuild is halted and will build nothing: {reason}");
+            }
+            info!(
+                "segbuild: extending {} from #{}, cutting every ~{} MB, building {} blocks \
+                 behind the executed head",
+                dir.display(),
+                set_end + 1,
+                args.segbuild_target_mb,
+                args.segbuild_lag
+            );
+            Some((boundaries, set_end + 1))
+        }
+        None => None,
+    };
+
+    // The handle execution writes through. Counting is one relaxed atomic add
+    // per write batch.
+    let trie_store_for_blocks: Arc<dyn rustock_trie::TrieStore> = match &segbuild {
+        Some((boundaries, _)) => Arc::new(rustock_storage::segbuild_boundaries::CountingWrites::new(
+            trie_store_for_exec.clone(),
+            boundaries.clone(),
+        )),
+        None => trie_store_for_exec.clone(),
+    };
+
     // Background collection. Kept out of the block-processing path on purpose:
     // mark and drain only read the oldest epoch and write the newest, and block
     // processing also writes the newest, so the two need no coordination beyond
@@ -3038,6 +3182,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         // moves. Empty when serving is off, and then collection is exactly
         // what it was.
         let snap_for_gc = snap_config.clone();
+        let segbuild_for_gc = segbuild.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(every).await;
@@ -3079,18 +3224,57 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                     );
                     continue;
                 }
-                let pins = rustock_sync::snap_servable_roots(&store_for_gc, &snap_for_gc);
-                if pins.is_empty() {
+                let mut pins = rustock_sync::snap_servable_roots(&store_for_gc, &snap_for_gc);
+                let snap_pins = pins.len();
+                // A pending segment range needs both halves: a bound, which
+                // keeps what the range's blocks wrote -- including nodes
+                // created and destroyed inside it, which no state reaches --
+                // and a pin on the state the range seeds from, which the bound
+                // cannot keep because it was written below it. See
+                // `SegmentBoundaries::collection_bound`.
+                let bounds: Vec<u64> = segbuild_for_gc
+                    .as_ref()
+                    .and_then(|(b, first)| b.collection_bound(*first))
+                    .into_iter()
+                    .collect();
+                for &bound in &bounds {
+                    match store_for_gc
+                        .canonical_hash(bound)
+                        .ok()
+                        .flatten()
+                        .and_then(|h| store_for_gc.header(h).ok().flatten())
+                    {
+                        Some(header) => pins.push(header.state_root),
+                        // Without the seed pin the bound alone would let the
+                        // range's starting state be collected, and the build
+                        // would fail on a missing node rather than be
+                        // protected. Say so rather than collect as if the
+                        // range were safe.
+                        None => warn!(
+                            target: "rustock::gc",
+                            "Segment build bound at #{bound} has no canonical header, so its                              seed state cannot be pinned. The pending range may have to be                              rebuilt from an archive."
+                        ),
+                    }
+                }
+                if pins.is_empty() && bounds.is_empty() {
                     info!(target: "rustock::gc", "Collecting against #{at} ({root:?})");
                 } else {
                     info!(
                         target: "rustock::gc",
-                        "Collecting against #{at} ({root:?}), pinning {} snapshot state(s)",
-                        pins.len()
+                        "Collecting against #{at} ({root:?}), pinning {snap_pins} snapshot                          state(s){}",
+                        bounds
+                            .first()
+                            .map(|b| format!(
+                                " and holding the floor at #{b} for a pending segment"
+                            ))
+                            .unwrap_or_default()
                     );
                 }
-                match es.collect_pinned(root, &pins, at, head_now) {
+                match es.collect_bounded(root, &pins, &bounds, at, head_now) {
                     Ok(stats) => {
+                        // A floor held by a bound is reported by the store
+                        // itself and is not a failure; nothing more to say
+                        // here.
                         for lost in &stats.unservable {
                             warn!(
                                 target: "rustock::gc",
@@ -3288,6 +3472,122 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         sync_handler.attach_snap_server(snap_server);
     }
 
+    // The builder. One range at a time, on a blocking thread, and every
+    // failure stays inside it: extending the set is a by-product of syncing,
+    // and nothing here is a reason to stop following the chain.
+    if let Some((boundaries, first_block)) = segbuild.clone() {
+        let out_root = args.segbuild_out.clone().expect("checked above");
+        // The builder's own processor, configured like the node's: chain
+        // config, fork detection and Bridge constants all change what a block
+        // computes, and a replay under different rules is not a replay. The
+        // caches are shared because they are shared state, not per-processor
+        // state. The legacy event store is deliberately left out: the builder
+        // re-executes blocks whose peg events have already been recorded, and
+        // recording them again would double every entry.
+        let mut segbuild_processor = rule_keeping_processor(&hardfork_cfg, &store, &config);
+        if let Some(cache) = &btc_block_cache {
+            segbuild_processor = segbuild_processor.with_btc_block_cache(cache.clone());
+        }
+        if let Some(cache) = &sender_cache {
+            segbuild_processor = segbuild_processor.with_sender_cache(cache.clone());
+        }
+        if config.genesis_spec.is_some() {
+            segbuild_processor = segbuild_processor.with_bridge_constants(
+                rustock_execution::bridge::constants::BridgeConstants::rskj_regtest(),
+            );
+        }
+        let builder = Arc::new(rustock_execution::segment_build::SegmentBuilder::new(
+            boundaries.clone(),
+            store.clone(),
+            // The unwrapped store: the builder only reads it, and its window
+            // must not feed the counter.
+            trie_store_for_exec.clone(),
+            Arc::new(segbuild_processor),
+            // The collection watermark, when there is a collector. A range the
+            // collector has already swept beneath cannot be built from this
+            // store, and the builder writes it off rather than replaying into
+            // a hole.
+            epoch_store.clone().map(|es| {
+                Arc::new(move || es.collected_below())
+                    as rustock_execution::segment_build::CollectedBelow
+            }),
+            rustock_execution::segment_build::BuildConfig {
+                out_root,
+                // The builder's memory budget, not the segment size: two
+                // tables of this, flushed into the segment's store as they
+                // fill. Memory, not core count, is what the measurements
+                // bounded.
+                seal_bytes: args.segbuild_seal_mb * (1 << 20),
+                tables: 2,
+            },
+            args.segbuild_lag,
+            first_block,
+        ));
+        let store_for_segbuild = store.clone();
+        tokio::spawn(async move {
+            // Deliberately slow. A boundary is one decision per gigabyte of
+            // written state, and a build is minutes of work; polling faster
+            // would only read `exec_head` more often.
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            // A build runs for minutes, so ticks are missed while it does.
+            // Delay rather than burst through the backlog afterwards: the
+            // next thing to do is the same either way, and bursting would
+            // only read the executed head several times in a row.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+
+                // The executed head, not the best header: a segment can only
+                // be built from state that exists, and only executed blocks
+                // have any. This is also why the boundary is cut here rather
+                // than inside the execution loop -- polling the executed head
+                // cannot name a block that has not been executed, and it needs
+                // no hook in the hot path. The cut lands on the first poll
+                // after the target is crossed instead of exactly on it, which
+                // sizes being advisory is what makes acceptable.
+                let head = match store_for_segbuild.exec_head() {
+                    Ok(Some((hash, _))) => match store_for_segbuild.header(hash) {
+                        Ok(Some(h)) => h.number,
+                        _ => continue,
+                    },
+                    Ok(None) => continue,
+                    Err(e) => {
+                        debug!(target: "rustock::segbuild", "No executed head to cut at: {e:#}");
+                        continue;
+                    }
+                };
+
+                if head >= first_block {
+                    match boundaries.end_block(head) {
+                        Ok(Some(b)) => info!(
+                            target: "rustock::segbuild",
+                            "Segment boundary at #{} ({} MB accumulated)",
+                            b.block, b.approx_bytes / (1 << 20)
+                        ),
+                        Ok(None) => {}
+                        Err(e) => warn!(
+                            target: "rustock::segbuild",
+                            "Could not record a segment boundary at #{head}: {e:#}"
+                        ),
+                    }
+                }
+
+                let b = builder.clone();
+                // A build is CPU-bound for minutes; it must not sit on the
+                // runtime. A panic inside it is logged and the loop continues,
+                // which is the whole point of keeping this out of the node's
+                // path.
+                match tokio::task::spawn_blocking(move || b.tick(head, &|| false)).await {
+                    Ok(_) => {}
+                    Err(e) => warn!(
+                        target: "rustock::segbuild",
+                        "The segment builder stopped with {e}; it will be tried again"
+                    ),
+                }
+            }
+        });
+    }
+
     let best_block_listeners = rustock_sync::BestBlockListeners::new();
     let mut sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
         .with_best_block_listeners(best_block_listeners.clone())
@@ -3308,7 +3608,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     if !args.spv {
         sync_service = sync_service.with_block_processor(
             block_processor,
-            trie_store_for_exec,
+            trie_store_for_blocks,
             initial_state_root,
         );
     }
@@ -3920,6 +4220,16 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                 let snap = snap_config.clone();
                 Some(Arc::new(move || rustock_sync::snap_servable_roots(&store, &snap)))
             },
+            gc_bounds: {
+                // The lowest block a pending segment build still needs. A
+                // forced collection honours it for the same reason the
+                // background one does: an operator asking to reclaim disk is
+                // not asking to break a build in progress.
+                segbuild.clone().map(|(boundaries, first)| {
+                    Arc::new(move || boundaries.collection_bound(first).into_iter().collect())
+                        as Arc<dyn Fn() -> Vec<u64> + Send + Sync>
+                })
+            },
             prune_keep_depth: args.prune_keep_depth,
             prune_max_batch: args.prune_max_batch,
             logs_max_blocks: args.rpc_logs_max_blocks,
@@ -4472,6 +4782,7 @@ fn trie_layout(args: &Args) -> Result<TrieLayout> {
         epochs: args.gc_epochs,
         burial_depth: args.gc_burial,
         rotate_bytes: args.gc_rotate_mb * (1 << 20),
+        max_bound_lag: args.gc_max_bound_lag,
     };
     let rotate_bytes = gc_config.rotate_bytes;
     let backend = rustock_storage::epoch_store::TrieBackend::parse(&args.trie_backend, gc_config)?;

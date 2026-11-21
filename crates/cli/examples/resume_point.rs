@@ -60,7 +60,7 @@ fn main() -> Result<()> {
     println!("Opening READ-ONLY: {data_dir} and {trie_dir} ({engine})\n");
 
     let store = BlockStore::open_read_only(&data_dir)?;
-    let cfg = EpochConfig { epochs: 4, burial_depth: 4_000, rotate_bytes: 1 << 30 };
+    let cfg = EpochConfig { epochs: 4, burial_depth: 4_000, rotate_bytes: 1 << 30, ..Default::default() };
     let factory: std::sync::Arc<dyn rustock_storage::epoch_backend::EpochBackendFactory> =
         match rustock_storage::TrieEngine::parse(&engine)? {
             rustock_storage::TrieEngine::RocksDb => std::sync::Arc::new(

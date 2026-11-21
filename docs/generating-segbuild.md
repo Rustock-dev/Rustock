@@ -189,12 +189,67 @@ tail arrives at the anchor.
 
 ## 3. Keeping the set current
 
-Rebuilding from an archive every time the chain advances does not scale.
-`crates/storage/src/segbuild_capture.rs` captures segments as a by-product of
-normal syncing: writes go to both stores, reads come from the primary and are
-written to the capture, and a sealed segment is closed when it fills. It is
-crash-safe — the high-water mark is written in the same atomic batch as the
-nodes it describes — and costs about 1.24x per-block execution.
+Rebuilding from an archive every time the chain advances does not scale, so the
+node extends the set itself — **not** by capturing as it syncs, but by deciding
+where segments should be cut and re-executing each range afterwards.
 
-**It is not wired into the node yet.** See
-[`trie-capture-design.md`](trie-capture-design.md) for what remains.
+The node syncs normally into its own store and adds each block's written bytes
+to a counter. When enough has accumulated, the block number is recorded as a
+boundary. Once the head is `--segbuild-lag` blocks past a boundary, a background
+task builds that range by re-executing it from the node's own store.
+
+```sh
+rustock-cli --segbuild-out /path/to/segbuild \
+            --segbuild-target-mb 1024 \
+            --segbuild-lag 1000
+```
+
+Blocks are executed twice. At the tip that is close to free — a 1,000-block
+range is about ten seconds of work per eight hours of chain — and it buys two
+properties interception could not give:
+
+- **The segment is exactly its range's read set.** A settled range of canonical
+  blocks, re-executed in isolation, touches exactly the nodes it needs. Capture
+  by interception also collected state from blocks executed beside the chain
+  that never became canonical, so the segment stopped being the read set of its
+  range.
+- **It cannot produce a wrong segment.** The build verifies every state root and
+  aborts on a missing node, so a failure leaves no segment rather than one that
+  silently under-covers.
+
+### 3.1 What the node checks before it starts extending
+
+`--segbuild-out` must point at a set that is **current**, and the node says so
+at startup rather than discovering it later:
+
+- the directory must already hold at least one `NNN-start-end` segment — a
+  continuous builder extends a set, it cannot bootstrap one, because the
+  pre-fork era needs the baseline of §2; and
+- the executed head must not be more than `--segbuild-lag` blocks past the set's
+  end. A gap cannot be built from the node's store: that state has been
+  collected. Fill it with §1 against an archive first.
+
+### 3.2 How a pending range is kept alive
+
+The node's trie store is garbage-collected, so a range waiting to be built has
+to be protected, and it takes two things that each cover what the other cannot:
+
+- a **collection bound** at the block the range seeds from, which keeps
+  everything blocks after it wrote — including nodes created and destroyed
+  inside the range, which no state reaches; and
+- a **pin** on that same block's state root, which keeps the seed trie, whose
+  nodes were written below the bound.
+
+Both are derived from one number and registered automatically. A builder that
+falls more than `--gc-max-bound-lag` blocks behind loses the protection — a node
+out of disk is worse than an incomplete set. Once the collector has actually
+swept beneath a pending range, that range is written off into `UNCOVERED`
+*without being attempted*: the store's own watermark says its nodes are not
+recoverable, so replaying it would only read into the hole. A build that fails
+for any other reason — a full disk, a damaged store — is retried twice more and
+then written off the same way. `UNCOVERED` is the set's list of known holes,
+which §1 can fill from an archive.
+
+See [`segbuild-continuous-design.md`](segbuild-continuous-design.md) for the
+argument in full, and [`trie-capture-design.md`](trie-capture-design.md) for why
+interception was abandoned.
