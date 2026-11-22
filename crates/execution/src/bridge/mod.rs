@@ -594,6 +594,7 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
     // or run. `Program.callToPrecompiledAddress` asks for the gas outside
     // every try, so the exception leaves the VM whatever the era.
     if from_contract && !hardfork_cfg.has_rskip88(block_number) {
+        crate::legacy_census::Legacy::InternalBridgeCallEndsCaller.hit();
         return Err(PrecompileError::other(CALLER_ABORT_MARKER));
     }
 
@@ -612,6 +613,33 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
             .filter(|m| abi_args_decode_ok(&input[4..], m.signature)),
     }
     .filter(|m| m.enabled.is_enabled(hardfork_cfg, block_number));
+    if let Some(m) = parsed {
+        // Six methods were enabled from genesis and disabled at an activation.
+        // `parsed` is `Some` only when the method is enabled at this height, so
+        // reaching here with one of these signatures is the window being used.
+        //
+        // Counted here rather than by scanning transaction inputs because this
+        // sees an internal call from a contract too, and four of the six are
+        // local-only getters whose only on-chain caller is a contract. A
+        // selector scan of transaction data cannot see those at all.
+        const WINDOWED: [&str; 6] = [
+            "addFederatorPublicKey(bytes)",
+            "getFederatorPublicKey(int256)",
+            "getRetiringFederatorPublicKey(int256)",
+            "getPendingFederatorPublicKey(int256)",
+            "addLockWhitelistAddress(string,int256)",
+            "getBtcBlockchainBlockLocator()",
+        ];
+        if WINDOWED.contains(&m.signature) {
+            crate::legacy_census::Legacy::WindowedBridgeMethod.hit();
+            tracing::warn!(
+                target: "rustock::rsk_opcodes",
+                "a windowed bridge method was invoked at #{block_number}: {} -- this one was \
+                 removed by a later activation, so the window it belongs to is occupied",
+                m.signature
+            );
+        }
+    }
     let Some(method) = parsed else {
         // Which selector, and from where. A Bridge method that exists in rskj
         // and not here fails exactly like a malformed call, and the two are
@@ -900,10 +928,20 @@ fn execute_method<CTX: crate::RskContextTr>(
         "updateCollections" => (true, false),
         // receiveHeadersIsPublic() = RSKIP124 && !RSKIP200; restricted otherwise.
         #[allow(clippy::nonminimal_bool)] // mirrors the rskj formula above
-        "receiveHeaders" => (
-            !(hardfork_cfg.has_rskip124(block_number) && !hardfork_cfg.has_rskip200(block_number)),
-            false,
-        ),
+        "receiveHeaders" => {
+            let public =
+                hardfork_cfg.has_rskip124(block_number) && !hardfork_cfg.has_rskip200(block_number);
+            if public {
+                // Deliberately an over-count: this fires for *any* call to
+                // receiveHeaders while the window is open, not only one from a
+                // caller the federation-only rule would have refused. An
+                // over-count that comes back zero is still a proof -- nobody
+                // called it at all -- and only a non-zero needs the finer
+                // question asked.
+                crate::legacy_census::Legacy::PublicReceiveHeaders.hit();
+            }
+            (!public, false)
+        }
         // registerBtcTransactionIsPublic() = RSKIP199.
         "registerBtcTransaction" => (!hardfork_cfg.has_rskip199(block_number), false),
         "addSignature" => (true, true),

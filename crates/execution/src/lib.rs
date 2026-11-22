@@ -8,6 +8,7 @@ pub mod executor;
 pub mod gas_estimator;
 pub mod hardfork;
 pub mod internal_tx;
+pub mod legacy_census;
 pub mod mining;
 pub(crate) mod native;
 pub mod precompiles;

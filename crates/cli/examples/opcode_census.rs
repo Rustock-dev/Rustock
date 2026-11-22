@@ -368,6 +368,29 @@ fn main() -> Result<()> {
     // judgement -- 443 of the first run's hits were the metadata trailer and
     // constant pools, and the only way to be sure of the survivors is to read
     // the bytes around them.
+    // Does an address exist as an account in the state trie? One lookup, no
+    // walk. Written to test a proposed screen for EVM-046 -- "no active
+    // precompile exists as an account, so no dirty-high-bits call ever landed"
+    // -- which needs the premise checked before it can be leaned on.
+    if let Some(hex) = flag("account") {
+        let node = TrieNode::from_message(&root_bytes, store.as_ref());
+        for one in hex.split(',') {
+            let bytes = alloy_primitives::hex::decode(one.trim().trim_start_matches("0x"))
+                .context("--account takes comma-separated hex addresses")?;
+            let key = rustock_trie::account_key_from_bytes(&bytes);
+            let found = node.get(&rustock_trie::TrieKeySlice::from_key(&key), store.as_ref());
+            println!(
+                "  0x{}  {}",
+                one.trim().trim_start_matches("0x"),
+                match found {
+                    Some(v) => format!("EXISTS ({} bytes of account state)", v.len()),
+                    None => "absent".to_string(),
+                }
+            );
+        }
+        return Ok(());
+    }
+
     if let Some(hex) = flag("dump") {
         let bytes = alloy_primitives::hex::decode(hex.trim_start_matches("0x"))
             .context("--dump takes a hex address")?;

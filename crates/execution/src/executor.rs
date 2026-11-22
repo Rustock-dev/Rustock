@@ -2700,10 +2700,16 @@ impl RskExecutor {
     /// transactions to the Bridge from the genesis federation or an
     /// authorized sender execute for free (zero gas).
     fn is_free_bridge_tx(&self, tx: &rustock_core::Transaction, sender: Address, block_number: u64) -> bool {
-        tx.to.len() == 20
+        let free = tx.to.len() == 20
             && tx.to.as_ref() == crate::precompiles::BRIDGE_ADDR.as_slice()
             && !self.hardfork_cfg.has_are_bridge_txs_paid(block_number)
-            && self.free_bridge_senders.contains(&sender)
+            && self.free_bridge_senders.contains(&sender);
+        if free {
+            // Expected non-zero: this exists because the bootstrap-era
+            // federation needed it, so it is the second positive control.
+            crate::legacy_census::Legacy::FreeBridgeTransaction.hit();
+        }
+        free
     }
 
     /// For contract creation transactions, compute the created address from

@@ -115,9 +115,27 @@ impl NativeContract for BlockHeader<'_> {
     fn execute(&self, call: Call) -> Result<Vec<u8>, Failure> {
         // `BlockHeaderContractMethod.execute`: a depth no short holds names no
         // block, and neither does one `getBlock` finds nothing at.
+        // PC-042. The depth is narrowed to a signed 16-bit value *before* the
+        // sign test, so -1 throws and -40,000 does not. Only the negative half
+        // needs measuring: on the positive side 5,000 and 40,000 both answer
+        // empty, by two different routes, so the narrowing is already
+        // invisible there and removing it would change nothing.
+        //
+        // Counted here rather than from receipts because a contract-internal
+        // call's input is in no receipt.
         let block = match call.depth.short_value_exact() {
-            Some(depth) => self.block_at(depth)?,
-            None => None,
+            Some(depth) => {
+                if depth < 0 {
+                    crate::legacy_census::Legacy::BlockHeaderDepthOutOfRange.hit();
+                }
+                self.block_at(depth)?
+            }
+            None => {
+                // Outside the 16-bit range entirely. Also outside 0..32,767,
+                // so it is part of the same predicate.
+                crate::legacy_census::Legacy::BlockHeaderDepthOutOfRange.hit();
+                None
+            }
         };
         let Some((hash, header)) = block else {
             return Ok(encode_bytes(&[]));

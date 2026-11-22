@@ -4393,6 +4393,10 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
     let migration_age_end = if hardfork_cfg.has_rskip357(block_number)
         && !hardfork_cfg.has_rskip374(block_number)
     {
+        // The positive control for the whole legacy census: this window is
+        // known occupied, because using the ordinary end age inside it
+        // diverged a real mainnet block.
+        crate::legacy_census::Legacy::MigrationEndAge.hit();
         config.special_case_funds_migration_age_end
     } else {
         config.funds_migration_age_end
