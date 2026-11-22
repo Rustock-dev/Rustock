@@ -1673,6 +1673,10 @@ fn rsk_return_create<CTX: ContextTr<Chain = crate::raw_storage::RskChainExt>>(
     );
     interpreter_result.result = InstructionResult::Return;
     if !unsaved {
+        // Counted here rather than at the frame's open: this is the point at
+        // which a contract exists with this code, and the question being
+        // answered is what was ever *deployed*, not what was ever run.
+        crate::rsk_instructions::record_contract_created(&interpreter_result.output);
         ctx.chain_mut().code_saved.insert(address);
     }
 }
