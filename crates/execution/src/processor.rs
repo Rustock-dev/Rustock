@@ -765,12 +765,19 @@ impl BlockProcessor {
     ) -> Result<(), ValidationError> {
         let number = block.header.number;
 
-        // rskj `BlockValidatorImpl.isValid` refuses genesis outright: it is
-        // loaded from the genesis file, never validated. Genesis carries no
-        // REMASC transaction, so running these rules on it would reject the
-        // chain's first block.
+        // rskj `BlockValidatorImpl.isValid` refuses genesis outright --
+        // `if (block.isGenesis()) { return false; }` -- because genesis is
+        // loaded from the genesis file and never validated. This used to
+        // return `Ok(())` instead, which is the opposite verdict for the same
+        // call: any caller that branched on the result behaved oppositely on
+        // the two clients.
+        //
+        // The rules themselves cannot run on genesis either way: it carries no
+        // REMASC transaction, so the body rules would reject it for a reason
+        // that says nothing about whether it is the right genesis. Refusing to
+        // answer is the honest verdict, and it is rskj's.
         if number == 0 {
-            return Ok(());
+            return Err(ValidationError::GenesisNotValidated);
         }
 
         self.validate_block_body_rules(block, parent)?;
@@ -805,6 +812,25 @@ impl BlockProcessor {
             rsk_header_rules, rsk_parent_rules, UncleForkDetection, UnclesValidationRule,
             UNCLE_GENERATION_LIMIT, UNCLE_LIST_LIMIT,
         };
+
+        // rskj runs `BlockUnclesHashValidationRule` inside
+        // `BlockUnclesValidationRule`, so the ommers hash is checked during
+        // *validation*. Rustock checked it only in `process_block_inner`,
+        // during execution, which agrees on every path that executes -- and
+        // differs on any that validates without executing, which is what snap
+        // and relay do.
+        //
+        // Still checked during execution too. The cost is one keccak over a
+        // list that holds at most ten headers, and a check that is cheap and
+        // in both places cannot be the one someone later moves to the wrong
+        // side of a branch.
+        let computed_ommers_hash = compute_ommers_hash(&block.ommers);
+        if !block.header.has_ommers_hash(computed_ommers_hash) {
+            return Err(ValidationError::OmmersHashMismatch {
+                header: block.header.ommers_hash,
+                computed: computed_ommers_hash,
+            });
+        }
 
         let ancestry = self.ancestry();
         let header_rules = rsk_header_rules(self.chain_config.clone());
@@ -3483,6 +3509,52 @@ mod tests {
         }
     }
 
+    /// rskj runs `BlockUnclesHashValidationRule` inside
+    /// `BlockUnclesValidationRule`, so the ommers hash is checked during
+    /// validation. Rustock checked it only while executing, which agrees on
+    /// every path that executes and differs on any that validates without --
+    /// snap and relay do exactly that.
+    #[test]
+    fn a_block_whose_ommers_hash_lies_is_refused_without_executing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let block_store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store.clone())
+            .with_chain_config(uncle_config());
+
+        let mut genesis = dummy_header(0);
+        genesis.difficulty = U256::from(1);
+        let b1 = child_of(1, &genesis, 1_700_000_010);
+        let b2 = child_of(2, &b1, 1_700_000_030);
+        for header in [&genesis, &b1, &b2] {
+            block_store.put_header(header).unwrap();
+        }
+        let uncle = child_of(2, &b1, 1_700_000_040);
+
+        // The honest block passes the uncle rules: whatever else this test
+        // shows, it must not pass for want of a well-formed block.
+        let honest = naming(3, &b2, &uncle, &[]);
+        let before = processor.validate_uncles(&honest);
+        assert!(
+            !matches!(before, Err(ValidationError::OmmersHashMismatch { .. })),
+            "the control block must not fail the hash check: {before:?}"
+        );
+
+        // Now claim an ommers hash the list does not have, leaving everything
+        // else untouched.
+        let mut lying = honest.clone();
+        lying.header.ommers_hash = B256::repeat_byte(0xAB);
+        let verdict = processor.validate_uncles(&lying);
+        assert!(
+            matches!(
+                verdict,
+                Err(ValidationError::OmmersHashMismatch { header, computed })
+                    if header == B256::repeat_byte(0xAB)
+                        && computed == compute_ommers_hash(&lying.ommers)
+            ),
+            "validation must refuse it, not leave it to execution: {verdict:?}"
+        );
+    }
+
     /// The import path's uncle rule holds each uncle to rskj's rules. It used
     /// to check only an uncle's place in the chain, so a block could name one
     /// that did no work and have its difficulty counted all the same.
@@ -3570,8 +3642,18 @@ mod tests {
         }
         // Newest first, from `tip` down, as the rule reads them.
         let data_from = |tip: usize| {
-            let view: Vec<Header> = chain[..=tip].iter().rev().cloned().collect();
-            calculate(&view).expect("449 headers to read")
+            // Exactly `REQUIRED_BLOCKS`, which is what `validate` asks its
+            // `MainchainView` for and what every implementation caps at. This
+            // used to hand over the whole chain and lean on the calculator
+            // taking the first 449 -- a shape no caller produces, and one
+            // rskj's `hasEnoughBlocksToCalculateForkDetectionData` refuses.
+            let view: Vec<Header> = chain[..=tip]
+                .iter()
+                .rev()
+                .take(REQUIRED_BLOCKS as usize)
+                .cloned()
+                .collect();
+            calculate(&view).expect("exactly REQUIRED_BLOCKS headers to read")
         };
 
         let tip = chain.len() - 1;

@@ -450,12 +450,20 @@ impl BlockTemplateBuilder {
         if uncles.is_empty() {
             return uncles;
         }
-        // The rule reads the block's number, its parent's hash and its
-        // uncles, and nothing else of its header.
+        // The rule reads the block's number, its parent's hash, its uncles and
+        // the ommers hash it claims of them -- rskj checks that inside
+        // `BlockUnclesValidationRule` -- and nothing else of its header.
+        //
+        // So the candidate has to claim the right one. Everything else here is
+        // the parent's, and the parent's ommers hash is the hash of a
+        // different list: inheriting it would make every candidate fail the
+        // check and the miner would drop every uncle it was offered, silently
+        // and with no uncle reward.
         let block = Block {
             header: Header {
                 number,
                 parent_hash: parent.hash(),
+                ommers_hash: crate::processor::compute_ommers_hash(&uncles),
                 cached_hash: None,
                 cached_hash_for_merged_mining: None,
                 ..parent.clone()
