@@ -100,6 +100,7 @@ does and does not hold.
 | [`archive_bound`](../crates/cli/examples/archive_bound.rs) | How high does an archive trie actually reach? |
 | [`refilter_segment`](../crates/cli/examples/refilter_segment.rs) **(writes)** | Rewrite a segment's SSTs with a bloom policy. The measurement behind §6.9a's negative result. |
 | [`key_shape`](../crates/cli/examples/key_shape.rs) | Key and value shape of a trie store: fixed-length keys, and how large do values get? |
+| [`bridge_event_width`](../crates/cli/examples/bridge_event_width.rs) | Did the bridge ever log an **empty** single dynamic field? Reads stored receipts, not execution, and separates the 96-octet width from a declared length of zero -- a field of 1 to 32 octets is the same width, legitimately. |
 | [`opcode_census`](../crates/cli/examples/opcode_census.rs) | Can any contract alive at a block reach a given opcode? Decodes every contract's code, so a byte inside a `PUSH` immediate, the metadata trailer or a dead region does not count. The cheap half of "is this rule change dead code?" |
 
 ## The pre-RSKIP126 root baseline
