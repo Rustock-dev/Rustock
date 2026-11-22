@@ -19,9 +19,21 @@
 //! the sizing exists to protect. So boundaries are appended and fsynced -- cheap,
 //! at one line per gigabyte of state written.
 //!
-//! **The counter need not.** It resets on restart, so the segment in progress
-//! is cut late. Sizes are advisory: they decide where to cut, and roughly the
-//! right place is all that is required.
+//! **The counter must survive a restart, but need not survive a crash.** The
+//! original design said it need not be durable at all: it resets, the segment
+//! in progress is cut late, and sizes are advisory. That reasoning holds for
+//! *one* late cut and breaks at the real time scale. Measured on the mainnet
+//! node, a gigabyte of written state is 25,000-50,000 blocks -- nine to
+//! eighteen days -- so a node restarted weekly would return to zero every time
+//! and **never cut a boundary at all**. The feature would look healthy and
+//! extend nothing.
+//!
+//! So the counter is persisted, and the asymmetry with boundaries is
+//! deliberate: `COUNTER` is rewritten in place rather than appended, and not
+//! fsynced. Losing the last few megabytes to a power cut delays a cut
+//! slightly, which is what "advisory" really does cover; losing a *boundary*
+//! merges two segments. The cost is one small write per poll of the executed
+//! head, and none at all while nothing is being written.
 //!
 //! # Append-only, two logs
 //!
@@ -98,8 +110,11 @@ pub struct UncoveredRange {
 pub struct SegmentBoundaries {
     dir: PathBuf,
     target_bytes: u64,
-    /// Bytes written since the last boundary. Deliberately not durable.
+    /// Bytes written since the last boundary.
     counter: AtomicU64,
+    /// What `COUNTER` on disk last said, so a poll that changed nothing writes
+    /// nothing. Only ever touched by the thread that persists.
+    persisted: AtomicU64,
     /// Boundaries in the order recorded, lowest block first.
     boundaries: std::sync::RwLock<Vec<Boundary>>,
     /// Every range already built, with the hash it was built against.
@@ -114,6 +129,8 @@ pub struct SegmentBoundaries {
 }
 
 const BOUNDARIES: &str = "BOUNDARIES";
+/// Bytes accumulated since the last boundary. Rewritten, not appended.
+const COUNTER: &str = "COUNTER";
 const BUILT: &str = "BUILT";
 const UNCOVERED: &str = "UNCOVERED";
 const HALTED: &str = "HALTED";
@@ -149,10 +166,17 @@ impl SegmentBoundaries {
         let boundaries = read_boundaries(&dir.join(BOUNDARIES))?;
         let built = read_built(&dir.join(BUILT))?;
         let uncovered = read_uncovered(&dir.join(UNCOVERED))?;
+        // A value that does not parse is taken as zero. The file is rewritten
+        // in place and not fsynced, so a crash can leave it torn; starting the
+        // segment over costs one late cut, while refusing to open would stop
+        // the node extending the set over a number that only decides where to
+        // cut.
+        let resumed = read_counter(&dir.join(COUNTER));
         Ok(Self {
             dir,
             target_bytes,
-            counter: AtomicU64::new(0),
+            counter: AtomicU64::new(resumed),
+            persisted: AtomicU64::new(resumed),
             boundaries: std::sync::RwLock::new(boundaries),
             built: std::sync::RwLock::new(built),
             uncovered: std::sync::RwLock::new(uncovered),
@@ -162,9 +186,33 @@ impl SegmentBoundaries {
 
     /// Account for bytes written by the block being executed.
     ///
-    /// The entire hot-path cost of this design: one relaxed atomic add.
+    /// The entire hot-path cost of this design: one relaxed atomic add. Making
+    /// the counter durable deliberately did not change that -- the write is done
+    /// by whoever polls, not by the block being executed.
     pub fn add_bytes(&self, bytes: u64) {
         self.counter.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Write the counter out, unless it has not moved since the last time.
+    ///
+    /// Called by the same poll that cuts boundaries, so the cost is one ~20
+    /// byte write per poll while the node is executing, and nothing while it is
+    /// idle. Not fsynced and not atomic-renamed: see the module note on why a
+    /// torn counter is a delayed cut rather than a lost fact.
+    ///
+    /// Failure is returned rather than logged, because the caller is the only
+    /// one that knows how loudly to say it -- and it is not a reason to stop.
+    pub fn persist(&self) -> Result<bool> {
+        let now = self.counter.load(Ordering::Relaxed);
+        if now == self.persisted.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let path = self.dir.join(COUNTER);
+        std::fs::write(&path, now.to_string())
+            .with_context(|| format!("writing {}", path.display()))?;
+        set_mode(&path, 0o644);
+        self.persisted.store(now, Ordering::Relaxed);
+        Ok(true)
     }
 
     /// Call when a block finishes. Records a boundary if enough has been
@@ -211,6 +259,12 @@ impl SegmentBoundaries {
             )?;
             guard.push(b);
         }
+        // Only now, and only on success. If the append above had failed, the
+        // reset would be in memory only and `COUNTER` would still hold the
+        // accumulated value -- so a restart resumes it rather than losing a
+        // segment's worth of accounting. Persisting before the append would
+        // throw that away to save nothing.
+        let _ = self.persist();
         Ok(Some(b))
     }
 
@@ -540,6 +594,14 @@ fn read_built(path: &Path) -> Result<Vec<BuiltRange>> {
     Ok(out)
 }
 
+/// Reads `COUNTER`. Absent, empty or unparseable is zero -- see `open`.
+fn read_counter(path: &Path) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 fn read_uncovered(path: &Path) -> Result<Vec<UncoveredRange>> {
     let Ok(text) = std::fs::read_to_string(path) else { return Ok(Vec::new()) };
     let mut out = Vec::new();
@@ -623,17 +685,62 @@ mod tests {
     }
 
     #[test]
-    fn boundaries_survive_a_restart_and_the_counter_does_not() {
+    fn boundaries_and_the_counter_both_survive_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         {
             let b = SegmentBoundaries::open(dir.path(), 100).unwrap();
             b.add_bytes(150);
             b.end_block(5).unwrap();
-            b.add_bytes(60); // in progress, deliberately not durable
+            b.add_bytes(60); // in progress
+            assert!(b.persist().unwrap(), "a moved counter is written");
+            assert!(!b.persist().unwrap(), "and an unmoved one is not");
         }
         let b = SegmentBoundaries::open(dir.path(), 100).unwrap();
         assert_eq!(b.boundaries(), vec![Boundary { block: 5, approx_bytes: 150 }]);
-        assert_eq!(b.accumulated(), 0, "the counter is not durable by design");
+        assert_eq!(
+            b.accumulated(),
+            60,
+            "the counter resumes: at 25,000-50,000 blocks per gigabyte, a node restarted \
+             weekly would otherwise never reach the target and never cut at all"
+        );
+    }
+
+    /// A cut has to clear the persisted value too, or a restart straight after
+    /// one would resume the pre-cut count and cut again immediately.
+    #[test]
+    fn a_cut_clears_the_persisted_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let b = SegmentBoundaries::open(dir.path(), 100).unwrap();
+            b.add_bytes(150);
+            b.persist().unwrap();
+            assert!(b.end_block(5).unwrap().is_some());
+            assert_eq!(b.accumulated(), 0);
+        }
+        let b = SegmentBoundaries::open(dir.path(), 100).unwrap();
+        assert_eq!(b.accumulated(), 0, "the next segment starts from zero");
+        assert_eq!(
+            b.end_block(6).unwrap(),
+            None,
+            "and does not cut again on the first block after a restart"
+        );
+    }
+
+    /// `COUNTER` is rewritten in place and not fsynced, so a crash can leave it
+    /// torn. Starting the segment over costs one late cut; refusing to open
+    /// would stop the set being extended over a number that only decides where
+    /// to cut.
+    #[test]
+    fn a_torn_counter_is_taken_as_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(COUNTER), "99").unwrap();
+        assert_eq!(SegmentBoundaries::open(dir.path(), 100).unwrap().accumulated(), 99);
+
+        for junk in ["", "  ", "not-a-number", "12\x009"] {
+            std::fs::write(dir.path().join(COUNTER), junk).unwrap();
+            let b = SegmentBoundaries::open(dir.path(), 100).unwrap();
+            assert_eq!(b.accumulated(), 0, "{junk:?} must open, counting zero");
+        }
     }
 
     /// A crash during the append can leave a line with no newline. Dropping it
