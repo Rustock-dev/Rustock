@@ -1,9 +1,13 @@
-//! Which legacy branches this chain actually took.
+//! Which branches of this chain's own behaviour were ever actually taken.
 //!
-//! Every activation that *changes* behaviour leaves a branch behind, guarded by
-//! a height test. A branch over a window that can never reopen is a candidate
-//! for deletion -- but only if nothing in the window ever took it, and that is a
-//! claim about history, not about the code.
+//! Most rows here are deletion candidates. Every activation that *changes*
+//! behaviour leaves a branch behind, guarded by a height test, and a branch
+//! over a window that can never reopen can go -- but only if nothing in the
+//! window ever took it, and that is a claim about history, not about the code.
+//!
+//! One row is not a deletion candidate at all. [`Legacy::HighBitAddressCall`]
+//! is active at every height on every network, so it will never be removed;
+//! its occupancy is worth knowing for a different reason, given with it.
 //!
 //! The expensive part of proving it is the replay. The counting is nearly free,
 //! so a replay that answers one such question should answer all of them: one
@@ -71,6 +75,13 @@ legacy_guards! {
         "EVM-033",
         "a contract created at an address holding a balance loses it",
         "mainnet below #3,614,800",
+    ),
+    // Not a deletion candidate: active at all heights, all networks.
+    HighBitAddressCall => (
+        "EVM-046",
+        "a call whose address word has bits above its low 20 octets, and whose low 20 \
+         octets name an active precompile, reaches the account rather than the precompile",
+        "all heights, all networks -- permanent, measured for divergence not deletion",
     ),
     InternalCreateNonceZero => (
         "EVM-034",

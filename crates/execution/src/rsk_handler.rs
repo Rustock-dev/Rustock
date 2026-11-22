@@ -928,6 +928,18 @@ where
                     // account at those bytes (`call_without_code`).
                     let to_account = past_an_address
                         && callee.is_some_and(|c| self.active_precompiles.contains(&c));
+                    if to_account {
+                        // EVM-046. Not a guard anyone can remove -- it holds at
+                        // every height -- but an Ethereum-derived client
+                        // truncates the word first and runs the precompile, so
+                        // it diverges on exactly this call, in the returned
+                        // data, the gas, and anything the precompile would have
+                        // written. Whether the chain contains one is therefore
+                        // worth knowing, and only a replay can say: the address
+                        // is a runtime stack value, so no scan of code can find
+                        // it.
+                        crate::legacy_census::Legacy::HighBitAddressCall.hit();
+                    }
                     let callee = callee.filter(|_| !to_account);
                     let creates = matches!(
                         init.frame_input,
