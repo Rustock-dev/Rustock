@@ -61,6 +61,13 @@ legacy_guards! {
         "funds-migration end age is 172,800 blocks, not 10,585",
         "mainnet #4,976,300..#5,468,000",
     ),
+    WindowedBridgeMethod => (
+        "BR-011a",
+        "a bridge method a later activation removed was invoked while it still existed \
+         (addFederatorPublicKey, getFederatorPublicKey, getRetiringFederatorPublicKey, \
+         getPendingFederatorPublicKey, addLockWhitelistAddress, getBtcBlockchainBlockLocator)",
+        "mainnet below #729,000 or #1,591,000 depending on the method",
+    ),
     PublicReceiveHeaders => (
         "BR-015",
         "receiveHeaders is public rather than federation-only",
@@ -75,6 +82,16 @@ legacy_guards! {
         "EVM-033",
         "a contract created at an address holding a balance loses it",
         "mainnet below #3,614,800",
+    ),
+    // Not a deletion candidate either: live at every height. Measured because
+    // only the *negative* half of the discontinuity needs proving, and a
+    // prospective close would remove it.
+    BlockHeaderDepthOutOfRange => (
+        "PC-042",
+        "a block-header precompile call supplied a depth outside 0..32,767: a negative one \
+         throws and costs the caller all its gas, while one past the 16-bit range answers \
+         empty, so the outcome is not monotonic in the argument",
+        "all heights -- the negative half is what a prospective close would remove",
     ),
     // Not a deletion candidate: active at all heights, all networks.
     HighBitAddressCall => (
