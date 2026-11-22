@@ -594,6 +594,7 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
     // or run. `Program.callToPrecompiledAddress` asks for the gas outside
     // every try, so the exception leaves the VM whatever the era.
     if from_contract && !hardfork_cfg.has_rskip88(block_number) {
+        crate::legacy_census::Legacy::InternalBridgeCallEndsCaller.hit();
         return Err(PrecompileError::other(CALLER_ABORT_MARKER));
     }
 
@@ -900,10 +901,20 @@ fn execute_method<CTX: crate::RskContextTr>(
         "updateCollections" => (true, false),
         // receiveHeadersIsPublic() = RSKIP124 && !RSKIP200; restricted otherwise.
         #[allow(clippy::nonminimal_bool)] // mirrors the rskj formula above
-        "receiveHeaders" => (
-            !(hardfork_cfg.has_rskip124(block_number) && !hardfork_cfg.has_rskip200(block_number)),
-            false,
-        ),
+        "receiveHeaders" => {
+            let public =
+                hardfork_cfg.has_rskip124(block_number) && !hardfork_cfg.has_rskip200(block_number);
+            if public {
+                // Deliberately an over-count: this fires for *any* call to
+                // receiveHeaders while the window is open, not only one from a
+                // caller the federation-only rule would have refused. An
+                // over-count that comes back zero is still a proof -- nobody
+                // called it at all -- and only a non-zero needs the finer
+                // question asked.
+                crate::legacy_census::Legacy::PublicReceiveHeaders.hit();
+            }
+            (!public, false)
+        }
         // registerBtcTransactionIsPublic() = RSKIP199.
         "registerBtcTransaction" => (!hardfork_cfg.has_rskip199(block_number), false),
         "addSignature" => (true, true),

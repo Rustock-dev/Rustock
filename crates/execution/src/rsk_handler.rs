@@ -1015,7 +1015,12 @@ where
                             // (wasabi) rskj's Program.createContract bumps the
                             // created contract's nonce to 1; before, it is 0.
                             let nonce = u64::from(self.rskip125_active);
-                            set_created_contract_nonce(evm, nonce);
+                            // A creation frame, below RSKIP125, is the legacy
+                            // branch: an internally created contract's nonce
+                            // stays 0 where it would otherwise be 1.
+                            if set_created_contract_nonce(evm, nonce) && !self.rskip125_active {
+                                crate::legacy_census::Legacy::InternalCreateNonceZero.hit();
+                            }
                             begin_creation(evm);
                             skip_code_header(evm);
                             self.open_frame(evm, creates);
@@ -1662,6 +1667,16 @@ fn rsk_return_create<CTX: ContextTr<Chain = crate::raw_storage::RskChainExt>>(
     // Short-circuit keeps the deposit uncharged in the oversize case, like
     // rskj (the exception set by either check skips spendGas + saveCode).
     let unsaved = oversize || !interpreter_result.gas.record_cost(deposit);
+    // Observed, not altered: this function is only reached below RSKIP-453 and
+    // at depth > 0, so `unsaved` here is exactly the empty-deploy quirk firing.
+    // Whether anything on this chain ever reached it decides whether both
+    // branches are live rules or dead guards.
+    crate::rsk_instructions::record_internal_deploy(
+        code_len,
+        cfg.max_code_size(),
+        unsaved,
+        oversize,
+    );
     if unsaved {
         interpreter_result.output = Bytes::new();
     }
@@ -1903,7 +1918,9 @@ where
 /// If the top (just-initialized) frame is a CREATE frame, reset the created
 /// account's nonce to 0. On revert the AccountCreated journal entry discards
 /// the account wholesale, so no extra journaling is needed.
-fn set_created_contract_nonce<EVM>(evm: &mut EVM, nonce: u64)
+/// Returns whether this was a creation frame, so a caller can tell a create
+/// from a call without repeating the frame inspection.
+fn set_created_contract_nonce<EVM>(evm: &mut EVM, nonce: u64) -> bool
 where
     EVM: EvmTr<
         Context: ContextTr<Journal: JournalTr<State = EvmState>>,
@@ -1911,11 +1928,12 @@ where
     >,
 {
     let FrameData::Create(CreateFrame { created_address }) = evm.frame_stack().get().data else {
-        return;
+        return false;
     };
     if let Ok(mut acc) = evm.ctx().journal_mut().load_account_mut(created_address) {
         acc.set_nonce(nonce);
     }
+    true
 }
 
 /// A creation's frame has opened (the top one): its contract has no code
@@ -1951,6 +1969,13 @@ where
     };
     let sent = evm.ctx().tx().value();
     if let Ok(mut account) = evm.ctx().journal_mut().load_account_mut(created_address) {
+        // Only when something is actually lost. Without this branch the
+        // balance would be what was there plus what was sent, so the outcome
+        // differs exactly when the address already held funds -- counting
+        // every creation instead would report a number that says nothing.
+        if !account.balance().is_zero() {
+            crate::legacy_census::Legacy::CreatedContractLosesBalance.hit();
+        }
         account.set_balance(sent);
     }
 }

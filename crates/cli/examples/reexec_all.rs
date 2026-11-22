@@ -760,6 +760,63 @@ fn report_rsk_opcodes(done: u64, planned: u64) {
         "contracts deployed in this run: {created}, of which {headered} carried the RSK \
          code header"
     );
+    // The legacy-branch census. Printed as a table with each row's window, so
+    // a zero is always read against the range that produced it.
+    let census = rustock_execution::legacy_census::census();
+    println!();
+    println!("legacy branches taken in this run:");
+    for (rule, what, window, hits) in &census {
+        println!("  {rule:<8} {hits:>10}  {what}  [{window}]");
+    }
+    // A campaign that only ever returns zero has not been validated. The
+    // migration-end-age window is known occupied -- using the ordinary end age
+    // inside it diverged a real mainnet block -- so a zero there means the
+    // instrument is broken and every other zero in the table is worthless.
+    if rustock_execution::legacy_census::positive_control_fired() {
+        println!("  positive control fired: the counters are live, so the zeros above mean something.");
+    } else {
+        println!(
+            "  POSITIVE CONTROL DID NOT FIRE. Either this run did not cover \
+             #4,976,300..#5,468,000, or the counters are not wired to the branches they \
+             name. Until that is resolved, treat every zero above as unproven."
+        );
+    }
+
+    let [staticcalls, with_value] =
+        rustock_execution::rsk_instructions::staticcall_value_counts();
+    println!(
+        "seven-operand STATICCALLs (RSKIP-91 to RSKIP-103, #729,000..#1,052,700): \
+         {staticcalls} executed, {with_value} carrying a non-zero value"
+    );
+    if staticcalls > 0 && with_value == 0 {
+        println!(
+            "  the form ran but was never passed a value, so nothing on this chain ever \
+             moved funds through a static call."
+        );
+    } else if staticcalls == 0 {
+        println!(
+            "  the seven-operand form never ran in this range -- which for a range below \
+             #729,000 means only that the window was not reached."
+        );
+    }
+
+    let [oversize, unpayable, largest] =
+        rustock_execution::rsk_instructions::empty_deploy_counts();
+    println!(
+        "internal creations below RSKIP-453 that deployed empty instead of reverting: \
+         {oversize} over the maximum code size, {unpayable} unable to pay the code deposit; \
+         largest code any of them returned: {largest} octets"
+    );
+    // The bound matters more than the counts. RSKIP-453 is #7,338,024 on
+    // mainnet, so a run that stops below that has only looked at part of the
+    // era where the quirk applies, and zero means "not here" rather than
+    // "never".
+    if oversize == 0 && unpayable == 0 {
+        println!(
+            "  neither branch fired in this range. Both are dead guards below the highest \
+             block this run reached -- not below #7,338,024, unless the run covered it."
+        );
+    }
     if created > 0 && headered == 0 {
         println!(
             "  no contract in this range was ever deployed with a header. A census of the \

@@ -1083,6 +1083,60 @@ pub fn record_contract_created(code: &[u8]) {
     }
 }
 
+/// The two ways an internal creation below RSKIP-453 deploys empty instead of
+/// reverting, and the largest code any such creation returned.
+///
+/// `[oversize, unpayable deposit, largest returned length]`.
+///
+/// Before RSKIP-453 (lovell700, #7,338,024 on mainnet), an internal create
+/// whose returned code exceeds the maximum, or whose frame cannot pay the code
+/// deposit, does **not** revert: rskj's `Program.finalizeContractCreation`
+/// deploys an empty contract, keeps the constructor's state changes and
+/// returns the address. From RSKIP-453 it fails like EIP-2.
+///
+/// Both branches are guards for behaviour nothing may ever have exercised. If
+/// no internal creation below #7,338,024 ever returned oversize code or ran
+/// out of gas for its deposit, the quirk is unreachable on this chain and the
+/// guards can go. That is a claim about 7.3 million blocks, so it is counted
+/// rather than argued -- and counted *here*, because this function is reached
+/// only when the quirk applies: below RSKIP-453 and at depth > 0.
+///
+/// `largest returned length` is the useful negative evidence. A maximum well
+/// under the 24,576-octet limit says the oversize branch was never close to
+/// firing, which is stronger than "it did not fire".
+pub static EMPTY_DEPLOY: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Record an internal creation below RSKIP-453.
+///
+/// `unsaved` is the quirk firing; `oversize` says which of the two branches,
+/// since the deposit is never charged once the size check has failed.
+pub fn record_internal_deploy(code_len: usize, max_code_size: usize, unsaved: bool, oversize: bool) {
+    EMPTY_DEPLOY[2].fetch_max(code_len as u64, Ordering::Relaxed);
+    if !unsaved {
+        return;
+    }
+    let which = usize::from(!oversize);
+    let n = EMPTY_DEPLOY[which].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 {
+        tracing::warn!(
+            target: "rustock::rsk_opcodes",
+            "an internal creation below RSKIP-453 deployed EMPTY instead of reverting: {} \
+             ({code_len} octets returned, maximum {max_code_size}), occurrence {n}",
+            if oversize { "code over the maximum size" } else { "the code deposit was unpayable" }
+        );
+    }
+}
+
+/// `[oversize, unpayable deposit, largest code an internal create returned]`.
+pub fn empty_deploy_counts() -> [u64; 3] {
+    [
+        EMPTY_DEPLOY[0].load(Ordering::Relaxed),
+        EMPTY_DEPLOY[1].load(Ordering::Relaxed),
+        EMPTY_DEPLOY[2].load(Ordering::Relaxed),
+    ]
+}
+
 /// `[contracts created, of those carrying the code header]`.
 pub fn contracts_created() -> [u64; 2] {
     [
@@ -1878,6 +1932,52 @@ pub fn rsk_static_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
 /// `Program.callToAddress` moves it to the callee, which runs static. Only
 /// CALL refuses a value inside a static call, and only CALL pays for an
 /// account it creates.
+/// Seven-operand `STATICCALL`s, and how many carried a non-zero value.
+///
+/// `[executed, with a non-zero value]`.
+///
+/// Between RSKIP-91 and RSKIP-103 -- mainnet #729,000 to #1,052,700, 323,700
+/// blocks -- rskj's `calculateCallValue` excepted only `DELEGATECALL`, so
+/// `STATICCALL` took seven operands and *transferred* the value it was given
+/// (`CallValue::Transfer` below). For that window, "a static call cannot
+/// change state" was false on this chain.
+///
+/// Whether any transaction ever used it is a different question from whether
+/// the rule existed, and only the chain answers it. Zero over the whole window
+/// means the seven-operand form was never passed a value, and the transfer
+/// branch is a rule nothing ever exercised.
+///
+/// Counted where the operands have been read, so a call that later fails for
+/// gas still counts: the question is what the opcode was *passed*, not what
+/// came of it.
+pub static STATICCALL_SEVEN_OPERAND: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Count a seven-operand `STATICCALL` and, if it carries value, say so.
+fn record_staticcall_value(to: Address, value: U256) {
+    STATICCALL_SEVEN_OPERAND[0].fetch_add(1, Ordering::Relaxed);
+    if value.is_zero() {
+        return;
+    }
+    let n = STATICCALL_SEVEN_OPERAND[1].fetch_add(1, Ordering::Relaxed) + 1;
+    // Every one of these earns a line: the expectation is zero, and if it is
+    // wrong the value and the target are the whole finding.
+    tracing::warn!(
+        target: "rustock::rsk_opcodes",
+        "STATICCALL carried a non-zero value of {value} to {to} -- a static call moving \
+         funds, which this chain allowed between RSKIP-91 and RSKIP-103. Occurrence {n}, \
+         transaction index {} of its block.",
+        TX_INDEX.with(|i| i.get())
+    );
+}
+
+/// `[seven-operand STATICCALLs executed, of those carrying a non-zero value]`.
+pub fn staticcall_value_counts() -> [u64; 2] {
+    [
+        STATICCALL_SEVEN_OPERAND[0].load(Ordering::Relaxed),
+        STATICCALL_SEVEN_OPERAND[1].load(Ordering::Relaxed),
+    ]
+}
+
 pub fn rsk_static_call_with_value<WIRE: InterpreterTypes, H: Host + ?Sized>(
     mut context: InstructionContext<'_, H, WIRE>,
 ) {
@@ -1888,6 +1988,7 @@ pub fn rsk_static_call_with_value<WIRE: InterpreterTypes, H: Host + ?Sized>(
     let past = past_an_address(to);
     let to = Address::from_word(B256::from(to));
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
+    record_staticcall_value(to, value);
 
     let Some((input, return_memory_offset)) =
         rsk_memory_input_and_out_ranges(context.interpreter, context.host.gas_params())
