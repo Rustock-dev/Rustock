@@ -133,6 +133,8 @@ pub fn receive_header<CTX: crate::RskContextTr>(
         && is_mainnet
         && !hardfork_cfg.has_rskip434(block_number)
     {
+        // BR-097, the singular `receiveHeader` arm.
+        crate::legacy_census::Legacy::BtcHeaderRefusedForChainWork.hit();
         return Ok(encode_int_result(gas_cost, ERR_UNEXPECTED_EXCEPTION));
     }
 
@@ -609,6 +611,10 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
             && is_mainnet
             && !rskip434
         {
+            // BR-097, the plural `receiveHeaders` arm. Counted here too: the
+            // window is the same one, and a count from either arm means a
+            // header was actually refused for chain work.
+            crate::legacy_census::Legacy::BtcHeaderRefusedForChainWork.hit();
             break;
         }
         // `btcBlockChain.add`, which takes a header already stored as it is.

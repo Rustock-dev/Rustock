@@ -90,6 +90,16 @@ impl DifficultyRule {
             1i32.wrapping_add(header.uncle_count as i32)
                 .wrapping_mul(self.config.duration_limit as i32),
         );
+        // BV-125: the same product without the narrowing. A difference means
+        // the 32-bit wrap changed the value that decides the difficulty, which
+        // is a live incident rather than a historical curiosity -- so this
+        // counter is monitoring, not a measurement to be removed afterwards.
+        let wide = (1i128 + i128::from(header.uncle_count))
+            * i128::from(self.config.duration_limit);
+        if wide != i128::from(calc_dur) {
+            crate::legacy_census::Legacy::UncleCountWrapsDifficulty.hit();
+        }
+
         let delta = delta as i64;
 
         let sign = if calc_dur > delta {

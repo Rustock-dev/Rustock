@@ -119,6 +119,14 @@ pub struct GasUsedRule;
 impl HeaderValidator for GasUsedRule {
     fn validate(&self, header: &Header) -> Result<(), ValidationError> {
         let limit = header.gas_limit_low_long();
+        // BV-110: the narrowed bound against the whole value. A header whose
+        // limit holds 2^63 or more reads negative here, and no gas used fits
+        // under it -- so such a header is invalid and a canonical replay
+        // should report zero. A non-zero count means a block we accepted
+        // carried one, which is a finding about the decoder, not the chain.
+        if header.gas_limit_value() > num_bigint::BigUint::from(i64::MAX as u64) {
+            crate::legacy_census::Legacy::GasLimitNarrowedToSignedLong.hit();
+        }
         // rskj reads the gas used exactly, so it is a `long` and never
         // negative.
         if i64::try_from(header.gas_used)

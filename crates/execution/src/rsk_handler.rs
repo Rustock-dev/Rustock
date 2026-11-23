@@ -945,6 +945,21 @@ where
                         init.frame_input,
                         revm::interpreter::interpreter_action::FrameInput::Create(_)
                     );
+                    // The deepest frame a CALL-family opcode ever opened.
+                    // Recorded at the open, before the depth cap can refuse it,
+                    // so the figure is the depth actually reached rather than
+                    // the depth that survived. Creates are excluded: the ask
+                    // was about the CALL opcodes.
+                    if !creates
+                        && rustock_core::vm_extremes::note_call_depth(init.depth as u64)
+                    {
+                        tracing::warn!(
+                            target: "rustock::vm_extremes",
+                            "new deepest CALL frame: depth {} opened by {:?}",
+                            init.depth,
+                            callee
+                        );
+                    }
                     // Before anything can refuse the call (`note_call`).
                     if let Some(callee) = callee {
                         self.note_call(callee);
@@ -1084,6 +1099,14 @@ where
                                     && outcome.instruction_result().is_ok()
                                     && outcome.result.output.len() > outcome.memory_length()
                                 {
+                                    // EVM-100: the output genuinely exceeded
+                                    // the declared region, so the legacy write
+                                    // past it is about to happen. Counting the
+                                    // enclosing `if let` instead would count
+                                    // every pre-RSKIP150 precompile call.
+                                    crate::legacy_census::Legacy
+                                        ::PrecompileOutputPastDeclaredRegion
+                                        .hit();
                                     unbounded_output = Some((
                                         outcome.memory_start(),
                                         outcome.result.output.clone(),
@@ -1111,18 +1134,56 @@ where
                                 FrameResult::Call(outcome) => {
                                     let precompile = callee
                                         .is_some_and(|c| self.active_precompiles.contains(&c));
+                                    // EVM-101's first two cases. Counted
+                                    // separately because they are separate
+                                    // windows -- RSKIP-90 closed one and
+                                    // RSKIP-171 the other -- so a single
+                                    // counter could not say which branch a
+                                    // removal would be retiring.
                                     if precompile && outcome.instruction_result().is_ok() {
-                                        !self.rskip90_active
+                                        let preserves = !self.rskip90_active;
+                                        if preserves {
+                                            crate::legacy_census::Legacy
+                                                ::PrecompileCallKeepsReturnData
+                                                .hit();
+                                        }
+                                        preserves
                                     } else {
-                                        !self.rskip171_active
+                                        let preserves = !self.rskip171_active;
+                                        if preserves {
+                                            crate::legacy_census::Legacy
+                                                ::EmptyCallKeepsReturnData
+                                                .hit();
+                                        }
+                                        preserves
                                     }
                                 }
-                                FrameResult::Create(outcome) => matches!(
-                                    outcome.instruction_result(),
-                                    InstructionResult::CallTooDeep
-                                        | InstructionResult::OutOfFunds
-                                        | InstructionResult::CreateCollision
-                                ),
+                                FrameResult::Create(outcome) => {
+                                    let refused = matches!(
+                                        outcome.instruction_result(),
+                                        InstructionResult::CallTooDeep
+                                            | InstructionResult::OutOfFunds
+                                            | InstructionResult::CreateCollision
+                                    );
+                                    // EVM-101's third case. RSKIP-171 added
+                                    // the clearing on the call paths only, so
+                                    // a CREATE refused before its program is
+                                    // built still leaves the caller's
+                                    // return-data buffer holding an earlier
+                                    // call's output -- at every height, with
+                                    // no upper bound.
+                                    //
+                                    // Counting the refused path alone settles
+                                    // whether the case ever arose. Only a
+                                    // non-zero makes the harder question --
+                                    // whether anything then read the stale
+                                    // buffer -- worth asking.
+                                    if refused {
+                                        crate::legacy_census::Legacy::RefusedCreateKeepsReturnData
+                                            .hit();
+                                    }
+                                    refused
+                                }
                             };
                             if rskj_preserves {
                                 use revm::interpreter::interpreter_types::ReturnData;
@@ -1147,6 +1208,37 @@ where
                         FrameResult::Create(outcome)
                             if matches!(outcome.instruction_result(), InstructionResult::Revert)
                     );
+                    // The most EVM memory this frame expanded, sampled as it
+                    // ends -- once per frame rather than per opcode, which a
+                    // memory-touching instruction hook would cost. The
+                    // chain-wide maximum over frames is the figure wanted.
+                    {
+                        use revm::interpreter::interpreter_types::{InputsTr, MemoryTr};
+                        let frame = evm.frame_stack().get();
+                        let used = frame.interpreter.memory.size() as u64;
+                        let who = frame.interpreter.input.target_address();
+                        if rustock_core::vm_extremes::note_memory_bytes(used) {
+                            tracing::warn!(
+                                target: "rustock::vm_extremes",
+                                "new EVM-memory high-water mark: {used} octets in a frame of {who}"
+                            );
+                        }
+                    }
+                    // The largest RETURN payload. `Return` only -- STOP and
+                    // SELFDESTRUCT end a frame with no RETURN behind them, and
+                    // a revert is not a return.
+                    if matches!(result.instruction_result(), InstructionResult::Return) {
+                        let returned = match &result {
+                            FrameResult::Call(o) => o.result.output.len(),
+                            FrameResult::Create(o) => o.result.output.len(),
+                        };
+                        if rustock_core::vm_extremes::note_return_bytes(returned as u64) {
+                            tracing::warn!(
+                                target: "rustock::vm_extremes",
+                                "new largest RETURN: {returned} octets"
+                            );
+                        }
+                    }
                     self.close_frame(evm, result.instruction_result().is_ok());
                     // The program's internal transactions (`crate::internal_tx`).
                     // rskj `Program.suicide` makes one of the balance it

@@ -86,6 +86,18 @@ pub fn uncle_sum(headers: &[Header]) -> Result<u8, ValidationError> {
         .fold(0i32, |sum, header| {
             sum.wrapping_add(header.uncle_count as i32)
         });
+    // BV-173: the same sum without the 32-bit narrowing. A difference means
+    // the wrap changed the value, which is a live incident rather than a
+    // historical curiosity -- the counts are the miners' to choose, so this
+    // counter is monitoring and should outlive the measurement.
+    let wide: i64 = headers
+        .iter()
+        .take(NUMBER_OF_UNCLES)
+        .map(|h| i64::from(h.uncle_count as u32))
+        .sum();
+    if wide != i64::from(sum) {
+        crate::legacy_census::Legacy::UncleSumWraps.hit();
+    }
     if sum < 0 {
         return Err(ValidationError::UncleCountsSumBelowZero { sum });
     }

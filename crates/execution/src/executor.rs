@@ -994,6 +994,10 @@ impl RskExecutor {
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<BlockExecutionResult, ExecutionError> {
+        // Attributes any extreme recorded while this block runs. Thread-local,
+        // so two workers replaying different heights cannot credit each other.
+        rustock_core::vm_extremes::set_block(header.number);
+        crate::rsk_instructions::set_block_number(header.number);
         // A tracer with a zero cap, and `trace_index: None` so `run` is used
         // for every transaction -- the inspector is never invoked.
         self.execute_block_with(
@@ -2106,6 +2110,18 @@ impl RskExecutor {
                 let _ = evm.ctx.journal_mut().load_account(callee);
 
                 let mut invisible_exception = false;
+                // EVM-023a / RSKIP-136, the non-Bridge half. `Outcome::OutOfGas`
+                // is raised only when `required > tx_gas`, so a limit in
+                // `[required, required + basic)` reaches the arms below and is
+                // charged past what it bought, exactly as the Bridge arm is.
+                // Counting only the Bridge would undercount the control.
+                let charge = |gas: u64| -> u64 {
+                    let used = gas.saturating_add(basic);
+                    if used > tx_gas {
+                        crate::legacy_census::Legacy::PrecompileTxGasExceedsLimit.hit();
+                    }
+                    used
+                };
                 let (gas_used, success, output, logs) = match pre136_outcome {
                     // What `getGasForData` asked for came to more than the whole
                     // limit: rskj's execError, all the gas used and nothing run.
@@ -2115,7 +2131,7 @@ impl RskExecutor {
                     Some(Outcome::Threw { gas, reason }) => {
                         debug!(tx_index = i, %reason, "direct precompile call threw");
                         invisible_exception = true;
-                        (gas.saturating_add(basic), true, Vec::new(), Vec::new())
+                        (charge(gas), true, Vec::new(), Vec::new())
                     }
                     Some(Outcome::Fatal(reason)) => return Err(ExecutionError::Evm(reason)),
                     // It returned, or returned rskj's null, which is no output.
@@ -2127,14 +2143,14 @@ impl RskExecutor {
                         if !markers.precompiles.contains(&callee) {
                             markers.precompiles.push(callee);
                         }
-                        (gas.saturating_add(basic), true, output.to_vec(), Vec::new())
+                        (charge(gas), true, output.to_vec(), Vec::new())
                     }
                     Some(Outcome::Null { gas }) => {
                         let _ = evm.ctx.journal_mut().transfer(*sender, callee, tx.value);
                         if !markers.precompiles.contains(&callee) {
                             markers.precompiles.push(callee);
                         }
-                        (gas.saturating_add(basic), true, Vec::new(), Vec::new())
+                        (charge(gas), true, Vec::new(), Vec::new())
                     }
                     // The Bridge, whose price depends on what its storage holds.
                     None => {
@@ -2152,7 +2168,26 @@ impl RskExecutor {
                             let limit = tx_gas;
                             if limit >= required {
                                 // gasUsed may exceed the limit; that is consensus here.
-                                (required.saturating_add(basic), true)
+                                let used = required.saturating_add(basic);
+                                // EVM-023a / RSKIP-136. The test above is
+                                // `limit >= required`; the charge is
+                                // `required + basic`. A limit in
+                                // `[required, required + basic)` therefore
+                                // passes a test it cannot afford, the
+                                // remainder goes negative, and the miner is
+                                // credited wei no account was debited.
+                                //
+                                // This is the campaign's second positive
+                                // control: a run covering mainnet #3,307 must
+                                // report a non-zero count here (31,280 used
+                                // against a 30,000 limit). A zero means the
+                                // instrument is broken, not that the window
+                                // is clean.
+                                if used > limit {
+                                    crate::legacy_census::Legacy::PrecompileTxGasExceedsLimit
+                                        .hit();
+                                }
+                                (used, true)
                             } else {
                                 // rskj execError: all gas consumed, nothing executed.
                                 (limit, false)
@@ -6933,6 +6968,42 @@ mod tests {
     /// succeeded, that slot (2 after a call that succeeded, 1 after one that
     /// failed, 0 where the contract never got to store it), and how many logs
     /// the transaction left.
+    /// The `vm_extremes` hooks are wired to live code, not merely compiled.
+    ///
+    /// This is the lesson of the whole-chain run that reported one SWAPN and
+    /// could not say where: an instrument whose liveness is unknown reports
+    /// zero exactly as convincingly as a behaviour that never happened. The
+    /// fixture below runs a contract that CODECOPYs its input (expanding
+    /// memory) and then CALLs a precompile (opening a frame), so all three
+    /// hooks must move. Maxima are process-global and tests run in parallel,
+    /// so this asserts movement rather than absolute figures.
+    #[test]
+    fn the_vm_extreme_hooks_are_reached_by_real_execution() {
+        use rustock_core::vm_extremes;
+        vm_extremes::enable();
+        let before = vm_extremes::extremes().map(|(_, v, _)| v);
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(2_100_000);
+        let _ = a_precompile_called_from_a_contract(
+            block_store,
+            &header,
+            crate::precompiles::BLOCK_HEADER_ADDR,
+            0xf1,
+            &[0u8; 32],
+        );
+
+        let after = vm_extremes::extremes().map(|(_, v, _)| v);
+        assert!(
+            after[0] >= before[0] && after[0] > 0,
+            "call-depth hook never fired: a CALL opened no frame the hook saw"
+        );
+        assert!(
+            after[1] >= before[1] && after[1] > 0,
+            "memory hook never fired: the contract CODECOPYs, so memory did expand"
+        );
+    }
+
     fn a_precompile_called_from_a_contract(
         block_store: Arc<BlockStore>,
         header: &Header,
@@ -13461,9 +13532,21 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         };
 
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        // The EVM-023a counter is this campaign's second positive control, so
+        // it is validated here rather than after an eleven-hour replay. The
+        // counters are process-global and tests run in parallel, so the test
+        // is `after > before` rather than an absolute count.
+        crate::legacy_census::enable();
+        let before = crate::legacy_census::Legacy::PrecompileTxGasExceedsLimit.count();
         let result = executor.execute_block(&header, &[(tx, sender)], &root, store).unwrap();
         assert!(result.tx_results[0].success);
         assert_eq!(result.tx_results[0].gas_used, 31_600, "gasUsed exceeds the tx gas limit pre-RSKIP136");
+        assert!(
+            crate::legacy_census::Legacy::PrecompileTxGasExceedsLimit.count() > before,
+            "EVM-023a is a positive control: this is the exact shape of mainnet #3,307, \
+             so a counter that does not fire here will report a false zero over the \
+             whole chain"
+        );
     }
 
     /// getCoinbaseAddress at depth 1 returns the grandparent's coinbase.

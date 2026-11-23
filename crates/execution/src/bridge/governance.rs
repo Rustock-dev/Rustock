@@ -762,7 +762,8 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
         );
         store_pending_federation(ctx, None, multikey);
     } else {
-        // Legacy handover. Move active-federation UTXOs to the old set.
+        // BR-125. Legacy handover. Move active-federation UTXOs to the old set.
+        crate::legacy_census::Legacy::CommitFederationHandsOverImmediately.hit();
         let active_utxos = load_federation_utxos(ctx, hardfork_cfg, block_number);
         store_federation_utxos(ctx, hardfork_cfg, block_number, &[]);
         super::storage::store_old_federation_utxos(ctx, &active_utxos);
