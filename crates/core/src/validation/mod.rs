@@ -88,6 +88,23 @@ pub enum ValidationError {
     #[error("Extra data is {got} bytes, over the {max}-byte maximum")]
     ExtraDataTooLarge { max: usize, got: usize },
 
+    #[error("Header version is {got}, but block {number} requires {required}")]
+    HeaderVersionMismatch { number: u64, required: u8, got: u8 },
+
+    /// rskj `BlockValidatorImpl.isValid`: `if (block.isGenesis()) return false`.
+    ///
+    /// Not a statement that the chain's genesis is wrong. It is the validator
+    /// refusing to answer for a block that never arrives through validation --
+    /// genesis is loaded from configuration -- so a height-0 block offered to
+    /// this entry point came from somewhere it should not have.
+    #[error("Block 0 is not validated: genesis is loaded from configuration, not accepted from a peer")]
+    GenesisNotValidated,
+
+    /// rskj `BlockUnclesHashValidationRule`, which it runs inside
+    /// `BlockUnclesValidationRule` and therefore in the block rule list.
+    #[error("Ommers hash is {header}, but the uncle list hashes to {computed}")]
+    OmmersHashMismatch { header: B256, computed: B256 },
+
     /// Read whole, as rskj's `Coin`s.
     #[error("Minimum gas price {got} outside the allowed range [{lower}, {upper}]")]
     MinGasPriceOutOfRange {
@@ -244,6 +261,12 @@ impl HeaderVerifier {
             // sync run it: a block no later than its parent is one rskj imports.
             .with_static_rule(TimestampRule::new(config.max_future_block_time))
             .with_static_rule(block_rules::ExtraDataRule::default())
+            // rskj's `BlockHeaderVersionRule`, which `RskContext` puts in both
+            // the block rule list and the snap one. Rustock computed the
+            // required version for *building* a header and nothing checked an
+            // incoming one against it, so a header declaring a version its
+            // height does not call for was accepted here and rejected there.
+            .with_static_rule(HeaderVersionRule { config: config.clone() })
             .with_parent_rule(BlockNumberRule)
             .with_parent_rule(BlockParentGasLimitRule { config: config.clone() })
             .with_parent_rule(block_rules::PrevMinGasPriceRule)
@@ -370,7 +393,7 @@ pub mod header_rules;
 pub mod difficulty;
 pub mod merged_mining;
 
-pub use header_rules::{BlockNumberRule, ParentHashRule, TimestampRule, GasUsedRule, GasLimitRule, BlockParentGasLimitRule};
+pub use header_rules::{BlockNumberRule, ParentHashRule, TimestampRule, GasUsedRule, GasLimitRule, BlockParentGasLimitRule, HeaderVersionRule};
 pub use difficulty::DifficultyRule;
 pub use merged_mining::{BitcoinTimestampRule, MergedMiningRule};
 pub use block_rules::{

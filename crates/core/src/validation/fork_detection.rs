@@ -42,7 +42,21 @@ pub trait MainchainView {
 /// reads is missing or doesn't decode, where the Java throws; and
 /// [`uncle_sum`]'s error where rskj's throws.
 pub fn calculate(headers: &[Header]) -> Result<[u8; 12], ValidationError> {
-    if (headers.len() as u64) < REQUIRED_BLOCKS {
+    // rskj's `hasEnoughBlocksToCalculateForkDetectionData` refuses a view that
+    // is not *exactly* `requiredBlocks`, not merely one that is too short.
+    //
+    // The two agree on every input that exists today: `validate` asks for
+    // exactly `REQUIRED_BLOCKS` and every `MainchainView` caps what it returns
+    // at `count`. The difference is what a longer view would do -- rskj would
+    // refuse it, and `<` would quietly compute from the first 449 and accept
+    // the block. That is a consensus split arriving through a change to the
+    // view builder, which is a place nobody would look for one, so the guard
+    // says what it means instead.
+    //
+    // The miner's `mining::fork_detection::calculate` keeps `<` deliberately:
+    // it takes the best chain uncapped and returns empty data for a chain too
+    // short, which is what rskj's `BlockToMineBuilder` does.
+    if headers.len() as u64 != REQUIRED_BLOCKS {
         return Err(ValidationError::ForkDetectionDataUnreadable);
     }
     let mut data = [0u8; 12];

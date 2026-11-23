@@ -29,6 +29,72 @@ fn db_path() -> Option<String> {
 ///
 /// Dense rather than sampled around iris300, because the activation edge is
 /// where an off-by-one in the height comparison would show.
+/// `HeaderVersionRule` against the chain itself.
+///
+/// This rule *rejects* headers, so the risk it carries is the usual one for
+/// this file: a required version that disagrees with what mainnet actually
+/// carries would reject real blocks and halt the node. Mainnet has RSKIP-351
+/// unscheduled, so every header from genesis to the tip must answer version 0
+/// -- and that is a claim about 9.4 million real headers, not about the
+/// config, which is why it is checked here rather than reasoned about.
+///
+/// Dense at the start and the tip, sampled in between: a version byte appearing
+/// anywhere would be a header built by something other than the clients that
+/// built this chain.
+#[test]
+#[ignore = "requires a synced block store (RUSTOCK_BLOCKS_DB)"]
+fn the_header_version_rule_accepts_every_sampled_mainnet_header() {
+    use rustock_core::config::ChainConfig;
+    use rustock_core::validation::{HeaderValidator, HeaderVersionRule};
+
+    let Some(path) = db_path() else {
+        eprintln!("RUSTOCK_BLOCKS_DB not set; skipping");
+        return;
+    };
+    let store = Arc::new(BlockStore::open_read_only(&path).expect("open block store"));
+    let head = store
+        .head()
+        .expect("head")
+        .and_then(|h| store.header(h).ok().flatten())
+        .expect("head header");
+
+    let config = Arc::new(ChainConfig::mainnet());
+    assert_eq!(
+        config.activation_heights.header_version(head.number),
+        0,
+        "mainnet has RSKIP-351 unscheduled, so the required version is 0 everywhere; \
+         if that has changed this test needs the activation height, not a new expectation"
+    );
+    let rule = HeaderVersionRule { config };
+
+    let mut heights: Vec<u64> = (1..=head.number).step_by(10_000).collect();
+    heights.extend(1..=200u64.min(head.number));
+    heights.extend((head.number.saturating_sub(200))..=head.number);
+    heights.sort_unstable();
+    heights.dedup();
+
+    let mut checked = 0usize;
+    let mut versioned: Vec<(u64, String)> = Vec::new();
+    for number in heights {
+        let Some(hash) = store.canonical_hash(number).ok().flatten() else { continue };
+        let Some(header) = store.header(hash).ok().flatten() else { continue };
+        checked += 1;
+        if let Err(e) = rule.validate(&header) {
+            versioned.push((number, e.to_string()));
+        }
+    }
+
+    assert!(checked > 100, "only {checked} headers read; is the store synced?");
+    assert!(
+        versioned.is_empty(),
+        "the header-version rule rejects {} real mainnet header(s) out of {checked} -- a rule \
+         stricter than the chain it must accept is a fork: {:?}",
+        versioned.len(),
+        &versioned[..versioned.len().min(10)]
+    );
+    eprintln!("header version: {checked} mainnet headers, all version 0 as required");
+}
+
 #[test]
 #[ignore = "requires a synced block store (RUSTOCK_BLOCKS_DB)"]
 fn rskip179_accepts_every_sampled_mainnet_block() {

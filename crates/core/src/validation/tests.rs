@@ -1646,6 +1646,29 @@ impl uncles::AncestorSource for Ancestry {
 /// rule an uncle faces runs, and without RSKIPUMM, so these headers need no
 /// UMM root: `a_header_carries_the_fields_rskj_reads_at_its_height` holds
 /// regtest's to it.
+/// Give a fixture header the version its height calls for, the way the mining
+/// template does (`mining::template`).
+///
+/// Needed because `HeaderVersionRule` -- rskj's `BlockHeaderVersionRule` --
+/// rejects a header whose version disagrees with its height, and these
+/// fixtures are built on regtest, where RSKIP-351 and RSKIP-535 are active
+/// from the start. An unversioned fixture there is not a header the chain
+/// would ever carry, so stamping it is making the fixture realistic rather
+/// than working around the rule.
+///
+/// Before sealing, always: the merged-mining proof commits to the header's
+/// hash, and the version is part of it.
+fn stamp_version(header: &mut Header, config: &crate::config::ChainConfig) {
+    let version = config.activation_heights.header_version(header.number);
+    header.version_fields = (version > 0).then(|| {
+        crate::types::header::HeaderVersionFields {
+            version,
+            edges: config.activation_heights.edges_active(header.number).then(Vec::new),
+            base_event: None,
+        }
+    });
+}
+
 fn uncle_config() -> Arc<crate::config::ChainConfig> {
     let mut config = crate::config::ChainConfig::regtest();
     config.max_future_block_time = 60;
@@ -1674,6 +1697,7 @@ fn uncle_chain(base: u64) -> (Ancestry, Header, Header) {
 /// its parent calls for.
 fn uncle_of(parent: &Header, timestamp: u64) -> Header {
     let mut uncle = create_dummy_header(parent.number + 1, timestamp, parent.hash());
+    stamp_version(&mut uncle, &uncle_config());
     uncle.beneficiary = Address::repeat_byte(0x0b);
     uncle.difficulty = DifficultyRule {
         config: uncle_config(),
@@ -1866,6 +1890,124 @@ fn default_rsk_holds_uncles_to_rskjs_uncle_rules() {
         5,
         "rskj's five, in its order"
     );
+}
+
+/// rskj's `hasEnoughBlocksToCalculateForkDetectionData` refuses a view that is
+/// not exactly `requiredBlocks`. Rustock refused only a short one, which
+/// agrees on every input that exists -- `validate` asks for exactly
+/// `REQUIRED_BLOCKS` and every `MainchainView` caps at `count` -- and would
+/// have differed on a longer one, computing from the first 449 and accepting a
+/// block rskj refuses.
+#[test]
+fn a_mainchain_view_of_the_wrong_length_is_refused_either_way() {
+    use crate::validation::fork_detection::{calculate, REQUIRED_BLOCKS};
+
+    let view = |n: u64| -> Vec<Header> {
+        (0..n).map(|i| create_dummy_header(n - i, 1000 + i, B256::ZERO)).collect()
+    };
+
+    for len in [0, 1, REQUIRED_BLOCKS - 1] {
+        assert_eq!(
+            calculate(&view(len)),
+            Err(ValidationError::ForkDetectionDataUnreadable),
+            "a view of {len} is too short"
+        );
+    }
+    for len in [REQUIRED_BLOCKS + 1, REQUIRED_BLOCKS + 100] {
+        assert_eq!(
+            calculate(&view(len)),
+            Err(ValidationError::ForkDetectionDataUnreadable),
+            "a view of {len} is too long, and rskj refuses it rather than \
+             computing from the first {REQUIRED_BLOCKS}"
+        );
+    }
+    // No positive case here on purpose. A view of exactly `REQUIRED_BLOCKS`
+    // still fails on these fixtures, because they carry no Bitcoin headers for
+    // the commit-to-parents vector to read -- and that failure uses the *same*
+    // error variant, so this test could not tell "passed the length guard"
+    // from "failed the next step". The positive case belongs where there is
+    // real data for it: `mainnet_block_rules::fork_detection_data_matches_on_\
+    // real_blocks` recomputes the data for real blocks and compares it against
+    // what their headers carry, which is better evidence than a fixture could
+    // give.
+}
+
+/// rskj `BlockHeaderVersionRule`, which Rustock did not have: it computed the
+/// required version for *building* a header and nothing checked an incoming
+/// one, so a header declaring a version its height does not call for was
+/// accepted here and rejected by rskj -- the two clients on different chains.
+///
+/// Every case below is one rskj decides the same way.
+#[test]
+fn a_header_version_the_height_does_not_call_for_is_refused() {
+    use crate::validation::HeaderVersionRule;
+
+    let at = |rskip351: Option<u64>, rskip535: Option<u64>| {
+        let mut config = crate::config::ChainConfig::regtest();
+        config.activation_heights.rskip351 = rskip351;
+        config.activation_heights.rskip535 = rskip535;
+        HeaderVersionRule { config: Arc::new(config) }
+    };
+    let header = |number: u64, version: Option<u8>| {
+        let mut h = create_dummy_header(number, 1000, B256::ZERO);
+        h.version_fields = version.map(|version| crate::types::header::HeaderVersionFields {
+            version,
+            edges: None,
+            base_event: None,
+        });
+        h
+    };
+
+    // Before RSKIP-351 the required version is 0, which is what an
+    // unversioned header answers.
+    let before = at(None, None);
+    assert_eq!(before.validate(&header(100, None)), Ok(()));
+    for declared in [1u8, 2] {
+        assert_eq!(
+            before.validate(&header(100, Some(declared))),
+            Err(ValidationError::HeaderVersionMismatch {
+                number: 100,
+                required: 0,
+                got: declared
+            }),
+            "version {declared} below RSKIP-351"
+        );
+    }
+
+    // From RSKIP-351 and before RSKIP-535 it is 1. A version-2 header here is
+    // the cheap split: the byte is free to set and it decodes perfectly well.
+    let v1 = at(Some(50), None);
+    assert_eq!(v1.validate(&header(100, Some(1))), Ok(()));
+    assert_eq!(
+        v1.validate(&header(100, Some(2))),
+        Err(ValidationError::HeaderVersionMismatch { number: 100, required: 1, got: 2 })
+    );
+    assert_eq!(
+        v1.validate(&header(100, None)),
+        Err(ValidationError::HeaderVersionMismatch { number: 100, required: 1, got: 0 }),
+        "an unversioned header above RSKIP-351 answers 0, which is not 1"
+    );
+    // Either side of the activation, one block apart.
+    assert_eq!(v1.validate(&header(49, None)), Ok(()));
+    assert_eq!(v1.validate(&header(50, Some(1))), Ok(()));
+
+    // From RSKIP-535 it is 2.
+    let v2 = at(Some(50), Some(80));
+    assert_eq!(v2.validate(&header(100, Some(2))), Ok(()));
+    assert_eq!(
+        v2.validate(&header(100, Some(1))),
+        Err(ValidationError::HeaderVersionMismatch { number: 100, required: 2, got: 1 })
+    );
+    assert_eq!(v2.validate(&header(79, Some(1))), Ok(()));
+    assert_eq!(v2.validate(&header(80, Some(2))), Ok(()));
+
+    // Genesis is exempt, as rskj returns true for `header.isGenesis()` before
+    // looking at the version. It comes from configuration rather than a peer,
+    // and a rule that refused it would stop a node whose genesis file predates
+    // the activation.
+    for version in [None, Some(1), Some(2)] {
+        assert_eq!(v2.validate(&header(0, version)), Ok(()), "genesis, {version:?}");
+    }
 }
 
 /// rskj's trunk takes the timestamp rule on the header alone. A block no

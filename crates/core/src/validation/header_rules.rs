@@ -16,6 +16,53 @@ impl ParentHeaderValidator for BlockNumberRule {
     }
 }
 
+/// rskj `BlockHeaderVersionRule`: a header's version must be the one its
+/// height calls for.
+///
+/// 0 before RSKIP-351, 1 from it, 2 from RSKIP-535
+/// ([`ChainConfig::header_version`]). rskj runs this in both the block rule
+/// list and the snap rule list (`RskContext.getBlockValidationRule`,
+/// `getSnapBlockValidationRule`).
+///
+/// # Why a missing rule is a split rather than a nicety
+///
+/// Nothing else rejects the mismatch. A header whose version byte is neither
+/// 1 nor 2 is read as version 0 -- rustock mirrors rskj building a
+/// `BlockHeaderV0` for it -- and a version-2 header below RSKIP-535 decodes
+/// perfectly well. So without this rule such a header is accepted here while
+/// rskj rejects it, which is the two clients on different chains.
+///
+/// # Genesis is exempt
+///
+/// rskj returns `true` for `header.isGenesis()` before looking at the version,
+/// and so does this. Genesis comes from configuration rather than from a peer,
+/// its version is whatever the file says, and a rule that rejected it would
+/// stop the node on a chain whose genesis predates the activation.
+pub struct HeaderVersionRule {
+    pub config: std::sync::Arc<crate::config::ChainConfig>,
+}
+
+impl HeaderValidator for HeaderVersionRule {
+    fn validate(&self, header: &Header) -> Result<(), ValidationError> {
+        if header.number == 0 {
+            return Ok(());
+        }
+        let required = self.config.activation_heights.header_version(header.number);
+        // A header with no version fields carries no version, which is what
+        // version 0 means: before RSKIP-351 there is no field to read, and
+        // rskj's `BlockHeaderV0.getVersion()` answers 0.
+        let got = header.version_fields.as_ref().map_or(0, |v| v.version);
+        if got != required {
+            return Err(ValidationError::HeaderVersionMismatch {
+                number: header.number,
+                required,
+                got,
+            });
+        }
+        Ok(())
+    }
+}
+
 pub struct ParentHashRule;
 impl ParentHeaderValidator for ParentHashRule {
     fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
