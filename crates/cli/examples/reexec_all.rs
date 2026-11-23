@@ -147,6 +147,19 @@ struct RamWithFallback {
     segment: String,
 }
 
+/// Distinct gap keys kept in memory, and so the most the repair list can hold.
+///
+/// A bound rather than a choice, but a generous one. At roughly fifty octets a
+/// key this is ~100 MB at the cap, against a whole-chain run that measured
+/// 510,219 fallback reads -- so the cap is about four times the largest figure
+/// observed rather than a tenth of it. The previous value of 50,000 truncated
+/// that run at 9.8%, and a truncated repair list applied as if complete leaves
+/// the segment set still under-covering while looking repaired.
+///
+/// Truncation is still reported out loud if it happens, because the counters
+/// stay exact either way.
+const GAP_KEY_LIMIT: usize = 2_000_000;
+
 impl TrieStore for RamWithFallback {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         if let Some(v) = self.ram.lookup(key) {
@@ -156,7 +169,7 @@ impl TrieStore for RamWithFallback {
             let n = self.from_full.fetch_add(1, Ordering::Relaxed) + 1;
             let blk = self.current_block.load(Ordering::Relaxed);
             let mut g = self.gaps.lock().unwrap();
-            if g.len() < 50_000 {
+            if g.len() < GAP_KEY_LIMIT {
                 g.push((blk, self.segment.clone(), key.to_vec()));
             }
             // Say the first few out loud: a segment-only run would have got
@@ -170,7 +183,26 @@ impl TrieStore for RamWithFallback {
             }
             return Some(v);
         }
-        self.absent.fetch_add(1, Ordering::Relaxed);
+        let n = self.absent.fetch_add(1, Ordering::Relaxed) + 1;
+        // Recorded as well, and marked. These are the reads the archive cannot
+        // serve either, so they are the ones that cannot be repaired from it --
+        // exactly the keys worth having, and until now the only trace they left
+        // was a number.
+        let blk = self.current_block.load(Ordering::Relaxed);
+        {
+            let mut g = self.gaps.lock().unwrap();
+            if g.len() < GAP_KEY_LIMIT {
+                g.push((blk, format!("{} ABSENT-IN-BOTH", self.segment), key.to_vec()));
+            }
+        }
+        if n <= 50 {
+            println!(
+                "[gap] block #{blk} segment {} wanted {} and NEITHER the segment nor the \
+                 fallback has it",
+                self.segment,
+                alloy_primitives::hex::encode(key)
+            );
+        }
         None
     }
     fn put(&self, _k: &[u8], _v: &[u8]) {}
@@ -387,7 +419,95 @@ fn rss_mb() -> u64 {
 
 // -------------------------------------------------------------------- main --
 
+
+/// A sidecar beside the state file: `<state>.<ext>`.
+fn sidecar(state_path: &str, ext: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(state_path);
+    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    p.with_file_name(format!("{name}.{ext}"))
+}
+
+/// Bank the counters so a stop does not lose them.
+///
+/// Written after every finished segment. Without this a resumed run reports
+/// only the segments it personally ran, so a known-occupied control could read
+/// zero and the whole table would look unvalidated.
+fn save_counters(path: &std::path::Path) {
+    let census: Vec<String> =
+        rustock_execution::legacy_census::snapshot().iter().map(|v| v.to_string()).collect();
+    let ext: Vec<String> =
+        rustock_core::vm_extremes::snapshot().iter().map(|v| v.to_string()).collect();
+    let body = format!("census {}\nextremes {}\n", census.join(" "), ext.join(" "));
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Reload counters banked by [`save_counters`]. Returns what it managed.
+fn load_counters(path: &std::path::Path) -> (bool, bool) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (false, false);
+    };
+    let (mut census_ok, mut ext_ok) = (false, false);
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("census") => {
+                let v: Vec<u64> = it.filter_map(|t| t.parse().ok()).collect();
+                census_ok = rustock_execution::legacy_census::restore(&v);
+            }
+            Some("extremes") => {
+                let v: Vec<u64> = it.filter_map(|t| t.parse().ok()).collect();
+                if let Ok(a) = <[u64; 3]>::try_from(v.as_slice()) {
+                    rustock_core::vm_extremes::restore(&a);
+                    ext_ok = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    (census_ok, ext_ok)
+}
+
+/// Append what the gap list holds to the repair file and clear it.
+///
+/// Called after every finished segment, which is what makes the repair list
+/// survive a stop, survive a crash, and survive a resume -- and keeps the
+/// in-memory list small enough that `GAP_KEY_LIMIT` is never reached.
+/// Entries carry their own segment name, so draining another worker's
+/// in-flight rows early is harmless.
+fn flush_gaps(gaps: &Mutex<Vec<(u64, String, Vec<u8>)>>, path: &std::path::Path) -> usize {
+    let drained: Vec<(u64, String, Vec<u8>)> = {
+        let mut g = gaps.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *g)
+    };
+    if drained.is_empty() {
+        return 0;
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+        eprintln!("WARNING: could not append {} gap rows to {}", drained.len(), path.display());
+        return 0;
+    };
+    for (b, seg, k) in &drained {
+        let _ = writeln!(f, "{b}\t{seg}\t{}", alloy_primitives::hex::encode(k));
+    }
+    let _ = f.flush();
+    drained.len()
+}
+
 fn main() -> anyhow::Result<()> {
+    // Without this there is no subscriber, so every `warn!` the counters emit
+    // is discarded -- and the report below used to claim the occurrences were
+    // "logged at WARN", which was false. A whole-chain run found one SWAPN and
+    // could not say which block it was in.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
     let a: Vec<String> = std::env::args().collect();
     let flag = |k: &str| a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).cloned();
     if a.len() < 3 {
@@ -471,9 +591,48 @@ fn main() -> anyhow::Result<()> {
     rustock_execution::supply::set_per_transaction(false);
     rustock_execution::supply::set_per_block(false);
 
+    // This is the measurement run, so recording is on. A node leaves both off
+    // and carries only the call sites.
+    rustock_execution::legacy_census::enable();
+    rustock_core::vm_extremes::enable();
+
     let done: HashSet<String> = std::fs::read_to_string(&state_path)
         .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
         .unwrap_or_default();
+
+    // Resume: reload the counters a previous run of this state file banked,
+    // and keep appending to the same repair list. A fresh run (empty state)
+    // starts both over.
+    let counters_path = sidecar(&state_path, "counters");
+    let stop_path = sidecar(&state_path, "stop");
+    // Named after the state file, not merely beside it. Deriving this from the
+    // parent directory alone meant every run on this machine shared one
+    // `segment-gaps.txt` whatever `--state` said -- so a second run with a
+    // fresh state file would truncate the first run's repair list. On
+    // 2026-11-23 that came within one condition of destroying an 18-hour,
+    // 510,219-row list; it survived only because the state file happened to be
+    // pre-seeded, which is luck, not design.
+    let gaps_path = sidecar(&state_path, "segment-gaps.txt");
+    if done.is_empty() {
+        let _ = std::fs::remove_file(&counters_path);
+        let _ = std::fs::write(
+            &gaps_path,
+            "# block\tsegment\tnode-key -- reads a segment could not serve\n",
+        );
+    } else {
+        let (census_ok, ext_ok) = load_counters(&counters_path);
+        println!(
+            "resuming: {} segment(s) already done; counters {}, high-water marks {}",
+            done.len(),
+            if census_ok { "reloaded" } else { "NOT reloaded -- totals below cover this run only" },
+            if ext_ok { "reloaded" } else { "NOT reloaded" },
+        );
+    }
+    let _ = std::fs::remove_file(&stop_path);
+    println!(
+        "to stop cleanly at the next segment boundary: touch {}",
+        stop_path.display()
+    );
 
     let all = discover(&segroot, base.is_some())?;
     let pending: Vec<Segment> = all.iter().filter(|s| !done.contains(&s.name)).cloned().collect();
@@ -525,6 +684,8 @@ fn main() -> anyhow::Result<()> {
         std::fs::OpenOptions::new().create(true).append(true).open(&state_path)?,
     ));
     let stop = Arc::new(AtomicBool::new(false));
+    // A requested stop is not a failure, and the exit code must say so.
+    let asked_to_stop = Arc::new(AtomicBool::new(false));
     let blocks_done = Arc::new(AtomicU64::new(0));
     let peak_rss = Arc::new(AtomicU64::new(0));
     let from_full = Arc::new(AtomicU64::new(0));
@@ -581,9 +742,29 @@ fn main() -> anyhow::Result<()> {
             let (fb, from_full, absent, gaps) =
                 (fallback_dir.clone(), from_full.clone(), absent.clone(), gaps.clone());
             let bl = base.clone();
+            let (gaps_path, counters_path, stop_path, asked_to_stop) = (
+                gaps_path.clone(),
+                counters_path.clone(),
+                stop_path.clone(),
+                asked_to_stop.clone(),
+            );
             scope.spawn(move || {
                 loop {
                     if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // An external, graceful stop: finish nothing new, keep
+                    // everything already banked. The in-flight segment on the
+                    // other worker still completes and is recorded.
+                    if stop_path.exists() {
+                        println!(
+                            "[t{id}] stop requested -- not starting another segment. \
+                             Progress is banked; resume with the same --state."
+                        );
+                        asked_to_stop.store(true, Ordering::Relaxed);
+                        stop.store(true, Ordering::Relaxed);
+                        let (_, cv) = &*sched;
+                        cv.notify_all();
                         return;
                     }
                     let seg = {
@@ -632,9 +813,19 @@ fn main() -> anyhow::Result<()> {
                                 bd as f64 / total_blocks as f64 * 100.0,
                                 el / 60.0
                             );
+                            // Bank the findings BEFORE the segment is marked
+                            // done: if this is interrupted between the two, the
+                            // segment is replayed again and its rows re-appended,
+                            // which is wasteful but correct. The other order
+                            // would mark a segment done whose gaps were lost.
+                            let wrote = flush_gaps(&gaps, &gaps_path);
+                            save_counters(&counters_path);
                             let mut f = state.lock().unwrap();
                             let _ = writeln!(f, "{}", seg.name);
                             let _ = f.flush();
+                            if wrote > 0 {
+                                println!("[t{id}]      banked {wrote} gap row(s) for repair");
+                            }
                         }
                         Err(e) => {
                             let msg = format!("{e:#}");
@@ -665,38 +856,42 @@ fn main() -> anyhow::Result<()> {
         peak_rss.load(Ordering::Relaxed)
     );
     if fallback_dir.is_some() {
-        let g = gaps.lock().unwrap();
+        // Whatever the last segments left; everything earlier was appended as
+        // it was found, so this is a remainder rather than the whole list.
+        let tail = flush_gaps(&gaps, &gaps_path);
+        save_counters(&counters_path);
+        let rows = std::fs::read_to_string(&gaps_path)
+            .map(|t| t.lines().filter(|l| !l.starts_with('#')).count())
+            .unwrap_or(0);
         println!(
-            "segment gaps: {} reads served by the fallback, {} absent in both, {} distinct keys recorded",
+            "segment gaps: {} reads served by the fallback, {} absent in both; \
+             {rows} row(s) in the repair list ({tail} appended just now)",
             from_full.load(Ordering::Relaxed),
             absent.load(Ordering::Relaxed),
-            g.len()
         );
-        // Beside the state file, not at a path baked in from the machine this
-        // was written on. It used to be the latter, inside an `if let Ok`, so
-        // anywhere else it produced no repair list and said nothing -- the
-        // failure mode this tool exists to complain about.
-        let gaps_path = std::path::Path::new(&state_path)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("segment-gaps.txt");
-        match std::fs::File::create(&gaps_path) {
-            Ok(mut f) => {
-                let _ = writeln!(f, "# block\tsegment\tnode-key -- reads a segment could not serve");
-                for (b, seg, k) in g.iter() {
-                    let _ = writeln!(f, "{b}\t{seg}\t{}", alloy_primitives::hex::encode(k));
-                }
-                println!("gap keys written to {} (the repair list)", gaps_path.display());
-            }
-            Err(e) => {
-                println!(
-                    "WARNING: could not write the repair list to {}: {e}. The {} gap(s) above \
-                     are the only record.",
-                    gaps_path.display(),
-                    g.len()
-                );
-            }
+        println!("gap keys written to {} (the repair list)", gaps_path.display());
+        // The list is now appended per segment, so it is complete for every
+        // segment this run finished -- including when the run is interrupted.
+        // The old cap could silently drop 90% of it; it survives only as a
+        // guard against a single segment producing an absurd number of rows.
+        if rows >= GAP_KEY_LIMIT {
+            println!(
+                "WARNING: {rows} rows is at or past the {GAP_KEY_LIMIT} guard. Check that \
+                 the list was not curtailed before repairing from it."
+            );
         }
+    }
+
+    if asked_to_stop.load(Ordering::Relaxed) {
+        println!(
+            "\nSTOPPED ON REQUEST. Everything finished is banked: segments in {}, \
+             counters in {}, gap rows in {}.\nResume by re-running the same command -- \
+             finished segments are skipped and the counters are reloaded.",
+            state_path,
+            counters_path.display(),
+            gaps_path.display()
+        );
+        std::process::exit(2);
     }
     if stop.load(Ordering::Relaxed) {
         println!("STOPPED on a failure -- see above");
@@ -764,21 +959,58 @@ fn report_rsk_opcodes(done: u64, planned: u64) {
     // a zero is always read against the range that produced it.
     let census = rustock_execution::legacy_census::census();
     println!();
-    println!("legacy branches taken in this run:");
+    println!(
+        "legacy branches taken in this run{}:",
+        if rustock_execution::legacy_census::is_enabled() {
+            ""
+        } else {
+            " -- RECORDING WAS OFF, so every figure below is zero for that reason"
+        }
+    );
     for (rule, what, window, hits) in &census {
         println!("  {rule:<8} {hits:>10}  {what}  [{window}]");
+    }
+
+    // Maxima rather than counts, so they are reported apart from the census
+    // and read differently: a zero here means nothing was observed at all,
+    // where a zero above means a branch was never taken.
+    println!("\nhigh-water marks over this run:");
+    for (what, value, block) in rustock_core::vm_extremes::extremes() {
+        if value == 0 {
+            println!("  {what:<34} {value:>12}  (nothing observed)");
+        } else {
+            println!("  {what:<34} {value:>12}  last reached at #{block}");
+        }
     }
     // A campaign that only ever returns zero has not been validated. The
     // migration-end-age window is known occupied -- using the ordinary end age
     // inside it diverged a real mainnet block -- so a zero there means the
     // instrument is broken and every other zero in the table is worthless.
+    // Two of them now. Reporting them by name matters: "the campaign failed"
+    // sends a reader looking at the whole table, where "EVM-023a reported 0"
+    // names one counter and one block to check.
+    let controls = rustock_execution::legacy_census::positive_controls();
+    for (rule, hits) in controls {
+        let window = match rule {
+            "BR-086" => "#4,976,300..#5,468,000",
+            "EVM-023a" => "#1..#3,396 (mainnet #3,307 must fire it)",
+            _ => "its window",
+        };
+        if hits > 0 {
+            println!("  positive control {rule}: {hits} -- fired.");
+        } else {
+            println!(
+                "  POSITIVE CONTROL {rule} DID NOT FIRE. Either this run did not cover \
+                 {window}, or the counter is not wired to the branch it names."
+            );
+        }
+    }
     if rustock_execution::legacy_census::positive_control_fired() {
-        println!("  positive control fired: the counters are live, so the zeros above mean something.");
+        println!("  both controls fired: the counters are live, so the zeros above mean something.");
     } else {
         println!(
-            "  POSITIVE CONTROL DID NOT FIRE. Either this run did not cover \
-             #4,976,300..#5,468,000, or the counters are not wired to the branches they \
-             name. Until that is resolved, treat every zero above as unproven."
+            "  AT LEAST ONE POSITIVE CONTROL DID NOT FIRE -- see above. Until that is \
+             resolved, treat every zero in this table as unproven, not as a clean window."
         );
     }
 
