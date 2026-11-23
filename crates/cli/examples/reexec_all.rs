@@ -1098,7 +1098,15 @@ fn run_segment(
             with_fb = Some(w.clone());
             w
         }
-        None => Arc::new(loaded),
+        // No fallback: every read must be served by the segment itself, so a
+        // miss is unambiguously a gap -- the caller asked for a node by its
+        // committed hash. Abort naming both explanations rather than answering
+        // `None`, which the trie walk would read as a genuine absence and turn
+        // into a STATE ROOT MISMATCH that looks like a consensus bug (#398).
+        None => Arc::new(rustock_storage::segment_reader::AbortOnMissingNode::new(
+            loaded,
+            seg.name.clone(),
+        )),
     };
 
     // Where to start, and what state to start from. Three cases, and only the
