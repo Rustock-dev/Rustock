@@ -3150,21 +3150,55 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                         set_end + 1
                     );
                 }
-                warn!(
-                    "segbuild: the set ends at #{set_end} and this node has executed to \
-                     #{exec_head}, a gap of {gap} blocks. The collector has not been \
-                     beneath it ({}), so it is still buildable, and all but the last {} \
-                     blocks of it are cut as a range of their own now. Its seed state at \
-                     #{set_end} is the one \
-                     part nothing can promise -- it was written below the watermark and \
-                     was not pinned while the node ran -- so the build may fail on a \
-                     missing node, loudly, leaving no segment.",
-                    match watermark {
-                        Some(w) => format!("watermark #{w}"),
-                        None => "no sweep has completed".into(),
-                    },
-                    args.segbuild_lag
-                );
+                // Whether the seed survived is checkable, not unknowable, and
+                // saying "nothing can promise" when the record settles it sends
+                // an operator looking for damage that is not there.
+                //
+                // A sweep preserves everything reachable from the root it
+                // collected against. So a state at or after that root's height
+                // is complete by construction: each of its nodes was either
+                // reachable then -- and preserved -- or written since, in an
+                // epoch the sweep never touched.
+                let last_sweep = epoch_store
+                    .as_ref()
+                    .and_then(|es| es.sweep_log().last().cloned());
+                let seed_verdict = match (&last_sweep, watermark) {
+                    (None, None) => Some(
+                        "no sweep has ever completed, so nothing has been collected and the \
+                         seed state is intact"
+                            .to_string(),
+                    ),
+                    (Some(r), _) if r.swept_at <= set_end => Some(format!(
+                        "the most recent sweep collected against #{} and preserved everything \
+                         reachable from it, so the seed at #{set_end} -- which is that state \
+                         carried forward -- is intact",
+                        r.swept_at
+                    )),
+                    _ => None,
+                };
+                match seed_verdict {
+                    Some(why) => info!(
+                        "segbuild: the set ends at #{set_end} and this node has executed to \
+                         #{exec_head}, a gap of {gap} blocks. All but the last {} blocks of \
+                         it are cut as a range of their own now, and {why}.",
+                        args.segbuild_lag
+                    ),
+                    None => warn!(
+                        "segbuild: the set ends at #{set_end} and this node has executed to \
+                         #{exec_head}, a gap of {gap} blocks. The collector has not been \
+                         beneath it ({}), so it is still buildable, and all but the last {} \
+                         blocks of it are cut as a range of their own now. But the most \
+                         recent sweep collected against #{}, which is ABOVE #{set_end}, so \
+                         the seed state there cannot be shown intact -- the build may fail \
+                         on a missing node, loudly, leaving no segment.",
+                        match watermark {
+                            Some(w) => format!("watermark #{w}"),
+                            None => "no sweep has completed".into(),
+                        },
+                        args.segbuild_lag,
+                        last_sweep.as_ref().map(|r| r.swept_at).unwrap_or(0)
+                    ),
+                }
             }
             if exec_head < set_end {
                 info!(
