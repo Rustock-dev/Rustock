@@ -7,8 +7,13 @@ about the code. Removing a guard on reasoning alone changes the state root this
 node computes for blocks that are already on the chain.
 
 This document records what has been measured, with the exact command for each
-and how to widen it. It is a draft: most rows are instrumented and unrun, and
-the two results that exist are marked as such.
+and how to widen it.
+
+As of 2026-11-23 the whole chain has been re-executed with every counter live:
+**9,429,718 blocks, 106 segments, 17.4 hours**, both positive controls firing.
+Twenty-eight branches were counted, thirteen of them never taken. What remains
+unrun is named as such -- `BR-134`, which needs a receipts scan rather than a
+replay, and every result's testnet half.
 
 ## The rule that decides what needs measuring
 
@@ -117,6 +122,67 @@ dead regions after a terminator until the next `JUMPDEST`, and honours RSK's
 **It also found the code header was never used** by any contract alive at that
 height.
 
+**And the replay disagreed with it, which is the useful part.** The whole-chain
+run found `SWAPN` **executed once**, in a chain where the census found it
+reachable in nothing. Both results are correct, and the gap between them is the
+census's scope: it decodes the contracts **alive at one height**, so it cannot
+see a contract that ran and was destroyed before that height, and it cannot see
+constructor code, which executes and is never stored.
+
+**Located, and then settled.** A second run carrying the block number and the
+executing contract put the occurrence at mainnet **#996,053**, transaction 0,
+contract `0x56bF637ee636D8ebDE45a046c45DEac6eF67a019`.
+
+The transaction is a contract **creation** whose init code is 68 octets of
+`transfer(address,uint256)` calldata:
+
+```text
+a9059cbb 000…c3439c113bf4e8da22f5bc6093a0dd7b95de06a4 000…1000000000000000000
+```
+
+Someone sent an ERC-20 transfer with an empty `to`, so the node treated the
+calldata as init code and executed it. Its first octet is `0xa9`, which below
+iris300 is `SWAPN`, and the octet after it is the operand: `SWAPN 5` on an empty
+stack. The creation fails, and the address holds no account to this day. Nobody
+ever used the opcode deliberately.
+
+**And removing it changes nothing.** With `SWAPN` present, `0xa9` underflows --
+an exceptional halt consuming all gas. With it replaced by the invalid-opcode
+handler, `0xa9` is `OpcodeNotFound` -- also an exceptional halt consuming all
+gas. Replaying the real block against the real pre-state both ways gives
+identical results:
+
+| | `SWAPN` enabled | `SWAPN` disabled |
+|---|---|---|
+| state root | `0x11686e23…91664e` | `0x11686e23…91664e` |
+| block gas used | 6,800,000 | 6,800,000 |
+| paid fees | 402,832,000,000,000 | 402,832,000,000,000 |
+| receipt 0 | gas 6,800,000, status false | gas 6,800,000, status false |
+| receipt 1 (REMASC) | gas 0, status true | gas 0, status true |
+
+Both roots match the baseline. **So `EVM-045` is removable on mainnet despite
+its count being non-zero** -- the window is occupied, but only nominally, and no
+count alone could have shown that.
+
+The fixture is `crates/execution/tests/swapn_at_996053.rs`, which replays the
+block from the baseline seed and the archival trie. Run it once as it stands and
+once with `SWAPN` replaced by `invalid_opcode` in `rsk_instructions::install`;
+one instruction changes between the runs and nothing else. Moving `iris300`
+instead would also move RSKIP-218's REMASC recipient and RSKIP-174's
+created-at-a-funded-address rule, either of which would shift the root for
+reasons unrelated to `SWAPN`.
+
+**Still open:** testnet. Its activation ladder differs and no equivalent replay
+has been run, so this closes the mainnet half only. `DUPN` and `TXINDEX` never
+executed on mainnet at all.
+
+So the census's zero was never the claim the campaign needed. It is a sound
+*necessary condition* over surviving code and nothing more -- which is how it was
+written up here, and it is still the cheapest way to rule a rule out. But a
+negative from it does not close a window; only the replay does. `EVM-041a`'s
+shift-opcode half, which this report hands to the census for want of a branch to
+count, inherits exactly that limitation and should be read with it.
+
 ```sh
 cargo run --release -p rustock-cli --example opcode_census -- \
     /var/lib/rustock /mnt/import/rustock-trie --block 3614799 --threads 3
@@ -161,55 +227,139 @@ candidate in any case: the spec records it active at all heights on all
 networks, and it is measured to learn whether this chain holds a block an
 Ethereum-derived client would get wrong.
 
-## Instrumented, not yet run
+## What the whole-chain run measured
 
-These need one historical replay. The counters cost one relaxed atomic add on a
-branch already behind a height test, so one replay measures all of them.
+Run over the whole chain on 2026-11-22/23: **9,429,718 blocks, 106 segments,
+17.4 hours** at two workers, with an archival trie behind the segment set as a
+fallback. Every block's state root was verified, and every segment with it.
+
+The counters cost one relaxed atomic add on a branch already behind a height
+test, so this one replay measured every row below at once.
+
+### Read the controls first
+
+| Control | Count | |
+|---|---|---|
+| `BR-086` | **55,834** | fired |
+| `EVM-023a` | **4,875** | fired |
+
+Both fired, so the zeros below are measurements rather than silence. A counter
+that cannot fire reports zero exactly as convincingly as a branch nothing took,
+which is why the tool prints this verdict before the table and refuses to call
+the campaign validated without it.
+
+### Windows this chain never entered
 
 | Rule | Branch | Window (mainnet) |
 |---|---|---|
-| `BR-086` | funds-migration end age is 172,800 blocks, not 10,585 | #4,976,300–#5,468,000 |
-| `EVM-024` | a bridge transaction from a privileged sender executes free | below #370,000 |
-| `BR-015` | `receiveHeaders` is public rather than federation-only | #1,591,000–#3,614,800 |
 | `BR-030` | an internal call to the bridge ends its caller | below #729,000 |
-| `BR-011a` | a bridge method a later activation removed was invoked while it existed | below #729,000 or #1,591,000 |
-| `EVM-033` | a contract created at a funded address loses that balance | below #3,614,800 |
-| `EVM-034` | an internally created contract's nonce is 0, not 1 | below #1,591,000 |
-| `EVM-046` | a dirty-high-bits address reaches the account, not the precompile | all heights |
+| `EVM-041a` | `STATICCALL` reached before RSKIP-91 made it an opcode | below #729,000 |
+| `EVM-062` | a call's stipend sum overflowed a signed 64-bit integer | below #2,018,000 |
+| `EVM-043` | `EXTCODEHASH` answered from the trie-existence marker | #2,392,700–#3,614,800 |
+| `EVM-023` | a precompile's exception burned the calling frame's gas | below #3,614,800 |
+| `BR-097` | a Bitcoin header refused for 12-octet chain-work overflow | BTC #849,138 to #6,549,300 |
+| `EVM-046` | a dirty-high-bits address reached the account, not the precompile | all heights |
 | `PC-042` | a block-header depth outside `0..32,767` | all heights |
+| `PC-051` | `ECRECOVER` given a `v` word with information above octet 63 | all heights |
+| `BV-110` | a gas limit of 2^63 or more, read as a negative signed long | all heights |
+| `BV-125` | the uncle count's 32-bit product wrapped in the difficulty | all heights |
+| `BV-173` | the uncle sum wrapped across the 32 newest headers | all heights |
+| `BR-061` | a peg-out amount that did not fit a signed 64-bit long | all heights |
 
-Three more have their own counters, because each carries a quantity a hit count
-would lose: seven-operand `STATICCALL` (`EVM-041b`, #729,000–#1,052,700),
-executions and those carrying a non-zero value; the two empty-deploy branches
-below RSKIP-453 (`EVM-037`, below #7,338,024) with the largest code any internal
-creation returned; and contracts deployed, with how many carried the `0xFC`
-header (`EVM-032`).
+**Every narrowing guard reports zero except `BR-112`.** No overflow or
+truncation has ever changed a value this chain accepted. That is the baseline
+those counters now monitor against, and it is clean.
 
-```sh
-# whole chain, about 13 h at two workers -- needs the node stopped
-SCOPE=all BUDGET_MB=6000 bash /mnt/import/paseo/tmp/night-reexec.sh
-```
+### Windows this chain occupies
 
-**Widen or narrow the range** with `SCOPE`: `iris300` (#1..#3,620,064, ~4.5 h),
-`rskip453` (#1..#7,338,024, ~10 h) or `all`. The scoping works by pre-seeding
-`reexec_all`'s state file with the segments above the bound, which it skips as
-already done — no code change, and the plan is printed by `--dry` before
-anything executes. To inspect blocks close to a particular activation, set the
-bound just above it; the segment that straddles the bound runs in full, so the
-covered range always ends at a segment boundary rather than exactly at the
-height.
+| Rule | Branch | Count |
+|---|---|---|
+| `EVM-100` | a precompile wrote its whole output past the declared region | **352,910** |
+| `EVM-101` (case 2) | a call that ran nothing kept the caller's return-data buffer | **178,728** |
+| `BR-015` | `receiveHeaders` public rather than federation-only | 84,315 |
+| `BR-086` | funds-migration end age 172,800 rather than 10,585 | 55,834 |
+| `EVM-024` | a privileged sender's bridge transaction executed free | 44,646 |
+| `BR-136` | `addSignature`'s topic carried the federator's BTC key | 28,038 |
+| `EVM-033` | a contract created at a funded address lost that balance | 4,874 |
+| `EVM-023a` | a precompile transaction charged past its own gas limit | 4,875 |
+| `EVM-034` | an internally created contract's nonce was 0, not 1 | 562 |
+| `BR-011a` | a windowed bridge method invoked while it existed | 83 |
+| `EVM-101` (case 3) | a refused `CREATE` kept a stale return-data buffer | 43 |
+| `BR-125` | `commitFederation` handed over immediately, with no SVP | 13 |
+| `BR-055` | a rejected, unrefundable peg-in marked processed | 4 |
+| `BR-112` | a negative flyover code sign-extended across 256 bits | 3 |
+| `EVM-101` (case 1) | a successful precompile call kept the caller's buffer | 11 |
 
-### Two positive controls, and why the report leads with them
+### The quantities a hit count would have lost
 
-**A campaign that only ever returns zero has not been validated.** A counter
-that cannot fire reports zero exactly as convincingly as a branch nothing took.
+- **RSK's own opcodes** (`EVM-045`): `DUPN` 0, **`SWAPN` 1**, `TXINDEX` 0. The
+  one occurrence is mainnet #996,053, and replaying that block with the opcode
+  removed gives an identical state root -- see `EVM-045` above. Occupied, but
+  removable.
+- **The code header** (`EVM-032`): 15,066 contracts deployed, **none** carrying
+  the `0xFC` header. This answers the question the census could only narrow.
+- **Seven-operand `STATICCALL`** (`EVM-041b`): 0 executed, 0 with a non-zero
+  value, over the whole #729,000–#1,052,700 window.
+- **Empty deploys below RSKIP-453** (`EVM-037`): 0 over the maximum code size,
+  **172** unable to pay the code deposit; the largest code any of them returned
+  was 24,532 octets, 44 short of the limit.
 
-`BR-086`'s window is known occupied — using the ordinary end age inside it
-diverged a real mainnet block — so `reexec_all` prints a verdict naming it, and
-says that until it fires every other zero in the table is unproven. `EVM-024` is
-the second control: it exists because the bootstrap-era federation needed it.
+### High-water marks
 
-Read that line before any of the zeros.
+Maxima rather than counts, so a zero here means nothing was observed at all
+rather than that a branch was never taken.
+
+| | Value | Block |
+|---|---|---|
+| Deepest CALL-family frame | **401** | #7,931,702 |
+| Most EVM memory expanded | **422,944 octets** | #9,085,105 |
+| Largest `RETURN` payload | **24,573 octets** | #6,714,553 |
+
+Two of the three sit on limits. 401 is one past RSKIP-150's call-depth cap of
+400 — the mark is taken where the frame is *opened*, before the cap refuses it,
+so it records the depth reached rather than the depth that survived. And 24,573
+is three octets under the 24,576 contract-size ceiling, so the largest `RETURN`
+this chain ever carried is a maximum-size deployment.
+
+### Four zeros that prove less than they look
+
+Stated here rather than left for a reader to infer:
+
+- **`EVM-023` is known occupied on testnet**, at #808,484. Its mainnet zero says
+  nothing about the branch being dead; a testnet replay would settle it and none
+  has been run.
+- **`BR-061` is unreachable on mainnet and testnet balances by construction** —
+  no balance approaches 2^63 satoshis. Its zero was never in doubt. The branch
+  *is* reachable on regtest, whose genesis funds accounts with 10^30 wei.
+- **`EVM-041a` is half-measured.** `STATICCALL` below orchid is an explicit
+  invalid-opcode substitution and is counted. The shift opcodes and `CREATE2`
+  below wasabi100 come from the spec selection rather than from a branch, so
+  there is nothing at that site to count; they need the reachability census.
+- **`BV-110`'s zero is expected.** A header carrying a gas limit of 2^63 or more
+  is invalid, so no canonical block holds one. A non-zero there would have been
+  a finding about the decoder, not about the chain.
+
+### One figure not yet reconciled
+
+`EVM-023a` reports **4,875** occurrences below #3,397, but both the
+specification and the RSKIP-136 write-up describe mainnet #3,307 as *the*
+occurrence, singular. 4,875 across 3,396 blocks is 1.4 per block, which is
+plausible for early federation traffic but contradicts the written claim. The
+control *fired*, which is all that was needed to validate the campaign, but the
+figure should not be cited as evidence until the discrepancy is resolved.
+
+### Segment completeness, as a by-product
+
+The replay reads state through the segment set with an archival trie behind it,
+and records every read a segment could not serve. Over the whole chain:
+**510,219 such reads, none absent from both stores**, concentrated in a small
+number of blocks that perform deep Bridge walks — a peg-in's confirmation count
+or a pegout's UTXO selection.
+
+That list is the input to repairing the segments. An earlier run capped the
+record at 50,000 keys and so retained 9.8% of it; the list is now appended per
+finished segment, which both removes the cap in practice and makes it survive an
+interrupted run.
 
 ## Instrumented separately: `BR-134`
 

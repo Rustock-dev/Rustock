@@ -169,6 +169,13 @@ fn ecrecover(input: &[u8]) -> Option<[u8; 32]> {
     if input.len() < 96 {
         return None;
     }
+    // PC-051: only octet 63 of the 32-octet `v` word is read, so a word
+    // Ethereum refuses outright is accepted here. Count the calls that
+    // actually carried information in the 31 octets this ignores -- that
+    // count is the whole proof obligation for tightening the rule.
+    if input[32..63].iter().any(|&b| b != 0) {
+        crate::legacy_census::Legacy::EcrecoverDirtyVWord.hit();
+    }
     let v = input[63];
     if v != 27 && v != 28 {
         return None;
@@ -1015,6 +1022,7 @@ impl RskPrecompileProvider {
             // and revert so the caller refunds the forwarded leftover.
             if let Some(spent) = crate::bridge::internal_throw_gas(e) {
                 if !self.rskip197_active(context) {
+                    crate::legacy_census::Legacy::PrecompileThrowBurnsCallerGas.hit();
                     // Before RSKIP197 (iris300) `Program.executePrecompiled`
                     // has no error handling: the throw leaves the VM and fails
                     // the contract that made the call, with all its gas, which

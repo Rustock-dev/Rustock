@@ -1,3 +1,5 @@
+pub mod vm_extremes;
+pub mod legacy_census;
 pub mod checkpoint;
 pub mod bloom;
 pub mod events;

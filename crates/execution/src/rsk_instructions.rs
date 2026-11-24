@@ -162,6 +162,21 @@ pub fn set_transaction_index(index: u64) {
     TX_INDEX.with(|i| i.set(index));
 }
 
+thread_local! {
+    /// The block being executed, for the RSK-opcode journal.
+    ///
+    /// The whole-chain run of 2026-11-22 found exactly one SWAPN in 9,429,718
+    /// blocks and could not say which block it was in, because the record
+    /// carried only the transaction index. A single occurrence in nine million
+    /// blocks is worth locating.
+    static BLOCK_NUMBER: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Called once per block, beside [`set_transaction_index`] per transaction.
+pub fn set_block_number(number: u64) {
+    BLOCK_NUMBER.with(|b| b.set(number));
+}
+
 /// Install the rskj-semantics CALL family into an instruction table.
 ///
 /// `extcodehash_enabled` reflects RSKIP140 (papyrus): the spec is PETERSBURG
@@ -380,7 +395,7 @@ pub fn install<WIRE, HOST>(
     instructions.insert_instruction(
         opcode::STATICCALL,
         if !staticcall_enabled {
-            Instruction::new(invalid_opcode::<WIRE, HOST>, 0)
+            Instruction::new(invalid_staticcall::<WIRE, HOST>, 0)
         } else if staticcall_takes_value {
             Instruction::new(rsk_static_call_with_value::<WIRE, HOST>, CALL_STATIC_GAS)
         } else {
@@ -500,6 +515,19 @@ fn invalid_opcode<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context.interpreter.halt(InstructionResult::OpcodeNotFound);
 }
 
+/// `invalid_opcode`, counted for `EVM-041a`.
+///
+/// A separate function rather than a flag inside `invalid_opcode`, because
+/// that handler is shared with EXTCODEHASH below papyrus200 and the two are
+/// different rules -- counting inside it would report one window's occupancy
+/// under the other's name.
+fn invalid_staticcall<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    crate::legacy_census::Legacy::StaticcallNotAnOpcode.hit();
+    invalid_opcode(context);
+}
+
 /// `keccak256("")`, the code hash rskj reports for an existing-but-codeless
 /// account and for active precompiles (`Keccak256Helper.keccak256(EMPTY)`).
 pub(crate) const KECCAK_EMPTY: B256 = B256::new([
@@ -591,7 +619,14 @@ fn rsk_extcodehash<WIRE: InterpreterTypes, H: Host + ContractMarker + ?Sized>(
         KECCAK_EMPTY
     } else {
         match context.host.holds_contract_marker(addr) {
-            Some(true) => B256::ZERO,
+            Some(true) => {
+                // EVM-043. Only this arm differs from the standard rule --
+                // `Some(false)` gives the empty-code hash either way -- so
+                // counting the whole legacy branch would overstate the
+                // window's occupancy.
+                crate::legacy_census::Legacy::ExtcodehashByTrieExistence.hit();
+                B256::ZERO
+            }
             Some(false) => KECCAK_EMPTY,
             None => {
                 context.interpreter.halt_fatal();
@@ -1026,7 +1061,7 @@ fn rsk_opcode_index(op: u8) -> usize {
 /// to look: the first occurrence of an opcode that may never have run on this
 /// chain belongs in the journal. Capped, because a contract in a loop would
 /// otherwise fill the log with the same discovery.
-fn record_rsk_opcode(op: u8) {
+fn record_rsk_opcode(op: u8, who: Address) {
     let n = RSK_OPCODE_HITS[rsk_opcode_index(op)].fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 8 {
         let name = match op {
@@ -1036,9 +1071,11 @@ fn record_rsk_opcode(op: u8) {
         };
         tracing::warn!(
             target: "rustock::rsk_opcodes",
-            "{name} (0x{op:02x}) executed, occurrence {n} in this process, transaction \
-             index {} of its block. These opcodes were removed by RSKIP191 at iris300.",
-            TX_INDEX.with(|i| i.get())
+            "{name} (0x{op:02x}) executed at block #{} transaction {} by contract {who}, \
+             occurrence {n} in this process. These opcodes were removed by RSKIP191 at \
+             iris300.",
+            BLOCK_NUMBER.with(|b| b.get()),
+            TX_INDEX.with(|i| i.get()),
         );
     }
 }
@@ -1155,7 +1192,10 @@ pub fn rsk_opcode_hits() -> [u64; 3] {
 }
 
 fn rsk_dupn<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
-    record_rsk_opcode(RSK_DUPN);
+    {
+        use revm::interpreter::interpreter_types::InputsTr;
+        record_rsk_opcode(RSK_DUPN, context.interpreter.input.target_address());
+    }
     let Some([depth]) = context.interpreter.stack.popn::<1>() else {
         context.interpreter.halt_underflow();
         return;
@@ -1173,7 +1213,10 @@ fn rsk_dupn<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContex
 /// top with the item `d + 2` from the top, so SWAPN of 0 is SWAP1. It fails
 /// as DUPN does, and steps over the next byte in the same way.
 fn rsk_swapn<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
-    record_rsk_opcode(RSK_SWAPN);
+    {
+        use revm::interpreter::interpreter_types::InputsTr;
+        record_rsk_opcode(RSK_SWAPN, context.interpreter.input.target_address());
+    }
     let Some([depth]) = context.interpreter.stack.popn::<1>() else {
         context.interpreter.halt_underflow();
         return;
@@ -1210,7 +1253,10 @@ fn step_over_next_byte<WIRE: InterpreterTypes>(
 /// TXINDEX (before RSKIP191), rskj `VM.doTXINDEX`: pushes the index in its
 /// block of the transaction being executed. See `TX_INDEX`.
 fn rsk_txindex<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
-    record_rsk_opcode(RSK_TXINDEX);
+    {
+        use revm::interpreter::interpreter_types::InputsTr;
+        record_rsk_opcode(RSK_TXINDEX, context.interpreter.input.target_address());
+    }
     assert_configured("TX_INDEX");
     let index = TX_INDEX.with(|i| i.get());
     if !context.interpreter.stack.push(U256::from(index)) {
@@ -1533,6 +1579,10 @@ where
     if stipend > 0 && stipend_sum_wraps() {
         let held = requested.min(i64::MAX as u64);
         if held > i64::MAX as u64 - stipend {
+            // EVM-062: the request was within the stipend of 2^63-1, so rskj's
+            // signed sum went negative and the calling frame failed with all
+            // its gas. Counting the branch is what licenses retiring it.
+            crate::legacy_census::Legacy::StipendSumOverflows.hit();
             context.interpreter.halt_oog();
             return None;
         }
