@@ -41,7 +41,12 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-const UNITRIE_FROM: u64 = 1_591_000;
+/// Mainnet's RSKIP-126 height, below which headers declare Orchid roots.
+///
+/// A default, not a constant of the protocol: on testnet `wasabi100` is at
+/// height 0, so the Unitrie starts at genesis, there is no Orchid era and no
+/// baseline is needed. `--network testnet` sets this to 0.
+const UNITRIE_FROM_MAINNET: u64 = 1_591_000;
 const PROGRESS_EVERY: u64 = 200;
 /// Blocks between dropping the materialized trie tree and re-rooting from the
 /// hash.
@@ -66,6 +71,38 @@ fn checkpoint_every() -> u64 {
         .and_then(|v| v.parse().ok())
         .filter(|v| *v > 0)
         .unwrap_or(CHECKPOINT_EVERY)
+}
+
+
+/// Open the archival trie, in whichever format it happens to be.
+///
+/// Rustock keeps trie nodes in a `trie_nodes` column family; rskj keeps the
+/// same bytes in the default one. The import between them is a straight
+/// key-to-value copy, so an rskj snapshot can serve as the archive directly --
+/// which for testnet is the difference between parallel range builds and a
+/// single sequential pass from genesis, since ranges are independent only when
+/// each can seed from an archival pre-state.
+///
+/// Chosen by inspecting the column families rather than by a flag, because the
+/// wrong flag here is silent: a default-family reader on a rustock store finds
+/// nothing and reports every node absent, which is indistinguishable from a
+/// pruned archive.
+fn open_archive(path: &str) -> anyhow::Result<Arc<dyn TrieStore>> {
+    let probe = rocksdb::Options::default();
+    let dir = {
+        let p = std::path::Path::new(path);
+        if p.join("unitrie").join("CURRENT").exists() { p.join("unitrie") } else { p.to_path_buf() }
+    };
+    let rustock_format = rocksdb::DB::list_cf(&probe, &dir)
+        .map(|cfs| cfs.iter().any(|c| c == "trie_nodes"))
+        .unwrap_or(true);
+    if rustock_format {
+        println!("archive {}: rustock format", dir.display());
+        Ok(Arc::new(RocksDbTrieStore::open_read_only(path)?))
+    } else {
+        println!("archive {}: rskj format, read directly (no import)", dir.display());
+        Ok(Arc::new(rustock_storage::rskj_trie_store::RskjTrieStore::open_read_only(&dir)?))
+    }
 }
 
 fn write_progress(path: &str, fields: &[(&str, String)]) {
@@ -135,13 +172,40 @@ fn reclaim_own(chunks: &std::path::Path, id: &str) {
 fn main() -> anyhow::Result<()> {
     let a: Vec<String> = std::env::args().skip(1).collect();
     if a.len() < 8 {
-        eprintln!("usage: build_segments <worker-id> <block-dir> <archive-trie> <chunks-dir> <out-root> <seal-mb> <tables> <progress-file>");
+        eprintln!(
+            "usage: build_segments <worker-id> <block-dir> <archive-trie> <chunks-dir> \
+             <out-root> <seal-mb> <tables> <progress-file>\n\
+             \n\
+             options:\n\
+             \x20 --network mainnet|testnet   consensus rules AND where the Unitrie starts\n\
+             \x20                             (testnet implies --unitrie-from 0, because\n\
+             \x20                             wasabi100 is at height 0 there)\n\
+             \x20 --unitrie-from N            override that height explicitly\n\
+             \x20 --baseline FILE             pre-RSKIP126 roots, needed only below\n\
+             \x20                             --unitrie-from\n\
+             \n\
+             The archive may be a rustock store or an rskj one; the format is detected\n\
+             from its column families, not from a flag."
+        );
         std::process::exit(2);
     }
     let (id, block_dir, archive, chunks_dir, out_root) = (&a[0], &a[1], &a[2], &a[3], &a[4]);
     let seal_mb: u64 = a[5].parse()?;
     let tables: usize = a[6].parse()?;
     let progress = a[7].clone();
+    // Which chain's rules to execute under, and where its Unitrie starts.
+    let testnet = a.iter().any(|x| x == "testnet")
+        || a.windows(2).any(|w| w[0] == "--network" && w[1] == "testnet");
+    let unitrie_from: u64 = a
+        .windows(2)
+        .find(|w| w[0] == "--unitrie-from")
+        .and_then(|w| w[1].parse().ok())
+        .unwrap_or(if testnet { 0 } else { UNITRIE_FROM_MAINNET });
+    println!(
+        "network: {}  unitrie from #{unitrie_from}",
+        if testnet { "TESTNET" } else { "mainnet" }
+    );
+
     let chunks = std::path::PathBuf::from(chunks_dir);
     reclaim_own(&chunks, id);
 
@@ -170,7 +234,7 @@ fn main() -> anyhow::Result<()> {
         };
         let out_dir = format!("{out_root}/{stem}");
         eprintln!("[w{id}] claimed {stem} (#{start}..#{end})");
-        match run_chunk(id, block_dir, archive, &out_dir, start, end, seal_mb, tables,
+        match run_chunk(id, block_dir, archive, &out_dir, testnet, unitrie_from, start, end, seal_mb, tables,
                         &progress, &t_all, &mut total_done, base.as_ref()) {
             Ok(n) => {
                 let _ = std::fs::rename(chunks.join(format!("{stem}.run-{id}")),
@@ -191,14 +255,14 @@ fn main() -> anyhow::Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_chunk(
-    id: &str, block_dir: &str, archive: &str, out_dir: &str,
+    id: &str, block_dir: &str, archive: &str, out_dir: &str, testnet: bool, unitrie_from: u64,
     start: u64, end: u64, seal_mb: u64, tables: usize,
     progress: &str, t_all: &Instant, total_done: &mut u64,
     base: Option<&std::sync::Arc<baseline::Baseline>>,
 ) -> anyhow::Result<u64> {
 
     let store = Arc::new(BlockStore::open_read_only(block_dir)?);
-    let fallback: Arc<dyn TrieStore> = Arc::new(RocksDbTrieStore::open_read_only(archive)?);
+    let fallback: Arc<dyn TrieStore> = open_archive(archive)?;
     let window = Arc::new(WindowStore::new(
         WindowConfig {
             seal_bytes: seal_mb * 1024 * 1024,
@@ -230,7 +294,7 @@ fn run_chunk(
 
     // Seed the starting state.
     let mut root = if let Some(r) = seeded_root { r } else if start <= 1 {
-        let config = ChainConfig::mainnet();
+        let config = if testnet { ChainConfig::testnet() } else { ChainConfig::mainnet() };
         let mut r = TrieNode::empty();
         for e in &config.genesis_alloc() {
             let k = account_key(&e.address);
@@ -240,7 +304,7 @@ fn run_chunk(
         eprintln!("[w{id}] genesis root {:?}", r.compute_hash(win.as_ref()));
         r
     } else if let Some(seed) = base.and_then(|b| {
-        if start - 1 < UNITRIE_FROM { b.root(start - 1) } else { None }
+        if start - 1 < unitrie_from { b.root(start - 1) } else { None }
     }) {
         // The parent header below the fork declares an Orchid root, which is
         // not a key in a Unitrie store, so the baseline is the only way to
@@ -271,17 +335,24 @@ fn run_chunk(
         TrieNode::from_message(&data, fallback.as_ref())
     };
 
-    let processor = BlockProcessor::new(RskHardforkConfig::mainnet(), store.clone());
+    // The network decides the consensus rules. Executing testnet blocks under
+    // mainnet rules would compute different state roots for every block that
+    // straddles an activation the two ladders place differently -- which is
+    // most of them, since testnet puts orchid and wasabi100 at height 0.
+    let processor = BlockProcessor::new(
+        if testnet { RskHardforkConfig::testnet() } else { RskHardforkConfig::mainnet() },
+        store.clone(),
+    );
     let ckpt_every = checkpoint_every();
     let t0 = Instant::now();
     let total = end - start + 1;
     let mut verified = 0u64;
-    if start < UNITRIE_FROM && base.is_none() {
+    if start < unitrie_from && base.is_none() {
         eprintln!(
-            "[w{id}] WARNING: #{start}..#{} lies below #{UNITRIE_FROM}, where headers carry \
+            "[w{id}] WARNING: #{start}..#{} lies below #{unitrie_from}, where headers carry \
              Orchid roots. Without --baseline these blocks are replayed but NOT verified, so \
              this segment will be built out of state nothing has checked.",
-            end.min(UNITRIE_FROM - 1)
+            end.min(unitrie_from.saturating_sub(1))
         );
     }
 
@@ -300,7 +371,7 @@ fn run_chunk(
         // header is Orchid-format, so the baseline is the only thing that can
         // check the block -- and with no baseline the range is replayed
         // unchecked, which the warning above the loop calls out.
-        let expected: Option<Vec<u8>> = if n >= UNITRIE_FROM {
+        let expected: Option<Vec<u8>> = if n >= unitrie_from {
             Some(header_root.as_slice().to_vec())
         } else {
             base.and_then(|b| b.root(n)).map(|r| r.to_vec())
@@ -342,10 +413,21 @@ fn run_chunk(
             let el = t_all.elapsed().as_secs_f64();
             let rate = (chunk_base + done) as f64 / el.max(0.001);
             let reads = window.reads.load(Ordering::Relaxed).max(1);
+            // Percent and ETA, so a reader does not have to divide two of the
+            // other fields to learn whether this will finish tonight.
+            let pct = (chunk_base + done) as f64 * 100.0 / (total.max(1)) as f64;
+            let remaining = total.saturating_sub(chunk_base + done) as f64;
+            let eta_s = if rate > 0.0 { remaining / rate } else { 0.0 };
+            println!(
+                "[w{id}] #{n}  {:.2}%  {rate:.1} blk/s  eta {:.1} h  ({}/{} blocks, {:.0}m elapsed)",
+                pct, eta_s / 3600.0, chunk_base + done, total, el / 60.0
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
             write_progress(progress, &[
                 ("id", id.to_string()), ("state", "running".into()),
                 ("block", n.to_string()), ("start", start.to_string()), ("end", end.to_string()),
                 ("done", (chunk_base + done).to_string()), ("total", total.to_string()),
+                ("pct", format!("{pct:.2}")), ("eta_s", format!("{eta_s:.0}")),
                 ("elapsed_s", format!("{el:.0}")), ("rate", format!("{rate:.2}")),
                 ("verified", verified.to_string()),
                 ("segments", window.segment_count().to_string()),
