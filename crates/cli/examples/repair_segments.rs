@@ -41,7 +41,12 @@ use std::sync::Arc;
 /// ever captured. Only the explicit repair write happens.
 struct RepairStore {
     segment: RocksDbTrieStore,
-    full: RocksDbTrieStore,
+    /// Shared across every segment, and opened once.
+    ///
+    /// The archival trie is 131 GB and read-only, and opening it costs 15-21
+    /// seconds. Opening it inside the per-segment loop spent about twenty
+    /// minutes of a thirty-minute run reopening the same database 77 times.
+    full: Arc<RocksDbTrieStore>,
     inserted: AtomicU64,
     served: AtomicU64,
 }
@@ -137,6 +142,16 @@ fn main() -> anyhow::Result<()> {
     println!("work: {} segments, {blocks} blocks", work.len());
 
     let store = Arc::new(BlockStore::open_read_only(&block_dir)?);
+    // Opened once, before the loop: see `RepairStore::full`. Skipped entirely
+    // under --verify-only, which never reads it.
+    let full: Arc<RocksDbTrieStore> = if verify_only {
+        Arc::new(RocksDbTrieStore::open_read_only(&full_dir)?)
+    } else {
+        let t = std::time::Instant::now();
+        let f = Arc::new(RocksDbTrieStore::open_read_only(&full_dir)?);
+        println!("fallback trie opened in {:.1}s (once, shared by every segment)", t.elapsed().as_secs_f64());
+        f
+    };
     let mut total_inserted = 0u64;
     let mut failures = 0usize;
 
@@ -151,7 +166,7 @@ fn main() -> anyhow::Result<()> {
         if !verify_only {
             let rs = Arc::new(RepairStore {
                 segment: RocksDbTrieStore::open(&dir)?,
-                full: RocksDbTrieStore::open_read_only(&full_dir)?,
+                full: Arc::clone(&full),
                 inserted: AtomicU64::new(0),
                 served: AtomicU64::new(0),
             });
