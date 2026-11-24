@@ -84,6 +84,27 @@ fn should_mark_rejected_pegin_as_processed(cfg: &RskHardforkConfig, block_number
     cfg.has_rskip459(block_number) && !cfg.has_rskip551(block_number)
 }
 
+/// The same predicate, counted (`BR-055`).
+///
+/// Every production caller goes through this rather than the bare predicate,
+/// and the counting is exact because of where the call sites sit. Two are
+/// `if marks(..) { set_btc_tx_processed(..) }`, so a count is a marking. The
+/// third is guarded by `evaluated &&`, which short-circuits before this is
+/// reached when nothing was evaluated. The fourth is the right arm of
+/// `!rskip379 || marks(..)` -- so when the marking happens *because* RSKIP-379
+/// is inactive, this is never evaluated and nothing is counted, which is
+/// correct: that marking is not the window's doing.
+///
+/// The bare predicate is left uncounted so its unit tests can probe the window
+/// edges without moving the counter.
+fn marks_rejected_pegin_as_processed(cfg: &RskHardforkConfig, block_number: u64) -> bool {
+    let yes = should_mark_rejected_pegin_as_processed(cfg, block_number);
+    if yes {
+        crate::legacy_census::Legacy::RejectedPeginMarkedProcessed.hit();
+    }
+    yes
+}
+
 /// rskj `PegUtilsLegacy.isValidPegInTx` minimum gate over the live-federations
 /// outputs. Under RSKIP293 each UTXO must be at least `min`
 /// (`isAnyUTXOAmountBelowMinimum`); before it, the *total* sent must be
@@ -671,7 +692,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             super::events::log_rejected_pegin(ctx, &hash, 5);
             super::events::log_unrefundable_pegin(ctx, &hash, 3);
         }
-        if evaluated && should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
+        if evaluated && marks_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
             set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         }
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
@@ -782,7 +803,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                         if logs {
                             super::events::log_unrefundable_pegin(ctx, &hash, 1);
                         }
-                        !rskip379 || should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height)
+                        !rskip379 || marks_rejected_pegin_as_processed(hardfork_cfg, rsk_height)
                     }
                 };
                 if mark {
@@ -951,7 +972,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             let hash = btc_txid_event_bytes(&btc_tx);
             super::events::log_rejected_pegin(ctx, &hash, 3);
             super::events::log_unrefundable_pegin(ctx, &hash, 1);
-            if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
+            if marks_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
                 set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
             }
         } else if hardfork_cfg.has_rskip170(rsk_height) {
@@ -1038,7 +1059,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             let hash = btc_txid_event_bytes(&btc_tx);
             super::events::log_rejected_pegin(ctx, &hash, 2);
             super::events::log_unrefundable_pegin(ctx, &hash, 4);
-            if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
+            if marks_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
                 set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
             }
             return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
@@ -1888,6 +1909,12 @@ mod flyover_codes {
 /// (mainnet #5,967,453: GENERIC_ERROR -900 mis-encoded as `2^128-900`).
 fn flyover_code_output(code: i64) -> Bytes {
     let value = if code < 0 {
+        // BR-112: the full-width encoding is load-bearing -- a mainnet
+        // transaction depends on the wrap being at bit 256, and a 128-bit-wide
+        // encoding of -900 diverged it. So this branch is known occupied, and
+        // a zero here would mean the counter is wrong rather than the branch
+        // unused.
+        crate::legacy_census::Legacy::FlyoverCodeSignExtended.hit();
         // Full 256-bit two's complement: 2^256 - |code|.
         U256::ZERO.wrapping_sub(U256::from(code.unsigned_abs()))
     } else {
@@ -2923,6 +2950,13 @@ pub fn release_btc<CTX: crate::RskContextTr>(
     // comes near 2^63 satoshis, but regtest's genesis funds accounts with
     // 10^30 wei, which wrap, and wrap negative past 2^63: a negative long is
     // below every minimum, and rskj logs and refunds it as it is.
+    // BR-061: the low 64 bits as a signed long. Where the wide value does not
+    // fit, this read differs from it -- and a negative long is below every
+    // minimum and is refunded as it stands. Counting the divergence is the
+    // §6d predicate, and it is monitoring rather than a one-shot measurement.
+    if amount_satoshis_u256 > U256::from(i64::MAX as u64) {
+        crate::legacy_census::Legacy::PegoutAmountSignedLong.hit();
+    }
     let satoshis = amount_satoshis_u256.as_limbs()[0] as i64;
     // The amount the events carry before RSKIP427.
     let satoshis_word = long_word(satoshis);
@@ -5211,6 +5245,8 @@ pub fn add_signature<CTX: crate::RskContextTr>(
             .map(|k| super::federation::key_encoding(&k).to_vec())
             .unwrap_or_else(|| fed_key.clone())
     } else {
+        // BR-136: the legacy topic key.
+        crate::legacy_census::Legacy::AddSignatureTopicUsesBtcKey.hit();
         fed_key.clone()
     };
     let emit_add_signature = |ctx: &mut CTX, btc_tx: &BtcTransaction| {

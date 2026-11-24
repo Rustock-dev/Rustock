@@ -4,12 +4,24 @@
 /// them into Ethereum-style hardforks. We map each RSK network upgrade to
 /// the closest Ethereum SpecId that captures the same EVM semantics:
 ///
-/// | RSK Upgrade      | Height    | Closest SpecId    | Key changes                          |
+/// **The SpecId is an aside, not the rule.** Rootstock gates each opcode on its
+/// own RSKIP, so the Ethereum fork label never decides what is available: the
+/// column below records which gates fire, and `upgrade_to_spec_id` and
+/// `rsk_instructions::install` are what actually bind.
+///
+/// This table previously credited BYZANTIUM with `STATICCALL` from genesis and
+/// put the shift opcodes and `CREATE2` at `papyrus200`. Both were wrong, and
+/// wrong in the direction a re-implementer would copy -- `STATICCALL` is
+/// replaced by the invalid-opcode handler below `orchid` (RSKIP-91), and the
+/// shifts and `CREATE2` arrive at `wasabi100` (RSKIP-120/125), which is also
+/// where PETERSBURG begins.
+///
+/// | RSK Upgrade      | Height    | Closest SpecId    | Gates that fire here                 |
 /// |------------------|-----------|-------------------|--------------------------------------|
-/// | genesis–orchid   | 0–728999  | BYZANTIUM         | REVERT, STATICCALL, RETURNDATASIZE   |
-/// | orchid           | 729000    | BYZANTIUM         | (RSK-specific fixes)                 |
-/// | wasabi100        | 1591000   | BYZANTIUM         | (RSK-specific fixes)                 |
-/// | papyrus200       | 2392700   | PETERSBURG        | SHL/SHR/SAR, CHAINID, CREATE2        |
+/// | genesis–orchid   | 0–728999  | BYZANTIUM         | REVERT, RETURNDATASIZE. NO STATICCALL |
+/// | orchid           | 729000    | BYZANTIUM         | STATICCALL (RSKIP-91), 7 operands until orchid060 |
+/// | wasabi100        | 1591000   | PETERSBURG        | SHL/SHR/SAR (RSKIP-120), CREATE2 (RSKIP-125) |
+/// | papyrus200       | 2392700   | PETERSBURG        | EXTCODEHASH (RSKIP-140), CHAINID/SELFBALANCE (RSKIP-152/151) |
 /// | iris300          | 3614800   | PETERSBURG        | (RSK-specific fixes)                 |
 /// | hop400           | 4598500   | PETERSBURG        | (RSK-specific fixes)                 |
 /// | fingerroot500    | 5468000   | PETERSBURG        | (RSK-specific fixes)                 |

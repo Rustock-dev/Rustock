@@ -274,6 +274,22 @@ pub fn build_range(
     if start > end {
         bail!("range #{start}..#{end} is not a range");
     }
+    // Empty the BTC block cache before replaying this range.
+    //
+    // A segment must contain every node a *cold* replay of its range reads. A
+    // cache carried in from the previous segment serves some of those reads
+    // from memory, so the nodes never enter the window and the segment is
+    // complete only for a reader whose cache happens to be warm the same way.
+    // Clearing here makes the build's read set match a replay that starts cold
+    // at the same boundary.
+    //
+    // Clearing rather than disabling is deliberate: the cache still pays for
+    // itself *within* a range, and a disabled cache would make the build read a
+    // superset of what any replay needs. See `docs/trie-segments-design.md`
+    // 6.9d and the 2026-11-22 measurement.
+    if let Some(cache) = processor.btc_block_cache() {
+        cache.clear();
+    }
     if start < UNITRIE_FROM {
         bail!(
             "refusing to build #{start}..#{end}: below #{UNITRIE_FROM} a header declares an \

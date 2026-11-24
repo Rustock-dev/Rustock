@@ -3584,8 +3584,23 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         // re-executes blocks whose peg events have already been recorded, and
         // recording them again would double every entry.
         let mut segbuild_processor = rule_keeping_processor(&hardfork_cfg, &store, &config);
-        if let Some(cache) = &btc_block_cache {
-            segbuild_processor = segbuild_processor.with_btc_block_cache(cache.clone());
+        // A PRIVATE BTC block cache, not a clone of the node's.
+        //
+        // Sharing it was the cause of the segment holes found on 2026-11-22.
+        // The builder's deep Bridge walks -- a peg-in's confirmation count, a
+        // pegout's UTXO selection -- were served from a cache warmed by earlier
+        // segments, so those nodes were never read from the trie, never
+        // promoted into the window, and never sealed into the segment. A cold
+        // replay then could not find them: 510,219 such reads over the chain,
+        // across 77 of 106 segments.
+        //
+        // Private rather than simply cleared, because `clear()` on the shared
+        // Arc would also wipe the live node's cache at every segment boundary
+        // while it syncs. The copy costs ~2 MB at the default 10,000 entries.
+        if btc_block_cache.is_some() {
+            segbuild_processor = segbuild_processor.with_btc_block_cache(std::sync::Arc::new(
+                rustock_execution::BtcBlockCache::new(args.btc_block_cache_entries),
+            ));
         }
         if let Some(cache) = &sender_cache {
             segbuild_processor = segbuild_processor.with_sender_cache(cache.clone());
