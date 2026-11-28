@@ -1,3 +1,4 @@
+pub mod rskj_trie_store;
 pub mod segment_reader;
 pub mod trie_store;
 pub mod cached_trie_store;
