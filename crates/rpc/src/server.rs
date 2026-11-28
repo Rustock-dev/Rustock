@@ -595,6 +595,7 @@ async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_getTransactionByBlockHashAndIndex" => tx::eth_get_transaction_by_block_hash_and_index(id, params, state),
         "eth_getTransactionByBlockNumberAndIndex" => tx::eth_get_transaction_by_block_number_and_index(id, params, state),
         "eth_getTransactionReceipt" => tx::eth_get_transaction_receipt(id, params, state),
+        "eth_getBlockReceipts" => tx::eth_get_block_receipts(id, params, state),
 
         // -- log filtering --
         "eth_getLogs" => logs::eth_get_logs(id, params, state),

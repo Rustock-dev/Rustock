@@ -3307,6 +3307,173 @@ async fn test_receipt_proof_rejects_malformed_input() {
 }
 
 
+// ========== eth_getBlockReceipts (#396) ==========
+
+/// **The test that matters: rebuild the root, do not just count the array.**
+///
+/// The method's whole claim is completeness, and the only check for
+/// completeness is that the returned set reconstructs the header's
+/// `receiptsRoot`. Asserting the length would pass against a server that
+/// returned the right number of wrong receipts, and asserting the shape
+/// would pass against one that dropped the last one and renumbered.
+#[tokio::test]
+async fn block_receipts_rebuild_the_headers_receipts_root() {
+    let (state, block_hash, _tx_hashes, receipts, _tmp) = setup_state_with_receipts(8);
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockReceipts", json!([format!("{block_hash:#x}")])),
+    )
+    .await;
+    let got = resp.result.expect("a held block answers");
+    let array = got.as_array().expect("an array of receipts");
+    assert_eq!(array.len(), receipts.len(), "every receipt, not a prefix");
+
+    // Index order is what the trie is keyed by, so an out-of-order answer
+    // would rebuild a different root. Check the ordering explicitly too, so a
+    // failure says which of the two went wrong.
+    for (i, r) in array.iter().enumerate() {
+        assert_eq!(
+            r["transactionIndex"].as_str().unwrap(),
+            format!("{i:#x}"),
+            "receipt {i} is out of index order"
+        );
+    }
+
+    let rebuilt = rustock_core::types::receipt::ordered_trie_root(&receipts, true);
+    let header = state.store.header(block_hash).unwrap().unwrap();
+    assert_eq!(
+        rebuilt, header.receipts_root,
+        "the fixture's own receipts must rebuild the header root, or this test proves nothing"
+    );
+}
+
+/// A number, a tag and a hash all name the same block.
+#[tokio::test]
+async fn block_receipts_accept_a_number_a_tag_and_a_hash() {
+    let (state, block_hash, _t, receipts, _tmp) = setup_state_with_receipts(3);
+
+    for selector in [json!("0x1"), json!("latest"), json!(format!("{block_hash:#x}"))] {
+        let resp = dispatch_for_test(
+            &state,
+            make_request("eth_getBlockReceipts", json!([selector.clone()])),
+        )
+        .await;
+        let got = resp.result.unwrap_or_else(|| panic!("{selector} should answer"));
+        assert_eq!(
+            got.as_array().map(|a| a.len()),
+            Some(receipts.len()),
+            "{selector} returned a different set"
+        );
+    }
+}
+
+/// A block with no transactions is an empty array, not null.
+///
+/// The two are different answers: the empty array says "this block had
+/// nothing in it", which rebuilds the empty receipts root and is a complete
+/// answer; null says "I cannot tell you". A client checking completeness has
+/// to be able to distinguish them.
+#[tokio::test]
+async fn an_empty_block_answers_with_an_empty_set_not_null() {
+    let (state, block_hash, _t, _r, _tmp) = setup_state_with_receipts(0);
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockReceipts", json!([format!("{block_hash:#x}")])),
+    )
+    .await;
+    assert_eq!(resp.result, Some(json!([])));
+}
+
+/// A block this node does not hold is null, not an empty array.
+#[tokio::test]
+async fn an_unheld_block_answers_null() {
+    let (state, _b, _t, _r, _tmp) = setup_state_with_receipts(2);
+    for selector in [json!("0x99"), json!(format!("{:#x}", B256::repeat_byte(0xab)))] {
+        let resp = dispatch_for_test(
+            &state,
+            make_request("eth_getBlockReceipts", json!([selector.clone()])),
+        )
+        .await;
+        assert_eq!(resp.result, Some(Value::Null), "{selector} should be null");
+    }
+}
+
+/// **The promise under failure: a short set is an error, never an answer.**
+///
+/// If the store holds fewer receipts than the block has transactions, the
+/// tempting thing is to return what there is. That would hand a verifying
+/// client exactly the artefact the method exists to rule out — a truncated
+/// set, indistinguishable at the API from a withheld receipt — and the client
+/// would discover it only by failing to rebuild the root, if it bothered.
+/// Refusing is the honest answer: this node cannot establish completeness
+/// here.
+#[tokio::test]
+async fn a_store_holding_fewer_receipts_than_transactions_refuses_rather_than_truncating() {
+    let (state, block_hash, _t, receipts, _tmp) = setup_state_with_receipts(4);
+
+    // Drop the last receipt, leaving the body's four transactions in place.
+    state.store.put_receipts(block_hash, &receipts[..3]).unwrap();
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockReceipts", json!([format!("{block_hash:#x}")])),
+    )
+    .await;
+    let error = resp.error.expect("a truncated set must be refused, not served");
+    assert!(
+        error.message.contains("3 receipts for 4 transactions"),
+        "the error should name the disagreement it found, got: {}",
+        error.message
+    );
+    assert!(resp.result.is_none(), "no partial set alongside the error");
+}
+
+/// `logIndex` is numbered over the block, so the same receipt must report the
+/// same index whether it was fetched alone or with its block.
+#[tokio::test]
+async fn block_receipts_agree_with_eth_get_transaction_receipt() {
+    let (state, block_hash, tx_hashes, _r, _tmp) = setup_state_with_receipts(5);
+
+    let bulk = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockReceipts", json!([format!("{block_hash:#x}")])),
+    )
+    .await
+    .result
+    .unwrap();
+
+    for (i, tx_hash) in tx_hashes.iter().enumerate() {
+        let single = dispatch_for_test(
+            &state,
+            make_request("eth_getTransactionReceipt", json!([format!("{tx_hash:#x}")])),
+        )
+        .await
+        .result
+        .unwrap();
+        assert_eq!(
+            bulk[i], single,
+            "receipt {i} differs between the bulk and the single-receipt method"
+        );
+    }
+}
+
+/// Malformed input is refused rather than answered null, so a typo in a
+/// selector does not read as "that block has no receipts".
+#[tokio::test]
+async fn block_receipts_reject_a_malformed_selector() {
+    let (state, _b, _t, _r, _tmp) = setup_state_with_receipts(1);
+    for params in [json!(["not-a-block"]), json!([]), json!(["99"])] {
+        let resp = dispatch_for_test(
+            &state,
+            make_request("eth_getBlockReceipts", params.clone()),
+        )
+        .await;
+        assert!(resp.error.is_some(), "{params} should be refused");
+    }
+}
+
+
 // ========== eth_bridgeState (#86) ==========
 
 /// The shape is two fields, and only two.
