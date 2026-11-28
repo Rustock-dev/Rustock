@@ -388,6 +388,7 @@ fn setup_state_with(store: impl FnOnce(BlockStore) -> BlockStore) -> (RpcState, 
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1036,6 +1037,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1101,6 +1103,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1299,6 +1302,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1443,6 +1447,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1542,6 +1547,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1739,6 +1745,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -2189,6 +2196,7 @@ async fn test_receipt_dto_failed_status() {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -3154,6 +3162,7 @@ fn setup_state_with_receipts(
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -3307,6 +3316,173 @@ async fn test_receipt_proof_rejects_malformed_input() {
 }
 
 
+// ========== eth_getBlockReceipts (#396) ==========
+
+/// **The test that matters: rebuild the root, do not just count the array.**
+///
+/// The method's whole claim is completeness, and the only check for
+/// completeness is that the returned set reconstructs the header's
+/// `receiptsRoot`. Asserting the length would pass against a server that
+/// returned the right number of wrong receipts, and asserting the shape
+/// would pass against one that dropped the last one and renumbered.
+#[tokio::test]
+async fn block_receipts_rebuild_the_headers_receipts_root() {
+    let (state, block_hash, _tx_hashes, receipts, _tmp) = setup_state_with_receipts(8);
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockReceipts", json!([format!("{block_hash:#x}")])),
+    )
+    .await;
+    let got = resp.result.expect("a held block answers");
+    let array = got.as_array().expect("an array of receipts");
+    assert_eq!(array.len(), receipts.len(), "every receipt, not a prefix");
+
+    // Index order is what the trie is keyed by, so an out-of-order answer
+    // would rebuild a different root. Check the ordering explicitly too, so a
+    // failure says which of the two went wrong.
+    for (i, r) in array.iter().enumerate() {
+        assert_eq!(
+            r["transactionIndex"].as_str().unwrap(),
+            format!("{i:#x}"),
+            "receipt {i} is out of index order"
+        );
+    }
+
+    let rebuilt = rustock_core::types::receipt::ordered_trie_root(&receipts, true);
+    let header = state.store.header(block_hash).unwrap().unwrap();
+    assert_eq!(
+        rebuilt, header.receipts_root,
+        "the fixture's own receipts must rebuild the header root, or this test proves nothing"
+    );
+}
+
+/// A number, a tag and a hash all name the same block.
+#[tokio::test]
+async fn block_receipts_accept_a_number_a_tag_and_a_hash() {
+    let (state, block_hash, _t, receipts, _tmp) = setup_state_with_receipts(3);
+
+    for selector in [json!("0x1"), json!("latest"), json!(format!("{block_hash:#x}"))] {
+        let resp = dispatch_for_test(
+            &state,
+            make_request("eth_getBlockReceipts", json!([selector.clone()])),
+        )
+        .await;
+        let got = resp.result.unwrap_or_else(|| panic!("{selector} should answer"));
+        assert_eq!(
+            got.as_array().map(|a| a.len()),
+            Some(receipts.len()),
+            "{selector} returned a different set"
+        );
+    }
+}
+
+/// A block with no transactions is an empty array, not null.
+///
+/// The two are different answers: the empty array says "this block had
+/// nothing in it", which rebuilds the empty receipts root and is a complete
+/// answer; null says "I cannot tell you". A client checking completeness has
+/// to be able to distinguish them.
+#[tokio::test]
+async fn an_empty_block_answers_with_an_empty_set_not_null() {
+    let (state, block_hash, _t, _r, _tmp) = setup_state_with_receipts(0);
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockReceipts", json!([format!("{block_hash:#x}")])),
+    )
+    .await;
+    assert_eq!(resp.result, Some(json!([])));
+}
+
+/// A block this node does not hold is null, not an empty array.
+#[tokio::test]
+async fn an_unheld_block_answers_null() {
+    let (state, _b, _t, _r, _tmp) = setup_state_with_receipts(2);
+    for selector in [json!("0x99"), json!(format!("{:#x}", B256::repeat_byte(0xab)))] {
+        let resp = dispatch_for_test(
+            &state,
+            make_request("eth_getBlockReceipts", json!([selector.clone()])),
+        )
+        .await;
+        assert_eq!(resp.result, Some(Value::Null), "{selector} should be null");
+    }
+}
+
+/// **The promise under failure: a short set is an error, never an answer.**
+///
+/// If the store holds fewer receipts than the block has transactions, the
+/// tempting thing is to return what there is. That would hand a verifying
+/// client exactly the artefact the method exists to rule out — a truncated
+/// set, indistinguishable at the API from a withheld receipt — and the client
+/// would discover it only by failing to rebuild the root, if it bothered.
+/// Refusing is the honest answer: this node cannot establish completeness
+/// here.
+#[tokio::test]
+async fn a_store_holding_fewer_receipts_than_transactions_refuses_rather_than_truncating() {
+    let (state, block_hash, _t, receipts, _tmp) = setup_state_with_receipts(4);
+
+    // Drop the last receipt, leaving the body's four transactions in place.
+    state.store.put_receipts(block_hash, &receipts[..3]).unwrap();
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockReceipts", json!([format!("{block_hash:#x}")])),
+    )
+    .await;
+    let error = resp.error.expect("a truncated set must be refused, not served");
+    assert!(
+        error.message.contains("3 receipts for 4 transactions"),
+        "the error should name the disagreement it found, got: {}",
+        error.message
+    );
+    assert!(resp.result.is_none(), "no partial set alongside the error");
+}
+
+/// `logIndex` is numbered over the block, so the same receipt must report the
+/// same index whether it was fetched alone or with its block.
+#[tokio::test]
+async fn block_receipts_agree_with_eth_get_transaction_receipt() {
+    let (state, block_hash, tx_hashes, _r, _tmp) = setup_state_with_receipts(5);
+
+    let bulk = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockReceipts", json!([format!("{block_hash:#x}")])),
+    )
+    .await
+    .result
+    .unwrap();
+
+    for (i, tx_hash) in tx_hashes.iter().enumerate() {
+        let single = dispatch_for_test(
+            &state,
+            make_request("eth_getTransactionReceipt", json!([format!("{tx_hash:#x}")])),
+        )
+        .await
+        .result
+        .unwrap();
+        assert_eq!(
+            bulk[i], single,
+            "receipt {i} differs between the bulk and the single-receipt method"
+        );
+    }
+}
+
+/// Malformed input is refused rather than answered null, so a typo in a
+/// selector does not read as "that block has no receipts".
+#[tokio::test]
+async fn block_receipts_reject_a_malformed_selector() {
+    let (state, _b, _t, _r, _tmp) = setup_state_with_receipts(1);
+    for params in [json!(["not-a-block"]), json!([]), json!(["99"])] {
+        let resp = dispatch_for_test(
+            &state,
+            make_request("eth_getBlockReceipts", params.clone()),
+        )
+        .await;
+        assert!(resp.error.is_some(), "{params} should be refused");
+    }
+}
+
+
 // ========== eth_bridgeState (#86) ==========
 
 /// The shape is two fields, and only two.
@@ -3432,6 +3608,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -4502,6 +4679,7 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 1_000,
         scoring: None,
@@ -6208,6 +6386,7 @@ fn setup_state_with_varied_logs() -> (RpcState, tempfile::TempDir, Vec<Address>,
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -8141,24 +8320,259 @@ async fn the_proof_chains_up_to_the_state_root() {
     }
 }
 
-/// An address the trie never heard of still gets a well-formed answer,
-/// rather than an error or a half-built path.
+/// **The topology that matters: a wallet against a FULL node.**
+///
+/// An SPV wallet server connects to an ordinary full Rustock node, not to a
+/// `--spv` one. So this is the case the wallet work has to serve, and here
+/// `codeHash` is the field with a hole in it: `accountProof` proves the
+/// account record, RSK's record is `(nonce, balance, stateFlags)`, and
+/// neither `codeHash` nor `storageHash` is in it. A caller that verifies
+/// `accountProof` has learned the balance and the nonce and has learned
+/// nothing about those two.
+///
+/// `includeCode` asks for the evidence. The test verifies it rather than
+/// checking that a field appeared: it walks the returned nodes with
+/// `verify_path` against the block's own state root and hashes what it
+/// finds, which is what a wallet would do.
 #[tokio::test]
-async fn get_proof_answers_for_an_absent_account() {
-    let (state, _tmp, _, _) = setup_proof_state();
+async fn a_full_node_can_prove_the_code_hash_it_reports() {
+    use rustock_trie::proof::{verify_path, Outcome};
+
+    let (state, _tmp, addr, state_root) = setup_proof_state();
+
+    let r = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getProof",
+            json!([format!("{addr:#x}"), [], "latest", {"includeCode": true}]),
+        ),
+    )
+    .await
+    .result
+    .expect("a full node answers");
+
+    let nodes: Vec<Vec<u8>> = r["codeProof"]
+        .as_array()
+        .expect("the evidence must be returned when asked for")
+        .iter()
+        .map(|n| unhex(n.as_str().unwrap()))
+        .collect();
+
+    let code = match verify_path(&nodes, &rustock_trie::code_key(&addr), state_root) {
+        Ok(Outcome::Value(code)) => code,
+        other => panic!("the code proof must verify against the state root, got {other:?}"),
+    };
+
+    let hashed = format!(
+        "{:#x}",
+        B256::from_slice(&<sha3::Keccak256 as sha3::Digest>::digest(&code))
+    );
+    assert_eq!(
+        r["codeHash"].as_str(),
+        Some(hashed.as_str()),
+        "the reported codeHash must be the hash of the code the proof carries"
+    );
+}
+
+/// The storage root, on the same terms — and with the node-not-value trap.
+///
+/// `storageHash` is the hash of the *node* at the storage prefix, and that
+/// node holds no value, so a verifier that asked `verify_path` for its value
+/// would be told "absent" and would conclude the account has no storage.
+#[tokio::test]
+async fn a_full_node_can_prove_the_storage_hash_it_reports() {
+    use rustock_trie::proof::verify_node_at;
+
+    let (state, _tmp, addr, state_root) = setup_proof_state();
+
+    let r = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getProof",
+            json!([format!("{addr:#x}"), [], "latest", {"includeStorageRoot": true}]),
+        ),
+    )
+    .await
+    .result
+    .unwrap();
+
+    let nodes: Vec<Vec<u8>> = r["storageRootProof"]
+        .as_array()
+        .expect("the evidence must be returned when asked for")
+        .iter()
+        .map(|n| unhex(n.as_str().unwrap()))
+        .collect();
+
+    let proved = verify_node_at(&nodes, &rustock_trie::storage_prefix_key(&addr), state_root)
+        .expect("the storage-root proof must verify");
+    assert_eq!(
+        proved.map(|h| format!("{h:#x}")),
+        r["storageHash"].as_str().map(|s| s.to_string()),
+        "the reported storageHash must be the hash of the node the proof reaches"
+    );
+    assert!(proved.is_some(), "the fixture's account has storage");
+}
+
+/// **Off by default, so no existing caller pays for bytecode.**
+///
+/// The two fields keep being reported, because that is EIP-1186's shape and
+/// dropping them would break callers; what is absent is the evidence, which
+/// nobody was getting before either.
+#[tokio::test]
+async fn the_proofs_are_absent_unless_the_fourth_parameter_asks() {
+    let (state, _tmp, addr, _) = setup_proof_state();
+    let r = dispatch_for_test(
+        &state,
+        make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest"])),
+    )
+    .await
+    .result
+    .unwrap();
+
+    assert!(r.get("codeProof").is_none());
+    assert!(r.get("storageRootProof").is_none());
+
+    // And the two fields go with their evidence. An unprovable value beside
+    // a real proof cannot be told from a proved one, and the proof next to
+    // it makes the whole object look checked -- so omission is the honest
+    // answer rather than EIP-1186's shape.
+    assert!(r.get("codeHash").is_none(), "not proved, not asserted");
+    assert!(r.get("storageHash").is_none());
+
+    // What the account proof does cover is still there.
+    assert!(r.get("balance").is_some());
+    assert!(r.get("nonce").is_some());
+    assert!(r.get("accountProof").is_some());
+}
+
+/// A fourth parameter that is not an object is a mistake worth naming,
+/// rather than silently ignored — a caller sending `true` meant something.
+#[tokio::test]
+async fn a_malformed_fourth_parameter_is_refused() {
+    let (state, _tmp, addr, _) = setup_proof_state();
+    for bad in [json!(true), json!("includeCode"), json!([1])] {
+        let r = dispatch_for_test(
+            &state,
+            make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest", bad])),
+        )
+        .await;
+        assert!(r.error.is_some(), "{bad} should be refused");
+    }
+}
+
+/// **An absent account is proved absent, not merely asserted (#392).**
+///
+/// This is a new wallet's first query, so it is the common case rather than
+/// the edge one. The old behaviour answered an empty `accountProof`, which a
+/// client cannot check: a node that wanted to deny an account's existence
+/// would send exactly the same thing. The test therefore does not assert a
+/// shape -- it runs the returned nodes through `verify_path` and demands
+/// `Outcome::Absent` against the block's real state root, which is the only
+/// assertion a withholding server could not satisfy.
+#[tokio::test]
+async fn get_proof_proves_an_absent_account_absent() {
+    use rustock_trie::proof::{verify_path, Outcome};
+
+    let (state, _tmp, _, state_root) = setup_proof_state();
     let absent: Address = "0x0000000000000000000000000000000000009999".parse().unwrap();
     let req = make_request("eth_getProof", json!([format!("{absent:#x}"), [], "latest"]));
     let r = dispatch_for_test(&state, req).await.result.unwrap();
 
     assert_eq!(r["balance"], json!("0x0"));
     assert_eq!(r["nonce"], json!("0x0"));
-    assert_eq!(
-        r["accountProof"].as_array().unwrap().len(),
-        0,
-        "absence is an empty array, not a truncated path that would read as inclusion"
-    );
-    assert_eq!(r["storageHash"], json!(format!("{:#x}", B256::ZERO)));
     assert_eq!(r["storageProof"].as_array().unwrap().len(), 0);
+
+    let nodes: Vec<Vec<u8>> = r["accountProof"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| unhex(n.as_str().unwrap()))
+        .collect();
+    assert!(
+        !nodes.is_empty(),
+        "an empty array is unverifiable; it is now reserved for an unwalkable store"
+    );
+    assert_eq!(
+        verify_path(&nodes, &rustock_trie::account_key(&absent), state_root),
+        Ok(Outcome::Absent),
+        "the divergence path must prove the account absent under the block's state root"
+    );
+}
+
+/// The same proof must not prove anything about a *different* absent account.
+///
+/// The failure this guards against is a server that answers every absent
+/// address with one canned divergence path. Such a path verifies against the
+/// root, so a client checking only "does this hang from the state root" would
+/// accept it; what rules it out is that the divergence it shows is not the
+/// one this key would reach.
+#[tokio::test]
+async fn an_absence_proof_for_one_address_does_not_prove_another_absent() {
+    use rustock_trie::proof::{verify_path, Outcome};
+
+    let (state, _tmp, _, state_root) = setup_proof_state();
+    let proved: Address = "0x0000000000000000000000000000000000009999".parse().unwrap();
+    let other: Address = "0x00000000000000000000000000000000000088ff".parse().unwrap();
+
+    let r = dispatch_for_test(
+        &state,
+        make_request("eth_getProof", json!([format!("{proved:#x}"), [], "latest"])),
+    )
+    .await
+    .result
+    .unwrap();
+    let nodes: Vec<Vec<u8>> = r["accountProof"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| unhex(n.as_str().unwrap()))
+        .collect();
+
+    // It proves its own key absent...
+    assert_eq!(
+        verify_path(&nodes, &rustock_trie::account_key(&proved), state_root),
+        Ok(Outcome::Absent)
+    );
+    // ...and must not be reusable for the other one. Either it fails to
+    // reach that key, or -- if the two happen to diverge at the same node --
+    // it is genuinely a proof for both; what it must never do is report a
+    // value.
+    match verify_path(&nodes, &rustock_trie::account_key(&other), state_root) {
+        Ok(Outcome::Absent) | Err(_) => {}
+        Ok(Outcome::Value(v)) => {
+            panic!("one address's absence proof reported a value for another: {v:?}")
+        }
+    }
+}
+
+/// A present account still gets an inclusion path, unchanged.
+///
+/// `try_nodes_toward` is `nodes_on_path` wherever the key is held, so this is
+/// the regression guard for the half of the change that was meant to be a
+/// no-op.
+#[tokio::test]
+async fn get_proof_still_proves_a_present_account_present() {
+    use rustock_trie::proof::{verify_path, Outcome};
+
+    let (state, _tmp, addr, state_root) = setup_proof_state();
+    let r = dispatch_for_test(
+        &state,
+        make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest"])),
+    )
+    .await
+    .result
+    .unwrap();
+
+    let nodes: Vec<Vec<u8>> = r["accountProof"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| unhex(n.as_str().unwrap()))
+        .collect();
+    match verify_path(&nodes, &rustock_trie::account_key(&addr), state_root) {
+        Ok(Outcome::Value(_)) => {}
+        other => panic!("a held account must still verify as present, got {other:?}"),
+    }
 }
 
 /// Slots are quantities, as `eth_getStorageAt` accepts them -- `0x1`, not a
@@ -8410,15 +8824,19 @@ async fn storage_nodes_prove_a_slot_that_is_not() {
     assert_eq!(slot["value"], json!("0x0"));
     assert_hangs_from(&slot["nodes"], state_root, &*trie_store);
 
+    // `eth_getProof` now answers the same slot the same way (#392): two
+    // methods reading one trie through one store must not disagree about
+    // what an absent slot is.
     let req = make_request(
         "eth_getProof",
         json!([format!("{addr:#x}"), ["0x3"], "latest"]),
     );
     let r = dispatch_for_test(&state, req).await.result.unwrap();
+    assert_eq!(r["storageProof"][0]["value"], json!("0x0"));
+    assert_hangs_from(&r["storageProof"][0]["proof"], state_root, &*trie_store);
     assert_eq!(
-        r["storageProof"][0]["proof"].as_array().unwrap().len(),
-        0,
-        "eth_getProof still answers an absent slot with an empty array"
+        r["storageProof"][0]["proof"], slot["nodes"],
+        "rsk_getStorageNodes and eth_getProof must return the same walk"
     );
 }
 
@@ -9048,21 +9466,37 @@ mod light_proof_tests {
     use std::sync::Arc;
 
     /// A peer, honest or otherwise.
+    #[derive(Default)]
     struct FakePeer {
         account_proof: Vec<alloy_primitives::Bytes>,
         storage_proofs: Vec<Vec<alloy_primitives::Bytes>>,
+        /// Empty by default, which is what a peer predating #393 sends: the
+        /// fields it has never heard of. Every existing test here therefore
+        /// keeps exercising the no-code path.
+        code_proof: Vec<alloy_primitives::Bytes>,
+        storage_root_proof: Vec<alloy_primitives::Bytes>,
     }
 
     #[async_trait::async_trait]
     impl crate::server::ProofFetcher for FakePeer {
         async fn fetch_proof(
             &self,
-            _block_number: u64,
-            _address: Address,
-            _storage_keys: Vec<B256>,
-        ) -> Result<(Vec<alloy_primitives::Bytes>, Vec<Vec<alloy_primitives::Bytes>>), String>
-        {
-            Ok((self.account_proof.clone(), self.storage_proofs.clone()))
+            ask: crate::server::ProofAsk,
+        ) -> Result<crate::server::FetchedProof, String> {
+            // Honours the ask, as a real peer does. A fake that served code
+            // whether or not it was asked would let a test pass while the
+            // flag plumbing was broken -- which is exactly what happened
+            // before this was tightened.
+            Ok(crate::server::FetchedProof {
+                account: self.account_proof.clone(),
+                storage: self.storage_proofs.clone(),
+                code: if ask.include_code { self.code_proof.clone() } else { Vec::new() },
+                storage_root: if ask.include_storage_root {
+                    self.storage_root_proof.clone()
+                } else {
+                    Vec::new()
+                },
+            })
         }
     }
 
@@ -9096,10 +9530,217 @@ mod light_proof_tests {
         let root = TrieNode::from_message(&root_bytes, &*trie_store);
         let peer = FakePeer {
             account_proof: path_for(&root, &*trie_store, &account_key(&addr)),
-            storage_proofs: Vec::new(),
+            ..Default::default()
         };
         std::mem::forget(_tmp);
         (peer, addr)
+    }
+
+    /// An honest peer that also serves code and the storage-subtree node,
+    /// which is what a peer understanding #393 does.
+    fn honest_peer_with_code() -> (FakePeer, Address) {
+        use rustock_trie::{code_key, storage_prefix_key};
+        let (state, _tmp, addr, _) = setup_proof_state();
+        let trie_store = state.trie_store.clone().unwrap();
+        let header = crate::state::resolve_header("latest", &state.store).unwrap();
+        let root_bytes = trie_store.get(header.state_root.as_slice()).unwrap();
+        let root = TrieNode::from_message(&root_bytes, &*trie_store);
+        let peer = FakePeer {
+            account_proof: path_for(&root, &*trie_store, &account_key(&addr)),
+            storage_proofs: Vec::new(),
+            code_proof: path_for(&root, &*trie_store, &code_key(&addr)),
+            storage_root_proof: path_for(&root, &*trie_store, &storage_prefix_key(&addr)),
+        };
+        std::mem::forget(_tmp);
+        (peer, addr)
+    }
+
+    /// **The SPV answer must equal the full node's answer (#393).**
+    ///
+    /// `codeHash` and `storageHash` used to be omitted here unconditionally,
+    /// because the proof message could not ask for either and inventing a
+    /// value is worse than silence. Now they can be asked for, and the test
+    /// that matters is not that the fields are present but that they carry
+    /// the same values a node reading its own trie reports — anything else
+    /// means the light path is computing them differently, which is how a
+    /// plausible wrong answer gets in.
+    #[tokio::test]
+    async fn a_light_node_fills_code_hash_and_storage_hash_from_proofs() {
+        // What a node with the trie says.
+        let (full, _tmp_full, addr, _) = setup_proof_state();
+        let asking = json!([
+            format!("{addr:#x}"),
+            [],
+            "latest",
+            {"includeCode": true, "includeStorageRoot": true}
+        ]);
+        let from_full =
+            dispatch_for_test(&full, make_request("eth_getProof", asking.clone()))
+                .await
+                .result
+                .expect("the full node answers");
+
+        // What a node with no trie says, over proofs.
+        let (peer, _) = honest_peer_with_code();
+        let (light, _tmp, addr2) = light_node(peer);
+        assert_eq!(addr, addr2);
+        let from_light = dispatch_for_test(&light, make_request("eth_getProof", asking))
+            .await
+            .result
+            .expect("the light node answers");
+
+        assert_eq!(
+            from_light["codeHash"], from_full["codeHash"],
+            "the proved code hash must equal the one read from the trie"
+        );
+        assert_eq!(
+            from_light["storageHash"], from_full["storageHash"],
+            "the proved storage hash must equal the one read from the trie"
+        );
+        assert!(
+            !from_full["storageHash"].as_str().unwrap().ends_with("0000000000000000"),
+            "the fixture must have storage, or this proves nothing"
+        );
+    }
+
+    /// **A peer predating #393 gets the old behaviour, not a wrong one.**
+    ///
+    /// It sends no code path. The field must be *omitted*, because zero is a
+    /// meaningful value here — the empty code hash — and publishing it would
+    /// report a contract as having no code.
+    #[tokio::test]
+    async fn a_peer_that_serves_no_code_leaves_the_field_out_rather_than_zeroing_it() {
+        let (peer, _) = honest_peer();
+        let (state, _tmp, addr) = light_node(peer);
+
+        let r = dispatch_for_test(
+            &state,
+            make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest"])),
+        )
+        .await
+        .result
+        .unwrap();
+
+        assert!(r.get("codeHash").is_none(), "silence, not the empty code hash");
+        assert!(r.get("storageHash").is_none(), "silence, not the empty storage root");
+        assert!(r.get("balance").is_some(), "and the rest of the answer still stands");
+    }
+
+    /// A code path for somebody else's account proves nothing about this one.
+    ///
+    /// Every node in it is genuine and correctly chained to the state root;
+    /// it is simply the path to a different key. A light node that checked
+    /// only "does this hang from the root" would accept it and publish
+    /// another contract's code hash as this account's.
+    #[tokio::test]
+    async fn a_code_proof_for_another_account_is_refused() {
+        use rustock_trie::code_key;
+        let (state, _tmp_f, addr, _) = setup_proof_state();
+        let trie_store = state.trie_store.clone().unwrap();
+        let header = crate::state::resolve_header("latest", &state.store).unwrap();
+        let root_bytes = trie_store.get(header.state_root.as_slice()).unwrap();
+        let root = TrieNode::from_message(&root_bytes, &*trie_store);
+
+        // A real path, to a real key, belonging to a different address.
+        let other = Address::repeat_byte(5);
+        let peer = FakePeer {
+            account_proof: path_for(&root, &*trie_store, &account_key(&addr)),
+            code_proof: path_for(&root, &*trie_store, &code_key(&other)),
+            ..Default::default()
+        };
+        let (light, _tmp, addr2) = light_node(peer);
+        assert_eq!(addr, addr2);
+
+        let r = dispatch_for_test(
+            &light,
+            make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest"])),
+        )
+        .await;
+
+        // The fixture's account has code, so the empty code hash is a wrong
+        // answer here and not a harmless one. Refusing is the expected
+        // outcome -- the path does not reach this account's code key -- but
+        // what the test pins is the weaker and more important property: the
+        // light node must not be talked into publishing a code hash that
+        // does not belong to the account asked about.
+        let truth = dispatch_for_test(
+            &state,
+            make_request(
+                "eth_getProof",
+                json!([format!("{addr:#x}"), [], "latest", {"includeCode": true}]),
+            ),
+        )
+        .await
+        .result
+        .unwrap();
+        let real_code_hash = truth["codeHash"].as_str().unwrap().to_string();
+
+        match r.result {
+            None => {} // refused, which is the honest answer
+            Some(result) => match result.get("codeHash").and_then(|v| v.as_str()) {
+                None => {} // omitted, also honest
+                Some(reported) => assert_eq!(
+                    reported, real_code_hash,
+                    "a path to another key must not yield a code hash for this one"
+                ),
+            },
+        }
+    }
+
+    /// **`eth_getCode` on a node with no state, which it could not serve at
+    /// all before #393.**
+    ///
+    /// The bytes come from a peer's proof of `code_key(address)`, checked
+    /// against the state root in a header this node validated. RSK's account
+    /// record has no `codeHash`, so this proof is the only way to
+    /// authenticate code here — and without it a verified `eth_call`, the
+    /// only route to an ERC-20 balance that needs no storage-layout oracle,
+    /// is closed.
+    #[tokio::test]
+    async fn a_light_node_serves_code_it_has_verified() {
+        let (full, _tmp_full, addr, _) = setup_proof_state();
+        let from_full = dispatch_for_test(
+            &full,
+            make_request("eth_getCode", json!([format!("{addr:#x}"), "latest"])),
+        )
+        .await
+        .result
+        .expect("the full node answers");
+        assert_ne!(from_full, json!("0x"), "the fixture's account must have code");
+
+        let (peer, _) = honest_peer_with_code();
+        let (light, _tmp, _) = light_node(peer);
+        let from_light = dispatch_for_test(
+            &light,
+            make_request("eth_getCode", json!([format!("{addr:#x}"), "latest"])),
+        )
+        .await
+        .result
+        .expect("the light node answers");
+
+        assert_eq!(from_light, from_full, "the proved code must be the stored code");
+    }
+
+    /// **Silence is not `0x`.**
+    ///
+    /// A peer that serves no code proof — because it predates the field, or
+    /// because its store is incomplete — leaves this node unable to answer.
+    /// `0x` would be indistinguishable from a proved "this account has no
+    /// code", and a caller about to run an EVM on the result would get a
+    /// silent no-op where it should get a visible failure.
+    #[tokio::test]
+    async fn a_peer_serving_no_code_proof_is_an_error_not_an_empty_answer() {
+        let (peer, _) = honest_peer(); // no code path
+        let (state, _tmp, addr) = light_node(peer);
+
+        let r = dispatch_for_test(
+            &state,
+            make_request("eth_getCode", json!([format!("{addr:#x}"), "latest"])),
+        )
+        .await;
+
+        assert!(r.result.is_none(), "an unanswerable question must not answer '0x'");
+        assert!(r.error.is_some(), "and must say so");
     }
 
     #[tokio::test]
@@ -9144,7 +9785,7 @@ mod light_proof_tests {
     /// account by sending nothing.
     #[tokio::test]
     async fn an_empty_proof_is_an_error_and_not_a_zero_balance() {
-        let peer = FakePeer { account_proof: Vec::new(), storage_proofs: Vec::new() };
+        let peer = FakePeer::default();
         let (state, _tmp, addr) = light_node(peer);
 
         let req = make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest"]));
@@ -9274,6 +9915,7 @@ mod witness_search_tests {
             snapshots: None,
             gas_estimator_binary_search: false,
             logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+            max_head_age: None,
             prune_keep_depth: 100_000,
             prune_max_batch: 50_000,
             scoring: None,
@@ -9527,4 +10169,185 @@ mod witness_search_tests {
             "1000 blocks should cost about log2(1000) ~ 10 probes, took {probes}"
         );
     }
+}
+
+// ========== rsk_nodeStatus, and the staleness bound (#394, #395) ==========
+
+/// The freshness and floor report, on a node that is not admin-gated.
+///
+/// `rsk_storageStatus` already carries a head and the collection counters,
+/// and it is behind `--rpc-admin` — which puts the one number a wallet needs
+/// out of reach on any public endpoint. A client cannot act on a limit it is
+/// not allowed to read, so this must answer with `admin_enabled: false`.
+#[tokio::test]
+async fn node_status_answers_without_the_admin_gate() {
+    let (mut state, _tmp) = setup_state_with_trie();
+    state.admin_enabled = false;
+
+    let r = dispatch_for_test(&state, make_request("rsk_nodeStatus", json!([])))
+        .await
+        .result
+        .expect("rsk_nodeStatus must not be admin-gated");
+
+    assert_eq!(r["head"]["number"], json!("0x2a"));
+    assert_eq!(r["executed"], json!("0x2a"));
+    assert_eq!(r["head"]["timestamp"], json!("0x5f5e102a"));
+}
+
+/// The fixture's head is from September 2020, so its age is large and
+/// positive. That is the number a wallet polls to decide whether the balance
+/// it is about to render means anything.
+#[tokio::test]
+async fn node_status_reports_the_age_of_a_stalled_head() {
+    let (state, _tmp) = setup_state_with_trie();
+    let r = dispatch_for_test(&state, make_request("rsk_nodeStatus", json!([])))
+        .await
+        .result
+        .unwrap();
+
+    let age_hex = r["head"]["ageSeconds"].as_str().expect("an age, not null");
+    let age = u64::from_str_radix(age_hex.trim_start_matches("0x"), 16).unwrap();
+    assert!(
+        age > 100_000_000,
+        "a head from 2020 should report an age in the hundreds of millions of seconds, got {age}"
+    );
+
+    // And `eth_syncing` says nothing about it: no peers and nothing to
+    // download means `false`, which is exactly the blind spot this method
+    // fills.
+    let syncing = dispatch_for_test(&state, make_request("eth_syncing", json!([])))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(syncing, json!(false), "the stalled node still claims to be synced");
+}
+
+/// **Null, not zero.** A node that cannot know its floor must say so.
+///
+/// Zero would claim the whole chain is provable, which on an SPV node — whose
+/// binding floor is its *peer's*, unknown to it — is a statement it has no
+/// basis for. A client would then draw its history line at genesis and show a
+/// restored wallet's older activity as "nothing happened".
+#[tokio::test]
+async fn an_unknown_state_floor_is_null_rather_than_zero() {
+    let (state, _tmp) = setup_state_with_trie();
+    let r = dispatch_for_test(&state, make_request("rsk_nodeStatus", json!([])))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(
+        r["oldestProvableBlock"],
+        Value::Null,
+        "a store that does not collect knows no floor, and zero would be a claim"
+    );
+}
+
+/// With no peers, `bestPeerBlock` is null — and null beside a growing head
+/// age is the signature of the partition.
+#[tokio::test]
+async fn node_status_reports_no_peers_as_null() {
+    let (state, _tmp) = setup_state_with_trie();
+    let r = dispatch_for_test(&state, make_request("rsk_nodeStatus", json!([])))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(r["bestPeerBlock"], Value::Null);
+}
+
+/// **The bound refuses `latest`, and only `latest`.**
+///
+/// An explicit block number is not a claim about now, so a caller naming one
+/// is not being misled and must still be served — it is also the escape
+/// hatch for a client that read the age, decided it could live with it, and
+/// asked for the head by number.
+#[tokio::test]
+async fn a_stale_head_refuses_latest_but_still_serves_an_explicit_block() {
+    let (mut state, _tmp) = setup_state_with_trie();
+    state.max_head_age = Some(60);
+    let addr = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+
+    let latest = dispatch_for_test(
+        &state,
+        make_request("eth_getBalance", json!([addr, "latest"])),
+    )
+    .await;
+    let error = latest.error.expect("a stale 'latest' must be refused");
+    assert_eq!(error.code, crate::types::STALE_HEAD);
+    assert!(
+        error.message.contains("past the 60s bound"),
+        "the error should say what bound it tripped, got: {}",
+        error.message
+    );
+
+    let explicit = dispatch_for_test(
+        &state,
+        make_request("eth_getBalance", json!([addr, "0x2a"])),
+    )
+    .await;
+    assert_eq!(
+        explicit.result,
+        Some(json!("0x2710")),
+        "an explicit block is not a claim about now and must still be served"
+    );
+}
+
+/// `pending` is as much a claim about now as `latest` is.
+#[tokio::test]
+async fn the_bound_covers_pending_too() {
+    let (mut state, _tmp) = setup_state_with_trie();
+    state.max_head_age = Some(60);
+    let r = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getBalance",
+            json!(["0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826", "pending"]),
+        ),
+    )
+    .await;
+    assert_eq!(r.error.map(|e| e.code), Some(crate::types::STALE_HEAD));
+}
+
+/// **Off by default.** The same fixture, same ancient head, no bound set:
+/// every method answers as it did before the flag existed.
+#[tokio::test]
+async fn without_a_bound_a_stale_head_is_served_as_before() {
+    let (state, _tmp) = setup_state_with_trie();
+    assert_eq!(state.max_head_age, None, "the default must be off");
+    let r = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getBalance",
+            json!(["0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826", "latest"]),
+        ),
+    )
+    .await;
+    assert_eq!(r.result, Some(json!("0x2710")));
+}
+
+/// `eth_syncing`'s three standard fields keep their names and meanings; the
+/// additive ones sit beside them.
+///
+/// rskj serves `startingBlock`, `currentBlock` and `highestBlock`, and a
+/// caller reading only those must not notice the difference.
+#[tokio::test]
+async fn eth_syncing_keeps_rskjs_three_fields_and_adds_beside_them() {
+    let (state, _tmp) = setup_state_with_trie();
+    // Head at #42, execution behind at #1, so the object form is returned.
+    let head = state.store.header(state.store.head().unwrap().unwrap()).unwrap().unwrap();
+    let behind = Header { state_root: head.state_root, ..test_header(1) };
+    let behind_hash = behind.hash();
+    state.store.put_header(&behind).unwrap();
+    state.store.put_canonical_hash(1, behind_hash).unwrap();
+    state.store.set_exec_head(behind_hash, head.state_root).unwrap();
+
+    let r = dispatch_for_test(&state, make_request("eth_syncing", json!([])))
+        .await
+        .result
+        .unwrap();
+
+    assert_eq!(r["startingBlock"], json!("0x0"));
+    assert_eq!(r["currentBlock"], json!("0x1"));
+    assert_eq!(r["highestBlock"], json!("0x2a"));
+    assert!(r["headTimestamp"].is_string(), "additive field present");
+    assert!(r.get("oldestProvableBlock").is_some(), "additive field present");
 }

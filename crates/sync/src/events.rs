@@ -108,5 +108,9 @@ pub enum SyncEvent {
         block_number: u64,
         account_proof: Vec<alloy_primitives::Bytes>,
         storage_proofs: Vec<Vec<alloy_primitives::Bytes>>,
+        /// Empty unless the request asked for code and the peer served it
+        /// (#393). Never a claim that the account has none.
+        code_proof: Vec<alloy_primitives::Bytes>,
+        storage_root_proof: Vec<alloy_primitives::Bytes>,
     },
 }

@@ -69,20 +69,29 @@ struct PeerProofFetcher(rustock_sync::proof_client::ProofClient);
 impl rustock_rpc::server::ProofFetcher for PeerProofFetcher {
     async fn fetch_proof(
         &self,
-        block_number: u64,
-        address: alloy_primitives::Address,
-        storage_keys: Vec<alloy_primitives::B256>,
-    ) -> Result<
-        (Vec<alloy_primitives::Bytes>, Vec<Vec<alloy_primitives::Bytes>>),
-        String,
-    > {
+        ask: rustock_rpc::server::ProofAsk,
+    ) -> Result<rustock_rpc::server::FetchedProof, String> {
         const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
         let proof = self
             .0
-            .fetch(block_number, address, storage_keys, DEADLINE)
+            .fetch(
+                rustock_sync::proof_client::ProofAsk {
+                    block_number: ask.block_number,
+                    address: ask.address,
+                    storage_keys: ask.storage_keys,
+                    include_code: ask.include_code,
+                    include_storage_root: ask.include_storage_root,
+                },
+                DEADLINE,
+            )
             .await
             .map_err(|e| e.to_string())?;
-        Ok((proof.account_proof, proof.storage_proofs))
+        Ok(rustock_rpc::server::FetchedProof {
+            account: proof.account_proof,
+            storage: proof.storage_proofs,
+            code: proof.code_proof,
+            storage_root: proof.storage_root_proof,
+        })
     }
 }
 
@@ -1329,6 +1338,31 @@ struct Args {
     #[arg(long, default_value_t = rustock_rpc::logs::DEFAULT_MAX_BLOCK_RANGE, value_name = "BLOCKS")]
     rpc_logs_max_blocks: u64,
 
+    /// Refuse `latest` and `pending` state reads once the head is older than
+    /// this many seconds.
+    ///
+    /// Off by default, which is how rskj behaves and how this node behaved
+    /// before the flag existed. Unset, a node whose header sync has died --
+    /// no peers, a wedged follow loop, a partition -- keeps answering state
+    /// queries against the last header it accepted. Every answer is valid and
+    /// every answer is about a block from hours ago, and nothing in the
+    /// answer says which.
+    ///
+    /// Set, a `latest` read past the bound fails with -32001 instead of
+    /// succeeding quietly. Explicit block numbers and hashes are never
+    /// refused: a caller naming an old block is not being misled, and that is
+    /// also the escape hatch for a client that has read `headAgeSeconds` from
+    /// `rsk_nodeStatus` and decided to proceed anyway.
+    ///
+    /// There is no recommended value yet. Rootstock targets ~30-second
+    /// blocks, so "a few slots" is a couple of minutes, but the inter-block
+    /// variance on this chain has not been measured and a bound set below it
+    /// would fail healthy nodes during an ordinary slow stretch. Measure
+    /// before choosing; until then `rsk_nodeStatus` publishes the age and the
+    /// client decides.
+    #[arg(long, value_name = "SECONDS")]
+    rpc_max_head_age: Option<u64>,
+
     /// Remember which key signed which transaction, so the pool and the
     /// executor do not each recover the same signature.
     ///
@@ -1781,6 +1815,9 @@ fn apply_file_config(
         f.rpc.logs_max_blocks.as_ref(),
         &mut a.rpc_logs_max_blocks,
     );
+    if matches.value_source("rpc_max_head_age").is_none() && f.rpc.max_head_age.is_some() {
+        a.rpc_max_head_age = f.rpc.max_head_age;
+    }
     apply(
         matches,
         "gas_estimator_binary_search",
@@ -4416,6 +4453,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             prune_keep_depth: args.prune_keep_depth,
             prune_max_batch: args.prune_max_batch,
             logs_max_blocks: args.rpc_logs_max_blocks,
+            max_head_age: args.rpc_max_head_age,
             gas_estimator_binary_search: args.gas_estimator_binary_search,
             snapshots: args
                 .dev_rpc

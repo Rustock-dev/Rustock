@@ -3696,8 +3696,20 @@ impl SyncService {
                 block_number,
                 account_proof,
                 storage_proofs,
+                code_proof,
+                storage_root_proof,
             } => {
-                self.on_trie_proof_response(peer, id, block_number, account_proof, storage_proofs);
+                self.on_trie_proof_response(
+                    id,
+                    crate::proof_client::RawProof {
+                        peer,
+                        block_number,
+                        account_proof,
+                        storage_proofs,
+                        code_proof,
+                        storage_root_proof,
+                    },
+                );
             }
             SyncEvent::BlockHashResponse { hash, .. } => {
                 self.on_block_hash_response(hash).await;
@@ -4961,12 +4973,10 @@ impl SyncService {
     /// and does the checking.
     pub(crate) fn on_trie_proof_response(
         &mut self,
-        peer: B512,
         id: u64,
-        block_number: u64,
-        account_proof: Vec<alloy_primitives::Bytes>,
-        storage_proofs: Vec<Vec<alloy_primitives::Bytes>>,
+        proof: crate::proof_client::RawProof,
     ) {
+        let peer = proof.peer;
         let Some(pending) = self.pending_proofs.remove(&id) else {
             trace!(
                 target: "rustock::sync",
@@ -4985,12 +4995,7 @@ impl SyncService {
             self.pending_proofs.insert(id, pending);
             return;
         }
-        let _ = pending.reply.send(crate::proof_client::RawProof {
-            peer,
-            block_number,
-            account_proof,
-            storage_proofs,
-        });
+        let _ = pending.reply.send(proof);
     }
 
     /// Send one caller's proof request to a peer.
@@ -5010,11 +5015,7 @@ impl SyncService {
             trace!(target: "rustock::sync", "no peer to ask for a trie proof");
             return;
         };
-        let (id, msg) = crate::proof_client::create_trie_proof_request(
-            cmd.block_number,
-            cmd.address,
-            cmd.storage_keys,
-        );
+        let (id, msg) = crate::proof_client::create_trie_proof_request(&cmd.ask);
         self.peer_store.send_to_peer(&peer, msg).await;
         self.pending_proofs.insert(
             id,

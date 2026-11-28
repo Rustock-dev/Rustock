@@ -41,14 +41,41 @@ pub trait TxSubmitter: Send + Sync {
 /// root it would verify against must not pretend to verify.
 #[async_trait::async_trait]
 pub trait ProofFetcher: Send + Sync {
-    /// Raw unitrie node messages: the account path, then one path per
-    /// requested storage key, in order.
-    async fn fetch_proof(
-        &self,
-        block_number: u64,
-        address: alloy_primitives::Address,
-        storage_keys: Vec<alloy_primitives::B256>,
-    ) -> Result<(Vec<alloy_primitives::Bytes>, Vec<Vec<alloy_primitives::Bytes>>), String>;
+    /// Raw unitrie node messages, **unverified**: whatever the peer sent.
+    ///
+    /// The caller checks every path against the state root in a header it
+    /// validated itself, so a lying peer costs a round trip rather than a
+    /// wrong answer. An implementation that verified here would be worse than
+    /// none, because it cannot name the root it would be checking against.
+    async fn fetch_proof(&self, ask: ProofAsk) -> Result<FetchedProof, String>;
+}
+
+/// What a light client wants proved about one account at one block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProofAsk {
+    pub block_number: u64,
+    pub address: alloy_primitives::Address,
+    pub storage_keys: Vec<alloy_primitives::B256>,
+    /// Ask for the account's code as well (#393). Off unless something needs
+    /// to run or hash the code, since the proof then carries the contract.
+    pub include_code: bool,
+    /// Ask for the node at the account's storage prefix, whose hash is what
+    /// `eth_getProof` reports as `storageHash`.
+    pub include_storage_root: bool,
+}
+
+/// The paths a peer answered with, each still to be checked.
+///
+/// Every field is empty when the peer sent nothing for it. **Empty is never
+/// a proof of anything** -- not that a key is absent, not that an account has
+/// no code. Absence is proved by a non-empty divergence path; emptiness means
+/// the peer could not walk its store, did not serve the field, or predates it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchedProof {
+    pub account: Vec<alloy_primitives::Bytes>,
+    pub storage: Vec<Vec<alloy_primitives::Bytes>>,
+    pub code: Vec<alloy_primitives::Bytes>,
+    pub storage_root: Vec<alloy_primitives::Bytes>,
 }
 
 /// What `eth_gasPrice` needs, without the RPC crate depending on sync.
@@ -178,6 +205,13 @@ pub struct RpcState {
     /// Widest block range an `eth_getLogs` may span. rskj's
     /// `rpc.logs.maxBlocksToQuery`; see `logs::DEFAULT_MAX_BLOCK_RANGE`.
     pub logs_max_blocks: u64,
+    /// Refuse a `latest` or `pending` state read when the head is older than
+    /// this many seconds. `None` disables the bound, which is the default and
+    /// the rskj-compatible behaviour.
+    ///
+    /// See `state::stale_head` for what this guards and why the default is
+    /// off (#394).
+    pub max_head_age: Option<u64>,
     /// Answer `eth_estimateGas` by binary search instead of in a single pass.
     /// False by default -- see `rustock_execution::gas_estimator`.
     pub gas_estimator_binary_search: bool,
@@ -446,7 +480,7 @@ async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
 
         // -- eth --
         "eth_protocolVersion" => eth::eth_protocol_version(id),
-        "eth_syncing" => eth::eth_syncing(id, &state.store, &state.peer_store).await,
+        "eth_syncing" => eth::eth_syncing(id, state).await,
         "eth_chainId" => eth::eth_chain_id(id, &state.config),
         "eth_blockNumber" => eth::eth_block_number(id, &state.store),
         "eth_gasPrice" => eth::eth_gas_price(id, state),
@@ -567,6 +601,7 @@ async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "rsk_getStorageBytesAt" => rsk::rsk_get_storage_bytes_at(id, params, state),
         "rsk_getStorageNodes" => proof::rsk_get_storage_nodes(id, params, state),
         "rsk_getStateNodes" => proof::rsk_get_state_nodes(id, params, state),
+        "rsk_nodeStatus" => rsk::rsk_node_status(id, state).await,
         "rsk_getBlockNumberByHash" => rsk::rsk_get_block_number_by_hash(id, params, &state.store),
         "rsk_getRawBlocks" => rsk::rsk_get_raw_blocks(id, params, &state.store),
         "rsk_getRawTransactionReceiptByHash" => {
@@ -583,7 +618,7 @@ async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         // -- state queries --
         "eth_getBalance" => state::eth_get_balance(id, params, state),
         "eth_getTransactionCount" => state::eth_get_transaction_count(id, params, state),
-        "eth_getCode" => state::eth_get_code(id, params, state),
+        "eth_getCode" => state::eth_get_code(id, params, state).await,
         "eth_getStorageAt" => state::eth_get_storage_at(id, params, state),
 
         // -- execution calls --
@@ -595,6 +630,7 @@ async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_getTransactionByBlockHashAndIndex" => tx::eth_get_transaction_by_block_hash_and_index(id, params, state),
         "eth_getTransactionByBlockNumberAndIndex" => tx::eth_get_transaction_by_block_number_and_index(id, params, state),
         "eth_getTransactionReceipt" => tx::eth_get_transaction_receipt(id, params, state),
+        "eth_getBlockReceipts" => tx::eth_get_block_receipts(id, params, state),
 
         // -- log filtering --
         "eth_getLogs" => logs::eth_get_logs(id, params, state),

@@ -362,6 +362,14 @@ The RPC server is compatible with rskj's JSON-RPC 2.0 interface. Supported metho
   method works over the socket too. See
   [docs/websocket-subscriptions.md](docs/websocket-subscriptions.md).
 
+- **Serving a light wallet**: a node with its own trie can answer a wallet's
+  questions with the evidence for them — account and storage proofs,
+  absence proofs, whole-block receipt sets, an account's change history, and
+  how fresh and how deep its own state is. Note that **running `--spv` and
+  serving an SPV wallet are opposite roles**: the first holds no trie and
+  asks peers, the second holds the trie and answers. See
+  [docs/serving-an-spv-wallet.md](docs/serving-an-spv-wallet.md).
+
 **Unsupported** (returns error): mining (`eth_sendTransaction`, `eth_sign`, compilers), and the `personal_*`, `evm_*`, `db_*` namespaces.
 
 ## Project Structure

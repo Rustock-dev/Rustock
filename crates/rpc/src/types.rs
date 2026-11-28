@@ -14,6 +14,16 @@ pub const TRANSACTION_ERROR: i64 = -32010;
 /// reverted with.
 pub const EXECUTION_ERROR: i64 = -32015;
 
+/// The head is older than `--rpc-max-head-age`, so a `latest` read was
+/// refused rather than answered from a stale header (#394).
+///
+/// Distinct from every other code here because the caller's response to it is
+/// distinct: not "retry the request", not "this node is broken", but "this
+/// node is behind -- ask another one, or tell the user the chain view is
+/// stale". -32001 is what the Nethermind light client answers for the same
+/// condition, so a client written against either reads the same number.
+pub const STALE_HEAD: i64 = -32001;
+
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: Option<String>,

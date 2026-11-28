@@ -24,11 +24,9 @@ pub fn eth_block_number(id: Value, store: &BlockStore) -> JsonRpcResponse {
     }
 }
 
-pub async fn eth_syncing(
-    id: Value,
-    store: &BlockStore,
-    peer_store: &rustock_networking::peers::PeerStore,
-) -> JsonRpcResponse {
+pub async fn eth_syncing(id: Value, state: &crate::server::RpcState) -> JsonRpcResponse {
+    let store = &state.store;
+    let peer_store = &state.peer_store;
     // `currentBlock` is the executed head, not the best downloaded header.
     //
     // Those two diverge precisely when something is wrong. Header download and
@@ -56,12 +54,32 @@ pub async fn eth_syncing(
     let highest = peer_best.max(downloaded);
 
     if highest > current {
+        // The three EIP-standard fields, then three additive ones. rskj
+        // serves only the first three and a caller that reads only those is
+        // unaffected; the rest answer questions this shape cannot otherwise
+        // express (#394, #395).
+        //
+        // They are here for the client that is *already* catching up and
+        // wants to know how far behind in time, and how far back it will be
+        // able to prove once it arrives. The same client caught up gets
+        // `false` and no fields at all, which is why `rsk_nodeStatus` exists
+        // and is the method to poll for freshness. This is a convenience on
+        // the path that happens to have somewhere to put it, not the fix.
+        let head_timestamp = head_header(store).map(|h| h.timestamp);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         JsonRpcResponse::success(
             id,
             json!({
                 "startingBlock": to_hex_u64(0),
                 "currentBlock": to_hex_u64(current),
                 "highestBlock": to_hex_u64(highest),
+                "headTimestamp": head_timestamp.map(to_hex_u64),
+                "headAgeSeconds": head_timestamp.and_then(|t| now.checked_sub(t)).map(to_hex_u64),
+                "oldestProvableBlock":
+                    crate::witness_search::retention_floor(state).map(to_hex_u64),
             }),
         )
     } else {
