@@ -296,6 +296,18 @@ pub fn rsk_storage_status(
                 "totalBytes": es.total_bytes(),
                 "newestBytes": es.newest_bytes(),
                 "lastCycle": last,
+                // The watermark: state at or below this height was collected
+                // and is gone. Byte counts say how much was reclaimed; this
+                // says what can no longer be answered, which is the number an
+                // operator needs when a missing node turns up and the
+                // question is whether it was taken deliberately or the store
+                // is damaged. `null` on a store that never collects, so a
+                // missing node there is damage by definition.
+                //
+                // `rsk_nodeStatus.oldestProvableBlock` publishes the same
+                // number ungated, for clients; this row is the operator's
+                // view of it, next to the cycle that moved it.
+                "collectedBelow": es.collected_below(),
             })
         }
     };

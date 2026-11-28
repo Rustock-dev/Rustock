@@ -388,6 +388,7 @@ fn setup_state_with(store: impl FnOnce(BlockStore) -> BlockStore) -> (RpcState, 
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1036,6 +1037,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1101,6 +1103,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1299,6 +1302,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1443,6 +1447,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1542,6 +1547,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1739,6 +1745,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -2189,6 +2196,7 @@ async fn test_receipt_dto_failed_status() {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -3154,6 +3162,7 @@ fn setup_state_with_receipts(
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -3599,6 +3608,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -4669,6 +4679,7 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 1_000,
         scoring: None,
@@ -6375,6 +6386,7 @@ fn setup_state_with_varied_logs() -> (RpcState, tempfile::TempDir, Vec<Address>,
         snapshots: None,
         gas_estimator_binary_search: false,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+        max_head_age: None,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -9441,6 +9453,7 @@ mod witness_search_tests {
             snapshots: None,
             gas_estimator_binary_search: false,
             logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+            max_head_age: None,
             prune_keep_depth: 100_000,
             prune_max_batch: 50_000,
             scoring: None,
@@ -9694,4 +9707,185 @@ mod witness_search_tests {
             "1000 blocks should cost about log2(1000) ~ 10 probes, took {probes}"
         );
     }
+}
+
+// ========== rsk_nodeStatus, and the staleness bound (#394, #395) ==========
+
+/// The freshness and floor report, on a node that is not admin-gated.
+///
+/// `rsk_storageStatus` already carries a head and the collection counters,
+/// and it is behind `--rpc-admin` — which puts the one number a wallet needs
+/// out of reach on any public endpoint. A client cannot act on a limit it is
+/// not allowed to read, so this must answer with `admin_enabled: false`.
+#[tokio::test]
+async fn node_status_answers_without_the_admin_gate() {
+    let (mut state, _tmp) = setup_state_with_trie();
+    state.admin_enabled = false;
+
+    let r = dispatch_for_test(&state, make_request("rsk_nodeStatus", json!([])))
+        .await
+        .result
+        .expect("rsk_nodeStatus must not be admin-gated");
+
+    assert_eq!(r["head"]["number"], json!("0x2a"));
+    assert_eq!(r["executed"], json!("0x2a"));
+    assert_eq!(r["head"]["timestamp"], json!("0x5f5e102a"));
+}
+
+/// The fixture's head is from September 2020, so its age is large and
+/// positive. That is the number a wallet polls to decide whether the balance
+/// it is about to render means anything.
+#[tokio::test]
+async fn node_status_reports_the_age_of_a_stalled_head() {
+    let (state, _tmp) = setup_state_with_trie();
+    let r = dispatch_for_test(&state, make_request("rsk_nodeStatus", json!([])))
+        .await
+        .result
+        .unwrap();
+
+    let age_hex = r["head"]["ageSeconds"].as_str().expect("an age, not null");
+    let age = u64::from_str_radix(age_hex.trim_start_matches("0x"), 16).unwrap();
+    assert!(
+        age > 100_000_000,
+        "a head from 2020 should report an age in the hundreds of millions of seconds, got {age}"
+    );
+
+    // And `eth_syncing` says nothing about it: no peers and nothing to
+    // download means `false`, which is exactly the blind spot this method
+    // fills.
+    let syncing = dispatch_for_test(&state, make_request("eth_syncing", json!([])))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(syncing, json!(false), "the stalled node still claims to be synced");
+}
+
+/// **Null, not zero.** A node that cannot know its floor must say so.
+///
+/// Zero would claim the whole chain is provable, which on an SPV node — whose
+/// binding floor is its *peer's*, unknown to it — is a statement it has no
+/// basis for. A client would then draw its history line at genesis and show a
+/// restored wallet's older activity as "nothing happened".
+#[tokio::test]
+async fn an_unknown_state_floor_is_null_rather_than_zero() {
+    let (state, _tmp) = setup_state_with_trie();
+    let r = dispatch_for_test(&state, make_request("rsk_nodeStatus", json!([])))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(
+        r["oldestProvableBlock"],
+        Value::Null,
+        "a store that does not collect knows no floor, and zero would be a claim"
+    );
+}
+
+/// With no peers, `bestPeerBlock` is null — and null beside a growing head
+/// age is the signature of the partition.
+#[tokio::test]
+async fn node_status_reports_no_peers_as_null() {
+    let (state, _tmp) = setup_state_with_trie();
+    let r = dispatch_for_test(&state, make_request("rsk_nodeStatus", json!([])))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(r["bestPeerBlock"], Value::Null);
+}
+
+/// **The bound refuses `latest`, and only `latest`.**
+///
+/// An explicit block number is not a claim about now, so a caller naming one
+/// is not being misled and must still be served — it is also the escape
+/// hatch for a client that read the age, decided it could live with it, and
+/// asked for the head by number.
+#[tokio::test]
+async fn a_stale_head_refuses_latest_but_still_serves_an_explicit_block() {
+    let (mut state, _tmp) = setup_state_with_trie();
+    state.max_head_age = Some(60);
+    let addr = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+
+    let latest = dispatch_for_test(
+        &state,
+        make_request("eth_getBalance", json!([addr, "latest"])),
+    )
+    .await;
+    let error = latest.error.expect("a stale 'latest' must be refused");
+    assert_eq!(error.code, crate::types::STALE_HEAD);
+    assert!(
+        error.message.contains("past the 60s bound"),
+        "the error should say what bound it tripped, got: {}",
+        error.message
+    );
+
+    let explicit = dispatch_for_test(
+        &state,
+        make_request("eth_getBalance", json!([addr, "0x2a"])),
+    )
+    .await;
+    assert_eq!(
+        explicit.result,
+        Some(json!("0x2710")),
+        "an explicit block is not a claim about now and must still be served"
+    );
+}
+
+/// `pending` is as much a claim about now as `latest` is.
+#[tokio::test]
+async fn the_bound_covers_pending_too() {
+    let (mut state, _tmp) = setup_state_with_trie();
+    state.max_head_age = Some(60);
+    let r = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getBalance",
+            json!(["0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826", "pending"]),
+        ),
+    )
+    .await;
+    assert_eq!(r.error.map(|e| e.code), Some(crate::types::STALE_HEAD));
+}
+
+/// **Off by default.** The same fixture, same ancient head, no bound set:
+/// every method answers as it did before the flag existed.
+#[tokio::test]
+async fn without_a_bound_a_stale_head_is_served_as_before() {
+    let (state, _tmp) = setup_state_with_trie();
+    assert_eq!(state.max_head_age, None, "the default must be off");
+    let r = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getBalance",
+            json!(["0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826", "latest"]),
+        ),
+    )
+    .await;
+    assert_eq!(r.result, Some(json!("0x2710")));
+}
+
+/// `eth_syncing`'s three standard fields keep their names and meanings; the
+/// additive ones sit beside them.
+///
+/// rskj serves `startingBlock`, `currentBlock` and `highestBlock`, and a
+/// caller reading only those must not notice the difference.
+#[tokio::test]
+async fn eth_syncing_keeps_rskjs_three_fields_and_adds_beside_them() {
+    let (state, _tmp) = setup_state_with_trie();
+    // Head at #42, execution behind at #1, so the object form is returned.
+    let head = state.store.header(state.store.head().unwrap().unwrap()).unwrap().unwrap();
+    let behind = Header { state_root: head.state_root, ..test_header(1) };
+    let behind_hash = behind.hash();
+    state.store.put_header(&behind).unwrap();
+    state.store.put_canonical_hash(1, behind_hash).unwrap();
+    state.store.set_exec_head(behind_hash, head.state_root).unwrap();
+
+    let r = dispatch_for_test(&state, make_request("eth_syncing", json!([])))
+        .await
+        .result
+        .unwrap();
+
+    assert_eq!(r["startingBlock"], json!("0x0"));
+    assert_eq!(r["currentBlock"], json!("0x1"));
+    assert_eq!(r["highestBlock"], json!("0x2a"));
+    assert!(r["headTimestamp"].is_string(), "additive field present");
+    assert!(r.get("oldestProvableBlock").is_some(), "additive field present");
 }

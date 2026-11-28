@@ -178,6 +178,13 @@ pub struct RpcState {
     /// Widest block range an `eth_getLogs` may span. rskj's
     /// `rpc.logs.maxBlocksToQuery`; see `logs::DEFAULT_MAX_BLOCK_RANGE`.
     pub logs_max_blocks: u64,
+    /// Refuse a `latest` or `pending` state read when the head is older than
+    /// this many seconds. `None` disables the bound, which is the default and
+    /// the rskj-compatible behaviour.
+    ///
+    /// See `state::stale_head` for what this guards and why the default is
+    /// off (#394).
+    pub max_head_age: Option<u64>,
     /// Answer `eth_estimateGas` by binary search instead of in a single pass.
     /// False by default -- see `rustock_execution::gas_estimator`.
     pub gas_estimator_binary_search: bool,
@@ -446,7 +453,7 @@ async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
 
         // -- eth --
         "eth_protocolVersion" => eth::eth_protocol_version(id),
-        "eth_syncing" => eth::eth_syncing(id, &state.store, &state.peer_store).await,
+        "eth_syncing" => eth::eth_syncing(id, state).await,
         "eth_chainId" => eth::eth_chain_id(id, &state.config),
         "eth_blockNumber" => eth::eth_block_number(id, &state.store),
         "eth_gasPrice" => eth::eth_gas_price(id, state),
@@ -567,6 +574,7 @@ async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "rsk_getStorageBytesAt" => rsk::rsk_get_storage_bytes_at(id, params, state),
         "rsk_getStorageNodes" => proof::rsk_get_storage_nodes(id, params, state),
         "rsk_getStateNodes" => proof::rsk_get_state_nodes(id, params, state),
+        "rsk_nodeStatus" => rsk::rsk_node_status(id, state).await,
         "rsk_getBlockNumberByHash" => rsk::rsk_get_block_number_by_hash(id, params, &state.store),
         "rsk_getRawBlocks" => rsk::rsk_get_raw_blocks(id, params, &state.store),
         "rsk_getRawTransactionReceiptByHash" => {

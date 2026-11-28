@@ -151,6 +151,10 @@ pub struct RpcSection {
     /// Widest block range an `eth_getLogs` may span (rskj
     /// `rpc.logs.maxBlocksToQuery`, whose default is 5000).
     pub logs_max_blocks: Option<u64>,
+    /// Refuse `latest` state reads once the head is older than this many
+    /// seconds. Unset disables the bound, which is the default; see
+    /// `--rpc-max-head-age`.
+    pub max_head_age: Option<u64>,
     /// Enable the `evm_*` development-chain namespace. Off by default.
     pub dev: Option<bool>,
     /// Serve `rsk_lastAccountChange`. Off by default: one call is a
@@ -640,6 +644,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "checkpoint_verify_hash",
     "checkpoint_bound_work",
     "rpc_logs_max_blocks",
+    "rpc_max_head_age",
     "sigcache",
     "account_slots",
     "gas_estimator_binary_search",

@@ -94,6 +94,15 @@
 # admin = false                     # default — enables rsk_collectTrie, rsk_pruneBlocks, …
 # disabled = false                  # default — true is the same as --no-rpc
 # logs_max_blocks = 10000           # default — widest eth_getLogs span; rskj's rpc.logs.maxBlocksToQuery is 5000
+# max_head_age = 300                # default: unset — refuse 'latest' and 'pending' state reads
+#                                   # once the head is older than this many seconds, with -32001.
+#                                   # Unset, a node whose sync has died keeps answering 'latest'
+#                                   # from the last header it accepted: every answer valid, every
+#                                   # answer hours old, nothing saying which. Explicit block
+#                                   # numbers are never refused. No recommended value yet — set it
+#                                   # above this chain's real inter-block variance or healthy
+#                                   # nodes will fail during an ordinary slow stretch. Clients can
+#                                   # instead read headAgeSeconds from rsk_nodeStatus and decide.
 # gas_estimator_binary_search = false # default — estimate gas in one pass.
 #                                   # true restores the old estimator, which
 #                                   # executes ~24 times narrowing an interval.

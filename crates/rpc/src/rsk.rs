@@ -422,3 +422,133 @@ pub fn rsk_get_transaction_receipt_nodes_by_hash(
         .collect();
     JsonRpcResponse::success(id, Value::Array(encoded))
 }
+
+/// `rsk_nodeStatus()` — what this node can and cannot answer about, right now:
+/// how fresh its head is, and how far back it can still prove state.
+///
+/// Two questions a verifying client has to ask and currently cannot (#394,
+/// #395). Neither is answerable through `eth_syncing`, for the same reason:
+/// `eth_syncing` returns `false` when the node believes it is caught up, and
+/// `false` carries no fields. Both of these questions are most urgent exactly
+/// then.
+///
+/// ## Why freshness is not a sync question
+///
+/// `eth_syncing` compares this node's height to the highest it knows to
+/// exist, and with no peers that highest *is* its own head — so a node whose
+/// header sync died hours ago, partitioned or wedged, answers `false`: fully
+/// synced. Every state read then succeeds against the last header it
+/// accepted. Every proof it returns is **valid**: real nodes, hashing to a
+/// real state root, in a header it validated itself. They are simply answers
+/// about a block from hours ago, and nothing in them says so.
+///
+/// That is the omission rule applied to time. The proof machinery is careful
+/// to separate "proved absent" from "did not learn" for state; a stalled
+/// chain is the same failure in the time dimension, and a balance screen
+/// rendered from a three-day-old header looks exactly like a current one.
+/// `eth_blockNumber` does not help either — it reports the last known height,
+/// which climbs to a number and stops, with no indication that it stopped.
+///
+/// So `headAgeSeconds` is published unconditionally and the policy is left to
+/// the caller: a wallet decides what "too old" means for a balance screen,
+/// and this node does not pretend to know. See `--spv-max-head-age` for
+/// turning a bound into a refusal on the server side.
+///
+/// ## Why the floor is not discoverable
+///
+/// `oldestProvableBlock` is the lowest height whose state this node can still
+/// walk. Below it a probe does not come back slow, it fails — so a client
+/// that does not know the floor discovers it by issuing a request that
+/// errors, and cannot tell "below my floor" from "I am broken".
+///
+/// A light client has to draw the line between history it can prove and
+/// history it cannot reach, and show it. The alternative is history that
+/// stops quietly, which a user reads as "nothing happened before this" — and
+/// that reading is wrong in precisely the case where it matters, a wallet
+/// restored from a seed whose older activity predates the window.
+///
+/// **`null` means unknown, and must not be read as zero.** An SPV node holds
+/// no trie, so the floor that binds it is its *peer's*, which it does not
+/// know; publishing zero there would claim the whole chain is provable. The
+/// same distinction `retention_floor` already draws internally.
+///
+/// ## Shape
+///
+/// ```json
+/// {
+///   "head":       { "number": "0x8f0b1", "hash": "0x…", "timestamp": "0x…",
+///                   "ageSeconds": "0x2d" },
+///   "executed":   "0x8f0b1",
+///   "syncing":    false,
+///   "bestPeerBlock": "0x8f0b1",
+///   "oldestProvableBlock": "0x0",
+///   "oldestBlock": "0x0"
+/// }
+/// ```
+///
+/// Quantities are hex, as the eth JSON-RPC convention has them, because the
+/// callers are wallets already parsing `eth_*` answers.
+///
+/// `executed` is the newest block whose *state* this node can serve, which is
+/// not always `head`: header download and block execution are separate
+/// pipelines, and a state read is answered from the executed one.
+/// `bestPeerBlock` is null with no peers — which, paired with a `headAge`
+/// that keeps growing, is the signature of the partition this method exists
+/// to expose.
+///
+/// `ageSeconds` is null when the head's timestamp is in the future: a clock
+/// disagreement is not freshness evidence, and reporting zero would read as
+/// "perfectly current" when the truth is "unknown".
+///
+/// New method, so nothing rskj serves changes. Deliberately **not** behind
+/// `--rpc-admin`: `rsk_storageStatus` is, which puts the same floor out of
+/// reach of any wallet on a public endpoint, and a client cannot act on a
+/// limit it is not allowed to read.
+pub async fn rsk_node_status(id: Value, state: &crate::server::RpcState) -> JsonRpcResponse {
+    let store = &state.store;
+
+    let head = store.head().ok().flatten().and_then(|h| store.header(h).ok().flatten());
+    let Some(head) = head else {
+        return JsonRpcResponse::error(id, INTERNAL_ERROR, "No chain head");
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age = now.checked_sub(head.timestamp);
+
+    let executed = store
+        .exec_head()
+        .ok()
+        .flatten()
+        .and_then(|(hash, _)| store.header(hash).ok().flatten())
+        .map(|h| h.number)
+        .unwrap_or(head.number);
+
+    let best_peer = state.peer_store.best_peer().await.map(|(_, meta)| meta.best_number);
+
+    // The state floor, and the block floor, which are different limits: the
+    // first is how far back state can be proved, the second how far back a
+    // header or body is held at all. A client walking an account's history
+    // needs both, and they move independently.
+    let oldest_provable = crate::witness_search::retention_floor(state);
+    let oldest_block = store.prune_floor().ok().flatten().map(|f| f.number);
+
+    JsonRpcResponse::success(
+        id,
+        json!({
+            "head": {
+                "number": to_hex_u64(head.number),
+                "hash": format!("{:#x}", head.hash()),
+                "timestamp": to_hex_u64(head.timestamp),
+                "ageSeconds": age.map(to_hex_u64),
+            },
+            "executed": to_hex_u64(executed),
+            "syncing": best_peer.unwrap_or(0).max(head.number) > executed,
+            "bestPeerBlock": best_peer.map(to_hex_u64),
+            "oldestProvableBlock": oldest_provable.map(to_hex_u64),
+            "oldestBlock": oldest_block.map(to_hex_u64),
+        }),
+    )
+}

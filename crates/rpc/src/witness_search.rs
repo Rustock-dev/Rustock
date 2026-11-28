@@ -117,7 +117,7 @@ pub struct Found {
 ///
 /// `None` on a node with no local trie: an SPV node cannot know its peer's
 /// floor, and guessing one would only move the error.
-fn retention_floor(state: &RpcState) -> Option<u64> {
+pub(crate) fn retention_floor(state: &RpcState) -> Option<u64> {
     state.trie_store.as_ref().and_then(|t| t.collected_below())
 }
 

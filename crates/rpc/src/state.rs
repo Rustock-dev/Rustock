@@ -136,6 +136,9 @@ pub(crate) fn queried_state(
     let refuse = |(code, message): (i64, String)| JsonRpcResponse::error(id.clone(), code, message);
     let (identifier, _) = crate::helpers::block_ref(block, &state.store).map_err(refuse)?;
     let lookup = crate::helpers::information_block(&identifier).map_err(refuse)?;
+    if let Some(refused) = stale_head(id, &lookup, state) {
+        return Err(refused);
+    }
     state_at(&lookup, state).map_err(|none| {
         refuse(match none {
             NoState::Block => (INVALID_REQUEST, format!("Block {identifier} not found")),
@@ -152,6 +155,9 @@ pub(crate) fn execution_state(
     block: &str,
     state: &RpcState,
 ) -> Result<(TrieNode, Header), JsonRpcResponse> {
+    if let Some(refused) = stale_head(id, block, state) {
+        return Err(refused);
+    }
     state_at(block, state).map_err(|none| no_execution_state(id, block, none))
 }
 
@@ -262,4 +268,69 @@ pub(crate) fn trie_get_account(root: &TrieNode, key: &[u8], state: &RpcState) ->
     let expanded = TrieKeySlice::from_key(key);
     let data = root.get(&expanded, &**trie_store)?;
     AccountState::decode(&data).ok()
+}
+
+/// Refuse a `latest` read served from a head that has stopped moving (#394).
+///
+/// A node whose header sync has died — no peers, a wedged follow loop, a
+/// partition — keeps answering state queries against the last header it
+/// accepted, and every answer is **valid**: real nodes under a real state
+/// root in a header it validated itself. They are answers about a block from
+/// hours ago, and nothing in them says so. A balance screen rendered from a
+/// three-day-old header looks exactly like a current one, which is the
+/// "plausible number" failure rather than the "visible error" one.
+///
+/// This is the omission rule applied to time. The proof machinery separates
+/// "proved absent" from "did not learn" for state; a stalled chain is the
+/// same failure in the time dimension, and without this it is reported as
+/// fact.
+///
+/// Scope, deliberately narrow:
+///
+/// * **Only the relative tags.** `latest` and `pending` mean "now", and the
+///   node is asserting something about now that it does not know. A caller
+///   naming an explicit number or hash is asking about a specific old block
+///   and is not being misled, so those are never refused — including by a
+///   client that has read the age from `rsk_nodeStatus` and decided to
+///   proceed anyway.
+/// * **Off unless configured.** `None` is the default, which keeps every
+///   method behaving as rskj's does. The right bound is a measured property
+///   of the chain's inter-block variance rather than a number to pick, and a
+///   server that guessed one would turn a working node into a failing one at
+///   the first slow stretch. Until it is measured, the node publishes
+///   `headAgeSeconds` through `rsk_nodeStatus` and leaves the policy to the
+///   client, which is the half of #394 that needs no guess.
+///
+/// A future block timestamp is a clock disagreement, not freshness evidence,
+/// and is never grounds to refuse: `checked_sub` yields `None` and the read
+/// goes through.
+pub(crate) fn stale_head(id: &Value, block_param: &str, state: &RpcState) -> Option<JsonRpcResponse> {
+    let bound = state.max_head_age?;
+    if !matches!(block_param, "latest" | "pending") {
+        return None;
+    }
+    let head = state
+        .store
+        .head()
+        .ok()
+        .flatten()
+        .and_then(|h| state.store.header(h).ok().flatten())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age = now.checked_sub(head.timestamp)?;
+    if age <= bound {
+        return None;
+    }
+    Some(JsonRpcResponse::error(
+        id.clone(),
+        STALE_HEAD,
+        format!(
+            "This node's head #{} is {age}s old, past the {bound}s bound, so \
+             '{block_param}' is not served. Ask another node, or name an \
+             explicit block number to read this one's view anyway.",
+            head.number
+        ),
+    ))
 }
