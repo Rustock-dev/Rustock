@@ -2,8 +2,8 @@
 //!
 //! A light client holds validated headers and no state. When something asks
 //! it for an account — an `eth_getProof` call, or a wallet walking an
-//! account's `lastModifiedBlock` backwards — it has to get the answer from a
-//! peer, and the peer has no reason to be honest.
+//! account's history through `rsk_lastAccountChange` — it has to get the
+//! answer from a peer, and the peer has no reason to be honest.
 //!
 //! The arrangement here keeps that honest by construction:
 //!
@@ -30,15 +30,49 @@ use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
 /// What a peer sent back, still unchecked.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RawProof {
     pub peer: B512,
     pub block_number: u64,
-    /// Nodes on the path to the account, deepest first. Empty is the peer's
-    /// *claim* that the account is absent, which verification must test
-    /// rather than accept.
+    /// Nodes toward the account, deepest first.
+    ///
+    /// A key the peer's trie does not hold comes back as the **divergence
+    /// path**, which verification tests and either accepts as a proof of
+    /// absence or rejects. Empty means the peer could not walk its own store
+    /// and has proved nothing either way -- never that the account is absent,
+    /// which is what an empty array used to be taken for (#392).
     pub account_proof: Vec<Bytes>,
     pub storage_proofs: Vec<Vec<Bytes>>,
+    /// The path to the account's code, when it was asked for. Empty means
+    /// not asked, not served, or not walkable — never "no code" (#393).
+    pub code_proof: Vec<Bytes>,
+    /// The path to the account's storage-subtree node, on the same terms.
+    pub storage_root_proof: Vec<Bytes>,
+}
+
+/// What a caller wants proved.
+///
+/// A struct rather than five positional arguments because two of them are
+/// booleans, and `fetch(n, addr, keys, true, false)` reads as nothing at the
+/// call site.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProofAsk {
+    pub block_number: u64,
+    pub address: Address,
+    pub storage_keys: Vec<B256>,
+    /// Prove the account's code too. Costs the contract's own bytes in the
+    /// answer, so it is off unless something needs to run the code.
+    pub include_code: bool,
+    /// Prove the node at the account's storage prefix, whose hash is what
+    /// `eth_getProof` reports as `storageHash`.
+    pub include_storage_root: bool,
+}
+
+impl ProofAsk {
+    /// The account alone, which is what an account trace needs.
+    pub fn account(block_number: u64, address: Address) -> Self {
+        Self { block_number, address, ..Default::default() }
+    }
 }
 
 /// A request waiting for its answer.
@@ -50,9 +84,7 @@ pub struct PendingProof {
 
 /// What the RPC layer sends to the sync service to get a proof.
 pub struct ProofCommand {
-    pub block_number: u64,
-    pub address: Address,
-    pub storage_keys: Vec<B256>,
+    pub ask: ProofAsk,
     pub reply: oneshot::Sender<RawProof>,
 }
 
@@ -82,13 +114,11 @@ impl ProofClient {
     /// that block before using anything in it.
     pub async fn fetch(
         &self,
-        block_number: u64,
-        address: Address,
-        storage_keys: Vec<B256>,
+        ask: ProofAsk,
         deadline: std::time::Duration,
     ) -> Result<RawProof, ProofError> {
         let (reply, rx) = oneshot::channel();
-        let cmd = ProofCommand { block_number, address, storage_keys, reply };
+        let cmd = ProofCommand { ask, reply };
         self.tx.send(cmd).await.map_err(|_| ProofError::Unavailable)?;
         match tokio::time::timeout(deadline, rx).await {
             Ok(Ok(proof)) => Ok(proof),
@@ -104,12 +134,15 @@ impl ProofClient {
 /// Masked to 63 bits for the same reason every other request here is: rskj
 /// carries ids as Java signed longs, and anything above 2^63 comes back
 /// sign-mangled.
-pub fn create_trie_proof_request(
-    block_number: u64,
-    address: Address,
-    storage_keys: Vec<B256>,
-) -> (u64, P2pMessage) {
+pub fn create_trie_proof_request(ask: &ProofAsk) -> (u64, P2pMessage) {
     let id: u64 = rand::random::<u64>() & 0x7FFF_FFFF_FFFF_FFFF;
-    let req = TrieProofRequest { id, block_number, address, storage_keys };
+    let req = TrieProofRequest {
+        id,
+        block_number: ask.block_number,
+        address: ask.address,
+        storage_keys: ask.storage_keys.clone(),
+        include_code: ask.include_code,
+        include_storage_root: ask.include_storage_root,
+    };
     (id, P2pMessage::RskMessage(RskMessage::new(RskSubMessage::TrieProofRequest(req))))
 }

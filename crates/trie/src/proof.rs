@@ -124,6 +124,55 @@ pub fn verify_path(
     }
 }
 
+/// Check `nodes` against `root_hash` and report the **hash of the node at
+/// `key`**, rather than the value it holds.
+///
+/// [`verify_path`] answers with the key's *value*, which is the right
+/// question for an account or a storage slot and the wrong one for a node
+/// that is a subtree root. RSK's `storageHash` is the hash of the node at
+/// `storage_prefix_key(address)`, and that node ordinarily carries **no
+/// value at all** -- it exists to hold children. Asking `verify_path` about
+/// it would get `Outcome::Absent`, and a caller that believed it would
+/// publish the empty-storage constant for an account that has storage: a
+/// plausible wrong answer, which is the worst kind.
+///
+/// `Ok(None)` means no node sits at the key, which for a storage prefix is a
+/// genuine "this account has no storage".
+pub fn verify_node_at(
+    nodes: &[impl AsRef<[u8]>],
+    key: &[u8],
+    root_hash: B256,
+) -> Result<Option<B256>, ProofError> {
+    if nodes.is_empty() {
+        return if root_hash == empty_trie_hash() {
+            Ok(None)
+        } else {
+            Err(ProofError::Empty)
+        };
+    }
+
+    let scratch = MemoryTrieStore::new();
+    let mut root_message: Option<&[u8]> = None;
+    for node in nodes {
+        let bytes = node.as_ref();
+        let hash = B256::from_slice(&Keccak256::digest(bytes));
+        scratch.put(hash.as_slice(), bytes);
+        if hash == root_hash {
+            root_message = Some(bytes);
+        }
+    }
+    let Some(root_message) = root_message else {
+        return Err(ProofError::RootNotPresent { expected: root_hash });
+    };
+
+    let root = TrieNode::from_message(root_message, &scratch);
+    match root.try_find(&TrieKeySlice::from_key(key), &scratch) {
+        Ok(Some(node)) => Ok(Some(node.compute_hash(&scratch))),
+        Ok(None) => Ok(None),
+        Err(missing) => Err(ProofError::Incomplete { missing }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

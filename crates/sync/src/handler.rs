@@ -787,6 +787,8 @@ impl P2pHandler for SyncHandler {
                         block_number: r.block_number,
                         account_proof: r.account_proof.clone(),
                         storage_proofs: r.storage_proofs.clone(),
+                        code_proof: r.code_proof.clone(),
+                        storage_root_proof: r.storage_root_proof.clone(),
                     });
                 }
 

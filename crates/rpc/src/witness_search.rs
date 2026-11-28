@@ -73,7 +73,16 @@ async fn record_at(state: &RpcState, address: Address, block: u64) -> Result<Rec
         .proof_fetcher
         .as_ref()
         .ok_or("this node holds no state and has no peer to ask")?;
-    let (account_proof, _) = fetcher.fetch_proof(block, address, Vec::new()).await?;
+    // The account alone: a history walk compares records, and code is both
+    // irrelevant to that and the expensive part of an answer.
+    let fetched = fetcher
+        .fetch_proof(crate::server::ProofAsk {
+            block_number: block,
+            address,
+            ..Default::default()
+        })
+        .await?;
+    let account_proof = fetched.account;
 
     match verify_path(&account_proof, &account_key(&address), header.state_root) {
         Ok(Outcome::Value(bytes)) => Ok(Some(bytes)),

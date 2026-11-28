@@ -31,7 +31,9 @@ use rustock_trie::snapshot::total_size;
 use rustock_trie::snapshot_legacy::{encode_blob as encode_legacy_blob, legacy_chunk};
 use rustock_trie::snapshot_legacy::rebuild as rebuild_legacy;
 use rustock_trie::snapshot_proof::{prove_cell, verify_chunk};
-use rustock_trie::{account_key, storage_key, TrieKeySlice, TrieNode, TrieStore};
+use rustock_trie::{
+    account_key, code_key, storage_key, storage_prefix_key, TrieKeySlice, TrieNode, TrieStore,
+};
 
 /// Most storage slots one request may ask to have proved.
 ///
@@ -40,6 +42,20 @@ use rustock_trie::{account_key, storage_key, TrieKeySlice, TrieNode, TrieStore};
 /// a wallet watching an account needs and small enough that a peer asking
 /// repeatedly is limited by its rate allowance rather than by this.
 const MAX_PROOF_STORAGE_KEYS: usize = 20;
+
+/// Most bytes of contract code one proof may carry.
+///
+/// A code proof is unlike every other path here: its leaf *is* the code, so
+/// the message grows with the contract rather than with the depth of the
+/// trie. RSK's own limit on deployed code is 24,576 bytes (EIP-170), so this
+/// admits any contract the chain will accept and refuses anything that could
+/// only come from a damaged or hostile store.
+///
+/// A request past it is answered with an empty code path -- "not served" --
+/// rather than with a refusal of the whole message, because the account and
+/// storage parts of the answer are still good and a client that wanted a
+/// balance should get one.
+const MAX_PROOF_CODE_BYTES: usize = 24_576;
 use alloy_primitives::B512;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -701,6 +717,36 @@ impl SnapServer {
             .map(|slot| path(storage_key(&request.address, slot)))
             .collect();
 
+        // Code and the storage-subtree node, each only when asked for (#393).
+        //
+        // Both are ordinary keys in the same trie, so the same divergence
+        // walk proves them, and `verify_path` checks them with no new logic
+        // on the client. Code is the one that needs a bound, because its leaf
+        // carries the contract itself.
+        let code_proof = if request.include_code {
+            let key = code_key(&request.address);
+            let size = root
+                .get(&TrieKeySlice::from_key(&key), self.trie.as_ref())
+                .map_or(0, |c| c.len());
+            if size > MAX_PROOF_CODE_BYTES {
+                trace!(
+                    target: "rustock::snap",
+                    "not serving {size} bytes of code for {}: past the {MAX_PROOF_CODE_BYTES}-byte bound",
+                    request.address
+                );
+                Vec::new()
+            } else {
+                path(key)
+            }
+        } else {
+            Vec::new()
+        };
+        let storage_root_proof = if request.include_storage_root {
+            path(storage_prefix_key(&request.address))
+        } else {
+            Vec::new()
+        };
+
         trace!(
             target: "rustock::snap",
             "serving a trie proof for {} at #{} ({} account nodes, {} slots)",
@@ -712,6 +758,8 @@ impl SnapServer {
             block_number: request.block_number,
             account_proof,
             storage_proofs,
+            code_proof,
+            storage_root_proof,
         })
     }
 }

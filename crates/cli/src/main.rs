@@ -69,20 +69,29 @@ struct PeerProofFetcher(rustock_sync::proof_client::ProofClient);
 impl rustock_rpc::server::ProofFetcher for PeerProofFetcher {
     async fn fetch_proof(
         &self,
-        block_number: u64,
-        address: alloy_primitives::Address,
-        storage_keys: Vec<alloy_primitives::B256>,
-    ) -> Result<
-        (Vec<alloy_primitives::Bytes>, Vec<Vec<alloy_primitives::Bytes>>),
-        String,
-    > {
+        ask: rustock_rpc::server::ProofAsk,
+    ) -> Result<rustock_rpc::server::FetchedProof, String> {
         const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
         let proof = self
             .0
-            .fetch(block_number, address, storage_keys, DEADLINE)
+            .fetch(
+                rustock_sync::proof_client::ProofAsk {
+                    block_number: ask.block_number,
+                    address: ask.address,
+                    storage_keys: ask.storage_keys,
+                    include_code: ask.include_code,
+                    include_storage_root: ask.include_storage_root,
+                },
+                DEADLINE,
+            )
             .await
             .map_err(|e| e.to_string())?;
-        Ok((proof.account_proof, proof.storage_proofs))
+        Ok(rustock_rpc::server::FetchedProof {
+            account: proof.account_proof,
+            storage: proof.storage_proofs,
+            code: proof.code_proof,
+            storage_root: proof.storage_root_proof,
+        })
     }
 }
 

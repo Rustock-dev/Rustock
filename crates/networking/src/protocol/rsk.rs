@@ -177,15 +177,61 @@ pub struct TrieProofRequest {
     /// Storage slots to prove alongside the account. Empty asks for the
     /// account alone, which is what the modification witness needs.
     pub storage_keys: Vec<B256>,
+    /// Also prove the account's **code**, at `code_key(address)`.
+    ///
+    /// On Ethereum a light client authenticates code by hashing it and
+    /// comparing against the account's `codeHash`. RSK's account record is
+    /// `(nonce, balance, stateFlags)` and carries no code hash, so that route
+    /// does not exist here: the only way to authenticate code on this chain
+    /// is a proof of the code key itself, and until this field existed the
+    /// proof message could not ask for one (#393).
+    ///
+    /// What that blocked is a **verified `eth_call`**, which is the only way
+    /// to show an ERC-20 balance without a per-token storage-layout oracle:
+    /// an EVM needs code, and an SPV node could not obtain any it could
+    /// check.
+    ///
+    /// A peer that does not understand this field ignores it and answers with
+    /// an empty code path, which the client reads as "not served" rather than
+    /// as "no code".
+    pub include_code: bool,
+    /// Also prove the node at `storage_prefix_key(address)`, whose hash is
+    /// the closest analogue RSK has to Ethereum's storage root.
+    ///
+    /// Without it an SPV node's `eth_getProof` cannot fill `storageHash`
+    /// honestly, and leaves the EIP-1186 field out rather than inventing a
+    /// plausible constant.
+    pub include_storage_root: bool,
 }
 
 /// The nodes proving what [`TrieProofRequest`] asked about.
 ///
 /// Each path runs **deepest first**: index 0 is the leaf, the last element is
-/// the state root. An empty path means the trie does not hold the key. It is
-/// never a truncated path -- proving absence in a radix trie needs the
-/// divergence point and its siblings, a different structure, and a shortened
-/// inclusion path would look like one without being one.
+/// the state root.
+///
+/// A key the trie does not hold is answered with the **divergence path** --
+/// the nodes down to where the search stops -- which is what lets the client
+/// verify the absence instead of taking the peer's word for it. Where the key
+/// is held, that walk is the inclusion path, so the two cases differ only in
+/// what the deepest node turns out to say.
+///
+/// It is never a *truncated* inclusion path. A shortened inclusion path would
+/// look like a divergence path without being one, so the deepest node has to
+/// be read on its own terms: its shared path parts from the key's, or the key
+/// ends inside it, or the child the key would take is empty, or the key ends
+/// at it and it holds no value.
+///
+/// **An empty path means the peer could not walk the trie**, not that the key
+/// is absent. That is incompleteness, and a client must treat it as a failure
+/// to answer -- `verify_path` returns `ProofError::Empty` for it under a
+/// non-empty root. Reading it as absence would let any peer deny any account
+/// by staying quiet, which is the thing the divergence path exists to
+/// prevent.
+///
+/// This comment previously said the opposite, describing behaviour
+/// `snap::server::trie_proof` was changed away from. It is the first thing a
+/// client implementer reads, and it told them to accept an unwalkable store
+/// as a proven absence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrieProofResponse {
     pub id: u64,
@@ -193,6 +239,17 @@ pub struct TrieProofResponse {
     pub account_proof: Vec<Bytes>,
     /// One path per requested storage key, in request order.
     pub storage_proofs: Vec<Vec<Bytes>>,
+    /// The path to `code_key(address)`, when the request asked for it.
+    ///
+    /// **Empty means no proof here** -- the field was not asked for, the peer
+    /// predates it, or the peer could not walk its store. It never means the
+    /// account has no code: an account with no code is proved so by a
+    /// *divergence path*, which is a non-empty answer. The client knows what
+    /// it asked for and reads emptiness accordingly.
+    pub code_proof: Vec<Bytes>,
+    /// The path to `storage_prefix_key(address)`, on the same terms as
+    /// [`Self::code_proof`].
+    pub storage_root_proof: Vec<Bytes>,
 }
 
 /// One trunk header and the uncle headers it references.
@@ -551,12 +608,23 @@ impl RskSubMessage {
                 r.address.encode(&mut params);
                 RlpHeader { list: true, payload_length: keys.len() }.encode(&mut params);
                 params.extend_from_slice(&keys);
+                // Appended after the original four fields, so a peer that
+                // predates them decodes the message it always did and stops
+                // where it always stopped (#393). RLP list decoding reads
+                // positionally and the older decoder never required the list
+                // to be exhausted, which is what makes this additive rather
+                // than a new message type.
+                r.include_code.encode(&mut params);
+                r.include_storage_root.encode(&mut params);
 
                 RlpHeader { list: true, payload_length: params.len() }.encode(out);
                 out.extend_from_slice(&params);
             }
             RskSubMessage::TrieProofResponse(r) => {
-                // RLP([id, blockNumber, [node...], [[node...], ...]])
+                // RLP([id, blockNumber, [node...], [[node...], ...],
+                //      [node...], [node...]])
+                // The last two are the code path and the storage-root path,
+                // appended after the original four fields (#393).
                 let encode_path = |path: &[Bytes], into: &mut Vec<u8>| {
                     let mut nodes = Vec::new();
                     for n in path {
@@ -580,6 +648,12 @@ impl RskSubMessage {
                 params.extend_from_slice(&account);
                 RlpHeader { list: true, payload_length: storage.len() }.encode(&mut params);
                 params.extend_from_slice(&storage);
+                // Always emitted, empty when there is nothing to say, so the
+                // encoding of a given value is one byte sequence and the
+                // round trip is exact. A peer that predates them stops after
+                // the storage list and never looks.
+                encode_path(&r.code_proof, &mut params);
+                encode_path(&r.storage_root_proof, &mut params);
 
                 RlpHeader { list: true, payload_length: params.len() }.encode(out);
                 out.extend_from_slice(&params);
@@ -1203,12 +1277,23 @@ impl Decodable for RskMessage {
                 while !keys_body.is_empty() {
                     storage_keys.push(B256::decode(&mut keys_body)?);
                 }
+                list_body = &list_body[keys_h.payload_length..];
+
+                // Trailing and optional: a peer that predates #393 sends four
+                // fields and the list simply ends here. Absent reads as
+                // `false`, which is the request that peer meant.
+                let include_code =
+                    if list_body.is_empty() { false } else { bool::decode(&mut list_body)? };
+                let include_storage_root =
+                    if list_body.is_empty() { false } else { bool::decode(&mut list_body)? };
 
                 RskSubMessage::TrieProofRequest(TrieProofRequest {
                     id,
                     block_number,
                     address,
                     storage_keys,
+                    include_code,
+                    include_storage_root,
                 })
             }
             30 => {
@@ -1242,10 +1327,21 @@ impl Decodable for RskMessage {
                 while !storage_body.is_empty() {
                     storage_proofs.push(decode_path(&mut storage_body)?);
                 }
+                list_body = &list_body[storage_h.payload_length..];
+
+                // Absent on a peer that predates #393, which reads as "no
+                // proof here" -- the same thing the client does with an empty
+                // one, so the two need not be told apart.
+                let code_proof =
+                    if list_body.is_empty() { Vec::new() } else { decode_path(&mut list_body)? };
+                let storage_root_proof =
+                    if list_body.is_empty() { Vec::new() } else { decode_path(&mut list_body)? };
 
                 RskSubMessage::TrieProofResponse(Box::new(TrieProofResponse {
                     id,
                     block_number,
+                    code_proof,
+                    storage_root_proof,
                     account_proof,
                     storage_proofs,
                 }))
@@ -2763,6 +2859,26 @@ mod block_message_tests {
 mod trie_proof_message_tests {
     use super::*;
 
+    /// Wrap hand-built params in the framing `RskMessage::decode` expects,
+    /// so a test can feed it a message this codebase can no longer produce --
+    /// which is the only way to check that a peer predating a field is still
+    /// understood.
+    fn frame(message_type: RskMessageType, params_rlp: &[u8]) -> Vec<u8> {
+        let mut msg_rlp = Vec::new();
+        (message_type as u8).encode(&mut msg_rlp);
+        RlpHeader { list: false, payload_length: params_rlp.len() }.encode(&mut msg_rlp);
+        msg_rlp.extend_from_slice(params_rlp);
+
+        let mut wrapped = Vec::new();
+        RlpHeader { list: true, payload_length: msg_rlp.len() }.encode(&mut wrapped);
+        wrapped.extend_from_slice(&msg_rlp);
+
+        let mut out = Vec::new();
+        RlpHeader { list: true, payload_length: wrapped.len() }.encode(&mut out);
+        out.extend_from_slice(&wrapped);
+        out
+    }
+
     fn roundtrip_msg(m: RskSubMessage) -> RskSubMessage {
         let mut buf = Vec::new();
         RskMessage::new(m).encode(&mut buf);
@@ -2776,6 +2892,8 @@ mod trie_proof_message_tests {
             block_number: 9_407_088,
             address: Address::repeat_byte(0xAB),
             storage_keys: vec![B256::repeat_byte(1), B256::repeat_byte(2)],
+            include_code: true,
+            include_storage_root: true,
         };
         match roundtrip_msg(RskSubMessage::TrieProofRequest(req.clone())) {
             RskSubMessage::TrieProofRequest(got) => assert_eq!(got, req),
@@ -2792,6 +2910,8 @@ mod trie_proof_message_tests {
             block_number: 7,
             address: Address::ZERO,
             storage_keys: Vec::new(),
+            include_code: false,
+            include_storage_root: false,
         };
         match roundtrip_msg(RskSubMessage::TrieProofRequest(req.clone())) {
             RskSubMessage::TrieProofRequest(got) => assert_eq!(got, req),
@@ -2812,6 +2932,8 @@ mod trie_proof_message_tests {
                 vec![Bytes::from(vec![0x01, 0x02])],
                 vec![Bytes::from(vec![0x03]), Bytes::from(vec![0x04, 0x05])],
             ],
+            code_proof: vec![Bytes::from(vec![0x0c, 0x0d])],
+            storage_root_proof: vec![Bytes::from(vec![0x0e])],
         };
         match roundtrip_msg(RskSubMessage::TrieProofResponse(Box::new(resp.clone()))) {
             RskSubMessage::TrieProofResponse(got) => assert_eq!(*got, resp),
@@ -2819,22 +2941,139 @@ mod trie_proof_message_tests {
         }
     }
 
-    /// An absent key is an empty path, and must not be confused with a
+    /// An empty path -- the peer could not walk its store -- must survive the
+    /// round trip as an empty path, and must stay distinguishable from a
     /// response that carries no storage section at all.
+    ///
+    /// The two mean different things to a client: one slot asked about and
+    /// unanswerable, against nothing asked about. Collapsing them in the
+    /// codec would make the distinction `snap::server::trie_proof` is careful
+    /// to draw unreadable on arrival.
     #[test]
-    fn an_absent_key_round_trips_as_an_empty_path() {
+    fn an_unwalkable_path_round_trips_as_an_empty_path() {
         let resp = TrieProofResponse {
             id: 9,
             block_number: 1,
             account_proof: Vec::new(),
             storage_proofs: vec![Vec::new()],
+            code_proof: Vec::new(),
+            storage_root_proof: Vec::new(),
         };
         match roundtrip_msg(RskSubMessage::TrieProofResponse(Box::new(resp.clone()))) {
             RskSubMessage::TrieProofResponse(got) => {
                 assert_eq!(*got, resp);
                 assert!(got.account_proof.is_empty());
                 assert_eq!(got.storage_proofs.len(), 1, "the slot was asked about");
-                assert!(got.storage_proofs[0].is_empty(), "and the trie does not hold it");
+                assert!(got.storage_proofs[0].is_empty(), "and the peer could not walk it");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// **A peer that predates #393 is still understood.**
+    ///
+    /// Its request carries four fields and the list ends there. The new
+    /// decoder must read it as the request that peer meant -- no code, no
+    /// storage root -- rather than failing on the short list.
+    #[test]
+    fn a_request_from_a_peer_without_the_new_fields_decodes() {
+        // The old encoding, built by hand: RLP([id, number, address, [keys]])
+        let mut params = Vec::new();
+        let mut inner = Vec::new();
+        7u64.encode(&mut inner);
+        99u64.encode(&mut inner);
+        Address::repeat_byte(0xAB).encode(&mut inner);
+        let mut keys = Vec::new();
+        B256::repeat_byte(3).encode(&mut keys);
+        RlpHeader { list: true, payload_length: keys.len() }.encode(&mut inner);
+        inner.extend_from_slice(&keys);
+        RlpHeader { list: true, payload_length: inner.len() }.encode(&mut params);
+        params.extend_from_slice(&inner);
+
+        let wire = frame(RskMessageType::TrieProofRequest, &params);
+        let decoded = RskMessage::decode(&mut wire.as_slice())
+            .expect("an old four-field request must still decode");
+        match decoded.sub_message {
+            RskSubMessage::TrieProofRequest(got) => {
+                assert_eq!(got.id, 7);
+                assert_eq!(got.block_number, 99);
+                assert_eq!(got.storage_keys, vec![B256::repeat_byte(3)]);
+                assert!(!got.include_code, "an absent field is the request that peer meant");
+                assert!(!got.include_storage_root);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// **And a peer that predates #393 can still read ours.**
+    ///
+    /// The new fields are appended, so the first four decode positionally
+    /// exactly as they always did. This reads a new message the way an older
+    /// decoder would -- taking four fields and stopping -- and checks it gets
+    /// the message it expects rather than an error or shifted values.
+    #[test]
+    fn an_older_decoder_still_reads_the_first_four_fields_of_our_request() {
+        let req = TrieProofRequest {
+            id: 11,
+            block_number: 500,
+            address: Address::repeat_byte(0x7E),
+            storage_keys: vec![B256::repeat_byte(9)],
+            include_code: true,
+            include_storage_root: true,
+        };
+        let mut buf = Vec::new();
+        RskMessage::new(RskSubMessage::TrieProofRequest(req)).encode(&mut buf);
+
+        // Unwrap the framing the way `RskMessage::decode` does, then read
+        // only the four fields the older decoder knew about.
+        let mut slice = buf.as_slice();
+        let h1 = RlpHeader::decode(&mut slice).unwrap();
+        let mut b1 = &slice[..h1.payload_length];
+        let h2 = RlpHeader::decode(&mut b1).unwrap();
+        let mut b2 = &b1[..h2.payload_length];
+        assert_eq!(u8::decode(&mut b2).unwrap(), RskMessageType::TrieProofRequest as u8);
+        let body_h = RlpHeader::decode(&mut b2).unwrap();
+        assert!(!body_h.list, "the params travel as an RLP string");
+        let mut body = &b2[..body_h.payload_length];
+        let list_h = RlpHeader::decode(&mut body).unwrap();
+        let mut list_body = &body[..list_h.payload_length];
+
+        assert_eq!(u64::decode(&mut list_body).unwrap(), 11);
+        assert_eq!(u64::decode(&mut list_body).unwrap(), 500);
+        assert_eq!(Address::decode(&mut list_body).unwrap(), Address::repeat_byte(0x7E));
+        let keys_h = RlpHeader::decode(&mut list_body).unwrap();
+        let mut keys_body = &list_body[..keys_h.payload_length];
+        assert_eq!(B256::decode(&mut keys_body).unwrap(), B256::repeat_byte(9));
+        assert!(keys_body.is_empty(), "one key, and the older decoder stops here");
+    }
+
+    /// The same for the response: a four-field answer from an older peer
+    /// reads as "no code proof here", which is what the client does with an
+    /// empty one anyway.
+    #[test]
+    fn a_response_from_a_peer_without_the_new_fields_decodes() {
+        let mut inner = Vec::new();
+        4u64.encode(&mut inner);
+        5u64.encode(&mut inner);
+        let mut account = Vec::new();
+        Bytes::from(vec![0xaa]).encode(&mut account);
+        RlpHeader { list: true, payload_length: account.len() }.encode(&mut inner);
+        inner.extend_from_slice(&account);
+        RlpHeader { list: true, payload_length: 0 }.encode(&mut inner);
+
+        let mut params = Vec::new();
+        RlpHeader { list: true, payload_length: inner.len() }.encode(&mut params);
+        params.extend_from_slice(&inner);
+
+        let wire = frame(RskMessageType::TrieProofResponse, &params);
+        match RskMessage::decode(&mut wire.as_slice())
+            .expect("an old four-field response must still decode")
+            .sub_message
+        {
+            RskSubMessage::TrieProofResponse(got) => {
+                assert_eq!(got.account_proof, vec![Bytes::from(vec![0xaa])]);
+                assert!(got.code_proof.is_empty(), "nothing served, nothing claimed");
+                assert!(got.storage_root_proof.is_empty());
             }
             other => panic!("wrong variant: {other:?}"),
         }

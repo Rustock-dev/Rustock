@@ -171,6 +171,68 @@ a server that does not implement it sends rskj's five elements.
 
 Specified upstream in RSKIP-696.
 
+## 4b. Trie proofs (`rsk/64`, types 29 and 30)
+
+**Source**: `crates/networking/src/protocol/rsk.rs`,
+`crates/sync/src/snap/server.rs`, `crates/sync/src/proof_client.rs`
+
+rustock's own extension, which rskj neither sends nor understands. A light
+client names a block by **number**, not by state root: it holds headers and
+can map one to the other itself, and the peer gains no latitude from it, since
+the nodes it returns have to hash up to the state root in the client's own
+validated header.
+
+| Message | Type ID | Params |
+|---------|---------|--------|
+| `TrieProofRequest` | 29 | `id`, `blockNumber`, `address`, `storageKeys[]`, *`includeCode`*, *`includeStorageRoot`* |
+| `TrieProofResponse` | 30 | `id`, `blockNumber`, `accountProof[]`, `storageProofs[][]`, *`codeProof[]`*, *`storageRootProof[]`* |
+
+The italicised elements are appended, by the same rule section 4a describes:
+a peer that predates them reads the first four and stops, and one that
+postdates them reads absence as `false` on the request side and as an empty
+path on the response side. No version bump, no flag day. They were added for
+#393 and are covered by four tests in `trie_proof_message_tests` that
+exercise both directions of the skew, including one that decodes a
+hand-built four-element message this codebase can no longer produce.
+
+### What an empty path means, and what it does not
+
+**An empty path means the responder could not walk its trie.** It is not an
+absence proof and must never be read as one.
+
+A key the trie does not hold is answered with the **divergence path**: the
+nodes down to the point where the search stops, which the client verifies
+exactly as it verifies an inclusion path. Where the key is held, that walk
+*is* the inclusion path. The two differ only in what the deepest node turns
+out to say, and `rustock_trie::proof::verify_path` reports which.
+
+This matters more than it looks. Answering an absent key with nothing would
+let any peer deny any account by staying quiet, and a never-used address is a
+new wallet's first query -- so the unprovable case would have been the common
+one. The same rule now holds on the RPC side (`eth_getProof`, #392).
+
+`codeProof` and `storageRootProof` carry the extra qualification that empty
+also covers "not asked for" and "peer predates the field". The client knows
+what it asked, so it can tell those apart; what it must not do is read any of
+them as "this account has no code".
+
+### Why code needs its own element
+
+On Ethereum a light client authenticates code by hashing it and comparing
+against the account's `codeHash`. RSK's account record is
+`(nonce, balance, stateFlags)` and has no code hash, so that route does not
+exist: the only way to authenticate code here is a proof of `code_key(address)`
+itself. Until type 29 could ask for one, an SPV node could obtain no code it
+could check, which closed off a verified `eth_call` -- and with it the only
+way to show an ERC-20 balance that does not need a per-token storage-layout
+oracle.
+
+A code proof is the one path whose size grows with the contract rather than
+with the depth of the trie, since its leaf *is* the code. The server bounds it
+at `MAX_PROOF_CODE_BYTES` (24,576, EIP-170's limit on deployed code) and
+answers an oversized request with an empty code path rather than refusing the
+whole message, so a client that wanted a balance still gets one.
+
 ---
 
 ## 5. Descending Header Delivery

@@ -51,10 +51,25 @@ pub fn eth_get_transaction_count(id: Value, params: &Value, state: &RpcState) ->
     }
 }
 
-pub fn eth_get_code(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
+pub async fn eth_get_code(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
     let Some(addr) = params.get(0).and_then(|v| v.as_str()).and_then(|s| s.parse::<Address>().ok()) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid address");
     };
+
+    // A node with no trie asks a peer and checks the answer, exactly as
+    // `eth_getProof` does. Before #393 the proof message could not ask for
+    // code, so an SPV node could not serve this at all -- it failed in
+    // `queried_state` on having no state, which is also the one thing
+    // standing between an SPV wallet and a verified `eth_call`.
+    if state.trie_store.is_none() {
+        let named = crate::helpers::block_ref(params.get(1), &state.store)
+            .and_then(|(identifier, _)| crate::helpers::information_block(&identifier));
+        return match named {
+            Ok(block) => light_code(id, addr, &block, state).await,
+            Err((code, message)) => JsonRpcResponse::error(id, code, message),
+        };
+    }
+
     let (root, _header) = match queried_state(&id, params.get(1), state) {
         Ok(found) => found,
         Err(refused) => return refused,
@@ -68,9 +83,87 @@ pub fn eth_get_code(id: Value, params: &Value, state: &RpcState) -> JsonRpcRespo
         None => return JsonRpcResponse::success(id, json!("0x")),
     };
 
-    match root.get(&expanded, &*trie_store) {
-        Some(data) => JsonRpcResponse::success(id, json!(to_hex_bytes(&data))),
-        None => JsonRpcResponse::success(id, json!("0x")),
+    // Strict: a node the store cannot produce is an error naming it, not an
+    // answer of "no code". `eth_getCode` reporting `0x` for a contract whose
+    // code node was collected is the plausible-wrong-answer failure, and a
+    // caller running an EVM on the result would get a silent no-op instead
+    // of a visible error.
+    match root.try_get(&expanded, &*trie_store) {
+        Ok(Some(data)) => JsonRpcResponse::success(id, json!(to_hex_bytes(&data))),
+        Ok(None) => JsonRpcResponse::success(id, json!("0x")),
+        Err(missing) => JsonRpcResponse::error(
+            id,
+            INTERNAL_ERROR,
+            format!("The state is incomplete here: node {missing:#x} is missing"),
+        ),
+    }
+}
+
+/// `eth_getCode` on a node holding no state: ask a peer, verify, answer.
+///
+/// The code comes back as a proof of `code_key(address)` against the state
+/// root in a header this node validated itself, so a peer that invents code
+/// is caught rather than believed. On RSK this is the **only** way to
+/// authenticate code: the account record is `(nonce, balance, stateFlags)`
+/// and carries no `codeHash` to compare hashed bytes against (#393).
+///
+/// A proved absence is `0x`, as on a full node. An unverifiable answer is an
+/// error, never `0x` -- the two are the same bytes to a caller and mean
+/// opposite things to an EVM about to run them.
+async fn light_code(
+    id: Value,
+    addr: Address,
+    block_param: &str,
+    state: &RpcState,
+) -> JsonRpcResponse {
+    use rustock_trie::proof::{verify_path, Outcome};
+
+    let Some(fetcher) = state.proof_fetcher.clone() else {
+        return JsonRpcResponse::error(
+            id,
+            INTERNAL_ERROR,
+            "State not available: this node holds no trie and has no peer to ask",
+        );
+    };
+    if let Some(refused) = stale_head(&id, block_param, state) {
+        return refused;
+    }
+    let Some(header) = resolve_header(block_param, &state.store) else {
+        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
+    };
+
+    let fetched = match fetcher
+        .fetch_proof(crate::server::ProofAsk {
+            block_number: header.number,
+            address: addr,
+            include_code: true,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return JsonRpcResponse::error(id, INTERNAL_ERROR, e),
+    };
+
+    if fetched.code.is_empty() {
+        // Nothing to check. Either the peer predates the field or it could
+        // not walk its store; both leave this node unable to answer, and
+        // `0x` would be a claim it cannot support.
+        return JsonRpcResponse::error(
+            id,
+            INTERNAL_ERROR,
+            "the peer served no code proof, so this node cannot answer for the code",
+        );
+    }
+
+    match verify_path(&fetched.code, &code_key(&addr), header.state_root) {
+        Ok(Outcome::Value(code)) => JsonRpcResponse::success(id, json!(to_hex_bytes(&code))),
+        Ok(Outcome::Absent) => JsonRpcResponse::success(id, json!("0x")),
+        Err(e) => JsonRpcResponse::error(
+            id,
+            INTERNAL_ERROR,
+            format!("the peer's code proof does not check out: {e}"),
+        ),
     }
 }
 
